@@ -1,0 +1,9 @@
+# Environment for scripts/e2e_smoke.py (and the stub services it spawns).
+# Any Python 3.12 venv with these works:  python3.12 -m venv .e2e-venv &&
+# .e2e-venv/bin/pip install -r scripts/requirements-e2e.txt
+# Pinned to the fleet versions (same as the service requirements).
+fastapi==0.141.1
+uvicorn==0.52.1
+httpx==0.28.1
+numpy==2.5.1
+opencv-python-headless==5.0.0.93
