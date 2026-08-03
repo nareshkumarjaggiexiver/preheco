@@ -1,0 +1,9 @@
+# ingest service — runtime + dev. heco-common (editable) brings pydantic,
+# numpy and opencv-python-headless.
+-e ../../common
+fastapi>=0.111
+uvicorn>=0.30
+# dev/test
+httpx>=0.27          # starlette TestClient transport (in-process, no network)
+pytest>=8.0
+ruff>=0.5

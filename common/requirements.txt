@@ -1,0 +1,5 @@
+# Dev/test environment for the shared library itself.
+# Runtime deps are declared in pyproject.toml and pulled in by the -e install.
+-e .
+pytest>=8.0
+ruff>=0.5

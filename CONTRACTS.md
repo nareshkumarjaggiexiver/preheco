@@ -21,10 +21,10 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | --------- | ---- | --- |
 | ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url|path} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
-| tracker   | 7103 | POST /track {boxes, tMs} → {tracks:[{id,box,age}]} — own SORT-style IoU+velocity, stateful per run |
-| faces     | 7104 | POST /detect {imageB64, within?} → {faces:[{box,landmarks,conf}]} — YuNet (OpenCV zoo) |
+| tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}) |
+| faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {embedding} → {personKey, isNew, cosine} — gallery in SQLite, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env) |
+| match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -44,8 +44,9 @@ Measured metrics the console charts: personBoxHPx, faceBoxWPx, embedMs, matchCos
 - Python 3.12; **one venv per service** (`make venv` in each); ruff + pytest.
 - Every module has docstrings; every service a README (what, run, test, tune).
 - Model weights are DOWNLOADED by `make models` (never committed); pinned URLs
-  + sha256 in models.lock. Licences: YOLOX Apache-2.0, YuNet/SFace Apache-2.0
-  via OpenCV zoo — nothing GPL/non-commercial (project hard rule).
+  + sha256 in models.lock. Licences: YOLOX Apache-2.0; YuNet MIT, SFace Apache-2.0
+  (per OpenCV-zoo model dirs; models.lock is authoritative) — nothing
+  GPL/non-commercial (project hard rule).
 - docker-compose.yml at repo root; `runner` reads PLANNER_URL (default
   http://host.docker.internal:8787). Everything runs CPU-only for POC.
 - Tests use tiny synthetic images + golden fixtures; no network in tests.

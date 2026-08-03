@@ -1,0 +1,30 @@
+# Virtual environments — one per service, created by `make venv`
+.venv/
+
+# Python build/runtime artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights are NEVER committed — `make models` downloads them
+# (pinned URL + sha256 in models.lock) into each service's models/ dir.
+models/
+
+# Local scratch data (galleries, sample footage, run output)
+data/
+*.sqlite
+*.sqlite3
+
+# Editor noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

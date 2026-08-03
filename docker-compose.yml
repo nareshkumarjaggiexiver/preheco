@@ -1,0 +1,128 @@
+# heco-pipeline — all seven services on one compose network.
+#
+# The shared base image must exist first (compose builds do not order it):
+#   docker build -f docker/base.Dockerfile -t heco-pipeline-base:latest .
+#   docker compose build
+#   docker compose up -d
+#
+# Model weights are never baked into images: run `make models-all` on the host
+# first — each model service's ./services/<name>/models is bind-mounted
+# read-only at the path the service expects.  The site-planner app runs on the
+# HOST at :8787; the runner reaches it via host.docker.internal (extra_hosts
+# provides that mapping on Linux).
+
+name: heco-pipeline
+
+x-heco-service: &heco-service
+  restart: unless-stopped
+  init: true
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >
+        import os,urllib.request,sys;
+        sys.exit(0 if urllib.request.urlopen(
+        f"http://localhost:{os.environ['HECO_PORT']}/health", timeout=3
+        ).status == 200 else 1)
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 15s
+
+services:
+  ingest:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: ingest, PORT: "7101" }
+    image: heco-ingest
+    ports: ["7101:7101"]
+    volumes:
+      - source-media:/media   # drop test clips here; /open them by path
+
+  persons:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: persons, PORT: "7102" }
+    image: heco-persons
+    ports: ["7102:7102"]
+    volumes:
+      - ./services/persons/models:/srv/services/persons/models:ro
+
+  tracker:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: tracker, PORT: "7103" }
+    image: heco-tracker
+    ports: ["7103:7103"]
+
+  faces:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: faces, PORT: "7104" }
+    image: heco-faces
+    ports: ["7104:7104"]
+    volumes:
+      - ./services/faces/models:/srv/services/faces/models:ro
+
+  embed:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: embed, PORT: "7105" }
+    image: heco-embed
+    ports: ["7105:7105"]
+    volumes:
+      - ./services/embed/models:/srv/services/embed/models:ro
+
+  match:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: match, PORT: "7106" }
+    image: heco-match
+    ports: ["7106:7106"]
+    volumes:
+      - match-data:/srv/services/match/data   # per-run galleries survive restarts
+
+  runner:
+    <<: *heco-service
+    build:
+      context: .
+      dockerfile: docker/service.Dockerfile
+      args: { SERVICE: runner, PORT: "7100" }
+    image: heco-runner
+    ports: ["7100:7100"]
+    environment:
+      # The site-planner console on the host machine.
+      PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
+      HECO_INGEST_URL: http://ingest:7101
+      HECO_PERSONS_URL: http://persons:7102
+      HECO_TRACKER_URL: http://tracker:7103
+      HECO_FACES_URL: http://faces:7104
+      HECO_EMBED_URL: http://embed:7105
+      HECO_MATCH_URL: http://match:7106
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux needs this mapping
+    depends_on:
+      ingest: { condition: service_healthy }
+      persons: { condition: service_healthy }
+      tracker: { condition: service_healthy }
+      faces: { condition: service_healthy }
+      embed: { condition: service_healthy }
+      match: { condition: service_healthy }
+
+volumes:
+  match-data:
+  source-media:
