@@ -1,0 +1,12 @@
+# Keep build contexts lean: no venvs, weights, caches or local data in images.
+# (Weights are bind-mounted at run time — see docker-compose.yml.)
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+**/models
+**/data
+**/*.sqlite
+**/*.sqlite3
+.git

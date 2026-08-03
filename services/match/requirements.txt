@@ -1,0 +1,10 @@
+# match service — runtime + dev, pinned to the fleet versions (Python 3.12).
+# Self-contained on purpose: no heco_common (pure geometry + sqlite + numpy).
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+numpy==2.5.1
+# dev/test (one file: `make venv` is the single install step)
+httpx==0.28.1
+pytest==9.1.1
+ruff==0.16.1

@@ -1,0 +1,10 @@
+# runner service — runtime + dev, pinned to the fleet versions (Python 3.12).
+# heco-common (editable) brings the wire schemas and the PlannerClient.
+-e ../../common
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+httpx==0.28.1
+# dev/test
+pytest==9.1.1
+ruff==0.16.1

@@ -1,0 +1,17 @@
+# Repo-wide ruff configuration. Every service and common/ lints against this
+# one file (ruff walks up from any subdirectory), so style is uniform without
+# per-service config drift. Run via `make lint` at the root or in any service.
+
+target-version = "py312"
+line-length = 100
+
+[lint]
+# E/W  pycodestyle          F    pyflakes
+# I    import sorting       UP   modernize to 3.12 idioms
+# B    bugbear (real bugs)  SIM  simplifications
+# D10x missing-docstring checks — the project hard rule is docstrings on
+#      every module, class and public function; ruff enforces it.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "D100", "D101", "D102", "D103", "D104"]
+
+[lint.pydocstyle]
+convention = "pep257"
