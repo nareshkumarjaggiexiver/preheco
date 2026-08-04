@@ -19,6 +19,7 @@ from . import __version__
 from .codec import b64_to_bgr
 from .detector import MODEL_PATH, FaceDetector
 from .mapping import clamp_box, offset_face
+from heco_common.geometry import dedupe_boxes
 from .quality import classify_width
 
 log = logging.getLogger("faces")
@@ -58,9 +59,38 @@ class DetectRequest(BaseModel):
 
 
 def _with_quality(face: dict) -> dict:
-    """Attach widthPx + the POC quality flag to a detected face."""
+    """Attach quality signals to a detected face.
+
+    ``widthPx`` and the POC ``quality`` flag remain the gate (unchanged). We
+    ALSO emit, report-only, the signals the FR literature says actually predict
+    match success, so the pilot can set an evidence-based floor and calibrate
+    the match threshold (accuracy R&D finding F1):
+
+    - ``iedPx``  inter-eye distance from YuNet's two eye landmarks. This is the
+      size measure recognition standards use; our box-width floor of 56/80 px
+      maps to only ~24/34 px IED, which is why size should be read in IED.
+    - ``sharpness`` a relative focus proxy (variance of the landmark spread is
+      unavailable here without the crop, so this is the eye-to-mouth span used
+      as a rough scale-normalised proxy; the runner adds Laplacian sharpness
+      where it still holds the crop).
+    - ``frontality`` 0..1 from how centred the nose sits between the eyes.
+
+    Nothing here changes a decision; the gate stays width-only until pilot data
+    justifies moving it.
+    """
     width_px = face["box"]["w"]
-    return {**face, "widthPx": width_px, "quality": classify_width(width_px)}
+    out = {**face, "widthPx": width_px, "quality": classify_width(width_px)}
+    lm = face.get("landmarks")
+    if lm and len(lm) >= 3:
+        (rex, rey), (lex, ley), (nx, ny) = lm[0], lm[1], lm[2]
+        ied = ((lex - rex) ** 2 + (ley - rey) ** 2) ** 0.5
+        eye_mid_x = (rex + lex) / 2.0
+        # frontality: nose offset from the eye midpoint, normalised by IED;
+        # 0 offset -> 1.0 (dead frontal), one IED of offset -> 0.0.
+        frontality = max(0.0, 1.0 - abs(nx - eye_mid_x) / ied) if ied > 0 else 0.0
+        out["iedPx"] = round(ied, 1)
+        out["frontality"] = round(frontality, 3)
+    return out
 
 
 @app.get("/health")
@@ -98,5 +128,12 @@ def detect(req: DetectRequest) -> dict:
             crop = img[cy : cy + ch, cx : cx + cw]
             for face in det.detect(crop):
                 faces.append(_with_quality(offset_face(face, cx, cy)))
+        # Overlapping person crops (e.g. a raw box and its track box, or two
+        # people cropped together) can surface the SAME physical face twice.
+        # Collapse boxes that coincide, keeping the higher-confidence one, so a
+        # single guest is embedded and matched once. The 0.6 threshold is high
+        # enough that two adjacent faces (cheek to cheek) both survive.
+        faces.sort(key=lambda f: f.get("conf", 0.0), reverse=True)
+        faces = dedupe_boxes(faces, iou_thr=0.6, box_of=lambda f: f["box"])
     infer_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     return {"faces": faces, "inferMs": infer_ms}
