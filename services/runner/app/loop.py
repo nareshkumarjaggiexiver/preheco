@@ -291,17 +291,26 @@ class RunLoop:
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
 
-        # face-detect region: the DEDUPED UNION of the raw person boxes and the
-        # confirmed-track boxes. Searching only confirmed tracks (the old
-        # `[t["box"] for t in tracks] or boxes`) silently dropped every
-        # unconfirmed, coasting or short-dwell person from face search once ANY
-        # track existed — and because the count is match.isNew, a face never
-        # searched is a guest never counted. Raw boxes restore recall; the
-        # dedupe stops a person covered by both a raw box and a track box from
-        # being searched (and embedded) twice. See docs/planning/pipeline/
-        # accuracy-and-tuning.md (finding D1).
+        # Face-detect region = every RAW person box this frame, deduped against
+        # the track boxes.
+        #
+        # The bug this replaced (finding D1): `[t["box"] for t in tracks] or
+        # boxes` searched ONLY confirmed-track boxes once any track existed.
+        # The tracker reports a track only after min_hits frames (sort.py
+        # SortLite.step), so a guest who has just walked in is a detection with
+        # no reported track — their face was never searched, and because the
+        # count is match.isNew, a face never searched is a guest never counted.
+        #
+        # Raw boxes are therefore the recall-bearing half and go FIRST. The
+        # track half is redundant while the tracker reports only misses == 0
+        # tracks, whose boxes are snapped to the matched detection
+        # (TrackState.update) and so duplicate a raw box. It is kept because
+        # that invariant is the tracker's to change: if coasting tracks are
+        # ever reported, their predicted boxes cover people the detector missed
+        # this frame, which is real recall. Boxes-first ordering means a fresh
+        # detection always wins the dedupe over a stale prediction.
         within = dedupe_boxes(
-            [t["box"] for t in tracks] + list(boxes), iou_thr=0.6
+            list(boxes) + [t["box"] for t in tracks], iou_thr=0.6
         )
         faces_out = self._timed(
             "face-detect",
