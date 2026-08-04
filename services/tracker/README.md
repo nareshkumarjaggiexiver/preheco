@@ -28,8 +28,15 @@ max-age coasting, min-hits confirmation. `/health` reports
 | method | path | body / response |
 | ------ | ---- | --------------- |
 | POST | `/reset` | `{runId}` — create/clear that run's state (also re-reads env) |
+| POST | `/release` | `{runId}` — forget the run entirely (end of run); idempotent |
 | POST | `/track` | `{runId, tMs, boxes:[{x,y,w,h,conf}]}` → `{tracks:[{id, box, ageFrames, hits}]}` |
-| GET | `/health` | `{ok, model, version}` |
+| GET | `/health` | `{ok, model, version, runs}` — `runs` = resident run trackers |
+
+Per-run state has a LIFECYCLE. Every run gets a fresh id, so the run table only
+ever grew: a season of events left one dead tracker per run resident until the
+process restarted. The runner calls `/release` when a run ends, and `/track`
+evicts runs untouched for `TRACKER_RUN_TTL_S` as the backstop for runs that
+died without releasing.
 
 Unknown `runId` on `/track` auto-creates the run. Only tracks *updated this
 frame* and past min-hits are returned (min-hits is waived during the first
@@ -65,6 +72,7 @@ id; per-run isolation; reset semantics; env tuning.
 | `TRACKER_MAX_AGE` | `15` | Frames a track may coast unmatched before it is dropped. |
 | `TRACKER_MIN_HITS` | `3` | Matched frames before a track is reported (ghost suppression). |
 | `TRACKER_IOU_MIN` | `0.2` | Association gate: pairs below this IoU never match. |
+| `TRACKER_RUN_TTL_S` | `3600` | Forget a run's tracker after this many seconds without a `/track`. `0` disables eviction. |
 | `TRACKER_VEL_SMOOTH` | `0.5` | Velocity filter alpha (1.0 = trust newest delta only). |
 
 Env is read when a run's tracker is created — POST `/reset` to apply changes

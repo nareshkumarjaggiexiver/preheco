@@ -94,8 +94,23 @@ def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
     return {"count": len(faces), "kept": kept, "gated": len(faces) - kept, "faces": rows}
 
 
-def match_payload(verdicts: list[dict], unique: int, staff_crossings: int) -> dict:
-    """Matcher verdicts (personKey + cosine + staff flag) with live counters."""
+def match_payload(
+    verdicts: list[dict],
+    unique: int,
+    staff_crossings: int,
+    staff_face_frames: int = 0,
+    manual_additions: int = 0,
+) -> dict:
+    """Matcher verdicts (personKey + cosine + staff flag) with live counters.
+
+    Both staff numbers are reported because they answer different questions
+    and only one of them is about people: ``staffCrossings`` counts passes (a
+    waiter through the gate ten times is ten), ``staffFaceFrames`` counts
+    matched face-frames and moves with the frame rate — useful for debugging
+    recall, meaningless in a report.  ``manualAdditions`` is how much of
+    ``unique`` an operator attested by hand rather than the pipeline detecting
+    it; a console that shows the total must be able to show that split.
+    """
     rows = [
         {
             "personKey": v.get("personKey"),
@@ -109,6 +124,8 @@ def match_payload(verdicts: list[dict], unique: int, staff_crossings: int) -> di
     return {
         "unique": unique,
         "staffCrossings": staff_crossings,
+        "staffFaceFrames": staff_face_frames,
+        "manualAdditions": manual_additions,
         "matched": len(verdicts),
         "matches": rows,
     }
@@ -120,6 +137,8 @@ def build_payloads(
     canon_px: float,
     unique: int,
     staff_crossings: int,
+    staff_face_frames: int = 0,
+    manual_additions: int = 0,
 ) -> dict[str, dict]:
     """Build the per-stage tap payloads from one frame's captured outputs.
 
@@ -132,7 +151,10 @@ def build_payloads(
         "person-detect": person_payload(last.get("boxes", [])),
         "track": track_payload(last.get("tracks", [])),
         "face-detect": face_payload(last.get("faces", []), min_px, canon_px),
-        "match": match_payload(last.get("verdicts", []), unique, staff_crossings),
+        "match": match_payload(
+            last.get("verdicts", []), unique, staff_crossings,
+            staff_face_frames, manual_additions,
+        ),
     }
 
 

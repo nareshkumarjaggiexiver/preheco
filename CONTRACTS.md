@@ -19,9 +19,9 @@ no message bus at POC scale (NATS arrives with multi-camera).
 
 | service   | port | job |
 | --------- | ---- | --- |
-| ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url|path} |
+| ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, owner?, takeover?}, POST /close {owner?} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
-| tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}) |
+| tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
 | match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env) |
@@ -138,3 +138,189 @@ Every step is best-effort and retried: a planner or match hiccup leaves the
 tombstone OPEN, and the next cycle (or the next run's start-up check) tries
 again. A dropped confirmation only means the purge re-runs, which is harmless.
 The runner reports a `staffPurged` counter in its status.
+
+## v2 — corrections from the 2026-08-05 adversarial review
+
+Eleven confirmed findings, all of which either killed a live run, corrupted a
+count, or put a number in the report that did not mean what its name said.
+The contract changes they forced are below; the principle behind most of them
+is one sentence: **the count is the product, reporting is secondary.**
+
+### The capture slot is exclusive (ingest)
+
+`POST /open` takes `owner` (the runner's run id) and `takeover` (bool).
+
+- An `/open` carrying an `owner` CLAIMS the single capture slot.
+- A later `/open` by a DIFFERENT owner is refused **409**, and the detail names
+  the run holding it. Previously it silently replaced the live run's source:
+  starting a staff enrolment during a gate count made the count run consume the
+  enrolment walk-through, with no error anywhere.
+- Escapes: the same owner may re-open (idempotent restart); a slot whose
+  capture thread has died is claimable; `takeover: true` is the operator's
+  explicit seizure. An `/open` with **no** owner keeps the old
+  replace-anything behaviour (ad-hoc probes, the smoke script).
+- `POST /close {owner?, force?}` releases the slot; owner-checked so a stale
+  stop cannot take the camera from the run that holds it now. Idempotent.
+- `GET /health` now also returns `owner`.
+
+### Per-run state has a lifecycle (runner, tracker, match)
+
+Every run got a fresh uuid-suffixed planner id, so nothing downstream was ever
+cleaned up: one dead SortLite per run resident in the tracker forever, and one
+`gallery-<runId>.db` per run on disk forever — each holding real guests' face
+embeddings, which is a retention liability, not just disk.
+
+- The runner RELEASES its state at the end of every run (and on failure),
+  before the closing `PUT /api/pipeline/runs/:id`: ingest `/close`, tracker
+  `/release`, match `/reset` (which deletes the gallery file). All best-effort
+  — a run that has produced its number must never fail while tidying up.
+- `POST tracker /release {runId}` → `{ok, runId, released}`; idempotent.
+  Tracker also evicts runs untouched for `TRACKER_RUN_TTL_S` (default 3600) on
+  every `/track`, as the backstop for runs that die without releasing.
+  `GET tracker /health` returns `runs` (resident count) so a leak is visible.
+- `POST match /gallery/sweep {maxAgeS?}` → `{swept:[runId], maxAgeS}` deletes
+  gallery files older than `maxAgeS` (default 24 h). Staff stores are NEVER
+  swept — they are meant to persist.
+
+### Enrolment is single-subject, and ranked by recognisability
+
+- A frame contributes a sample only when **exactly one** face passes the
+  quality gate. Frames with two or more are skipped and counted in the run
+  status as `multiFaceFramesSkipped`.
+- An enrolment that captured no single-subject frame **fails** (state
+  `failed`, with an error telling the operator to walk the member through
+  alone and re-run) rather than quietly reporting zero samples.
+- The best-N shortlist is ranked by `iedPx × frontality` (both already emitted
+  by faces), falling back to box width only when landmarks are absent.
+
+Why it is worth failing an enrolment: the store is per-SITE and PERSISTENT,
+and `staff.enrol` supersedes the member's prior templates. A bystander caught
+in the walk-through therefore becomes permanently matched as that staff member
+at every future event at the venue and silently excluded from every guest
+count, while the real member may stop matching — with no signal that it
+happened.
+
+### staffCrossings means crossings
+
+- `staffCrossings` counts **passes**: the same staff member seen again within
+  `HECO_STAFF_COOLDOWN_S` (default 5 s) of their last sighting is still the
+  same pass. It used to be incremented per matched face per frame, so one
+  waiter passing 30 times reported hundreds — a number that moved with the
+  frame rate, not with staff behaviour.
+- `staffFaceFrames` is the raw per-frame figure, kept because it is genuinely
+  useful for debugging recall. Both appear in the run status, in the match tap
+  payload, and in the end-of-run notes.
+
+### The feedback ledger tells the truth
+
+The kinds table, revised:
+
+    duplicate   {personKeys:[a,b]}    → merge b into a          (unique −1)
+    false-match {personKeys:[a,b]}    → split (do-not-merge)     (unique ±0)
+    mark-staff  {personKey, staffId?} → move to the staff store  (unique −1)
+                                        REQUIRES a run with siteId
+    missed      {note?}               → manual count            (unique +1)
+    note                              → acknowledged only (audit trail)
+
+- **mark-staff requires a siteId.** `POST match /mark-staff` without one is
+  **400**, and the runner maps it to `invalid` → resolved `rejected`. It used
+  to delete the person's templates with nowhere to put them, return `moved>0`,
+  and resolve `applied` — after which the person was counted as a brand-new
+  guest at their next crossing. The correction silently undid itself.
+- **An applied correction is never re-resolved as rejected.** The runner
+  remembers the outcome of every correction it has carried out but not yet
+  managed to report; a dropped `PUT /api/feedback/:id` is retried with the
+  SAME status and the gallery call is NOT repeated. This is also what makes
+  the (non-idempotent) `missed` lever safe: +1 means +1.
+- **Nothing the runner cannot do is reported `applied`.** An unrecognised kind
+  resolves `rejected` (it still closes, so it does not re-poll forever); a
+  4xx from the match service settles as `rejected`; a 5xx leaves the item open
+  for the next poll.
+
+### The operator can correct an under-count
+
+`POST match /count/manual {runId, note?}` → `{personKey, galleryN, manual:true}`
+
+Under-counting is this pipeline's dominant failure mode (open-set 1:N matching
+at a 1:1 verification threshold), and every previously implemented lever moved
+the count DOWN. `missed` now mints a person with an `m#####` key and **no
+embedding**: they count towards the unique total, can never be matched into,
+and stay permanently distinguishable from an automatically detected `p#####`
+person. The runner reports `manualAdditions` in its status, in the match tap,
+and in the end-of-run notes, so a report can always state how much of the
+headline number a human attested by hand. `note` stays audit-only.
+
+### Reporting can never stall or kill the count
+
+- The stats flush is best-effort. It used to raise `PlannerError` straight
+  into the frame loop, failing the run — and a restarted run gets a fresh
+  planner id and therefore a fresh EMPTY gallery, so every guest already
+  counted was counted again. A five-second planner restart corrupted the
+  event total. Lost reports are counted in `plannerReportErrors`; stats are
+  upserted aggregates, so the next successful flush repairs the gap.
+- **Three timeouts, not one.** Stage calls keep `HECO_REQUEST_TIMEOUT_S`
+  (30 s, the product); retrying planner calls get `HECO_PLANNER_TIMEOUT_S`
+  (5 s); single-shot taps/frames/feedback get `HECO_REPORT_TIMEOUT_S` (2 s).
+  "Best effort" used to mean only "errors are swallowed", which does nothing
+  about a planner that accepts connections and then answers slowly — and
+  ingest's drop-not-queue slot discards every crossing during a stall.
+- A whole tap ROUND (5 payloads + 5 JPEGs) additionally shares
+  `HECO_TAP_BUDGET_S` (3 s); when it is spent the rest of the round is
+  dropped and counted in `tapRoundsAbandoned`.
+
+### Match is opened once, scanned in memory
+
+Every `/match` used to `sqlite3.connect` + run the schema script + `SELECT`
+every row + rebuild the numpy matrix from BLOBs — twice with a siteId, three
+times on a staff hit, dozens of times a second.
+
+Stores are now opened **once per file** for the life of the process, with the
+key list and the `(n, dim)` float32 matrix resident and updated write-through
+on every mutation. SQLite is still the durable record (WAL +
+`synchronous=NORMAL`; a per-run gallery is deleted at run end anyway and a
+staff store can be re-enrolled).
+
+Measured on synthetic galleries (median of 3 runs, per full match call =
+staff check over 100 staff templates + gallery match), microseconds:
+
+| gallery | re-sighting before → after | new person before → after |
+| ------- | -------------------------- | ------------------------- |
+| 50      | 483 → 100 µs (4.8×)        | 3030 → 130 µs (23×)       |
+| 200     | 704 → 78 µs (9.0×)         | 3260 → 130 µs (25×)       |
+| 500     | 1414 → 86 µs (16×)         | 4340 → 144 µs (30×)       |
+
+The shape matters more than the ratio: the old cost GREW with gallery size
+(connect + schema + full-table read + BLOB rebuild every call), the new one is
+flat — the scan is a RAM matrix-vector multiply.
+
+Consequence for callers: `gallery.reset` / `sweep` CLOSE the cached connection
+before unlinking (an open connection to an unlinked inode keeps answering from
+a database nobody can see), and the match service closes every store on
+shutdown.
+
+### Run status fields (GET runner /runs/:id)
+
+Added: `staffFaceFrames`, `manualAdditions`, `feedbackRejected`,
+`multiFaceFramesSkipped`, `plannerReportErrors`, `tapRoundsAbandoned`.
+`staffCrossings` keeps its name and changes its meaning (see above).
+
+
+## v2 addition — authenticating to the planner (2026-08-05)
+
+The planner binds loopback only by default and REFUSES to listen on any other
+address without `HECO_TOKEN` set. A dockerised runner reaches it across the
+bridge network (`host.docker.internal`), so that deployment always needs a
+token on both sides.
+
+- Set the SAME value as `HECO_TOKEN` for the planner process and the runner
+  (docker-compose passes it through).
+- The runner sends `Authorization: Bearer <token>` on every planner call: run
+  create/update, stats, samples, taps, the multipart frame upload, the feedback
+  poll and its status writes, the tombstone poll and its confirmations, and the
+  enrolment report. The header rides on the httpx clients so no adapter has to
+  know about auth; `PlannerClient(token=…)` also covers the stdlib transport.
+- A 401 is a CONFIGURATION error, not a transient. It fails fast with a message
+  naming `HECO_TOKEN` rather than being retried — retrying would bury the real
+  problem behind a wall of failed attempts.
+- With no token configured on either side (loopback development) nothing
+  changes.

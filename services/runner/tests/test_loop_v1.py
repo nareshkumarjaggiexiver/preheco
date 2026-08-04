@@ -58,7 +58,13 @@ class V1Fake:
         self.merges: list[dict] = []
         self.splits: list[dict] = []
         self.mark_staff: list[dict] = []
+        self.manual_counts: list[dict] = []
+        self.opened: dict | None = None
+        self.closed: dict | None = None
         self.run_ended: dict | None = None
+        self.drop_resolve = 0  # PUT /api/feedback/:id to swallow (dropped reply)
+        self.merge_ok = True  # False once the drop key no longer exists
+        self.feedback_sticky = False  # re-serve open items until a PUT lands
 
     # -- helpers -----------------------------------------------------------
 
@@ -79,9 +85,22 @@ class V1Fake:
             return httpx.Response(200, json={"ok": True})
         if path.endswith("/feedback") and request.method == "GET":
             self.feedback_polls += 1
+            if self.feedback_sticky:
+                # Real planner behaviour: an item stays OPEN until a status PUT
+                # actually lands, so a dropped PUT means it is served again.
+                done = {fid for fid, _ in self.resolved}
+                return httpx.Response(
+                    200,
+                    json={"feedback": [i for i in self.feedback_items if i["id"] not in done]},
+                )
             items, self.feedback_items = self.feedback_items, []  # serve once
             return httpx.Response(200, json={"feedback": items})
         if path.startswith("/api/feedback/") and request.method == "PUT":
+            if self.drop_resolve > 0:
+                # The planner got it but the reply never came back (or it never
+                # got it) — either way the runner must not assume it landed.
+                self.drop_resolve -= 1
+                return httpx.Response(504, json={"error": "gateway timeout"})
             self.resolved.append((path.rsplit("/", 1)[-1], body["status"]))
             return httpx.Response(200, json={"ok": True})
         if path == "/api/staff-tombstones" and request.method == "GET":
@@ -100,12 +119,26 @@ class V1Fake:
             return httpx.Response(200, json={"ok": True})
         if path == "/merge":
             self.merges.append(body)
-            return httpx.Response(200, json={"merged": True, "galleryN": max(0, self.guest_n - 1)})
+            merged, self.merge_ok = self.merge_ok, False  # a merge is one-shot
+            return httpx.Response(
+                200, json={"merged": merged, "galleryN": max(0, self.guest_n - 1)}
+            )
+        if path == "/count/manual":
+            self.manual_counts.append(body)
+            return httpx.Response(200, json={
+                "personKey": f"m{len(self.manual_counts):05d}",
+                "galleryN": self.guest_n + len(self.manual_counts),
+                "manual": True,
+            })
         if path == "/split":
             self.splits.append(body)
             return httpx.Response(200, json={"ok": True, "galleryN": self.guest_n})
         if path == "/mark-staff":
             self.mark_staff.append(body)
+            if not body.get("siteId"):
+                # The real service refuses: destroying the templates would
+                # re-count the person as a brand-new guest next crossing.
+                return httpx.Response(400, json={"detail": "mark-staff needs a siteId"})
             return httpx.Response(200, json={
                 "moved": 1, "galleryN": max(0, self.guest_n - 1),
                 "staffKey": body.get("staffId") or "anon00001",
@@ -158,7 +191,11 @@ class V1Fake:
             return self._planner(request, path, body)
         if host == "ingest":
             if path == "/open":
+                self.opened = body
                 return httpx.Response(200, json={"ok": True})
+            if path == "/close":
+                self.closed = body
+                return httpx.Response(200, json={"ok": True, "released": True})
             if path == "/frame":
                 i = min(self.frame_i, self.n_frames - 1)
                 if self.frame_i < self.n_frames:
@@ -170,7 +207,7 @@ class V1Fake:
             box = {"x": 10, "y": 20, "w": 40, "h": 110, "conf": 0.9}
             return httpx.Response(200, json={"boxes": [box]})
         if host == "tracker":
-            if path == "/reset":
+            if path in ("/reset", "/release"):
                 return httpx.Response(200, json={"ok": True})
             if path == "/track":
                 tracks = [{"id": n + 1, "box": b, "ageFrames": self.frame_i, "hits": 1}
@@ -214,14 +251,20 @@ def make_loop(fake: V1Fake, request: dict, **settings_kw) -> RunLoop:
 
 
 def test_staff_hit_excluded_from_unique_count():
-    """A staff face is a staffCrossing; only guest faces grow matches/unique."""
+    """A staff face is a staff sighting; only guest faces grow matches/unique.
+
+    Three consecutive frames of the same staff member are ONE crossing (they
+    never left) and three staff face-frames.
+    """
     fake = V1Fake(n_frames=3, face_widths=(99.0, 85.0), staff_width=99.0)
     request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
     assert final["state"] == "ended"
-    assert final["staffCrossings"] == 3  # the 99 px face each frame
+    assert final["staffCrossings"] == 1
+    assert final["staffFaceFrames"] == 3  # the 99 px face each frame
     assert final["matches"] == 3  # only the 85 px guest face counts as a match
-    assert "staffCrossings=3" in fake.run_ended["notes"]
+    assert "staffCrossings=1" in fake.run_ended["notes"]
+    assert "staffFaceFrames=3" in fake.run_ended["notes"]
 
 
 def test_taps_and_frames_posted_on_interval():
@@ -313,8 +356,206 @@ def test_tombstoned_staff_purged_at_run_start_and_confirmed():
 
 
 def test_no_tombstones_means_no_purge_calls():
+    """No open tombstones means the purge chain is not invoked at all."""
     fake = V1Fake(n_frames=1)
     request = {"eventId": "ev-1", "siteId": "site9", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
     assert fake.purges == []
     assert final["staffPurged"] == 0
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_staff_crossings_debounced_but_face_frames_are_not():
+    """staffCrossings must count PASSES, not matched face-frames.
+
+    Regression: ``staffCrossings`` was incremented once per matched face per
+    frame with no debounce, so one waiter passing the gate 30 times reported
+    hundreds — a figure that moved with the frame rate rather than with staff
+    behaviour, and that an operator reading the event report could not use (3
+    busy waiters were indistinguishable from 30 staff).
+    """
+    fake = V1Fake(n_frames=12, face_widths=(99.0,), staff_width=99.0)
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, staff_cooldown_s=60.0).run()
+    assert final["staffFaceFrames"] == 12, "the raw per-frame figure is still kept"
+    assert final["staffCrossings"] == 1, "twelve frames of one waiter is ONE pass"
+    assert final["unique"] == 0  # staff never enter the guest count
+
+
+def test_staff_crossing_counted_again_after_the_cooldown():
+    """A staff member seen again after the cooldown IS a second crossing."""
+    fake = V1Fake(n_frames=6, face_widths=(99.0,), staff_width=99.0)
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    # Cooldown 0 => every sighting is far enough from the last to be a new pass.
+    final = make_loop(fake, request, staff_cooldown_s=0.0).run()
+    assert final["staffCrossings"] == final["staffFaceFrames"] == 6
+
+
+def test_applied_correction_is_never_re_resolved_as_rejected():
+    """A dropped status PUT must not turn an APPLIED correction into a rejection.
+
+    Regression: ``resolve_feedback`` is single-shot.  When its PUT was dropped
+    the item stayed open, the next poll re-ran the merge, the merge failed (the
+    dropped key no longer existed), and the item was recorded REJECTED beside a
+    unique count that had visibly fallen — leaving the operator unable to tell
+    what had actually happened, which is the entire point of the ledger.
+    """
+    item = {"id": "fb-1", "kind": "duplicate", "status": "open",
+            "payload": {"personKeys": ["p00001", "p00003"]}}
+    fake = V1Fake(n_frames=6, face_widths=(85.0,), feedback_items=[item])
+    fake.feedback_sticky = True
+    fake.drop_resolve = 1  # the first PUT never lands
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, feedback_poll_s=0.0).run()
+
+    assert len(fake.merges) == 1, "an applied correction must never be re-executed"
+    assert fake.resolved == [("fb-1", "applied")], "and must be re-reported as applied"
+    assert final["feedbackApplied"] == 1
+    assert final["feedbackRejected"] == 0
+
+
+def test_mark_staff_without_site_id_is_refused_not_applied():
+    """mark-staff on a siteless run is rejected, and never reaches the gallery.
+
+    Regression: the runner sent mark-staff without a siteId, the match service
+    removed the person's templates anyway and returned moved>0, so the runner
+    decremented unique and resolved the item APPLIED — while the person, now
+    with no templates anywhere, was counted as a brand-new guest at their next
+    crossing.  The correction silently undid itself and the audit trail lied.
+    """
+    item = {"id": "fb-9", "kind": "mark-staff", "status": "open",
+            "payload": {"personKey": "p00001"}}
+    fake = V1Fake(n_frames=4, face_widths=(85.0,), feedback_items=[item])
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}  # no siteId
+    final = make_loop(fake, request, feedback_poll_s=0.0).run()
+
+    assert fake.mark_staff == [], "the gallery must not be touched at all"
+    assert fake.resolved == [("fb-9", "rejected")]
+    assert final["feedbackRejected"] == 1
+    assert final["feedbackApplied"] == 0
+
+
+def test_missed_feedback_adds_an_attested_person_to_the_count():
+    """'missed' must actually move the count UP, recorded as human-attested.
+
+    Regression: every implemented lever moved the count DOWN; 'missed' was
+    acknowledged and changed nothing, so an operator who watched an uncounted
+    guest walk through had no way to fix it and the delivered number stayed
+    short.
+    """
+    item = {"id": "fb-m", "kind": "missed", "status": "open",
+            "payload": {"note": "child behind the pillar"}}
+    fake = V1Fake(n_frames=4, face_widths=(85.0,), feedback_items=[item])
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, feedback_poll_s=0.0).run()
+
+    assert len(fake.manual_counts) == 1
+    assert fake.manual_counts[0]["note"] == "child behind the pillar"
+    assert ("fb-m", "applied") in fake.resolved
+    assert final["manualAdditions"] == 1, "attested additions are counted apart"
+    assert "manualAdditions=1" in fake.run_ended["notes"]
+
+
+def test_missed_is_applied_once_even_if_the_status_put_is_dropped():
+    """The un-idempotent lever must never run twice: +1 means +1."""
+    item = {"id": "fb-m2", "kind": "missed", "status": "open", "payload": {}}
+    fake = V1Fake(n_frames=6, face_widths=(85.0,), feedback_items=[item])
+    fake.feedback_sticky = True
+    fake.drop_resolve = 2
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, feedback_poll_s=0.0).run()
+    assert len(fake.manual_counts) == 1
+    assert final["manualAdditions"] == 1
+
+
+def test_unknown_feedback_kind_is_rejected_not_claimed_applied():
+    """A correction this runner cannot act on must not be reported applied."""
+    item = {"id": "fb-x", "kind": "teleport-guest", "status": "open", "payload": {}}
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), feedback_items=[item])
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, feedback_poll_s=0.0).run()
+    assert fake.resolved == [("fb-x", "rejected")]
+    assert final["feedbackApplied"] == 0
+
+
+def test_enrol_skips_frames_with_more_than_one_face():
+    """Only ONE person may be enrolled per walk-through.
+
+    Regression: every gate-passing face in every frame was appended as a sample
+    for the staffId being enrolled, and the shortlist was ranked by box width
+    alone.  Two people walking through together meant the taller/closer one's
+    embeddings were stored under the OTHER person's roster entry — superseding
+    their real templates — so that bystander was matched isStaff at every
+    future event at the venue and silently excluded from every guest count.
+    """
+    fake = V1Fake(n_frames=5, face_widths=(85.0, 82.0))  # two faces every frame
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.enrolled is None, "nothing may be written from ambiguous frames"
+    assert final["multiFaceFramesSkipped"] == 5
+    # The refusal must be LOUD: the operator has to know to redo the walk-through.
+    assert final["state"] == "failed"
+    assert "more than one face" in final["error"]
+    assert "re-run the enrolment" in final["error"]
+
+
+def test_enrol_ranks_by_inter_eye_distance_and_frontality_not_width():
+    """The best-N shortlist prefers the most recognisable face, not the widest."""
+
+    class LandmarkFaces(V1Fake):
+        """One face per frame; frame 0 is wide but side-on, frame 1 narrow but frontal."""
+
+        SHAPES = [
+            {"w": 120.0, "iedPx": 20.0, "frontality": 0.10},  # wide, side-on
+            {"w": 60.0, "iedPx": 40.0, "frontality": 0.99},  # narrower, square-on
+        ]
+
+        def handler(self, request):
+            if request.url.host == "faces" and request.url.path == "/detect":
+                self.calls.append("faces /detect")
+                s = self.SHAPES[min(self.frame_i - 1, len(self.SHAPES) - 1)]
+                return httpx.Response(200, json={"faces": [{
+                    "box": {"x": 1, "y": 1, "w": s["w"], "h": s["w"] * 1.3},
+                    "landmarks": [[1, 1]] * 5, "conf": 0.9,
+                    "iedPx": s["iedPx"], "frontality": s["frontality"],
+                }]})
+            return super().handler(request)
+
+    fake = LandmarkFaces(n_frames=2)
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    make_loop(fake, request, enrol_best_n=1).run()
+
+    assert fake.enrolled is not None
+    kept = fake.enrolled["samples"][0]["quality"]
+    assert kept == 40.0 * 0.99, "ied x frontality must beat raw box width"
+
+
+def test_enrol_hands_the_camera_back():
+    """An enrolment must release ingest's single slot when it finishes."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    make_loop(fake, request).run()
+    assert fake.opened["owner"] == "run-local"
+    assert fake.closed == {"owner": "run-local"}
+
+
+def test_tap_round_is_abandoned_when_its_budget_is_spent():
+    """A slow-but-alive planner must not hold the frame loop for a tap round.
+
+    Regression: taps/frames/feedback shared the 30 s stage timeout and had no
+    round budget, so a wedged-but-accepting planner could freeze the loop for
+    minutes per tick — and ingest's drop-not-queue slot discards every guest
+    crossing during a freeze.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_budget_s=0.0).run()
+    assert fake.taps == [] and fake.frames_posted == []
+    assert final["tapRoundsAbandoned"] >= 1
+    assert final["state"] == "ended" and final["frames"] == 3  # counting unharmed

@@ -35,7 +35,10 @@ evidence (project hard rule: measure first).
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop}` | `{merged, galleryN}` — *duplicate* correction |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
-| POST | `/mark-staff` | `{runId, personKey, siteId?, staffId?}` | `{moved, galleryN, staffKey}` |
+| POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
+| POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
+| POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
+| POST | `/gallery/sweep` | `{maxAgeS?}` | `{swept:[runId], maxAgeS}` — retention backstop |
 
 `quality` is the face box width in pixels. `cosine` is the best similarity
 against the pre-existing gallery (`null` on the very first face of a run).
@@ -50,10 +53,28 @@ against the pre-existing gallery (`null` on the very first face of a run).
   `/split` records that constraint ("raise the pair's internal distance, no
   auto-merge later"); `/mark-staff` lifts a guest out of the gallery (count −1)
   and re-homes their templates in the staff store (under `staffId`, or a fresh
-  `anon#####` key).
+  `anon#####` key). `/mark-staff` **refuses without a siteId**: the templates
+  are the only record of who that person is, so removing them with nowhere to
+  put them destroys them and the person is counted as a brand-new guest at
+  their next crossing — the correction silently undoing itself.
+- **`/count/manual` is the only lever that moves the count UP.** Under-counting
+  is the dominant failure mode (open-set 1:N at a 1:1 verification threshold),
+  so a *missed* correction mints an `m#####` person with NO embedding: counted,
+  never matchable, and permanently distinguishable from a detected `p#####`.
 - **Re-enrolment supersedes.** `/staff/enrol` replaces a member's prior samples
   with the new best-N, so `sampleCount` is exact rather than growing across
   walk-throughs.
+- **Gallery files have a lifecycle.** `/reset` deletes a run's gallery (the
+  runner calls it at start AND at end of run); `/gallery/sweep` deletes files
+  older than `maxAgeS` for runs that died without releasing. Each file holds
+  real guests' face embeddings, so this is a retention control. Staff stores
+  are never swept — they persist by design.
+- **Open once, scan in memory.** Every store is opened once per process and
+  its `(n, dim)` float32 matrix stays resident, updated write-through on each
+  mutation (SQLite in WAL mode remains the durable record). A full match call
+  (staff check + gallery match) at a 500-person gallery went from ~1414 µs to
+  ~86 µs for a re-sighting and ~4340 µs to ~144 µs for a new person — and, more
+  importantly, stopped growing with gallery size.
 
 ## Run
 

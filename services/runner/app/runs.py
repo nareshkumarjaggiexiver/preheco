@@ -21,15 +21,38 @@ class RunManager:
         self._lock = threading.Lock()
 
     def start(self, request: dict) -> str:
-        """Spawn a RunLoop thread for a validated POST /runs body; returns runId."""
+        """Spawn a RunLoop thread for a validated POST /runs body; returns runId.
+
+        THREE http clients, deliberately: the stage client keeps the generous
+        timeout (a stage call is the product), the planner client a short one
+        (reporting), and the best-effort client a shorter one still.  They used
+        to be one 30 s client, so a planner that accepted connections and then
+        wedged could freeze the frame loop for minutes per tick while ingest's
+        drop-not-queue slot threw away every crossing.
+        """
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         settings = self.settings
         planner_url = request.get("plannerUrl") or settings.planner_url
         client = httpx.Client(timeout=settings.request_timeout_s)
+        # The planner's token rides on the CLIENT, so both the JSON transports
+        # and the multipart frame upload carry it without each adapter having
+        # to know about auth. Absent when the planner is loopback-only, which
+        # is the default and needs no token.
+        # Passed only when there IS a token, so the loopback default keeps the
+        # plain two-argument construction (which test doubles rely on).
+        auth = (
+            {"headers": {"Authorization": f"Bearer {settings.planner_token}"}}
+            if settings.planner_token
+            else {}
+        )
+        planner_http = httpx.Client(timeout=settings.planner_timeout_s, **auth)
+        report_http = httpx.Client(timeout=settings.report_timeout_s, **auth)
         planner = PlannerClient(
             planner_url,
-            transport=httpx_transport(client),
-            file_transport=httpx_file_transport(client),
+            transport=httpx_transport(planner_http),
+            best_effort_transport=httpx_transport(report_http),
+            file_transport=httpx_file_transport(report_http),
+            token=settings.planner_token,
         )
         loop = RunLoop(run_id, request, settings, client, planner)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)
