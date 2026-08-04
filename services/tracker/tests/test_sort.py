@@ -109,3 +109,30 @@ def test_ids_are_stable_and_monotonic():
     assert sorted(t.tid for t in out) == [1, 2]
     out = trk.step([_box(2, 0), _box(302, 300), _box(600, 600)])
     assert sorted(t.tid for t in out) == [1, 2, 3]
+
+
+def test_a_new_arrival_is_not_reported_until_confirmed():
+    """The invariant behind runner finding D1.
+
+    After warm-up the tracker reports a person only once they have min_hits
+    frames, so a guest who has just walked into shot is a DETECTION with no
+    reported track. The runner must therefore search faces in the raw
+    detection boxes, never in the reported tracks alone — a face never
+    searched is a guest never counted. If this test ever fails because new
+    arrivals ARE reported, the runner's face-search region can be simplified;
+    until then, loop.py must keep raw boxes in `within`.
+    """
+    t = SortLite(min_hits=3, max_age=15, iou_min=0.3)
+    steady = (100.0, 100.0, 50.0, 120.0, 0.9)
+    for _ in range(6):                       # past warm-up
+        reported = t.step([steady])
+    assert len(reported) == 1
+
+    arrival = (400.0, 100.0, 50.0, 120.0, 0.9)
+    reported = t.step([steady, arrival])
+    assert len(reported) == 1, "an unconfirmed arrival must not be reported yet"
+
+    # ...and every reported box IS a detection box (why the union's track half
+    # is redundant today, and why raw boxes must come first in the dedupe).
+    x, y, w, h = reported[0].box()
+    assert (round(x), round(y), round(w), round(h)) == (100, 100, 50, 120)
