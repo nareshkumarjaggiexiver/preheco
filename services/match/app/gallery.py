@@ -1,39 +1,26 @@
-"""SQLite-backed embedding gallery, one database file per run.
+"""The per-run guest gallery: one SQLite file per run, matched brute-force.
 
-POC scale: a run holds hundreds of people, not millions, so matching is a
-brute-force cosine scan over every stored template.  That is deliberate — it
-is exact, dependency-free, and fast enough (<1 ms for a few thousand 128-d
-vectors with numpy).  A vector index (FAISS/pgvector) is a scale decision for
-later, taken on profiling evidence, per the project rule.
+Thin policy layer over :class:`app.store.VectorStore`.  The store owns the
+mechanics (cosine scan, float32 BLOB rows, monotonic keys, merge/split/remove);
+this module owns the *guest-counting policy*: mint ``p#####`` keys, treat
+``cosine >= threshold`` as a re-sighting, tag sub-canon faces, and expose the
+operator corrections the runner applies from the feedback loop.
 
-Concurrency: a connection is opened per operation with a busy timeout, and the
-match-then-insert decision runs inside one IMMEDIATE transaction so two
-concurrent /match calls cannot both insert the same brand-new person.
+Concurrency: the match-then-insert decision runs inside one IMMEDIATE
+transaction (see :meth:`VectorStore.begin_immediate`) so two concurrent /match
+calls can never both insert the same brand-new person.
+
+Files: ``data/gallery-<runId>.db``.  A run resets its gallery at start, so the
+unique count always begins at zero.
 """
 
 import re
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
+from .store import VectorStore
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS persons (
-    person_key TEXT PRIMARY KEY,
-    sub_canon  INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS templates (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    person_key TEXT NOT NULL REFERENCES persons(person_key),
-    embedding  BLOB NOT NULL,
-    dim        INTEGER NOT NULL,
-    quality    REAL,
-    sub_canon  INTEGER NOT NULL DEFAULT 0
-);
-"""
 
 
 class BadRunIdError(ValueError):
@@ -58,33 +45,18 @@ def db_path(data_dir: Path, run_id: str) -> Path:
     return data_dir / f"gallery-{run_id}.db"
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    """Open the gallery database, creating the schema if needed."""
-    conn = sqlite3.connect(path, timeout=5.0)
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.executescript(_SCHEMA)
-    return conn
-
-
 def reset(data_dir: Path, run_id: str) -> None:
     """Delete any existing gallery for the run so it starts empty."""
+    db_path(data_dir, run_id).unlink(missing_ok=True)
+
+
+def count(data_dir: Path, run_id: str) -> int:
+    """Distinct guest count for a run (0 when the gallery does not exist yet)."""
     path = db_path(data_dir, run_id)
-    path.unlink(missing_ok=True)
-
-
-def _as_unit(embedding: list[float]) -> np.ndarray:
-    """Return the embedding as an L2-normalised float32 vector.
-
-    SFace embeddings arrive normalised already; normalising again is a cheap
-    no-op that makes the cosine maths safe for any caller.
-    """
-    v = np.asarray(embedding, dtype=np.float32)
-    if v.ndim != 1 or v.size < 8:
-        raise ValueError("embedding must be a flat vector of at least 8 floats")
-    n = float(np.linalg.norm(v))
-    if n == 0.0:
-        raise ValueError("embedding must not be the zero vector")
-    return v / n
+    if not path.exists():
+        return 0
+    with VectorStore(path) as store:
+        return store.distinct_count()
 
 
 def match(
@@ -98,43 +70,56 @@ def match(
     """Match one embedding against the run's gallery; insert if new.
 
     Rule: best cosine >= threshold means "seen before" (the SFace operating
-    point counts equality as a match).  New persons store the embedding as
-    their first template.  Sub-canon faces (quality < canon_px) are matched
-    normally but tagged, per the POC contract.
+    point counts equality as a match).  A new person stores the embedding as
+    their first template under a fresh monotonic key.  Sub-canon faces
+    (quality < canon_px) are matched normally but tagged, per the POC contract.
     """
-    v = _as_unit(embedding)
     sub_canon = quality is not None and quality < canon_px
     path = db_path(data_dir, run_id)
 
-    with _connect(path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute("SELECT person_key, embedding, dim FROM templates").fetchall()
+    with VectorStore(path) as store:
+        store.begin_immediate()
+        hit = store.search(embedding)
+        if hit is not None and hit.cosine >= threshold:
+            return MatchResult(hit.key, False, hit.cosine, store.distinct_count(), sub_canon)
+        key = store.add_auto(embedding, quality=quality, sub_canon=sub_canon, prefix="p")
+        best = hit.cosine if hit is not None else None
+        return MatchResult(key, True, best, store.distinct_count(), sub_canon)
 
-        best_key: str | None = None
-        best_cos: float | None = None
-        if rows:
-            dim = rows[0][2]
-            if v.size != dim:
-                raise ValueError(f"embedding dim {v.size} != gallery dim {dim}")
-            mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
-            mat = mat.reshape(len(rows), dim)
-            sims = mat @ v  # rows are unit vectors, so the dot product is cosine
-            i = int(np.argmax(sims))
-            best_key, best_cos = rows[i][0], float(sims[i])
 
-        if best_key is not None and best_cos is not None and best_cos >= threshold:
-            n = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-            return MatchResult(best_key, False, best_cos, n, sub_canon)
+def merge(data_dir: Path, run_id: str, keep: str, drop: str) -> tuple[bool, int]:
+    """Fold ``drop`` into ``keep`` (a *duplicate* correction).
 
-        n_before = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-        person_key = f"p{n_before + 1:05d}"
-        conn.execute(
-            "INSERT INTO persons (person_key, sub_canon) VALUES (?, ?)",
-            (person_key, int(sub_canon)),
-        )
-        conn.execute(
-            "INSERT INTO templates (person_key, embedding, dim, quality, sub_canon)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (person_key, v.tobytes(), v.size, quality, int(sub_canon)),
-        )
-        return MatchResult(person_key, True, best_cos, n_before + 1, sub_canon)
+    Returns ``(merged, galleryN)``; ``merged`` is False (and the count
+    unchanged) when a cannot-link constraint or an unknown key blocks it.
+    """
+    with VectorStore(db_path(data_dir, run_id)) as store:
+        store.begin_immediate()
+        merged = store.merge(keep, drop)
+        return merged, store.distinct_count()
+
+
+def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
+    """Record a *false-match* do-not-merge constraint; returns galleryN.
+
+    Both keys keep their templates, so the distinct count is unchanged — the
+    effect is forward-looking (a later :func:`merge` of the pair is refused).
+    """
+    with VectorStore(db_path(data_dir, run_id)) as store:
+        store.begin_immediate()
+        store.split(a, b)
+        return store.distinct_count()
+
+
+def remove(
+    data_dir: Path, run_id: str, person_key: str
+) -> tuple[list[tuple[bytes, float | None, int]], int]:
+    """Lift a person out of the gallery (for *mark-staff*).
+
+    Returns ``(templates, galleryN)`` where ``templates`` are the removed rows
+    (blob, quality, sub_canon) for the caller to re-home in the staff store.
+    """
+    with VectorStore(db_path(data_dir, run_id)) as store:
+        store.begin_immediate()
+        templates = store.remove(person_key)
+        return templates, store.distinct_count()

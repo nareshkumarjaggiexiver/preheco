@@ -33,6 +33,16 @@ class Settings:
     sample_batch_max: int = 200  # planner ingest contract: batch <= 200 rows
     request_timeout_s: float = 30.0
 
+    # Debug taps (annotated frames + structured payloads) cadence, and the
+    # operator-feedback poll cadence (CONTRACTS.md v1: ~2 s / ~3 s). Both are
+    # best-effort — a planner hiccup never blocks or crashes the loop.
+    tap_interval_s: float = 2.0
+    feedback_poll_s: float = 3.0
+
+    # ENROL MODE: how many face samples (best by quality) to keep per staff
+    # walk-through before writing them to the site staff store.
+    enrol_best_n: int = 5
+
     # Ingest serves the LATEST frame with a monotonically increasing `seq`;
     # a stalled seq is the end-of-source signal (there is no `ended` flag on
     # the real service).  The loop polls every source_poll_s while the seq is
@@ -59,4 +69,7 @@ def from_env() -> Settings:
         request_timeout_s=float(os.environ.get("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s)),
         source_poll_s=float(os.environ.get("HECO_SOURCE_POLL_S", s.source_poll_s)),
         source_stall_s=float(os.environ.get("HECO_SOURCE_STALL_S", s.source_stall_s)),
+        tap_interval_s=float(os.environ.get("HECO_TAP_INTERVAL_S", s.tap_interval_s)),
+        feedback_poll_s=float(os.environ.get("HECO_FEEDBACK_POLL_S", s.feedback_poll_s)),
+        enrol_best_n=int(os.environ.get("HECO_ENROL_BEST_N", s.enrol_best_n)),
     )

@@ -2,10 +2,17 @@
 
 Endpoints (CONTRACTS.md):
     GET  /health          -> {ok, model, version}
-    POST /runs            {eventId, placementId?, source:{url|path}, plannerUrl?, label?}
+    POST /runs            {eventId, placementId?, source:{url|path}, plannerUrl?,
+                           label?, mode?:'count'|'enrol', siteId?, staffId?}
     GET  /runs/{runId}    -> live local status
     POST /runs/{runId}/stop
+
+``mode`` defaults to ``count`` (the counting loop).  ``mode:'enrol'`` runs the
+staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
+``staffId``; ``siteId`` on a count run opts it into the staff whitelist.
 """
+
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
@@ -38,13 +45,27 @@ class Source(BaseModel):
 
 
 class RunRequest(BaseModel):
-    """Body of POST /runs — what to run and where to report it."""
+    """Body of POST /runs — what to run and where to report it.
+
+    ``mode`` selects the counting loop (default) or the staff-enrolment
+    walk-through.  ``siteId`` names the site whose staff store to check (count)
+    or enrol into; ``staffId`` names the roster member being enrolled.
+    """
 
     eventId: str
     placementId: str | None = None
     source: Source
     plannerUrl: str | None = None
     label: str | None = None
+    mode: Literal["count", "enrol"] = "count"
+    siteId: str | None = None
+    staffId: str | None = None
+
+    @model_validator(mode="after")
+    def _enrol_needs_site_and_staff(self) -> "RunRequest":
+        if self.mode == "enrol" and not (self.siteId and self.staffId):
+            raise ValueError("enrol mode requires siteId and staffId")
+        return self
 
 
 @app.get("/health")

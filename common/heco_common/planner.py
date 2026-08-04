@@ -20,6 +20,13 @@ Design points:
   reaches ``batch_size`` and always on ``end_run``. Explicit lists posted via
   ``post_samples`` are chunked to the contract's 200-sample cap.
 
+v1 (2026-08-04) adds the best-effort debug/feedback surface: ``post_tap`` and
+``post_frame`` (annotated JPEG, multipart) push what each stage produced;
+``poll_feedback``/``resolve_feedback`` drive the operator-correction loop; and
+``report_enrolment`` confirms a staff enrolment. The taps and feedback calls
+are single-shot and swallow failures — CONTRACTS.md requires they never block
+or crash the run loop when the planner hiccups.
+
 The client is intentionally synchronous: the runner reports stats every ~2 s,
 which never justifies an async dependency at POC scale.
 """
@@ -27,6 +34,7 @@ which never justifies an async dependency at POC scale.
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 
@@ -37,6 +45,10 @@ MAX_SAMPLES_PER_POST = 200
 
 #: (method, url, json-payload-or-None) -> (status_code, decoded-json-body).
 Transport = Callable[[str, str, dict | None], tuple[int, dict]]
+
+#: (url, form-fields, filename, file-bytes, content-type) -> (status, body).
+#: Separate from ``Transport`` because debug frames are multipart, not JSON.
+FileTransport = Callable[[str, dict, str, bytes, str], tuple[int, dict]]
 
 
 class PlannerError(RuntimeError):
@@ -85,6 +97,7 @@ class PlannerClient:
         self,
         base_url: str,
         transport: Transport | None = None,
+        file_transport: FileTransport | None = None,
         retries: int = 3,
         backoff_s: float = 0.2,
         batch_size: int = 100,
@@ -93,10 +106,13 @@ class PlannerClient:
         """Configure the client; nothing is sent until create_run.
 
         ``batch_size`` is the local auto-flush threshold for ``add_sample``
-        and is clamped to the contract cap of 200.
+        and is clamped to the contract cap of 200.  ``file_transport`` is only
+        needed for :meth:`post_frame` (multipart debug frames); without it that
+        one method is a no-op and every other call is unaffected.
         """
         self.base_url = base_url.rstrip("/")
         self.transport = transport or urllib_transport
+        self.file_transport = file_transport
         self.retries = max(1, retries)
         self.backoff_s = backoff_s
         self.batch_size = min(max(1, batch_size), MAX_SAMPLES_PER_POST)
@@ -163,7 +179,99 @@ class PlannerClient:
             payload = {"samples": [s.model_dump() for s in chunk]}
             self._request("POST", f"/api/pipeline/runs/{run_id}/samples", payload)
 
+    # ------------------------------------------------- debug taps (v1)
+
+    def post_tap(self, stage: str, payload: dict) -> bool:
+        """Best-effort POST of one stage's structured debug payload.
+
+        Debug taps must never block or crash the run loop on a planner hiccup
+        (CONTRACTS.md), so this is a single attempt with no retry and swallows
+        every failure, returning True only when the planner accepted it.
+        """
+        ok, _ = self._send_once(
+            "POST", f"/api/pipeline/runs/{self._require_run()}/taps",
+            {"stage": stage, "payload": payload},
+        )
+        return ok
+
+    def post_frame(
+        self,
+        stage: str,
+        jpeg: bytes,
+        filename: str = "frame.jpg",
+        content_type: str = "image/jpeg",
+    ) -> bool:
+        """Best-effort multipart POST of one stage's annotated JPEG frame.
+
+        No-op (returns False) when the client was built without a
+        ``file_transport``.  Like :meth:`post_tap`, a single attempt that
+        swallows failures so the loop is never held up by frame uploads.
+        """
+        if self.file_transport is None:
+            return False
+        url = f"{self.base_url}/api/pipeline/runs/{self._require_run()}/frames"
+        try:
+            status, _ = self.file_transport(url, {"stage": stage}, filename, jpeg, content_type)
+        except Exception:  # noqa: BLE001 — best-effort, never propagate
+            return False
+        return status < 400
+
+    # ---------------------------------------- operator feedback (v1)
+
+    def poll_feedback(self, since: str | None = None) -> list[dict]:
+        """Return the run's open feedback items (best-effort; [] on any failure).
+
+        Polls ``GET /api/pipeline/runs/:id/feedback?since=<iso>``.  Accepts the
+        planner returning either a bare list or an object wrapping the items
+        under ``feedback``/``items`` so the two sides can settle that detail
+        without breaking this client.
+        """
+        path = f"/api/pipeline/runs/{self._require_run()}/feedback"
+        if since:
+            path += "?" + urllib.parse.urlencode({"since": since})
+        ok, body = self._send_once("GET", path, None)
+        if not ok:
+            return []
+        if isinstance(body, list):
+            return body
+        items = body.get("feedback") or body.get("items") or []
+        return items if isinstance(items, list) else []
+
+    def resolve_feedback(self, feedback_id: int | str, status: str) -> bool:
+        """Best-effort ``PUT /api/feedback/:id {status}`` after acting on an item.
+
+        A dropped status update is harmless: the item stays open and is
+        re-applied next poll, and the corrections are idempotent (a second
+        merge of an already-folded pair is a no-op), so no retry is needed.
+        """
+        ok, _ = self._send_once("PUT", f"/api/feedback/{feedback_id}", {"status": status})
+        return ok
+
+    # ------------------------------------------- staff enrolment (v1)
+
+    def report_enrolment(self, staff_id: int | str, enrolled_at: str, sample_count: int) -> dict:
+        """Report a completed staff enrolment: ``PUT /api/staff/:id``.
+
+        Uses the retrying transport (the samples are already stored pipeline
+        side; this is the operator-facing confirmation, worth a retry).  Raises
+        PlannerError after exhausting retries — the enrol flow catches it so a
+        planner outage cannot fail the enrolment itself.
+        """
+        return self._request(
+            "PUT", f"/api/staff/{staff_id}",
+            {"enrolledAt": enrolled_at, "sampleCount": sample_count},
+        )
+
     # ---------------------------------------------------------- internals
+
+    def _send_once(self, method: str, path: str, payload: dict | None) -> tuple[bool, dict]:
+        """One transport attempt that never raises: (accepted, body)."""
+        url = f"{self.base_url}{path}"
+        try:
+            status, body = self.transport(method, url, payload)
+        except Exception:  # noqa: BLE001 — best-effort callers want no exceptions
+            return False, {}
+        return status < 400, (body or {})
 
     def _require_run(self) -> int | str:
         """Return the current run id or fail: reporting needs create_run first."""
