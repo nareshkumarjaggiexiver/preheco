@@ -10,7 +10,7 @@ apart in how they decide "these two boxes are the same face".
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 
 def iou_xywh(a: dict, b: dict) -> float:

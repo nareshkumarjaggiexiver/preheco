@@ -16,11 +16,22 @@ There is no DNN here: `/health` reports `model: "opencv-videocapture"`.
 
 | method | path | body / response |
 | ------ | ---- | --------------- |
-| POST | `/open` | `{url \| path, loop}` — exactly one source; replaces the current one |
+| POST | `/open` | `{url \| path, loop, owner?, takeover?}` — exactly one source; CLAIMS the capture slot |
+| POST | `/close` | `{owner?, force?}` — release the slot; owner-checked, idempotent |
 | GET | `/frame` | `{tMs, imageB64, w, h, seq}` — 409 nothing open, 503 not ready yet |
-| GET | `/health` | `{ok, model, version}` |
+| GET | `/health` | `{ok, model, version, owner}` |
 
 `tMs` is milliseconds since the source was opened (monotonic clock).
+
+**One slot, one owner.** This service holds exactly ONE capture worker, so an
+`/open` carrying an `owner` (the runner sends its run id) claims it and any
+later `/open` by a different owner is refused **409**, naming the holder.
+Without that, starting a staff enrolment while a count run was live at the gate
+silently replaced the count run's camera and it began counting the enrolment
+walk-through — no error anywhere. Escapes: the same owner may re-open
+(idempotent restart), a slot whose capture thread has died is claimable, and
+`takeover: true` is an explicit seizure. An `/open` with **no** owner keeps the
+old replace-anything behaviour, for ad-hoc probes.
 
 ## Run
 

@@ -2,12 +2,19 @@
 
 **What.** Owns the run lifecycle. In **count mode** it creates the planner-side
 run record (`heco_common.planner.PlannerClient`), resets the match gallery and
-tracker state, opens the source on ingest, then drives the loop —
+tracker state, claims the source on ingest, then drives the loop —
 `frame → persons → tracker → faces (within tracked boxes) → quality gate →
 embed → match → unique count` — timing every stage. Aggregates
 (count/min/mean/max) and sampled raw rows are POSTed to the site-planner every
-2 s; the run ends with a `PUT … {status: ended, notes}` carrying the unique
-count, frame count, staff-crossings and sub-canon share.
+2 s; the run releases its downstream state (camera, tracker, gallery) and ends
+with a `PUT … {status: ended, notes}` carrying the unique count, frame count,
+staff crossings, staff face-frames, manual additions and sub-canon share.
+
+**The count is the product; reporting is secondary.** No planner call made from
+the frame loop can fail a run or stall it for long: errors are swallowed AND
+latency is bounded. A planner restart mid-event used to fail the run, and a
+restarted run gets a fresh planner id and therefore a fresh EMPTY gallery — so
+a five-second hiccup re-counted every guest already counted.
 
 The quality gate lives here: faces below **56 px** width never reach the
 embedder; **56–79 px** pass but are flagged *sub-canon* (POC geometry: 2.8 mm
@@ -19,6 +26,10 @@ camera at 2.0 m, faces ~64–85 px — see CONTRACTS.md).
   the matcher checks the site staff store first. A staff hit is counted as a
   `staffCrossing` and excluded from the guest `unique` count — the track stays
   tracked and visible upstream (suppression would corrupt track association).
+  A **crossing is one pass**: the same member re-seen within
+  `HECO_STAFF_COOLDOWN_S` is still the same pass. The raw per-frame figure is
+  kept separately as `staffFaceFrames` (useful for recall debugging, useless in
+  a report — it moves with the frame rate, not with staff behaviour).
 - **Debug taps** (every `tap_interval_s`, best-effort). Per stage the runner
   POSTs an annotated JPEG (person boxes / track ids+ages / face boxes coloured
   by quality band / match verdicts, staff grey; ingest posts the raw frame) and
@@ -28,13 +39,29 @@ camera at 2.0 m, faces ~64–85 px — see CONTRACTS.md).
 - **Operator feedback** (every `feedback_poll_s`, best-effort). The runner polls
   the planner and applies each open correction to the live gallery via the
   match service — `duplicate → /merge` (unique −1), `false-match → /split`,
-  `mark-staff → /mark-staff` (unique −1), `missed`/`note` → acknowledged — then
-  PUTs `applied`/`rejected`. Corrections are idempotent, so a dropped status
-  update is harmless (the item is retried next poll).
+  `mark-staff → /mark-staff` (unique −1, REQUIRES a run with `siteId`),
+  `missed → /count/manual` (unique +1, recorded as an operator attestation),
+  `note` → acknowledged — then PUTs `applied`/`rejected`. An outcome already
+  carried out is remembered, so a dropped status update is re-reported with the
+  SAME status and the gallery call is never repeated; an unknown kind or a 4xx
+  refusal resolves `rejected` rather than claiming `applied`.
 - **Enrol mode** (`mode:'enrol'`, requires `siteId` + `staffId`). A staff
-  walk-through: capture faces, keep the best `enrol_best_n` by quality, write
-  them to the site staff store (`/staff/enrol`), and `PUT /api/staff/:id` with
-  the sample count. No pipeline_run, no counting.
+  walk-through: capture faces, keep the best `enrol_best_n` by
+  `iedPx × frontality`, write them to the site staff store (`/staff/enrol`),
+  and `PUT /api/staff/:id` with the sample count. No pipeline_run, no counting.
+  **Single subject only**: a frame contributes a sample only when exactly one
+  face passes the gate (others are counted in `multiFaceFramesSkipped`), and an
+  enrolment that captured nothing FAILS with an instruction to redo the
+  walk-through. The staff store is per-site and persistent, and enrolment
+  supersedes prior templates, so a bystander caught in the walk-through would
+  be matched as that member at every future event at the venue.
+- **Reporting never stalls or kills the count.** The stats flush is best-effort
+  (`plannerReportErrors` counts what was lost; stats are upserted aggregates,
+  so the next flush repairs the gap), planner traffic uses its own short
+  timeouts, and a whole tap round shares `HECO_TAP_BUDGET_S`.
+- **End of run the runner hands state back**: ingest `/close`, tracker
+  `/release`, match `/reset` (deleting the gallery file) — all best-effort,
+  before the closing planner PUT.
 
 ## API
 
@@ -42,7 +69,7 @@ camera at 2.0 m, faces ~64–85 px — see CONTRACTS.md).
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?}` | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, staffCrossings, subCanonShare, sampleCount, state, error) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -68,9 +95,12 @@ make lint     # ruff
 ```
 
 Tests cover orchestration order, aggregation maths, sample-batch capping,
-end-of-source/stop/failure settlement, and the v1 additions: staff-crossing
-exclusion, tap + annotated-frame posting (and the opaque-frame skip), feedback
-merge/split/mark-staff application, and the enrol walk-through — all offline.
+end-of-source/stop/failure settlement, the v1 additions (staff-crossing
+exclusion, tap + annotated-frame posting and the opaque-frame skip, feedback
+merge/split/mark-staff application, the enrol walk-through), and the v2
+regressions: a planner outage never failing a run, run-state release, capture
+slot conflicts, staff-crossing debounce, feedback status truthfulness, the
+`missed` +1 lever, single-subject enrolment, and the tap budget — all offline.
 The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
 
 ## Tune
@@ -85,7 +115,11 @@ The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
 | `HECO_TAP_INTERVAL_S` | `2.0` | Debug frame + tap cadence (best-effort) |
 | `HECO_FEEDBACK_POLL_S` | `3.0` | Operator-feedback poll cadence (best-effort) |
 | `HECO_ENROL_BEST_N` | `5` | Enrol: face samples kept per staff walk-through |
-| `HECO_REQUEST_TIMEOUT_S` | `30` | Per-stage HTTP timeout |
+| `HECO_REQUEST_TIMEOUT_S` | `30` | Per-STAGE HTTP timeout (a stage call is the product) |
+| `HECO_PLANNER_TIMEOUT_S` | `5.0` | Retrying planner calls (run record, stats, samples) |
+| `HECO_REPORT_TIMEOUT_S` | `2.0` | Best-effort planner calls (taps, frames, feedback) — bounds the stall a wedged planner can cause |
+| `HECO_TAP_BUDGET_S` | `3.0` | Ceiling for ONE tap round (5 payloads + 5 JPEGs); the rest is dropped |
+| `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `5.0` | Stalled-seq duration treated as end-of-source |
 

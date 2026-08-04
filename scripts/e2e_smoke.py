@@ -166,7 +166,13 @@ def build_stub_app(name: str):
                 frames.append(base64.b64encode(buf.tobytes()).decode())
             cap.release()
             state["frames"], state["i"] = frames, 0
-            return {"ok": True, "frames": len(frames)}
+            state["owner"] = body.get("owner")
+            return {"ok": True, "frames": len(frames), "owner": state.get("owner")}
+
+        @app.post("/close")
+        def close_source(body: dict) -> dict:
+            state["frames"], state["i"], state["owner"] = [], 0, None
+            return {"ok": True, "released": True}
 
         @app.get("/frame")
         def frame() -> dict:
@@ -199,6 +205,11 @@ def build_stub_app(name: str):
             return {"boxes": boxes}
 
     elif name == "tracker":
+
+        @app.post("/release")
+        def release(body: dict) -> dict:
+            state["age"] = 0
+            return {"ok": True, "runId": body.get("runId"), "released": True}
 
         @app.post("/track")
         def track(body: dict) -> dict:

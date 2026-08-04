@@ -1,7 +1,7 @@
 """API tests: per-run state isolation, reset semantics, wire shapes."""
 
 import pytest
-from app.main import _runs, app
+from app.main import _last_used, _runs, app
 from fastapi.testclient import TestClient
 
 
@@ -9,9 +9,11 @@ from fastapi.testclient import TestClient
 def client():
     """In-process client with a clean run table per test."""
     _runs.clear()
+    _last_used.clear()
     with TestClient(app) as c:
         yield c
     _runs.clear()
+    _last_used.clear()
 
 
 def _track(client, run_id: str, boxes):
@@ -87,3 +89,47 @@ def test_track_rejects_malformed_box(client):
         json={"runId": "r", "tMs": 0, "boxes": [{"x": 0, "y": 0, "w": -5, "h": 4}]},
     )
     assert res.status_code == 422
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_release_forgets_a_finished_runs_state(client):
+    """A finished run's tracker must not stay resident forever.
+
+    Regression: ``_runs`` only ever gained entries. Every run gets a fresh
+    uuid-suffixed id, so /reset never replaced an old one and a season of
+    events left one dead SortLite per run in memory until a process restart.
+    """
+    _track(client, "r1", [(10, 50)])
+    assert client.get("/health").json()["runs"] == 1
+
+    res = client.post("/release", json={"runId": "r1"})
+    assert res.status_code == 200 and res.json()["released"] is True
+    assert _runs == {} and _last_used == {}
+    assert client.get("/health").json()["runs"] == 0
+
+    # Idempotent: releasing again (or an unknown run) is still success.
+    assert client.post("/release", json={"runId": "r1"}).json()["released"] is False
+
+
+def test_idle_runs_are_evicted_on_the_next_track(client, monkeypatch):
+    """A run that died without releasing is swept by the TTL, not kept for ever."""
+    monkeypatch.setenv("TRACKER_RUN_TTL_S", "0.05")
+    _track(client, "dead-run", [(10, 50)])
+    assert "dead-run" in _runs
+
+    import time
+    time.sleep(0.06)
+    _track(client, "live-run", [(10, 50)])  # any traffic sweeps the stale ones
+
+    assert "dead-run" not in _runs, "an idle run's tracker must be evicted"
+    assert "live-run" in _runs, "the run being served is never evicted"
+
+
+def test_ttl_never_evicts_the_run_being_served(client, monkeypatch):
+    """A long, quiet run must not evict itself mid-event."""
+    monkeypatch.setenv("TRACKER_RUN_TTL_S", "0.01")
+    for i in range(4):
+        tracks = _track(client, "slow", [(10 + i * 8, 50)])
+    assert tracks[0]["ageFrames"] == 4, "its own state must survive every tick"

@@ -13,13 +13,13 @@ import logging
 import time
 
 from fastapi import FastAPI, HTTPException
+from heco_common.geometry import dedupe_boxes
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .codec import b64_to_bgr
 from .detector import MODEL_PATH, FaceDetector
 from .mapping import clamp_box, offset_face
-from heco_common.geometry import dedupe_boxes
 from .quality import classify_width
 
 log = logging.getLogger("faces")
@@ -82,7 +82,9 @@ def _with_quality(face: dict) -> dict:
     out = {**face, "widthPx": width_px, "quality": classify_width(width_px)}
     lm = face.get("landmarks")
     if lm and len(lm) >= 3:
-        (rex, rey), (lex, ley), (nx, ny) = lm[0], lm[1], lm[2]
+        # Only the nose's x matters for a yaw proxy; its y would speak to
+        # pitch, which we do not gate on.
+        (rex, rey), (lex, ley), (nx, _ny) = lm[0], lm[1], lm[2]
         ied = ((lex - rex) ** 2 + (ley - rey) ** 2) ** 0.5
         eye_mid_x = (rex + lex) / 2.0
         # frontality: nose offset from the eye midpoint, normalised by IED;

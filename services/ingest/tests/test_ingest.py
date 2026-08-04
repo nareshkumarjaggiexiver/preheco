@@ -97,3 +97,66 @@ def test_shutdown_stops_capture_thread(synthetic_video):
         assert worker is not None and worker.is_alive()
     assert not worker.is_alive()
     assert state.worker is None
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_second_run_cannot_silently_steal_a_live_runs_camera(client, synthetic_video):
+    """A claimed capture slot is refused to anyone else, by name.
+
+    Regression: /open unconditionally swapped THE one capture worker and
+    /frame had no run affinity, so starting a staff enrolment during a live
+    gate count replaced the count run's source — the count run then counted
+    the enrolment walk-through. Nothing errored; the only trace was a
+    plausible-looking frame stream and a corrupted event total.
+    """
+    first = client.post("/open", json={"path": synthetic_video, "loop": True, "owner": "run-gate1"})
+    assert first.status_code == 200 and first.json()["owner"] == "run-gate1"
+    _wait_frame(client)
+
+    clash = client.post("/open", json={"path": synthetic_video, "owner": "run-enrol"})
+    assert clash.status_code == 409
+    assert "run-gate1" in clash.json()["detail"], "the operator must learn WHO holds it"
+    assert client.get("/health").json()["owner"] == "run-gate1"
+    # And the live run still has its own source.
+    assert _wait_frame(client)["w"] == VID_W
+
+
+def test_same_owner_may_reopen_and_takeover_is_explicit(client, synthetic_video):
+    """Re-opening your own slot is idempotent; seizing another's is deliberate."""
+    client.post("/open", json={"path": synthetic_video, "loop": True, "owner": "run-a"})
+    _wait_frame(client)
+
+    same = client.post("/open", json={"path": synthetic_video, "loop": True, "owner": "run-a"})
+    assert same.status_code == 200, "a run may restart its own capture"
+
+    seize = client.post(
+        "/open", json={"path": synthetic_video, "loop": True, "owner": "run-b", "takeover": True}
+    )
+    assert seize.status_code == 200
+    assert client.get("/health").json()["owner"] == "run-b"
+
+
+def test_close_releases_the_slot_for_the_next_run(client, synthetic_video):
+    """End of run hands the camera back; a stale close cannot steal it."""
+    client.post("/open", json={"path": synthetic_video, "loop": True, "owner": "run-a"})
+    _wait_frame(client)
+
+    stale = client.post("/close", json={"owner": "run-zzz"})
+    assert stale.status_code == 409, "a finished run must not stop the live one"
+
+    res = client.post("/close", json={"owner": "run-a"})
+    assert res.status_code == 200 and res.json()["released"] is True
+    assert client.get("/frame").status_code == 409  # slot really is empty
+    assert client.post("/close", json={"owner": "run-a"}).json()["released"] is False
+
+    nxt = client.post("/open", json={"path": synthetic_video, "loop": True, "owner": "run-b"})
+    assert nxt.status_code == 200
+
+
+def test_unowned_open_keeps_the_old_replace_anything_behaviour(client, synthetic_video):
+    """Ad-hoc probes (no owner) are unaffected by the exclusivity rule."""
+    client.post("/open", json={"path": synthetic_video, "loop": True})
+    _wait_frame(client)
+    assert client.post("/open", json={"path": synthetic_video, "loop": True}).status_code == 200

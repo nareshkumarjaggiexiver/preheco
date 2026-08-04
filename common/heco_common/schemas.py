@@ -83,11 +83,19 @@ class OpenSource(BaseModel):
 
     ``loop`` applies to file sources only: when true the file restarts at EOF
     so a short clip behaves like an endless camera.
+
+    ``owner`` names the run that claims the single capture slot.  Ingest holds
+    ONE source at a time, so without an owner a second run silently replaces a
+    live run's camera and both loops then read the wrong frames; with one, the
+    second /open is refused (409) naming the run that holds it.  ``takeover``
+    is the operator's explicit override for a slot whose owner is gone.
     """
 
     url: str | None = None
     path: str | None = None
     loop: bool = False
+    owner: str | None = None
+    takeover: bool = False
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "OpenSource":
@@ -95,6 +103,17 @@ class OpenSource(BaseModel):
         if bool(self.url) == bool(self.path):
             raise ValueError("provide exactly one of 'url' or 'path'")
         return self
+
+
+class CloseSource(BaseModel):
+    """POST /close body for ingest: release the slot held by ``owner``.
+
+    Releasing is owner-checked so a stale stop from a finished run can never
+    take the camera away from the run that has it now.
+    """
+
+    owner: str | None = None
+    force: bool = False
 
 
 class Frame(BaseModel):

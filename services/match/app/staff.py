@@ -16,6 +16,12 @@ Two entry points serve the professional enrolment flow of CONTRACTS.md:
 
 Staff are excluded from the guest count but never from tracking (CONTRACTS.md):
 suppression would corrupt track association and hide occlusions.
+
+Like the gallery, a site store is opened once per process and scanned from
+memory (:func:`app.store.open_store`) — :func:`check` runs on every face of
+every frame, so a connect-and-full-scan per call was the single hottest cost
+in the pipeline.  The ``path.exists()`` guards stay: a site with no enrolments
+must not get an empty database file created just by being asked about.
 """
 
 import re
@@ -23,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .store import Neighbour, VectorStore
+from .store import Neighbour, open_store
 
 _SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -55,8 +61,8 @@ def enrol(
     """
     if not staff_id:
         raise ValueError("staffId is required to enrol")
-    with VectorStore(db_path(data_dir, site_id)) as store:
-        store.begin_immediate()
+    store = open_store(db_path(data_dir, site_id))
+    with store.transaction():
         store.remove(staff_id)  # supersede any prior enrolment of this member
         for s in samples:
             store.add(
@@ -82,7 +88,8 @@ def check(
     path = db_path(data_dir, site_id)
     if not path.exists():
         return None
-    with VectorStore(path) as store:
+    store = open_store(path)
+    with store.reading():
         hit = store.search(embedding)
     if hit is not None and hit.cosine >= threshold:
         return hit
@@ -103,8 +110,8 @@ def absorb(
     (``anon#####``) is minted so the person is still excluded from future guest
     counts without claiming a named identity.  Returns ``(staffKey, count)``.
     """
-    with VectorStore(db_path(data_dir, site_id)) as store:
-        store.begin_immediate()
+    store = open_store(db_path(data_dir, site_id))
+    with store.transaction():
         key = staff_id or store.mint_key("anon")
         for blob, quality, sub_canon in templates:
             vec = np.frombuffer(blob, dtype=np.float32)
@@ -127,9 +134,8 @@ def purge(data_dir: Path, site_id: str, staff_ids: list[str]) -> dict[str, int]:
     if not path.exists():
         # No store for this site yet — nothing to erase, every id trivially done.
         return {sid: 0 for sid in staff_ids}
-    with VectorStore(path) as store:
-        # __exit__ commits; begin_immediate makes the whole purge one write txn.
-        store.begin_immediate()
+    store = open_store(path)
+    with store.transaction():  # one write txn for the whole purge
         for sid in staff_ids:
             removed[sid] = len(store.remove(sid))
     return removed

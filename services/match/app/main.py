@@ -10,24 +10,44 @@ Endpoints:
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
+    POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
     POST /merge  {runId, keep, drop}          -> {merged, galleryN}   (duplicate)
     POST /split  {runId, a, b}                -> {ok, galleryN}       (false-match)
-    POST /mark-staff {runId, personKey, siteId?, staffId?}
+    POST /mark-staff {runId, personKey, siteId, staffId?}
         -> {moved, galleryN, staffKey}                                (mark-staff)
+    POST /count/manual {runId, note?}
+        -> {personKey, galleryN, manual:true}                         (missed)
+    POST /gallery/sweep {maxAgeS?}            -> {swept:[runId]}      (retention)
 
 Staff are checked FIRST (CONTRACTS.md v1): a staff hit is tagged
 ``isStaff=true`` and excluded from the guest unique count, but the track that
 carries it stays visible and tracked upstream.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import config, gallery, staff
+from .store import close_all_stores
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
-app = FastAPI(title="heco-match", version=VERSION)
+#: Default age after which an unreferenced gallery file is sweepable (24 h).
+#: Long enough that a same-day re-run of a crashed event still has its data,
+#: short enough that guests' embeddings do not outlive the event by a season.
+DEFAULT_SWEEP_MAX_AGE_S = 24 * 3600.0
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Release every cached store connection on shutdown."""
+    yield
+    close_all_stores()
+
+
+app = FastAPI(title="heco-match", version=VERSION, lifespan=_lifespan)
 
 
 class ResetRequest(BaseModel):
@@ -82,12 +102,31 @@ class SplitRequest(BaseModel):
 
 
 class MarkStaffRequest(BaseModel):
-    """Body of POST /mark-staff — move a guest person to the staff store."""
+    """Body of POST /mark-staff — move a guest person to the staff store.
+
+    ``siteId`` is optional on the wire so a caller that omits it gets a
+    readable 400 rather than a validation dump, but it is REQUIRED in
+    practice: without a site there is no staff store to move the templates
+    into, and the endpoint refuses (see :func:`mark_staff`).
+    """
 
     runId: str
     personKey: str
     siteId: str | None = None
     staffId: str | None = None
+
+
+class ManualCountRequest(BaseModel):
+    """Body of POST /count/manual — one person the operator saw uncounted."""
+
+    runId: str
+    note: str | None = None
+
+
+class SweepRequest(BaseModel):
+    """Body of POST /gallery/sweep — delete gallery files older than maxAgeS."""
+
+    maxAgeS: float | None = Field(default=None, ge=0)
 
 
 @app.get("/health")
@@ -225,17 +264,65 @@ def split(body: SplitRequest) -> dict:
 
 @app.post("/mark-staff")
 def mark_staff(body: MarkStaffRequest) -> dict:
-    """Move a guest person out of the gallery and into the staff store."""
+    """Move a guest person out of the gallery and into the staff store.
+
+    Refuses (400) without a ``siteId``.  The templates are the ONLY record of
+    who this person is: lifting them out of the gallery with nowhere to put
+    them destroys them, and the person is then re-counted as a brand-new guest
+    on their next crossing — the correction silently undoing itself while the
+    audit trail claims it was applied.  A run with no site has no staff store,
+    so the honest answer is to refuse and let the operator see it.
+    """
     data_dir = config.data_dir()
+    if not body.siteId:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "mark-staff needs a siteId: without a site staff store the "
+                "person's templates would be destroyed, not moved"
+            ),
+        )
     try:
+        # Remove only after the destination is known to exist and be valid.
+        staff.db_path(data_dir, body.siteId)
         templates, n = gallery.remove(data_dir, body.runId, body.personKey)
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except staff.BadSiteIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
     staff_key: str | None = None
-    if templates and body.siteId:
-        try:
-            staff_key, _ = staff.absorb(data_dir, body.siteId, body.staffId, templates)
-        except staff.BadSiteIdError as e:
-            raise HTTPException(status_code=422, detail=str(e)) from e
+    if templates:
+        staff_key, _ = staff.absorb(data_dir, body.siteId, body.staffId, templates)
     return {"moved": len(templates), "galleryN": n, "staffKey": staff_key}
+
+
+@app.post("/count/manual")
+def count_manual(body: ManualCountRequest) -> dict:
+    """Add one operator-attested person to the run's unique count (*missed*).
+
+    The only lever that moves the count UP.  Under-counting is this pipeline's
+    dominant failure mode (open-set 1:N at a 1:1 verification threshold), and
+    before this the operator could watch an uncounted guest walk through and
+    do nothing about it.  The person is stored with an ``m`` key and no
+    embedding, so the report can always say how many of the unique total a
+    human added by hand.
+    """
+    try:
+        key, n = gallery.add_manual(config.data_dir(), body.runId, body.note)
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"personKey": key, "galleryN": n, "manual": True}
+
+
+@app.post("/gallery/sweep")
+def gallery_sweep(body: SweepRequest) -> dict:
+    """Delete gallery files older than ``maxAgeS`` (default 24 h); list them.
+
+    The documented cleanup entry point for galleries whose run died without
+    releasing them.  Each file holds real guests' face embeddings, so this is
+    a retention control, not housekeeping.  Staff stores are never touched —
+    they are meant to persist.
+    """
+    max_age = DEFAULT_SWEEP_MAX_AGE_S if body.maxAgeS is None else body.maxAgeS
+    return {"swept": gallery.sweep(config.data_dir(), max_age), "maxAgeS": max_age}

@@ -27,6 +27,15 @@ v1 (2026-08-04) adds the best-effort debug/feedback surface: ``post_tap`` and
 are single-shot and swallow failures — CONTRACTS.md requires they never block
 or crash the run loop when the planner hiccups.
 
+* **Two transports, because "best effort" is also about time.** Swallowing
+  errors stops a hiccup CRASHING the loop; it does nothing about a planner
+  that accepts connections and then answers slowly (SQLite lock, event-loop
+  stall), which stalls the loop just as effectively and loses every frame the
+  drop-not-queue ingest slot overwrites meanwhile. So the single-shot calls
+  speak through ``best_effort_transport`` — the caller wires that to a client
+  with a much SHORTER timeout than the retrying one. It defaults to
+  ``transport``, so a caller that does not care keeps the old behaviour.
+
 The client is intentionally synchronous: the runner reports stats every ~2 s,
 which never justifies an async dependency at POC scale.
 """
@@ -55,7 +64,24 @@ class PlannerError(RuntimeError):
     """Raised when a planner call fails after all retries (or on 4xx)."""
 
 
-def urllib_transport(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
+def bearer_urllib_transport(token: str) -> "Transport":
+    """A stdlib transport that carries ``Authorization: Bearer <token>``.
+
+    The planner refuses to listen beyond loopback without a token, so any
+    deployment where the runner is not on the same host needs this. Used
+    automatically when a PlannerClient is given a token and no explicit
+    transport (the httpx path sets the header on its client instead).
+    """
+
+    def transport(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
+        return urllib_transport(method, url, payload, token=token)
+
+    return transport
+
+
+def urllib_transport(
+    method: str, url: str, payload: dict | None, token: str | None = None
+) -> tuple[int, dict]:
     """Default stdlib transport: JSON in, JSON out, 10 s timeout.
 
     HTTP error statuses are returned (not raised) so the retry policy in
@@ -66,7 +92,10 @@ def urllib_transport(method: str, url: str, payload: dict | None) -> tuple[int, 
         url,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"} if body else {},
+        headers={
+            **({"Content-Type": "application/json"} if body else {}),
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
@@ -102,6 +131,8 @@ class PlannerClient:
         backoff_s: float = 0.2,
         batch_size: int = 100,
         sleep: Callable[[float], None] = time.sleep,
+        best_effort_transport: Transport | None = None,
+        token: str | None = None,
     ) -> None:
         """Configure the client; nothing is sent until create_run.
 
@@ -109,9 +140,31 @@ class PlannerClient:
         and is clamped to the contract cap of 200.  ``file_transport`` is only
         needed for :meth:`post_frame` (multipart debug frames); without it that
         one method is a no-op and every other call is unaffected.
+        ``best_effort_transport`` carries the single-shot taps/feedback traffic
+        and should be wired to a short-timeout client; it defaults to
+        ``transport``.
+
+        ``token`` is the planner's shared secret (its ``HECO_TOKEN``).  It is
+        required whenever the planner is exposed beyond loopback, which it
+        refuses to be without one — so a dockerised runner, reaching the host
+        over the bridge network, always needs it.  When set it is sent as
+        ``Authorization: Bearer`` on every call, including the multipart frame
+        upload.  A 401 back is a CONFIGURATION error, not a transient: retrying
+        it forever would only bury the real problem, so the retrying path fails
+        it fast and says what to fix.
         """
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or urllib_transport
+        self.token = token or None
+        # Best-effort calls swallow failures by design, which is right for taps
+        # and stats — but a 401 is not a hiccup, it is a misconfiguration that
+        # silently stops erasure purges and operator corrections from ever
+        # being seen. Counted here so the runner can surface it instead of
+        # quietly doing nothing all night.
+        self.auth_failures = 0
+        self.transport = transport or (
+            bearer_urllib_transport(self.token) if self.token else urllib_transport
+        )
+        self.best_effort_transport = best_effort_transport or self.transport
         self.file_transport = file_transport
         self.retries = max(1, retries)
         self.backoff_s = backoff_s
@@ -289,12 +342,18 @@ class PlannerClient:
     # ---------------------------------------------------------- internals
 
     def _send_once(self, method: str, path: str, payload: dict | None) -> tuple[bool, dict]:
-        """One transport attempt that never raises: (accepted, body)."""
+        """One best-effort attempt that never raises: (accepted, body).
+
+        Uses ``best_effort_transport`` so a hung planner costs the caller that
+        transport's (short) timeout once, rather than the retrying budget.
+        """
         url = f"{self.base_url}{path}"
         try:
-            status, body = self.transport(method, url, payload)
+            status, body = self.best_effort_transport(method, url, payload)
         except Exception:  # noqa: BLE001 — best-effort callers want no exceptions
             return False, {}
+        if status == 401:
+            self.auth_failures += 1
         return status < 400, (body or {})
 
     def _require_run(self) -> int | str:
@@ -316,6 +375,14 @@ class PlannerClient:
                 if status < 400:
                     return body
                 last = f"HTTP {status}: {body!r}"
+                if status == 401:
+                    # A configuration error, not a transient: retrying it would
+                    # bury the real problem behind a wall of failed attempts.
+                    raise PlannerError(
+                        f"{method} {url} refused: the planner requires a token and this "
+                        f"runner {'sent the wrong one' if self.token else 'sent none'}. "
+                        "Set HECO_TOKEN on the runner to the same value the planner uses."
+                    )
                 if status < 500:
                     raise PlannerError(f"{method} {url} rejected — {last}")
             if attempt < self.retries - 1:

@@ -4,13 +4,22 @@ COUNT MODE — per frame: ingest /frame -> persons /detect -> tracker /track ->
 faces /detect (within the tracked boxes) -> local quality gate -> embed /embed
 -> match /match per face -> unique count.  Every stage is timed; aggregates and
 sampled raw rows flush to the planner every ``flush_interval_s`` seconds.  On
-top of that (CONTRACTS.md v1, all best-effort so a planner hiccup never blocks
-or crashes the loop): annotated debug frames + structured taps go up every
-``tap_interval_s``, and operator feedback is polled every ``feedback_poll_s``
-and applied to the live gallery (merge / split / mark-staff), adjusting the
-unique count.  The matcher checks the site STAFF store first when the run
-carries a ``siteId``: a staff hit is counted as a staffCrossing and kept out of
-the guest unique count, but the track stays visible upstream.
+top of that (CONTRACTS.md v1): annotated debug frames + structured taps go up
+every ``tap_interval_s``, and operator feedback is polled every
+``feedback_poll_s`` and applied to the live gallery (merge / split / mark-staff
+/ missed), adjusting the unique count.  The matcher checks the site STAFF store
+first when the run carries a ``siteId``: a staff hit is counted as a staff
+crossing and kept out of the guest unique count, but the track stays visible
+upstream.
+
+**THE COUNT IS THE PRODUCT; reporting is secondary.**  Every planner call made
+from inside the frame loop is best-effort in both senses — errors are
+swallowed AND latency is bounded (short-timeout transports, plus a whole-round
+budget on taps).  A planner restart mid-event used to raise out of the stats
+flush, fail the run and stop counting; restarting then gave the run a fresh
+planner id and therefore a fresh EMPTY gallery, so every guest already counted
+was counted again.  A five-second laptop hiccup corrupted the event total.  It
+must cost nothing but a gap in the charts, which the next upsert repairs.
 
 ENROL MODE — a professional-enrolment walk-through: capture faces, keep the
 best ``enrol_best_n`` by quality, write them to the site staff store, and PUT
@@ -21,6 +30,11 @@ End-of-source: ingest serves the LATEST frame with a monotonically increasing
 (see services/ingest).  The loop also accepts a stub-friendly explicit end
 (``{"ended": true}``, missing ``imageB64``, or HTTP 204/404/410).  RTSP
 sources stall only on network loss; stop those via POST /runs/:id/stop.
+
+End-of-run: per-run state downstream has an owner and is HANDED BACK — the
+ingest capture slot, the tracker's SortLite, and the gallery file (which holds
+real guests' face embeddings, so leaving it behind is a retention liability,
+not just disk).  See :meth:`RunLoop._release_run_state`.
 """
 
 import contextlib
@@ -29,9 +43,9 @@ import time
 from datetime import UTC, datetime
 
 import httpx
-from heco_common.imaging import decode_jpeg_b64
 from heco_common.geometry import dedupe_boxes
-from heco_common.planner import FileTransport, PlannerClient, Transport
+from heco_common.imaging import decode_jpeg_b64
+from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 
 from . import annotate, taps
@@ -40,12 +54,28 @@ from .feedback import plan_action
 from .stats import SampleBuffer, StatsBoard
 
 
+class StageError(RuntimeError):
+    """A pipeline stage refused a call; carries its status and own message.
+
+    ``raise_for_status`` alone would report only the status code, which turns
+    a deliberate, explanatory refusal (ingest's 409 "the capture slot is held
+    by run X") into an opaque failure the operator cannot act on.  The status
+    is kept because the two families mean opposite things to a retry: 4xx is
+    "understood you, no" (settle it), 5xx is "try me again".
+    """
+
+    def __init__(self, message: str, status_code: int = 0) -> None:
+        """Record the message and the HTTP status the stage answered with."""
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def httpx_transport(client: httpx.Client) -> Transport:
     """Adapt an httpx client to the PlannerClient transport callable.
 
-    Lets production share one connection pool for stages and planner, and
-    lets tests route planner traffic through the same httpx.MockTransport
-    that fakes the stage services.
+    One adapter, several clients: the runner builds a long-timeout client for
+    stage calls and short-timeout ones for planner traffic (see RunManager),
+    and tests route everything through one httpx.MockTransport.
     """
 
     def transport(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
@@ -74,6 +104,24 @@ def httpx_file_transport(client: httpx.Client) -> FileTransport:
 def _now_iso() -> str:
     """ISO-8601 UTC timestamp for planner reports (e.g. enrolledAt)."""
     return datetime.now(UTC).isoformat()
+
+
+def enrol_score(face: dict) -> float:
+    """Rank one candidate enrolment face; higher is a better template.
+
+    Box width was the old ranking and it is the wrong axis: it rewards whoever
+    stands closest to the camera, not whoever is most recognisable.  The faces
+    service already emits the two signals recognition actually depends on —
+    ``iedPx`` (inter-eye distance, the size measure FR standards use) and
+    ``frontality`` (0..1 from how centred the nose sits between the eyes) — and
+    their product prefers a large, square-on face over a large, side-on one.
+    Width is the fallback for a detector reply without landmarks; the faces
+    service emits both signals for every face or neither, so a shortlist is
+    never ranked on mixed scales.
+    """
+    if "iedPx" in face:
+        return float(face["iedPx"]) * float(face.get("frontality", 1.0))
+    return float(face["box"]["w"])
 
 
 class RunLoop:
@@ -110,6 +158,13 @@ class RunLoop:
         self._last_feedback: float = 0.0
         self._last_purge: float = 0.0
         self._handled_feedback: set = set()
+        # fid -> outcome we already carried out but could not tell the planner
+        # about.  Without this a dropped PUT made the next poll re-execute an
+        # already-applied correction, which then failed (the key is gone) and
+        # was recorded as REJECTED next to a count that had visibly changed.
+        self._settled_feedback: dict = {}
+        # staffId -> monotonic time last seen, for crossing debounce.
+        self._staff_last_seen: dict = {}
         self._status: dict = {
             "runId": run_id,
             "plannerRunId": None,
@@ -120,12 +175,19 @@ class RunLoop:
             "unique": 0,
             "matches": 0,
             "staffCrossings": 0,
+            "staffFaceFrames": 0,
             "subCanonMatches": 0,
             "subCanonShare": 0.0,
             "feedbackApplied": 0,
+            "feedbackRejected": 0,
+            "manualAdditions": 0,
             "staffPurged": 0,
+            "plannerAuthFailures": 0,
             "sampleCount": 0,
             "samplesDropped": 0,
+            "multiFaceFramesSkipped": 0,
+            "plannerReportErrors": 0,
+            "tapRoundsAbandoned": 0,
             "error": None,
         }
 
@@ -144,12 +206,20 @@ class RunLoop:
         with self._lock:
             self._status.update(kv)
 
+    def _bump(self, key: str, by: int = 1) -> None:
+        with self._lock:
+            self._status[key] = self._status.get(key, 0) + by
+
     # ------------------------------------------------------------------ HTTP
 
     def _post(self, url: str, body: dict) -> dict:
+        """POST to a stage service, raising a StageError that quotes its reply."""
         r = self.client.post(url, json=body)
-        r.raise_for_status()
-        return r.json()
+        if r.status_code >= 400:
+            raise StageError(
+                f"POST {url} -> HTTP {r.status_code}: {_detail(r)}", r.status_code
+            )
+        return r.json() if r.content else {}
 
     def _next_frame(self) -> dict | None:
         """Poll ingest for a frame with a NEW seq; None once the source ends.
@@ -176,6 +246,17 @@ class RunLoop:
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
         return None  # stalled past source_stall_s (or stopped): source ended
 
+    def _open_source(self) -> None:
+        """Claim ingest's exclusive capture slot for this run.
+
+        The slot is single: without an owner a second run silently replaced a
+        live run's camera and both loops read the wrong frames.  A 409 here is
+        ingest telling us which run holds it — let it fail the run loudly.
+        """
+        self._post(
+            f"{self.s.ingest_url}/open", {**self.request["source"], "owner": self.run_id}
+        )
+
     # ------------------------------------------------------------- the loop
 
     def run(self) -> dict:
@@ -187,6 +268,7 @@ class RunLoop:
                 self._run()
         except Exception as e:  # noqa: BLE001 — a run must always settle
             self._set(state="failed", error=f"{type(e).__name__}: {e}")
+            self._release_run_state()
             if self.planner.run_id is not None:
                 # Best effort: the planner may be down too; local status
                 # already says failed either way.
@@ -221,7 +303,7 @@ class RunLoop:
         # deleted while the pipeline was off never matches again.
         self._maybe_purge_staff()  # before the first frame is matched
         self._post(f"{self.s.tracker_url}/reset", {"runId": planner_run_id})
-        self._post(f"{self.s.ingest_url}/open", req["source"])
+        self._open_source()
 
         t0 = time.monotonic()
         last_flush = t0
@@ -254,11 +336,44 @@ class RunLoop:
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
+            f"staffFaceFrames={st['staffFaceFrames']} "
+            f"manualAdditions={st['manualAdditions']} "
             f"subCanonShare={st['subCanonShare']:.2f} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
-        self.planner.end_run(status="ended", notes=notes)
+        # Hand back the camera, the tracker state and the gallery file before
+        # the run is closed off in the planner.
+        self._release_run_state()
+        try:
+            self.planner.end_run(status="ended", notes=notes)
+        except PlannerError as e:  # the count happened; only the report is lost
+            self._bump("plannerReportErrors")
+            self._set(error=f"run ended but the planner was not told: {e}")
         self._set(state="ended")
+
+    def _release_run_state(self) -> None:
+        """Give back every piece of per-run state this run created downstream.
+
+        Nothing here can fail the run — it has already produced its number —
+        so each call is independently best-effort.  Three owners:
+
+        * ingest's capture slot, so the next run can claim the camera;
+        * the tracker's per-run SortLite, which otherwise stays resident until
+          the process restarts (one leak per run, forever);
+        * the gallery file, which holds this event's guests' face embeddings.
+          A per-run file that nobody deletes is a retention liability; the
+          match service's /gallery/sweep is only the backstop for runs that
+          die before reaching here.
+        """
+        planner_run_id = self.status().get("plannerRunId")
+        with contextlib.suppress(Exception):
+            self._post(f"{self.s.ingest_url}/close", {"owner": self.run_id})
+        if not planner_run_id:
+            return
+        with contextlib.suppress(Exception):
+            self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
+        with contextlib.suppress(Exception):
+            self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
@@ -384,23 +499,44 @@ class RunLoop:
                     "box": face.get("box"),
                 }
             )
+            if m.get("isStaff"):
+                self._count_staff(m)
+                continue
             with self._lock:
                 st = self._status
-                if m.get("isStaff"):
-                    # Staff: tagged and counted separately, excluded from unique.
-                    st["staffCrossings"] += 1
-                else:
-                    st["matches"] += 1
-                    if m.get("subCanon"):
-                        st["subCanonMatches"] += 1
-                    if m.get("isNew"):
-                        st["unique"] += 1
-                    st["subCanonShare"] = (
-                        st["subCanonMatches"] / st["matches"] if st["matches"] else 0.0
-                    )
+                st["matches"] += 1
+                if m.get("subCanon"):
+                    st["subCanonMatches"] += 1
+                if m.get("isNew"):
+                    st["unique"] += 1
+                st["subCanonShare"] = (
+                    st["subCanonMatches"] / st["matches"] if st["matches"] else 0.0
+                )
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
+
+    def _count_staff(self, verdict: dict) -> None:
+        """Record one staff sighting: a face-frame always, a crossing sometimes.
+
+        ``staffCrossings`` used to be incremented per matched face per frame,
+        so one waiter passing the gate 30 times reported hundreds — a number
+        that moved with the frame rate rather than with staff behaviour, and
+        that an operator could not read (3 busy waiters looked like 30 staff).
+        A CROSSING is now one appearance: the same staff member seen again
+        within ``staff_cooldown_s`` of their last sighting is still the same
+        pass.  The raw per-frame figure survives as ``staffFaceFrames`` because
+        it is genuinely useful when debugging recall — it is simply not a
+        crossing count and no longer pretends to be.
+        """
+        staff_id = verdict.get("staffId") or verdict.get("personKey") or "staff:unknown"
+        now = time.monotonic()
+        last = self._staff_last_seen.get(staff_id)
+        self._staff_last_seen[staff_id] = now
+        with self._lock:
+            self._status["staffFaceFrames"] += 1
+            if last is None or (now - last) >= self.s.staff_cooldown_s:
+                self._status["staffCrossings"] += 1
 
     def _remember(
         self,
@@ -436,6 +572,13 @@ class RunLoop:
         Entirely best-effort: structured payloads always attempted; annotated
         frames only when the frame decodes (a stub/opaque frame simply skips the
         image upload).  Nothing here raises into the loop.
+
+        A tap round is up to 5 payload POSTs plus 5 JPEG uploads, so bounding
+        each call's timeout is not enough — a planner answering slowly but
+        successfully would still cost ten timeouts per tick.  The whole round
+        therefore shares ``tap_budget_s``: when it is spent the rest of the
+        round is dropped (counted in ``tapRoundsAbandoned``) and the loop goes
+        back to counting.  Debug frames are worth less than a guest.
         """
         if now - self._last_tap < self.s.tap_interval_s:
             return
@@ -443,12 +586,18 @@ class RunLoop:
         last = self._last
         if last is None:
             return
+        deadline = time.monotonic() + self.s.tap_budget_s
         st = self.status()
         payloads = taps.build_payloads(
             last, self.s.quality_min_px, self.s.quality_canon_px,
             st["unique"], st["staffCrossings"],
+            staff_face_frames=st["staffFaceFrames"],
+            manual_additions=st["manualAdditions"],
         )
         for stage, payload in payloads.items():
+            if time.monotonic() >= deadline:
+                self._bump("tapRoundsAbandoned")
+                return
             self.planner.post_tap(stage, payload)
 
         try:
@@ -456,6 +605,9 @@ class RunLoop:
         except Exception:  # noqa: BLE001 — opaque/stub frame: skip the image upload
             return
         for stage in annotate.STAGES:
+            if time.monotonic() >= deadline:
+                self._bump("tapRoundsAbandoned")
+                return
             try:
                 jpeg = annotate.render(
                     stage, img, last, self.s.quality_min_px, self.s.quality_canon_px
@@ -491,6 +643,11 @@ class RunLoop:
             tombs = self.planner.staff_tombstones(site_id)
         except Exception:  # noqa: BLE001 - erasure must never kill the loop
             return
+        # A rejected token makes the poll look like "nothing to erase" forever.
+        # Erasure silently not happening is the exact failure this whole chain
+        # exists to prevent, so it is reported, not shrugged off.
+        if self.planner.auth_failures:
+            self._set(plannerAuthFailures=self.planner.auth_failures)
         if not tombs:
             return
         ids = [t["staffId"] for t in tombs if t.get("staffId")]
@@ -519,9 +676,19 @@ class RunLoop:
     def _apply_feedback(self, items: list[dict]) -> None:
         """Apply each open feedback item to the live gallery, then PUT status.
 
-        A transient match-service error leaves the item open (not resolved) so
-        it is retried on the next poll; the gallery corrections are idempotent,
-        so a retry after a dropped status update never double-counts.
+        Two guarantees, and the second one is why ``_settled_feedback`` exists.
+
+        1. A transient match-service error leaves the item OPEN (unresolved and
+           unsettled), so it is retried on the next poll — nothing is lost.
+        2. An item this runner has already settled is NEVER executed twice, and
+           is always re-reported with the SAME status.  ``resolve_feedback`` is
+           single-shot, so a dropped PUT used to leave the item open, the next
+           poll re-ran the correction, the re-run failed (the merged key no
+           longer exists / the templates have already moved), and the item was
+           recorded REJECTED beside a unique count that had visibly dropped.
+           The operator could not tell what actually happened, which is the
+           entire purpose of the feedback ledger.  Worse for ``missed``, which
+           is not idempotent at all: a re-run would add a second person.
         """
         for item in items:
             if item.get("status", "open") != "open":
@@ -529,18 +696,28 @@ class RunLoop:
             fid = item.get("id")
             if fid in self._handled_feedback:
                 continue
-            applied = self._execute_action(plan_action(item))
-            if applied is None:
-                continue  # transient error — leave open, retry next poll
-            if self.planner.resolve_feedback(fid, "applied" if applied else "rejected"):
+            settled = self._settled_feedback.get(fid)
+            if settled is None:
+                action = plan_action(item, has_site_id=bool(self.request.get("siteId")))
+                applied = self._execute_action(action)
+                if applied is None:
+                    continue  # transient error — leave open, retry next poll
+                settled = "applied" if applied else "rejected"
+                self._settled_feedback[fid] = settled
+                self._bump("feedbackRejected" if settled == "rejected" else "feedbackApplied")
+            if self.planner.resolve_feedback(fid, settled):
                 self._handled_feedback.add(fid)
+                self._settled_feedback.pop(fid, None)
 
     def _execute_action(self, action) -> bool | None:
         """Run one correction against the match service.
 
         Returns True (applied, gallery changed), False (rejected / no-op) or
         None (transient error — caller should retry).  Merge and mark-staff
-        decrement the live unique count only when the gallery confirms a change.
+        decrement the live unique count only when the gallery confirms a
+        change; ``count-missed`` increments it.  ``invalid`` never touches the
+        gallery and is reported rejected: claiming "applied" for something the
+        runner could not do is exactly the lie this loop must not tell.
         """
         run = self.planner.run_id
         site_id = self.request.get("siteId")
@@ -561,9 +738,7 @@ class RunLoop:
                 )
                 return True
             if action.kind == "mark-staff":
-                body = {"runId": run, "personKey": action.person_key}
-                if site_id:
-                    body["siteId"] = site_id
+                body = {"runId": run, "personKey": action.person_key, "siteId": site_id}
                 if action.staff_id:
                     body["staffId"] = action.staff_id
                 r = self._post(f"{self.s.match_url}/mark-staff", body)
@@ -571,9 +746,23 @@ class RunLoop:
                     self._dec_unique()
                     return True
                 return False
-            # ack (missed / note / unknown): filed, gallery untouched.
-            # invalid: reject without a gallery call.
+            if action.kind == "count-missed":
+                body = {"runId": run}
+                if action.note:
+                    body["note"] = action.note
+                r = self._post(f"{self.s.match_url}/count/manual", body)
+                if r.get("personKey"):
+                    self._inc_unique()
+                    return True
+                return False
+            # ack (note): filed, gallery untouched.
+            # invalid: rejected without a gallery call.
             return action.kind == "ack"
+        except StageError as e:
+            # 4xx: the service understood us and refused (a mark-staff with no
+            # staff store, a malformed key) — retrying cannot help, settle it
+            # as rejected.  5xx: the service is unwell; leave the item open.
+            return False if 400 <= e.status_code < 500 else None
         except Exception:  # noqa: BLE001 — match hiccup: retry on the next poll
             return None
 
@@ -582,7 +771,19 @@ class RunLoop:
         with self._lock:
             st = self._status
             st["unique"] = max(0, st["unique"] - 1)
-            st["feedbackApplied"] += 1
+
+    def _inc_unique(self) -> None:
+        """Add one operator-attested person the pipeline missed (*missed*).
+
+        Counted separately as ``manualAdditions`` so the report can always say
+        how much of the headline number a human put there by hand — an
+        attested count and a detected one are different evidence and must not
+        be silently blended.
+        """
+        with self._lock:
+            st = self._status
+            st["unique"] += 1
+            st["manualAdditions"] += 1
 
     # ------------------------------------------------------------ enrol mode
 
@@ -592,15 +793,32 @@ class RunLoop:
         No pipeline_run and no counting: the deliverable is the site staff
         store plus a ``PUT /api/staff/:id`` reporting the sample count, so the
         operator can confirm the enrolment in the UI before the next person.
+
+        **SINGLE-SUBJECT RULE.** A frame contributes a sample only when EXACTLY
+        ONE face passes the quality gate; frames with two or more are skipped
+        and counted in ``multiFaceFramesSkipped``.  Enrolment writes to a
+        PERSISTENT, per-site whitelist and supersedes the member's previous
+        templates, so a bystander caught in the walk-through does not just add
+        noise — they become permanently recognised as that staff member at
+        every future event at the venue, silently excluded from every guest
+        count, while the real member may stop matching.  There is no signal
+        that this happened and no way to notice it later.  A refusal the
+        operator can see (and redo the walk-through for) is strictly better
+        than a poisoned whitelist nobody knows about, so an enrolment that
+        captured nothing FAILS loudly instead of reporting zero samples.
+
+        Within the surviving single-subject frames the shortlist is ranked by
+        :func:`enrol_score` — inter-eye distance x frontality, not box width.
         """
         req = self.request
         site_id, staff_id = req["siteId"], req["staffId"]
         self._set(state="enrolling")
-        self._post(f"{self.s.ingest_url}/open", req["source"])
+        self._open_source()
 
-        captured: list[tuple[float, list]] = []  # (quality, embedding)
+        captured: list[tuple[float, list]] = []  # (score, embedding)
         frames = 0
         faces_seen = 0
+        skipped = 0
 
         while not self._stop.is_set():
             frame = self._next_frame()
@@ -616,33 +834,59 @@ class RunLoop:
                 {"imageB64": image_b64, "within": boxes or None},
             ).get("faces", [])
             kept = [f for f in faces if float(f["box"]["w"]) >= self.s.quality_min_px]
-            if not kept:
-                self._set(frames=frames)
+            if len(kept) != 1:
+                if len(kept) > 1:
+                    skipped += 1
+                self._set(frames=frames, multiFaceFramesSkipped=skipped)
                 continue
-            faces_seen += len(kept)
+            faces_seen += 1
             embeddings = self._post(
                 f"{self.s.embed_url}/embed", {"imageB64": image_b64, "faces": kept}
             ).get("embeddings", [])
             for face, emb in zip(kept, embeddings, strict=False):
-                captured.append((float(face["box"]["w"]), emb))
+                captured.append((enrol_score(face), emb))
             # Keep only the running best-N by quality to bound memory.
             captured.sort(key=lambda qe: qe[0], reverse=True)
             del captured[self.s.enrol_best_n :]
-            self._set(frames=frames, facesSeen=faces_seen, sampleCount=len(captured))
-
-        samples = [{"embedding": emb, "quality": q} for q, emb in captured[: self.s.enrol_best_n]]
-        n = 0
-        if samples:
-            out = self._post(
-                f"{self.s.match_url}/staff/enrol",
-                {"siteId": site_id, "staffId": staff_id, "samples": samples},
+            self._set(
+                frames=frames,
+                facesSeen=faces_seen,
+                sampleCount=len(captured),
+                multiFaceFramesSkipped=skipped,
             )
-            n = int(out.get("sampleCount", len(samples)))
+
+        self._release_run_state()  # capture is done: hand the camera back
+        samples = [{"embedding": emb, "quality": q} for q, emb in captured[: self.s.enrol_best_n]]
+        if not samples:
+            self._set(
+                state="failed",
+                sampleCount=0,
+                facesSeen=faces_seen,
+                frames=frames,
+                multiFaceFramesSkipped=skipped,
+                error=(
+                    f"enrolment captured no single-subject frames "
+                    f"({skipped} frame(s) had more than one face, {frames} seen) — "
+                    f"walk {staff_id} through alone and re-run the enrolment"
+                ),
+            )
+            return
+        out = self._post(
+            f"{self.s.match_url}/staff/enrol",
+            {"siteId": site_id, "staffId": staff_id, "samples": samples},
+        )
+        n = int(out.get("sampleCount", len(samples)))
         # Report to the planner (retrying, but a planner outage must not fail
         # the enrolment itself — the samples are already stored).
         with contextlib.suppress(Exception):
             self.planner.report_enrolment(staff_id, _now_iso(), n)
-        self._set(state="ended", sampleCount=n, facesSeen=faces_seen, frames=frames)
+        self._set(
+            state="ended",
+            sampleCount=n,
+            facesSeen=faces_seen,
+            frames=frames,
+            multiFaceFramesSkipped=skipped,
+        )
 
     # -------------------------------------------------------------- plumbing
 
@@ -655,12 +899,36 @@ class RunLoop:
         return out
 
     def _flush(self, elapsed_s: float) -> None:
-        """Push per-stage aggregates and the sample batch to the planner."""
-        for body in self.board.snapshot(elapsed_s):
-            self.planner.post_stats(
-                body["stage"], frames=body["frames"], fps=body["fps"], metrics=body["metrics"]
-            )
-        rows = self.samples.drain()
-        if rows:
-            self.planner.post_samples([Sample(**row) for row in rows])
+        """Push per-stage aggregates and the sample batch to the planner.
+
+        NEVER raises into the loop.  Stats are upserted aggregates and samples
+        are supplementary, so a failed flush costs a gap the next successful
+        flush repairs — whereas letting PlannerError out of here failed the
+        whole run, and a restarted run gets a fresh empty gallery, re-counting
+        every guest already counted.  A planner restart must cost chart data,
+        never the count.
+        """
+        try:
+            for body in self.board.snapshot(elapsed_s):
+                self.planner.post_stats(
+                    body["stage"], frames=body["frames"], fps=body["fps"], metrics=body["metrics"]
+                )
+            rows = self.samples.drain()
+            if rows:
+                self.planner.post_samples([Sample(**row) for row in rows])
+        except PlannerError:
+            self._bump("plannerReportErrors")
+        except Exception:  # noqa: BLE001 — reporting must never stop counting
+            self._bump("plannerReportErrors")
         self._set(samplesDropped=self.samples.dropped)
+
+
+def _detail(response: httpx.Response) -> str:
+    """Best readable explanation a stage gave for refusing a call."""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — not JSON; fall back to raw text
+        return response.text[:300]
+    if isinstance(body, dict) and body.get("detail"):
+        return str(body["detail"])
+    return str(body)[:300]

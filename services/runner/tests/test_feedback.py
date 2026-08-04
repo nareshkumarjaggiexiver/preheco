@@ -25,15 +25,43 @@ def test_mark_staff_with_and_without_roster_id():
     assert anon.kind == "mark-staff" and anon.staff_id is None
 
 
-def test_missed_and_note_are_acknowledged():
-    """Missed / note items are filed, not acted on."""
-    assert plan_action({"id": 5, "kind": "missed", "payload": {}}).kind == "ack"
+def test_missed_becomes_a_manual_count_and_note_stays_audit_only():
+    """'missed' is the operator's +1 lever; 'note' is still audit-only.
+
+    Regression: 'missed' mapped to 'ack' and changed nothing, so every
+    implemented lever moved the count DOWN and an operator watching an
+    uncounted guest walk through had no way to correct it.
+    """
+    missed = plan_action({"id": 5, "kind": "missed", "payload": {"note": "by the bar"}})
+    assert missed.kind == "count-missed" and missed.note == "by the bar"
     assert plan_action({"id": 6, "kind": "note", "payload": {}}).kind == "ack"
 
 
-def test_unknown_kind_is_acknowledged():
-    """An unrecognised kind is acked so it does not re-poll forever."""
-    assert plan_action({"id": 7, "kind": "whatever"}).kind == "ack"
+def test_unknown_kind_is_rejected_not_claimed_applied():
+    """An unrecognised kind is rejected (with a reason), never 'applied'.
+
+    Regression: it mapped to 'ack', which the loop reported as APPLIED — the
+    operator was told their correction had landed when this runner did not
+    even understand it.  Rejecting still closes the item, so it does not
+    re-poll forever.
+    """
+    a = plan_action({"id": 7, "kind": "whatever"})
+    assert a.kind == "invalid"
+    assert "whatever" in a.reason
+
+
+def test_mark_staff_needs_a_run_with_a_site():
+    """mark-staff on a siteless run is invalid, not a template-destroying no-op.
+
+    Regression: with no siteId the match service removed the guest's templates
+    and absorbed them nowhere, yet reported moved>0 — so the runner decremented
+    unique, resolved the item 'applied', and the person was re-counted as a new
+    guest at their next crossing.
+    """
+    item = {"id": 13, "kind": "mark-staff", "payload": {"personKey": "p9"}}
+    refused = plan_action(item, has_site_id=False)
+    assert refused.kind == "invalid" and "siteId" in refused.reason
+    assert plan_action(item, has_site_id=True).kind == "mark-staff"
 
 
 def test_malformed_pair_is_invalid():
