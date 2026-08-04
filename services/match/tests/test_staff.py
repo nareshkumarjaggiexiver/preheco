@@ -174,3 +174,31 @@ def test_enrol_rejects_bad_site_id(client):
 def test_staff_check_module_missing_store(tmp_path):
     """staff.check on a site with no enrolments is a clean 'not staff'."""
     assert staff.check(tmp_path, "unseen-site", [0.1] * 128, config.DEFAULT_THRESHOLD) is None
+
+
+def test_purge_erases_only_the_named_member(tmp_path):
+    """The erasure half of consent: purge removes one member's templates,
+    leaves the colleague's, and is idempotent."""
+    import numpy as np
+    from app import staff
+
+    a = np.zeros(128, dtype=np.float32); a[0] = 1.0
+    b = np.zeros(128, dtype=np.float32); b[1] = 1.0
+    staff.enrol(tmp_path, "site1", "ravi", [{"embedding": a.tolist(), "quality": 90}])
+    staff.enrol(tmp_path, "site1", "sunita", [{"embedding": b.tolist(), "quality": 88}])
+
+    removed = staff.purge(tmp_path, "site1", ["ravi"])
+    assert removed == {"ravi": 1}
+
+    # ravi no longer matches; sunita still does
+    assert staff.check(tmp_path, "site1", a, threshold=0.9) is None
+    hit = staff.check(tmp_path, "site1", b, threshold=0.9)
+    assert hit is not None and hit.key == "sunita"
+
+    # idempotent: purging again (or an unknown id) reports 0 and succeeds
+    assert staff.purge(tmp_path, "site1", ["ravi", "ghost"]) == {"ravi": 0, "ghost": 0}
+
+
+def test_purge_with_no_store_file_is_trivially_done(tmp_path):
+    from app import staff
+    assert staff.purge(tmp_path, "empty-site", ["x"]) == {"x": 0}

@@ -108,6 +108,7 @@ class RunLoop:
         self._last: dict | None = None
         self._last_tap: float = 0.0
         self._last_feedback: float = 0.0
+        self._last_purge: float = 0.0
         self._handled_feedback: set = set()
         self._status: dict = {
             "runId": run_id,
@@ -122,6 +123,7 @@ class RunLoop:
             "subCanonMatches": 0,
             "subCanonShare": 0.0,
             "feedbackApplied": 0,
+            "staffPurged": 0,
             "sampleCount": 0,
             "samplesDropped": 0,
             "error": None,
@@ -214,6 +216,10 @@ class RunLoop:
 
         # Fresh per-run state downstream, then open the source.
         self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
+        # Honour any pending consent withdrawals BEFORE the first frame is
+        # matched: purge tombstoned staff from the site store now, so a member
+        # deleted while the pipeline was off never matches again.
+        self._maybe_purge_staff()  # before the first frame is matched
         self._post(f"{self.s.tracker_url}/reset", {"runId": planner_run_id})
         self._post(f"{self.s.ingest_url}/open", req["source"])
 
@@ -221,6 +227,7 @@ class RunLoop:
         last_flush = t0
         self._last_tap = t0
         self._last_feedback = t0
+        self._last_purge = t0
         frames = 0
 
         while not self._stop.is_set():
@@ -240,6 +247,7 @@ class RunLoop:
                 last_flush = now
             self._maybe_tap(now)  # best-effort debug frames + payloads
             self._maybe_feedback(now)  # best-effort operator corrections
+            self._maybe_purge_staff(now)  # best-effort consent-withdrawal purge
 
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
@@ -448,6 +456,47 @@ class RunLoop:
             self.planner.post_frame(stage, jpeg)
 
     # ------------------------------------------------------ operator feedback
+
+    def _maybe_purge_staff(self, now: float | None = None) -> None:
+        """Purge tombstoned staff from the site store (best-effort, idempotent).
+
+        The erasure half of the consented-whitelist contract: the planner
+        tombstones a deleted roster member, we relay the ids to the match
+        service (which owns ``data/staff-<siteId>.db``) and confirm each purge
+        so the planner's ledger records that the withdrawal was honoured.
+
+        Called once before the first frame (``now=None`` forces the check, so a
+        member deleted while the pipeline was off can never match again) and
+        then on ``feedback_poll_s`` during the run, so an erasure requested
+        mid-event lands within seconds.  Every step is best-effort: a planner
+        or match hiccup leaves the tombstone open and the next cycle retries.
+        """
+        site_id = self.request.get("siteId")
+        if not site_id:
+            return
+        if now is not None:
+            if now - self._last_purge < self.s.feedback_poll_s:
+                return
+            self._last_purge = now
+        try:
+            tombs = self.planner.staff_tombstones(site_id)
+        except Exception:  # noqa: BLE001 - erasure must never kill the loop
+            return
+        if not tombs:
+            return
+        ids = [t["staffId"] for t in tombs if t.get("staffId")]
+        if not ids:
+            return
+        try:
+            r = self._post(f"{self.s.match_url}/staff/purge", {"siteId": site_id, "staffIds": ids})
+        except Exception:  # noqa: BLE001 - match hiccup: tombstones stay open, retried
+            return
+        removed = r.get("removed", {})
+        with self._lock:
+            self._status["staffPurged"] += sum(1 for v in removed.values())
+        for t in tombs:
+            if t.get("staffId") in removed:
+                self.planner.confirm_tombstone(t["id"])
 
     def _maybe_feedback(self, now: float) -> None:
         """Poll the planner for open corrections and apply what we can."""

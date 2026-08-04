@@ -101,3 +101,40 @@ Every ~2 s while running:
   (multipart/x-mixed-replace) so the browser can watch any channel.
 - Staff: CRUD under /api/sites/:id/staff; PUT /api/events/:id/staff.
 - Control proxy: POST /api/pipeline/control/start|stop → RUNNER_URL.
+
+
+## v1 addition — staff erasure (consent withdrawal), 2026-08-05
+
+Deleting a staff member in the planner removes the roster row and the consent
+record, but their FACE EMBEDDINGS live in the pipeline's per-site staff store
+(`data/staff-<siteId>.db`) on the analysis box. Without a signal across the two
+repos, a member who withdrew consent keeps being matched as staff at every
+future event at that venue — the erasure half of DPDP is simply missing.
+
+The tombstone ledger closes it:
+
+1. PLANNER, on `DELETE /api/staff/:id`: in ONE transaction, insert a row into
+   `staff_tombstones` (schema v7 — id, site_id, staff_id, name, deleted_at,
+   purged_at NULL) and delete the staff row. The tombstone has no foreign keys
+   on purpose: the staff row is already gone and the signal must outlive even a
+   site deletion.
+2. RUNNER polls `GET /api/staff-tombstones?siteId=` — returns the site's OPEN
+   tombstones `[{id, siteId, staffId, deletedAt}]`. Called once BEFORE the
+   first frame of a run (so a member deleted while the pipeline was off can
+   never match again — this ordering is the guarantee, pinned by test) and then
+   every `feedback_poll_s` during the run (so a mid-event withdrawal lands
+   within seconds).
+3. RUNNER relays the ids to `POST {match}/staff/purge {siteId, staffIds[]}`.
+   The match service removes every template keyed by each id from the site
+   store and returns `{siteId, removed: {staffId: templatesRemoved}}`. Erasure
+   is IDEMPOTENT: an id with no templates reports 0 removed and is success —
+   the guarantee is that nothing remains, not that something was found.
+4. RUNNER confirms each purge with `PUT /api/staff-tombstones/:id`, which
+   stamps `purged_at`. The row is never deleted: a consent withdrawal and the
+   proof it was honoured are exactly what an audit asks for. Confirmation is
+   idempotent (a second PUT keeps the first stamp).
+
+Every step is best-effort and retried: a planner or match hiccup leaves the
+tombstone OPEN, and the next cycle (or the next run's start-up check) tries
+again. A dropped confirmation only means the purge re-runs, which is harmless.
+The runner reports a `staffPurged` counter in its status.

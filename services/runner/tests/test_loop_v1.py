@@ -51,6 +51,9 @@ class V1Fake:
         self.feedback_polls = 0
         self.resolved: list[tuple[str, str]] = []  # (feedbackId, status)
         self.enrolled: dict | None = None
+        self.tombstones: list[dict] = []          # served once, like feedback
+        self.tombstones_confirmed: list[str] = []
+        self.purges: list[dict] = []
         self.enrol_report: dict | None = None
         self.merges: list[dict] = []
         self.splits: list[dict] = []
@@ -81,6 +84,12 @@ class V1Fake:
         if path.startswith("/api/feedback/") and request.method == "PUT":
             self.resolved.append((path.rsplit("/", 1)[-1], body["status"]))
             return httpx.Response(200, json={"ok": True})
+        if path == "/api/staff-tombstones" and request.method == "GET":
+            items, self.tombstones = self.tombstones, []  # serve once
+            return httpx.Response(200, json=items)
+        if path.startswith("/api/staff-tombstones/") and request.method == "PUT":
+            self.tombstones_confirmed.append(path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"ok": True, "purgedAt": "2026-08-05T00:00:00Z"})
         if path.startswith("/api/staff/") and request.method == "PUT":
             self.enrol_report = {"id": path.rsplit("/", 1)[-1], **body}
             return httpx.Response(200, json={"ok": True})
@@ -100,6 +109,12 @@ class V1Fake:
             return httpx.Response(200, json={
                 "moved": 1, "galleryN": max(0, self.guest_n - 1),
                 "staffKey": body.get("staffId") or "anon00001",
+            })
+        if path == "/staff/purge":
+            self.purges.append(body)
+            return httpx.Response(200, json={
+                "siteId": body["siteId"],
+                "removed": {sid: 1 for sid in body["staffIds"]},
             })
         if path == "/staff/enrol":
             self.enrolled = body
@@ -269,3 +284,37 @@ def test_enrol_mode_writes_best_samples_and_reports():
     assert fake.enrol_report["id"] == "st-1" and fake.enrol_report["sampleCount"] == 5
     # Enrol does not create a pipeline run or reset the gallery.
     assert "match /reset" not in fake.calls and "planner /api/pipeline/runs" not in fake.calls
+
+
+def test_tombstoned_staff_purged_at_run_start_and_confirmed():
+    """The erasure chain: planner tombstone -> match /staff/purge -> confirm.
+
+    A roster member deleted while the pipeline was off must be purged from the
+    site staff store BEFORE the first frame is matched, and the planner's
+    ledger must receive the confirmation that closes the tombstone.
+    """
+    fake = V1Fake(n_frames=1)
+    fake.tombstones = [
+        {"id": "tomb-1", "siteId": "site9", "staffId": "ravi", "deletedAt": "2026-08-05T00:00:00Z"}
+    ]
+    request = {"eventId": "ev-1", "siteId": "site9", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.purges == [{"siteId": "site9", "staffIds": ["ravi"]}]
+    assert fake.tombstones_confirmed == ["tomb-1"]
+    assert final["staffPurged"] == 1
+
+    # ORDERING IS THE GUARANTEE: the purge must complete before the first face
+    # is matched, or a withdrawn member is still recognised as staff on frame 1.
+    calls = fake.calls
+    purge_at = calls.index("match /staff/purge")
+    match_at = next(i for i, c in enumerate(calls) if c == "match /match")
+    assert purge_at < match_at, "staff purge must precede the first /match"
+
+
+def test_no_tombstones_means_no_purge_calls():
+    fake = V1Fake(n_frames=1)
+    request = {"eventId": "ev-1", "siteId": "site9", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert fake.purges == []
+    assert final["staffPurged"] == 0

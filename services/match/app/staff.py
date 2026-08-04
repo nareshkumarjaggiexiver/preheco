@@ -110,3 +110,26 @@ def absorb(
             vec = np.frombuffer(blob, dtype=np.float32)
             store.add(key, vec, quality=quality, sub_canon=bool(sub_canon))
         return key, store.count_for(key)
+
+
+def purge(data_dir: Path, site_id: str, staff_ids: list[str]) -> dict[str, int]:
+    """Erase staff members' templates from the site store; return removed counts.
+
+    The erasure half of the consent story: the planner tombstones a deleted
+    roster member, the runner relays the ids here, and every template keyed by
+    each id is removed from ``staff-<siteId>.db``.  Returns
+    ``{staff_id: templates_removed}`` — a zero means the id had no templates
+    (never enrolled, or already purged), which is success, not an error:
+    erasure is idempotent.
+    """
+    removed: dict[str, int] = {}
+    path = db_path(data_dir, site_id)
+    if not path.exists():
+        # No store for this site yet — nothing to erase, every id trivially done.
+        return {sid: 0 for sid in staff_ids}
+    with VectorStore(path) as store:
+        # __exit__ commits; begin_immediate makes the whole purge one write txn.
+        store.begin_immediate()
+        for sid in staff_ids:
+            removed[sid] = len(store.remove(sid))
+    return removed
