@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 
 import httpx
 from heco_common.imaging import decode_jpeg_b64
+from heco_common.geometry import dedupe_boxes
 from heco_common.planner import FileTransport, PlannerClient, Transport
 from heco_common.schemas import Sample
 
@@ -282,9 +283,18 @@ class RunLoop:
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
 
-        # face-detect (within tracked person boxes; raw boxes before the
-        # tracker confirms any — min-hits means early frames have no tracks)
-        within = [t["box"] for t in tracks] or boxes
+        # face-detect region: the DEDUPED UNION of the raw person boxes and the
+        # confirmed-track boxes. Searching only confirmed tracks (the old
+        # `[t["box"] for t in tracks] or boxes`) silently dropped every
+        # unconfirmed, coasting or short-dwell person from face search once ANY
+        # track existed — and because the count is match.isNew, a face never
+        # searched is a guest never counted. Raw boxes restore recall; the
+        # dedupe stops a person covered by both a raw box and a track box from
+        # being searched (and embedded) twice. See docs/planning/pipeline/
+        # accuracy-and-tuning.md (finding D1).
+        within = dedupe_boxes(
+            [t["box"] for t in tracks] + list(boxes), iou_thr=0.6
+        )
         faces_out = self._timed(
             "face-detect",
             "faceDetectMs",
@@ -296,7 +306,16 @@ class RunLoop:
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
-            samples.add("face-detect", t_ms, {"faceBoxWPx": float(f["box"]["w"])})
+            sample = {"faceBoxWPx": float(f["box"]["w"])}
+            # report-only quality signals (accuracy R&D F1): recognition size is
+            # honestly read in inter-eye distance, not box width.
+            if "iedPx" in f:
+                board.observe("face-detect", "faceIedPx", float(f["iedPx"]))
+                sample["faceIedPx"] = float(f["iedPx"])
+            if "frontality" in f:
+                board.observe("face-detect", "frontality", float(f["frontality"]))
+                sample["frontality"] = float(f["frontality"])
+            samples.add("face-detect", t_ms, sample)
 
         # quality gate (local): floor 56 px; 56-79 px flagged sub-canon
         tq = time.perf_counter()

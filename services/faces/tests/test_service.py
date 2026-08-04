@@ -99,3 +99,19 @@ def test_within_degenerate_boxes_skipped():
 def test_detect_rejects_bad_base64():
     r = TestClient(app).post("/detect", json={"imageB64": "!!nope!!"})
     assert r.status_code == 400
+
+
+def test_ied_and_frontality_emitted():
+    """F1: a face with landmarks reports inter-eye distance and frontality."""
+    from app.main import _with_quality
+    face = {
+        "box": {"x": 0, "y": 0, "w": 100, "h": 120},
+        "landmarks": [[30, 40], [70, 40], [50, 60], [35, 80], [65, 80]],
+        "conf": 0.9,
+    }
+    out = _with_quality(face)
+    assert out["iedPx"] == 40.0            # |70-30| horizontally
+    assert out["frontality"] == 1.0        # nose dead-centre between the eyes
+    # a face with no landmarks still gets width + quality, no IED keys
+    bare = _with_quality({"box": {"x": 0, "y": 0, "w": 60, "h": 70}, "conf": 0.8})
+    assert bare["widthPx"] == 60 and "iedPx" not in bare
