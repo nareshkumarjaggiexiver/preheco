@@ -182,8 +182,10 @@ def test_purge_erases_only_the_named_member(tmp_path):
     import numpy as np
     from app import staff
 
-    a = np.zeros(128, dtype=np.float32); a[0] = 1.0
-    b = np.zeros(128, dtype=np.float32); b[1] = 1.0
+    a = np.zeros(128, dtype=np.float32)
+    a[0] = 1.0
+    b = np.zeros(128, dtype=np.float32)
+    b[1] = 1.0
     staff.enrol(tmp_path, "site1", "ravi", [{"embedding": a.tolist(), "quality": 90}])
     staff.enrol(tmp_path, "site1", "sunita", [{"embedding": b.tolist(), "quality": 88}])
 
@@ -200,5 +202,95 @@ def test_purge_erases_only_the_named_member(tmp_path):
 
 
 def test_purge_with_no_store_file_is_trivially_done(tmp_path):
+    """A site that never enrolled anyone has trivially honoured every erasure."""
     from app import staff
     assert staff.purge(tmp_path, "empty-site", ["x"]) == {"x": 0}
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_mark_staff_without_site_id_is_refused_and_keeps_the_templates(client):
+    """Never destroy a person's templates when there is nowhere to move them.
+
+    Regression: /mark-staff removed the guest's templates UNCONDITIONALLY but
+    only absorbed them into a staff store ``if templates and siteId`` — with no
+    siteId they were simply deleted, while moved>0 was still returned. The
+    runner then decremented unique and resolved the correction 'applied', and
+    the person, now unknown to every store, was counted as a brand-new guest
+    at their next crossing. The correction silently undid itself.
+    """
+    c = centroid()
+    g = _match(client, "run-z", sighting(c))
+    assert g["galleryN"] == 1
+
+    res = client.post("/mark-staff", json={"runId": "run-z", "personKey": g["personKey"]})
+    assert res.status_code == 400
+    assert "siteId" in res.json()["detail"]
+
+    # The person is still there, still the same key: nothing was destroyed.
+    again = _match(client, "run-z", sighting(c))
+    assert again["isNew"] is False and again["personKey"] == g["personKey"]
+    assert again["galleryN"] == 1
+
+
+def test_missed_correction_adds_an_attested_person_to_the_count(client):
+    """The one lever that moves the count UP, and it is marked as human-made.
+
+    Regression: 'missed' feedback was acknowledged and changed nothing, so an
+    operator watching an uncounted guest walk through had no way to fix the
+    number they were about to deliver.
+    """
+    c = centroid()
+    first = _match(client, "run-mm", sighting(c))
+    assert first["galleryN"] == 1
+
+    res = client.post("/count/manual", json={"runId": "run-mm", "note": "by the bar"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["manual"] is True and body["galleryN"] == 2
+    assert body["personKey"].startswith("m"), "human-added people stay distinguishable"
+
+    # An attested person owns no template, so they can never absorb a sighting.
+    again = _match(client, "run-mm", sighting(c))
+    assert again["personKey"] == first["personKey"] and again["galleryN"] == 2
+
+
+def test_manual_additions_survive_a_reopen_and_never_match(client, tmp_path):
+    """The manual row is durable and stays out of the cosine scan."""
+    from app import gallery
+    key, n = gallery.add_manual(tmp_path, "run-p", "wheelchair user")
+    assert (key.startswith("m"), n) == (True, 1)
+    from app.store import close_all_stores
+    close_all_stores()  # force a reload from disk
+    assert gallery.count(tmp_path, "run-p") == 1
+
+
+def test_gallery_sweep_deletes_orphaned_run_files_only(client, tmp_path):
+    """Gallery files have a lifecycle; staff stores deliberately do not.
+
+    Regression: gallery.reset only deleted the CURRENT run's file, and a run id
+    is freshly minted per run, so no prior file was ever removed — data/ grew
+    one gallery per run indefinitely, each holding real guests' face
+    embeddings. That is a retention liability, not just disk.
+    """
+    import os
+    import time
+
+    from app import gallery
+
+    _match(client, "old-run", sighting(centroid()))
+    _match(client, "new-run", sighting(centroid()))
+    client.post("/staff/enrol", json={
+        "siteId": "site-keep", "staffId": "st", "samples": [{"embedding": sighting(centroid())}],
+    })
+    old = gallery.db_path(tmp_path, "old-run")
+    stale = time.time() - 7200
+    os.utime(old, (stale, stale))
+
+    res = client.post("/gallery/sweep", json={"maxAgeS": 3600})
+    assert res.status_code == 200, res.text
+    assert res.json()["swept"] == ["old-run"]
+    assert not old.exists()
+    assert gallery.db_path(tmp_path, "new-run").exists(), "a live run must be untouched"
+    assert staff.db_path(tmp_path, "site-keep").exists(), "staff stores persist by design"

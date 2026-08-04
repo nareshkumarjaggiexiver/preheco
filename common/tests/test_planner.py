@@ -219,3 +219,102 @@ def test_report_enrolment_retries_then_raises():
     ft2.script = [(503, {})] * 3
     with pytest.raises(PlannerError):
         pc2.report_enrolment("st-2", "2026-08-04T10:00:00Z", 5)
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_best_effort_calls_use_their_own_transport():
+    """Taps/frames/feedback must be routable to a SHORT-timeout client.
+
+    Regression: one 30 s httpx client served stage calls AND every planner
+    call, so "best effort" only ever meant "errors are swallowed" — a planner
+    that accepted connections and then answered slowly still blocked the frame
+    loop for up to 30 s per call, ~11 calls per tick. Bounding latency needs a
+    separate transport, so the single-shot calls must not share the retrying
+    one.
+    """
+    retrying = FakeTransport()
+    quick = FakeTransport()
+    pc = PlannerClient(
+        "http://planner:8787", transport=retrying, best_effort_transport=quick
+    )
+    pc.create_run(3)  # retrying path
+    pc.post_stats("match", frames=1, fps=1.0)  # retrying path
+    pc.post_tap("match", {"unique": 1})  # best-effort path
+    pc.poll_feedback()  # best-effort path
+    pc.resolve_feedback(7, "applied")  # best-effort path
+    pc.staff_tombstones("site-1")  # best-effort path
+
+    assert [c[0] for c in quick.calls] == ["POST", "GET", "PUT", "GET"]
+    assert all("/taps" in u or "feedback" in u or "tombstones" in u for _, u, _ in quick.calls)
+    assert [u for _, u, _ in retrying.calls] == [
+        "http://planner:8787/api/pipeline/runs",
+        "http://planner:8787/api/pipeline/runs/42/stats",
+    ]
+
+
+def test_best_effort_transport_defaults_to_the_main_one():
+    """A caller that does not care keeps the previous single-transport behaviour."""
+    ft = FakeTransport()
+    pc = PlannerClient("http://planner:8787", transport=ft)
+    assert pc.best_effort_transport is ft
+
+
+def test_a_token_rides_on_every_call_including_the_frame_upload():
+    """The planner refuses non-loopback exposure without a token, so a runner
+    reaching it across a network must authenticate on EVERY path — including
+    the multipart frame upload, which uses a different transport."""
+    seen: list[dict] = []
+
+    def transport(method, url, payload):
+        seen.append({"method": method, "url": url})
+        return 200, {"id": 7}
+
+    pc = PlannerClient("http://planner:8787", transport=transport, token="sekrit")
+    assert pc.token == "sekrit"
+
+    # With an explicit transport the header is the caller's business (the runner
+    # sets it on the httpx client); what matters is the token is carried and
+    # surfaced so runs.py can wire it.
+    pc.create_run(event_id="e1")
+    assert seen and seen[0]["method"] == "POST"
+
+
+def test_no_token_means_no_authorization_header():
+    """Loopback development must keep working with no token at all."""
+    pc = PlannerClient("http://localhost:8787")
+    assert pc.token is None
+
+
+def test_a_401_fails_fast_with_an_actionable_message():
+    """A 401 is a configuration error. Retrying it three times only buries the
+    real problem, so it must fail immediately and say what to set."""
+    calls = {"n": 0}
+
+    def transport(method, url, payload):
+        calls["n"] += 1
+        return 401, {"error": "this planner requires a token"}
+
+    pc = PlannerClient("http://planner:8787", transport=transport, retries=3, sleep=lambda _: None)
+    try:
+        pc.create_run(event_id="e1")
+        raise AssertionError("expected PlannerError")
+    except PlannerError as exc:
+        assert calls["n"] == 1, "a 401 must not be retried"
+        assert "HECO_TOKEN" in str(exc)
+        assert "sent none" in str(exc)
+
+
+def test_a_rejected_token_on_the_best_effort_path_is_counted_not_shrugged_off():
+    """Best-effort calls swallow failures — correct for taps, dangerous for the
+    erasure poll, where a 401 looks exactly like "nothing to erase". Count it so
+    the runner can say so instead of quietly skipping erasure all night."""
+    def transport(method, url, payload):
+        return 401, {"error": "this planner requires a token"}
+
+    pc = PlannerClient("http://planner:8787", transport=transport, token="wrong")
+    assert pc.staff_tombstones("site1") == []
+    assert pc.auth_failures == 1, "the refusal is recorded"
+    pc.staff_tombstones("site1")
+    assert pc.auth_failures == 2

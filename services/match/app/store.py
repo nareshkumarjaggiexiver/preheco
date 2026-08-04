@@ -19,6 +19,24 @@ answers ``k``-nearest-neighbour queries with an ANN index, so the migration is
 encoding and every caller stay put.  Do that only when profiling shows the
 scan is a bottleneck (project hard rule: measure before you optimise).
 
+Open once, scan in memory
+-------------------------
+The scan itself was never the cost.  Profiling the POC hot path (one /match
+per face per frame, up to 45/s with a staff store in play) showed the money
+going to *re-opening*: every call used to ``sqlite3.connect`` + run the schema
+script + ``SELECT`` every row + rebuild the numpy matrix from BLOBs, two or
+three times per face.  So a store is now opened **once per file** and kept
+open (:func:`open_store`), with the key list and the ``(n, dim)`` float32
+matrix held in memory and updated **write-through** on every mutation.  SQLite
+remains the durable record — nothing is acknowledged before it is committed —
+but a match is a matrix-vector multiply against RAM, not disk I/O.
+
+Because the cached store is shared by FastAPI's request threadpool, every
+connection is opened ``check_same_thread=False`` and *all* access (read and
+write) is serialised on the store's own lock; :meth:`transaction` is the write
+path and rolls the in-memory index back (by dropping it, so the next read
+reloads from disk) whenever the SQL transaction rolls back.
+
 Storage
 -------
 * ``vectors``     one row per stored template: ``key``, the ``float32`` BLOB,
@@ -30,6 +48,13 @@ Storage
                   :meth:`merge` refuses to fold a constrained pair — that is
                   how "raise the pair's internal distance, no auto-merge later"
                   is realised in a brute-force store.
+* ``manual``      operator-attested people who were counted but never matched
+                  (a *missed* correction).  They own no vector on purpose —
+                  there is no face to store — so they can never be matched
+                  into, but they DO count towards :meth:`distinct_count`.  The
+                  ``m#####`` key prefix is what makes a human-added person
+                  distinguishable from an automatically detected ``p#####``
+                  one in any later audit.
 * ``meta``        small integer counters (the monotonic key sequence), so keys
                   never collide even after merges and removals shrink the
                   distinct-person count.
@@ -38,7 +63,9 @@ Vectors are L2-normalised on the way in, so the dot product IS the cosine
 similarity and :meth:`search` is a single matrix-vector multiply.
 """
 
+import contextlib
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +88,11 @@ CREATE TABLE IF NOT EXISTS cannot_link (
     a TEXT NOT NULL,
     b TEXT NOT NULL,
     PRIMARY KEY (a, b)
+);
+CREATE TABLE IF NOT EXISTS manual (
+    key        TEXT PRIMARY KEY,
+    note       TEXT,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
@@ -100,28 +132,53 @@ def _pair(a: str, b: str) -> tuple[str, str]:
 
 
 class VectorStore:
-    """A single embedding store file, opened for one unit of work.
+    """A single embedding store file: SQLite on disk, the scan matrix in RAM.
 
-    Use as a context manager so the connection is committed and closed even on
-    error::
+    Two ways to use it.  Long-lived (the service path) — :func:`open_store`
+    hands back the one cached instance per file and writes go through a
+    transaction::
 
-        with VectorStore(path) as store:
+        store = open_store(path)
+        with store.transaction():
             hit = store.search(vec)
             if hit is None or hit.cosine < threshold:
                 key = store.add_auto(vec, quality=71.0)
 
-    A fresh instance per request mirrors the connection-per-operation style the
-    service started with; :meth:`begin_immediate` gives a caller the
-    read-then-write atomicity the match decision needs (two concurrent /match
-    calls cannot both insert the same brand-new person).
+    Short-lived (tests, one-off tools) — the context manager owns the whole
+    connection and closes it on the way out::
+
+        with VectorStore(path) as store:
+            ...
+
+    ``cached=True`` is what :func:`open_store` sets: it stops :meth:`__exit__`
+    from closing a connection other callers still hold.
     """
 
-    def __init__(self, path: Path, timeout: float = 5.0) -> None:
+    def __init__(self, path: Path, timeout: float = 5.0, cached: bool = False) -> None:
         """Open ``path`` (creating the schema if new) with a busy timeout."""
         self.path = Path(path)
-        self.conn = sqlite3.connect(self.path, timeout=timeout)
+        self.cached = cached
+        # Shared by FastAPI's request threadpool when cached, so the connection
+        # must not police its creating thread; `_lock` provides the real safety.
+        self.conn = sqlite3.connect(self.path, timeout=timeout, check_same_thread=False)
+        self._lock = threading.RLock()
         self.conn.execute("PRAGMA busy_timeout = 5000")
+        # WAL + synchronous=NORMAL: every new guest is an INSERT + COMMIT on the
+        # frame loop's critical path, and a full fsync per commit costs more
+        # than the whole cosine scan.  NORMAL still survives a process crash
+        # (the WAL is replayed); only an OS/power failure can lose the last few
+        # commits — an acceptable trade for a gallery that is deleted at the end
+        # of the run anyway, and for a staff store that can be re-enrolled.
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(_SCHEMA)
+        # In-memory index, loaded lazily and kept write-through afterwards.
+        # None means "not loaded / invalidated" — the next read reloads it.
+        self._keys: list[str] | None = None
+        self._manual: list[str] = []
+        self._buf: np.ndarray | None = None  # (capacity, dim) float32
+        self._n = 0  # rows of _buf in use
+        self._dim = 0
 
     # ---------------------------------------------------------- lifecycle
 
@@ -130,60 +187,162 @@ class VectorStore:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        """Commit on clean exit, roll back on error, then close."""
-        try:
-            if exc_type is None:
+        """Commit on clean exit, roll back on error; close if we own the file."""
+        with self._lock:
+            try:
+                if exc_type is None:
+                    self.conn.commit()
+                else:
+                    self.conn.rollback()
+                    self._invalidate()
+            finally:
+                if not self.cached:
+                    self.conn.close()
+
+    def close(self) -> None:
+        """Commit and close for good (cached stores, at run end or sweep)."""
+        with self._lock:
+            with contextlib.suppress(sqlite3.Error):
                 self.conn.commit()
-            else:
-                self.conn.rollback()
-        finally:
             self.conn.close()
+            self._invalidate()
 
     def begin_immediate(self) -> "VectorStore":
         """Start an IMMEDIATE transaction (write lock now) for search+insert.
 
-        Returned so it reads well as ``with store.begin_immediate():`` — the
-        surrounding :meth:`__exit__` still owns the final commit/close, but the
-        IMMEDIATE lock is taken up front so the match-then-insert window cannot
-        interleave with another writer.
+        Kept for the short-lived ``with VectorStore(...)`` form; the cached
+        service path uses :meth:`transaction`, which additionally repairs the
+        in-memory index when the SQL transaction rolls back.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         return self
 
-    # ------------------------------------------------------------- reads
+    @contextlib.contextmanager
+    def transaction(self):
+        """Serialise + wrap one unit of work in an IMMEDIATE transaction.
 
-    def _rows(self) -> list[tuple[str, bytes, int]]:
-        """All (key, vec-bytes, dim) rows — the whole table for a scan."""
-        return self.conn.execute("SELECT key, vec, dim FROM vectors").fetchall()
+        Holds the store lock for the whole block, so the read-then-write window
+        a match decision needs cannot interleave with another request's writer.
+        On any exception the SQL transaction is rolled back AND the in-memory
+        index is dropped, because a partially applied write-through would
+        otherwise leave RAM claiming rows the database no longer has.
+        """
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self
+            except BaseException:
+                self.conn.rollback()
+                self._invalidate()
+                raise
+            self.conn.commit()
+
+    @contextlib.contextmanager
+    def reading(self):
+        """Serialise a read-only unit of work (no transaction needed).
+
+        Reads answer from the in-memory index, but still need the lock: a
+        concurrent :meth:`transaction` may be appending to it.
+        """
+        with self._lock:
+            yield self
+
+    # ------------------------------------------------------------- index
+
+    def _invalidate(self) -> None:
+        """Forget the in-memory index; the next read reloads it from SQLite."""
+        self._keys = None
+        self._buf = None
+        self._n = 0
+        self._manual = []
+
+    def _index(self) -> None:
+        """Load the key list + scan matrix from SQLite if not already held."""
+        if self._keys is not None:
+            return
+        rows = self.conn.execute("SELECT key, vec, dim FROM vectors ORDER BY id").fetchall()
+        self._keys = [r[0] for r in rows]
+        self._manual = [
+            r[0] for r in self.conn.execute("SELECT key FROM manual").fetchall()
+        ]
+        if not rows:
+            self._buf, self._n, self._dim = None, 0, 0
+            return
+        self._dim = int(rows[0][2])
+        mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
+        self._buf = mat.reshape(len(rows), self._dim).copy()  # writable, growable
+        self._n = len(rows)
+
+    def _append_row(self, key: str, vec: np.ndarray) -> None:
+        """Write-through one new template into the in-memory index.
+
+        Capacity doubles rather than reallocating per insert, so a run that
+        counts N guests does O(N) copying in total, not O(N²).
+        """
+        self._index()
+        if self._buf is None:
+            self._dim = int(vec.size)
+            self._buf = np.empty((8, self._dim), dtype=np.float32)
+            self._n = 0
+        if self._n == self._buf.shape[0]:
+            bigger = np.empty((self._buf.shape[0] * 2, self._dim), dtype=np.float32)
+            bigger[: self._n] = self._buf[: self._n]
+            self._buf = bigger
+        self._buf[self._n] = vec
+        self._n += 1
+        self._keys.append(key)
+
+    def _drop_rows(self, key: str) -> None:
+        """Write-through the removal of every row belonging to ``key``."""
+        self._index()
+        if not self._keys:
+            return
+        mask = np.array([k != key for k in self._keys], dtype=bool)
+        self._keys = [k for k in self._keys if k != key]
+        if self._buf is not None and self._n:
+            kept = self._buf[: self._n][mask]
+            self._buf = kept.copy() if kept.size else None
+            self._n = int(mask.sum())
+
+    # ------------------------------------------------------------- reads
 
     def search(self, embedding: list[float] | np.ndarray) -> Neighbour | None:
         """Return the nearest stored template by cosine, or None if empty.
 
         Rows are unit vectors, so the dot product is the cosine and the whole
-        scan is one ``(n, dim) @ (dim,)`` multiply.  The best row's key is
+        scan is one ``(n, dim) @ (dim,)`` multiply against the resident matrix
+        — no SQLite round trip, no BLOB rebuild.  The best row's key is
         returned even when several templates share it (multi-template person).
         """
-        rows = self._rows()
-        if not rows:
+        self._index()
+        if not self._n:
             return None
         q = as_unit(embedding)
-        dim = rows[0][2]
-        if q.size != dim:
-            raise ValueError(f"embedding dim {q.size} != store dim {dim}")
-        mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
-        mat = mat.reshape(len(rows), dim)
-        sims = mat @ q
+        if q.size != self._dim:
+            raise ValueError(f"embedding dim {q.size} != store dim {self._dim}")
+        sims = self._buf[: self._n] @ q
         i = int(np.argmax(sims))
-        return Neighbour(key=rows[i][0], cosine=float(sims[i]))
+        return Neighbour(key=self._keys[i], cosine=float(sims[i]))
 
     def distinct_count(self) -> int:
-        """Number of distinct keys (persons / staff members) in the store."""
-        return int(self.conn.execute("SELECT COUNT(DISTINCT key) FROM vectors").fetchone()[0])
+        """Distinct people in the store: matched keys plus manual additions.
+
+        Manual (operator-attested) entries have no template, so they are
+        invisible to :meth:`search` but are real people and must show up in the
+        unique count — that is the whole point of the *missed* correction.
+        """
+        self._index()
+        return len(set(self._keys)) + len(self._manual)
 
     def keys(self) -> list[str]:
-        """All distinct keys, ascending — small at POC scale."""
-        rows = self.conn.execute("SELECT DISTINCT key FROM vectors ORDER BY key").fetchall()
-        return [r[0] for r in rows]
+        """All distinct keys with templates, ascending — small at POC scale."""
+        self._index()
+        return sorted(set(self._keys))
+
+    def manual_keys(self) -> list[str]:
+        """Keys of operator-attested people (no template), ascending."""
+        self._index()
+        return sorted(self._manual)
 
     def vectors_for(self, key: str) -> list[np.ndarray]:
         """Every stored template for one key as float32 arrays."""
@@ -194,14 +353,13 @@ class VectorStore:
 
     def count_for(self, key: str) -> int:
         """How many templates a single key owns."""
-        return int(
-            self.conn.execute("SELECT COUNT(*) FROM vectors WHERE key = ?", (key,)).fetchone()[0]
-        )
+        self._index()
+        return self._keys.count(key)
 
     # ------------------------------------------------------------ writes
 
     def mint_key(self, prefix: str = "p", width: int = 5) -> str:
-        """Return the next monotonic key (``p00001``, ``p00002`, …).
+        """Return the next monotonic key (``p00001``, ``p00002``, …).
 
         Backed by a ``meta`` counter, not by ``COUNT`` — so a key is never
         reused after a merge or removal shrinks the distinct count, which would
@@ -224,11 +382,13 @@ class VectorStore:
     ) -> None:
         """Store one template under an explicit key (used for staff ids)."""
         v = as_unit(embedding)
+        self._index()  # load BEFORE the insert, or the load would see it twice
         self.conn.execute(
             "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (key, v.tobytes(), v.size, quality, int(sub_canon), _now()),
         )
+        self._append_row(key, v)
 
     def add_auto(
         self,
@@ -240,6 +400,24 @@ class VectorStore:
         """Mint a fresh monotonic key, store the template under it, return it."""
         key = self.mint_key(prefix)
         self.add(key, embedding, quality, sub_canon)
+        return key
+
+    def add_manual(self, note: str | None = None, prefix: str = "m") -> str:
+        """Record one operator-attested person with no template; return its key.
+
+        Backs the *missed* correction: the operator watched somebody the
+        pipeline did not count and says so.  There is no embedding to store —
+        the face was never captured — so this person can never be matched into
+        and never absorbs a later sighting; they simply exist in the count.
+        The ``m`` prefix keeps them separable from detected people forever.
+        """
+        self._index()  # load BEFORE the insert, or the load would see it twice
+        key = self.mint_key(prefix)
+        self.conn.execute(
+            "INSERT INTO manual (key, note, created_at) VALUES (?, ?, ?)",
+            (key, note, _now()),
+        )
+        self._manual.append(key)
         return key
 
     # ------------------------------------- operator corrections (pure ops)
@@ -291,6 +469,8 @@ class VectorStore:
             "UPDATE OR IGNORE cannot_link SET b = ? WHERE b = ?", (keep, drop)
         )
         self.conn.execute("DELETE FROM cannot_link WHERE a = b")
+        self._index()
+        self._keys = [keep if k == drop else k for k in self._keys]
         return True
 
     def remove(self, key: str) -> list[tuple[bytes, float | None, int]]:
@@ -300,13 +480,62 @@ class VectorStore:
         (distinct count −1) and its returned templates are re-added to the site
         staff store under a staff id.  Returns an empty list for an unknown key.
         """
+        self._index()  # load BEFORE the delete, so the index still has the rows
         rows = self.conn.execute(
             "SELECT vec, quality, sub_canon FROM vectors WHERE key = ?", (key,)
         ).fetchall()
         if rows:
             self.conn.execute("DELETE FROM vectors WHERE key = ?", (key,))
             self.conn.execute("DELETE FROM cannot_link WHERE a = ? OR b = ?", (key, key))
+            self._drop_rows(key)
         return [(bytes(v), q, int(sc)) for v, q, sc in rows]
+
+
+# ------------------------------------------------------------- open cache
+
+#: One open store per file for the whole process — the fix for "re-open and
+#: full-scan per /match call".  Keyed by resolved path so two spellings of the
+#: same file cannot end up with two connections (and two divergent indexes).
+_CACHE: dict[Path, VectorStore] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def open_store(path: Path, timeout: float = 5.0) -> VectorStore:
+    """Return the process-wide open store for ``path``, opening it once.
+
+    The returned store is SHARED: never close it directly and never use it as
+    a context manager — use :meth:`VectorStore.transaction` for writes and
+    :meth:`VectorStore.reading` for reads, and :func:`close_store` when the
+    file's life is over (run ended, gallery swept, store deleted).
+    """
+    p = Path(path)
+    with _CACHE_LOCK:
+        store = _CACHE.get(p)
+        if store is None:
+            store = _CACHE[p] = VectorStore(p, timeout=timeout, cached=True)
+        return store
+
+
+def close_store(path: Path) -> None:
+    """Close and forget the cached store for ``path`` (idempotent).
+
+    MUST be called before the file is deleted: an open connection to an
+    unlinked inode keeps answering from a database nobody can see.
+    """
+    p = Path(path)
+    with _CACHE_LOCK:
+        store = _CACHE.pop(p, None)
+    if store is not None:
+        store.close()
+
+
+def close_all_stores() -> None:
+    """Close every cached store (service shutdown, test teardown)."""
+    with _CACHE_LOCK:
+        stores = list(_CACHE.values())
+        _CACHE.clear()
+    for store in stores:
+        store.close()
 
 
 def _now() -> str:

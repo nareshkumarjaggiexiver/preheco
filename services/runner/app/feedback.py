@@ -12,7 +12,24 @@ The kinds (planner ``run_feedback.kind``, mirrored in api.js ``FEEDBACK_KINDS``)
     duplicate   {personKeys:[a,b]}   -> merge b into a   (unique -1 on success)
     false-match {personKeys:[a,b]}   -> split (do-not-merge; unique unchanged)
     mark-staff  {personKey, staffId?} -> move to staff store (unique -1)
-    missed | note                     -> acknowledge only (audit trail)
+                                        REQUIRES the run to carry a siteId
+    missed      {note?}               -> manual count (unique +1)
+    note                              -> acknowledge only (audit trail)
+
+Two rules earn their own paragraph, because both were places the audit trail
+used to lie.
+
+**Refuse what you cannot do.**  ``mark-staff`` on a run with no ``siteId`` has
+nowhere to move the person's templates to; doing it anyway destroyed them and
+the person was re-counted as a brand-new guest at their next crossing.  So the
+run's site is an input to the mapping and a siteless mark-staff becomes
+``invalid`` — rejected honestly, with a reason, instead of "applied" over a
+correction that silently undid itself.
+
+**Never claim more than you did.**  An unrecognised kind used to map to ``ack``
+and be reported *applied*, which tells the operator their correction landed
+when this runner did not even understand it.  Unknown kinds are ``invalid``
+now: rejected, still closed, no re-poll forever.
 """
 
 import json
@@ -23,10 +40,11 @@ from dataclasses import dataclass
 class Action:
     """A planned correction for one feedback item.
 
-    ``kind`` is one of ``merge`` | ``split`` | ``mark-staff`` | ``ack`` |
-    ``invalid``.  ``ack`` items are filed (acknowledged) with no gallery
-    change; ``invalid`` items have a malformed payload and are rejected without
-    a gallery call.  The key fields carry only what the chosen kind needs.
+    ``kind`` is one of ``merge`` | ``split`` | ``mark-staff`` | ``count-missed``
+    | ``ack`` | ``invalid``.  ``ack`` items are filed (acknowledged) with no
+    gallery change; ``invalid`` items cannot be acted on and are rejected
+    without a gallery call, with ``reason`` saying why.  The key fields carry
+    only what the chosen kind needs.
     """
 
     feedback_id: object
@@ -35,6 +53,8 @@ class Action:
     key_b: str | None = None
     person_key: str | None = None
     staff_id: str | None = None
+    note: str | None = None
+    reason: str | None = None
 
 
 def _payload(item: dict) -> dict:
@@ -56,12 +76,14 @@ def _two_keys(payload: dict) -> tuple[str, str] | None:
     return None
 
 
-def plan_action(item: dict) -> Action:
+def plan_action(item: dict, has_site_id: bool = True) -> Action:
     """Map one feedback item to the correction the runner should apply.
 
-    A malformed correction (a duplicate/false-match without a valid key pair,
-    a mark-staff without a personKey) becomes an ``invalid`` action so the loop
-    rejects it cleanly rather than issuing a bad gallery call.
+    ``has_site_id`` says whether the RUN carries a siteId, which decides
+    whether mark-staff is possible at all (there is no staff store without a
+    site).  A malformed correction (a duplicate/false-match without a valid key
+    pair, a mark-staff without a personKey) becomes an ``invalid`` action so
+    the loop rejects it cleanly rather than issuing a bad gallery call.
     """
     fid = item.get("id")
     kind = item.get("kind")
@@ -70,25 +92,36 @@ def plan_action(item: dict) -> Action:
     if kind == "duplicate":
         pair = _two_keys(payload)
         if pair is None:
-            return Action(fid, "invalid")
+            return Action(fid, "invalid", reason="duplicate needs two distinct personKeys")
         return Action(fid, "merge", key_a=pair[0], key_b=pair[1])
 
     if kind == "false-match":
         pair = _two_keys(payload)
         if pair is None:
-            return Action(fid, "invalid")
+            return Action(fid, "invalid", reason="false-match needs two distinct personKeys")
         return Action(fid, "split", key_a=pair[0], key_b=pair[1])
 
     if kind == "mark-staff":
         person_key = payload.get("personKey")
         if not person_key:
-            return Action(fid, "invalid")
+            return Action(fid, "invalid", reason="mark-staff needs a personKey")
+        if not has_site_id:
+            # Refusing is the SAFE branch: applying it would delete the only
+            # templates this person has and re-count them as a new guest.
+            return Action(
+                fid,
+                "invalid",
+                reason="mark-staff needs a run with a siteId (no staff store to move them to)",
+            )
         staff_id = payload.get("staffId")
         return Action(fid, "mark-staff", person_key=str(person_key),
                       staff_id=str(staff_id) if staff_id else None)
 
-    if kind in ("missed", "note"):
+    if kind == "missed":
+        note = payload.get("note")
+        return Action(fid, "count-missed", note=str(note) if note else None)
+
+    if kind == "note":
         return Action(fid, "ack")
 
-    # Unknown kind: acknowledge so it does not re-poll forever, but touch nothing.
-    return Action(fid, "ack")
+    return Action(fid, "invalid", reason=f"unsupported feedback kind {kind!r}")

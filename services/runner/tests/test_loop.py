@@ -41,7 +41,9 @@ class FakePipeline:
         self.match_qualities: list[float] = []
         self.match_reset: dict | None = None
         self.tracker_reset: dict | None = None
+        self.tracker_released: dict | None = None
         self.opened: dict | None = None
+        self.closed: dict | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Route one request to the scripted service behaviour."""
@@ -67,6 +69,9 @@ class FakePipeline:
             if path == "/open":
                 self.opened = body
                 return httpx.Response(200, json={"ok": True})
+            if path == "/close":
+                self.closed = body
+                return httpx.Response(200, json={"ok": True, "released": True})
             if path == "/frame":
                 # Real-ingest semantics: latest frame only; seq stalls at EOF.
                 i = min(self.frame_i, self.n_frames - 1)
@@ -89,6 +94,9 @@ class FakePipeline:
             if path == "/reset":
                 self.tracker_reset = body
                 return httpx.Response(200, json={"ok": True, "runId": body["runId"]})
+            if path == "/release":
+                self.tracker_released = body
+                return httpx.Response(200, json={"ok": True, "released": True})
             if path == "/track":
                 if "runId" not in body or not isinstance(body.get("tMs"), int):
                     return httpx.Response(422, json={"detail": "runId/tMs required"})
@@ -138,8 +146,12 @@ class FakePipeline:
         return httpx.Response(500, json={"error": f"unscripted {host} {path}"})
 
 
-def make_loop(fake: FakePipeline, **settings_kw) -> RunLoop:
-    """Build a RunLoop wired to the fake pipeline over MockTransport."""
+def make_loop(fake: FakePipeline, no_planner_sleep: bool = False, **settings_kw) -> RunLoop:
+    """Build a RunLoop wired to the fake pipeline over MockTransport.
+
+    ``no_planner_sleep`` removes the retry backoff so an outage test can drive
+    dozens of failing planner calls in milliseconds.
+    """
     settings = Settings(
         ingest_url="http://ingest:7101",
         persons_url="http://persons:7102",
@@ -154,7 +166,11 @@ def make_loop(fake: FakePipeline, **settings_kw) -> RunLoop:
         **settings_kw,
     )
     client = httpx.Client(transport=httpx.MockTransport(fake.handler))
-    planner = PlannerClient(settings.planner_url, transport=httpx_transport(client))
+    planner = PlannerClient(
+        settings.planner_url,
+        transport=httpx_transport(client),
+        **({"sleep": lambda _s: None} if no_planner_sleep else {}),
+    )
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4", "loop": False}}
     return RunLoop("run-local", request, settings, client, planner)
 
@@ -185,12 +201,14 @@ def test_orchestration_order():
     ]
     assert non_planner[3 : 3 + 7] == per_frame
     assert non_planner[10 : 10 + 7] == per_frame
-    # Teardown: stalled-seq polls on ingest, then the planner PUT last.
-    assert non_planner[-1] == "ingest /frame"
+    # Teardown: stalled-seq polls on ingest, then per-run state is handed back
+    # (camera, tracker, gallery), and only then is the planner PUT — which
+    # stays the LAST planner interaction of the run.
+    assert non_planner[-3:] == ["ingest /close", "tracker /release", "match /reset"]
     assert fake.calls[-1] == "planner /api/pipeline/runs/prun-1"
     assert fake.match_reset == {"runId": "prun-1"}
     assert fake.tracker_reset == {"runId": "prun-1"}
-    assert fake.opened == {"path": "/x.mp4", "loop": False}
+    assert fake.opened == {"path": "/x.mp4", "loop": False, "owner": "run-local"}
 
 
 def test_quality_gate_and_sub_canon_share():
@@ -305,3 +323,144 @@ def test_stop_ends_rtsp_style_source():
     assert final["state"] == "ended"
     assert 3 <= final["frames"] <= 5
     assert fake.run_ended["status"] == "ended"
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+def test_planner_outage_during_flush_never_kills_the_count():
+    """A planner restart mid-run costs chart data, never the count.
+
+    Regression: ``_flush`` called ``post_stats``/``post_samples`` bare.  Those
+    use the RETRYING transport, which raises PlannerError after three
+    attempts, and the exception propagated out of the frame-loop body into
+    run()'s catch-all — the run was marked failed and counting stopped.
+    Restarting it minted a fresh planner run id and therefore a fresh EMPTY
+    gallery, so every guest already counted was counted again: a five-second
+    laptop hiccup corrupted the event-wide unique total, not just paused it.
+    """
+
+    class PlannerDown(FakePipeline):
+        """Planner accepts run create/end but 503s every stats/samples post."""
+
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if request.url.host == "planner" and (
+                path.endswith("/stats") or path.endswith("/samples")
+            ):
+                self.calls.append(f"planner {path}")
+                return httpx.Response(503, json={"error": "planner restarting"})
+            return super().handler(request)
+
+    fake = PlannerDown(n_frames=4)
+    final = make_loop(fake, no_planner_sleep=True).run()
+
+    assert final["state"] == "ended", "a planner outage must not fail the run"
+    assert final["frames"] == 4, "every frame must still be counted"
+    assert final["unique"] == 4  # 8 matches, the fake alternates isNew
+    assert final["plannerReportErrors"] > 0, "the lost reports must be visible"
+    assert fake.run_ended["status"] == "ended"
+
+
+def test_run_end_hands_back_camera_tracker_and_gallery():
+    """Per-run state has an owner and is released when the run ends.
+
+    Regression: nothing was ever released.  Every run left its SortLite
+    resident in the tracker process and its ``gallery-<id>.db`` — full of real
+    guests' face embeddings — on disk forever, because gallery.reset only ever
+    deleted the file for the run's own freshly minted id.
+    """
+    fake = FakePipeline(n_frames=2)
+    final = make_loop(fake).run()
+    assert final["state"] == "ended"
+    assert fake.closed == {"owner": "run-local"}, "the camera must be handed back"
+    assert fake.tracker_released == {"runId": "prun-1"}
+    # /reset is the gallery's delete: once at start, once to release at end.
+    assert len([c for c in fake.calls if c == "match /reset"]) == 2
+
+
+def test_failed_run_also_releases_its_state():
+    """A crashed run must not keep the camera or leak its gallery either."""
+
+    class BrokenPersons(FakePipeline):
+        def handler(self, request):
+            if request.url.host == "persons":
+                self.calls.append("persons /detect")
+                return httpx.Response(500, json={"error": "boom"})
+            return super().handler(request)
+
+    fake = BrokenPersons(n_frames=2)
+    final = make_loop(fake).run()
+    assert final["state"] == "failed"
+    assert fake.closed == {"owner": "run-local"}
+    assert fake.tracker_released == {"runId": "prun-1"}
+
+
+def test_capture_slot_conflict_names_the_live_run():
+    """Ingest refusing the slot fails the run with WHO holds the camera.
+
+    Regression: /open always won, so starting a staff enrolment during a live
+    gate count silently swapped the count run's source and it began counting
+    the enrolment walk-through.  Now ingest refuses; the runner must surface
+    that refusal verbatim rather than an opaque HTTP error.
+    """
+
+    class SlotBusy(FakePipeline):
+        def handler(self, request):
+            if request.url.path == "/open":
+                self.calls.append("ingest /open")
+                return httpx.Response(
+                    409, json={"detail": "capture slot is held by run 'run-gate1'"}
+                )
+            return super().handler(request)
+
+    fake = SlotBusy(n_frames=2)
+    final = make_loop(fake).run()
+    assert final["state"] == "failed"
+    assert "409" in final["error"] and "run-gate1" in final["error"]
+
+
+def test_open_claims_the_slot_for_this_run():
+    """Every /open carries the run id, or ingest cannot enforce exclusivity."""
+    fake = FakePipeline(n_frames=1)
+    make_loop(fake).run()
+    assert fake.opened["owner"] == "run-local"
+
+
+def test_best_effort_planner_calls_get_their_own_short_timeout(monkeypatch):
+    """The three kinds of call must not share one 30 s client.
+
+    Regression: RunManager built ONE httpx.Client(timeout=30) for stage calls
+    AND all planner traffic.  Per tick the loop makes up to 11 sequential
+    best-effort planner calls, so a planner that accepted connections and then
+    wedged froze the frame loop for minutes — and ingest's drop-not-queue slot
+    discards every guest crossing during a freeze.  Swallowing errors was never
+    the same as bounding latency.
+    """
+    from app import runs as runs_module
+
+    timeouts: list[float] = []
+    built: dict = {}
+
+    class RecordingClient:
+        def __init__(self, timeout=None):
+            timeouts.append(timeout)
+
+    class DummyLoop:
+        def __init__(self, run_id, request, settings, client, planner):
+            built["planner"] = planner
+
+        def run(self):
+            return {}
+
+    monkeypatch.setattr(runs_module.httpx, "Client", RecordingClient)
+    monkeypatch.setattr(runs_module, "RunLoop", DummyLoop)
+
+    settings = Settings()
+    runs_module.RunManager(settings).start({"eventId": "ev-1", "source": {"path": "/x.mp4"}})
+
+    stage_t, planner_t, report_t = timeouts
+    assert stage_t == settings.request_timeout_s
+    assert report_t < planner_t < stage_t, "reporting must be bounded well below a stage call"
+    planner = built["planner"]
+    assert planner.best_effort_transport is not planner.transport

@@ -113,6 +113,11 @@ services:
       HECO_FACES_URL: http://faces:7104
       HECO_EMBED_URL: http://embed:7105
       HECO_MATCH_URL: http://match:7106
+      # The planner's shared secret. A dockerised runner reaches the planner
+      # across the bridge network, and the planner refuses to listen beyond
+      # loopback without a token — so this is required for this deployment.
+      # Export it in your shell (or a .env) as the same value the planner uses.
+      HECO_TOKEN: ${HECO_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux needs this mapping
     depends_on:

@@ -137,3 +137,139 @@ def test_persistence_across_reopen(tmp_path):
     with VectorStore(path) as store:
         assert store.distinct_count() == 1
         assert store.search(sighting(c)).key == k
+
+
+# ---------------------------------------------- regressions (2026-08-05 review)
+
+
+@pytest.fixture(autouse=True)
+def _no_store_leak():
+    """Never let one test's cached connections reach the next."""
+    yield
+    from app.store import close_all_stores
+
+    close_all_stores()
+
+
+def test_open_store_is_one_connection_per_file(tmp_path):
+    """The whole point of the cache: open once, not once per /match.
+
+    Regression: every /match constructed a fresh VectorStore — sqlite3.connect
+    + PRAGMA + the schema script + a SELECT of every row + a numpy rebuild from
+    BLOBs, two or three times per face, dozens of times a second.
+    """
+    from app.store import close_store, open_store
+
+    path = tmp_path / "s.db"
+    first = open_store(path)
+    assert open_store(path) is first
+    close_store(path)
+    assert open_store(path) is not first
+
+
+def test_write_through_index_never_diverges_from_disk(tmp_path):
+    """Whatever the in-memory scan matrix says, a reload from SQLite agrees."""
+    from app.store import close_all_stores, open_store
+
+    path = tmp_path / "s.db"
+    store = open_store(path)
+    cents = [centroid() for _ in range(6)]
+    with store.transaction():
+        keys = [store.add_auto(sighting(c)) for c in cents]
+    with store.transaction():
+        store.merge(keys[0], keys[1])  # rename in the index
+        store.remove(keys[2])  # drop rows from the index
+        store.add(keys[3], sighting(cents[3]))  # append to the index
+        store.add_manual("operator saw one more")  # counted, never matched
+
+    query = sighting(cents[4])  # ONE query vector, asked of both views
+    live = (store.distinct_count(), store.keys(), store.manual_keys())
+    hit_live = store.search(query)
+
+    close_all_stores()  # force everything to come back off disk
+    fresh = open_store(path)
+    assert (fresh.distinct_count(), fresh.keys(), fresh.manual_keys()) == live
+    hit_fresh = fresh.search(query)
+    assert hit_fresh.key == hit_live.key
+    assert hit_fresh.cosine == pytest.approx(hit_live.cosine)
+
+
+def test_rolled_back_write_leaves_no_phantom_row_in_memory(tmp_path):
+    """A failed transaction must not leave the index claiming rows SQLite lost."""
+    from app.store import open_store
+
+    store = open_store(tmp_path / "s.db")
+    with store.transaction():
+        store.add_auto(sighting(centroid()))
+    assert store.distinct_count() == 1
+
+    with pytest.raises(RuntimeError), store.transaction():
+        store.add_auto(sighting(centroid()))
+        raise RuntimeError("something failed after the write")
+
+    assert store.distinct_count() == 1, "the rolled-back person must be gone from RAM too"
+    assert len(store.keys()) == 1
+
+
+def test_manual_entries_count_but_never_match(tmp_path):
+    """An operator-attested person exists in the count and nowhere else."""
+    from app.store import open_store
+
+    store = open_store(tmp_path / "s.db")
+    c = centroid()
+    with store.transaction():
+        real = store.add_auto(sighting(c))
+        manual = store.add_manual("child behind the pillar")
+    assert manual.startswith("m")
+    assert store.distinct_count() == 2
+    assert store.search(sighting(c)).key == real, "no vector, so never the nearest"
+
+
+def test_concurrent_matches_do_not_corrupt_the_shared_store(tmp_path):
+    """The cached store is shared by the request threadpool; it must hold up."""
+    import threading
+
+    from app import gallery
+
+    cents = [centroid() for _ in range(24)]
+    errors: list[BaseException] = []
+
+    def worker(lo: int, hi: int) -> None:
+        try:
+            for i in range(lo, hi):
+                gallery.match(
+                    tmp_path, "run-t", sighting(cents[i]), 85.0,
+                    threshold=0.9, canon_px=80.0,
+                )
+        except BaseException as e:  # noqa: BLE001 — surface it in the assertion
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i * 6, i * 6 + 6)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert gallery.count(tmp_path, "run-t") == 24
+
+
+def test_reset_closes_the_store_before_deleting_the_file(tmp_path):
+    """A gallery reset must really empty the gallery, not just unlink the file.
+
+    An open connection to an unlinked inode keeps answering from a database
+    nobody can see, so a run would silently resume a previous run's people.
+    """
+    from app import gallery
+
+    c = centroid()
+    kw = {"threshold": 0.9, "canon_px": 80.0}
+    assert gallery.match(tmp_path, "r", sighting(c), 85.0, **kw).is_new is True
+    assert gallery.match(tmp_path, "r", sighting(c), 85.0, **kw).is_new is False
+
+    gallery.reset(tmp_path, "r")
+    assert not gallery.db_path(tmp_path, "r").exists()
+    assert gallery.count(tmp_path, "r") == 0
+
+    after = gallery.match(tmp_path, "r", sighting(c), 85.0, **kw)
+    assert after.is_new is True and after.gallery_n == 1
