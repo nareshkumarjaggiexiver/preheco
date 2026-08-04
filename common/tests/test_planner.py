@@ -119,3 +119,103 @@ def test_4xx_fails_fast_without_retry():
     with pytest.raises(PlannerError, match="rejected"):
         pc.create_run("nope")
     assert len(ft.calls) == 1
+
+
+# ------------------------------------------------ v1: taps / frames / feedback
+
+
+def test_post_tap_is_single_shot_and_swallows_failure():
+    """A tap posts once, never retries, and reports success as a bool."""
+    pc, ft, naps = _client()
+    pc.create_run(3)
+    ft.script = [(200, {"ok": True}), (500, {})]
+    assert pc.post_tap("match", {"unique": 4}) is True
+    method, url, payload = ft.calls[-1]
+    assert (method, url) == ("POST", "http://planner:8787/api/pipeline/runs/42/taps")
+    assert payload == {"stage": "match", "payload": {"unique": 4}}
+    # A 5xx is swallowed (no raise) and NOT retried — best-effort.
+    before = len(ft.calls)
+    assert pc.post_tap("match", {"unique": 5}) is False
+    assert len(ft.calls) == before + 1 and naps == []
+
+
+def test_post_tap_swallows_transport_exception():
+    """A transport blow-up never propagates out of a best-effort tap."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    ft.script = [OSError("planner down")]
+    assert pc.post_tap("track", {"tracks": 2}) is False
+
+
+def test_post_frame_uses_file_transport():
+    """A frame goes through the multipart file transport, not the JSON one."""
+    calls = []
+
+    def file_transport(url, fields, filename, content, ctype):
+        calls.append((url, fields, filename, content, ctype))
+        return 200, {"ok": True}
+
+    pc, _, _ = _client()
+    pc.file_transport = file_transport
+    pc.create_run(3)
+    assert pc.post_frame("face-detect", b"\xff\xd8jpeg") is True
+    url, fields, filename, content, ctype = calls[0]
+    assert url == "http://planner:8787/api/pipeline/runs/42/frames"
+    assert fields == {"stage": "face-detect"} and content == b"\xff\xd8jpeg"
+    assert ctype == "image/jpeg"
+
+
+def test_post_frame_without_file_transport_is_noop():
+    """No file transport configured: framing is skipped, never errors."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    before = len(ft.calls)
+    assert pc.post_frame("ingest", b"jpeg") is False
+    assert len(ft.calls) == before  # nothing sent
+
+
+def test_poll_feedback_accepts_list_or_wrapped():
+    """Feedback poll tolerates a bare list or an items/feedback wrapper."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    ft.script = [(200, [{"id": 1}]), (200, {"feedback": [{"id": 2}]})]
+    assert pc.poll_feedback() == [{"id": 1}]
+    assert pc.poll_feedback(since="2026-08-04T00:00:00Z") == [{"id": 2}]
+    _, url, _ = ft.calls[-1]
+    assert url.endswith("/api/pipeline/runs/42/feedback?since=2026-08-04T00%3A00%3A00Z")
+
+
+def test_poll_feedback_empty_on_failure():
+    """A planner hiccup yields no items, not an exception."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    ft.script = [(503, {})]
+    assert pc.poll_feedback() == []
+
+
+def test_resolve_feedback_puts_status():
+    """resolve_feedback PUTs the item status and reports acceptance."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    ft.script = [(200, {"ok": True})]
+    assert pc.resolve_feedback(9, "applied") is True
+    method, url, payload = ft.calls[-1]
+    assert (method, url) == ("PUT", "http://planner:8787/api/feedback/9")
+    assert payload == {"status": "applied"}
+
+
+def test_report_enrolment_retries_then_raises():
+    """Enrolment reporting uses the retrying transport (worth a retry)."""
+    pc, ft, _ = _client()
+    pc.create_run(3)
+    ft.script = [(200, {"ok": True})]
+    pc.report_enrolment("st-1", "2026-08-04T10:00:00Z", 5)
+    method, url, payload = ft.calls[-1]
+    assert (method, url) == ("PUT", "http://planner:8787/api/staff/st-1")
+    assert payload == {"enrolledAt": "2026-08-04T10:00:00Z", "sampleCount": 5}
+
+    pc2, ft2, _ = _client()
+    pc2.create_run(3)
+    ft2.script = [(503, {})] * 3
+    with pytest.raises(PlannerError):
+        pc2.report_enrolment("st-2", "2026-08-04T10:00:00Z", 5)

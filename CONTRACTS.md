@@ -50,3 +50,54 @@ Measured metrics the console charts: personBoxHPx, faceBoxWPx, embedMs, matchCos
 - docker-compose.yml at repo root; `runner` reads PLANNER_URL (default
   http://host.docker.internal:8787). Everything runs CPU-only for POC.
 - Tests use tiny synthetic images + golden fixtures; no network in tests.
+
+
+## v1 additions — debug taps, staff whitelist, operator feedback (2026-08-04)
+
+### Debug taps (runner → planner, best-effort, never blocks the loop)
+Every ~2 s while running:
+- POST {planner}/api/pipeline/runs/:id/frames   multipart form: stage, file
+  (JPEG annotated with that stage's output: person boxes / track ids / face
+  boxes+quality / match verdict labels; ingest posts the raw frame). Server
+  keeps latest + a ring of 4 per stage.
+- POST {planner}/api/pipeline/runs/:id/taps     {stage, payload}
+  payload = the stage's latest structured output, truncated to what a human
+  debugger needs (≤32 KB): boxes, track ids+ages, face quality flags,
+  personKey + cosine per match, unique/staff counters.
+
+### Staff whitelist (the professional enrolment flow)
+- SITE STAFF STORE: data/staff-<siteId>.db (SQLite; embeddings table:
+  staff_id TEXT, vec BLOB float32[128], created_at). Brute-force cosine at
+  roster scale; sqlite-vec is the documented growth path past ~5k vectors.
+- ENROL MODE: POST runner /runs {mode:'enrol', eventId, staffId, source,
+  plannerUrl}. The runner captures faces from the walk-through, keeps the
+  best N=5 by quality, appends embeddings to the site staff store, then
+  reports sampleCount to the planner (PUT /api/staff/:id — enrolledAt,
+  sampleCount). The operator confirms identity in the UI before the next
+  person walks.
+- COUNT MODE: the matcher checks the STAFF STORE FIRST (threshold as guest
+  matching). A staff hit tags the track staff — it stays tracked and visible
+  (grey in the console), is excluded from the unique GUEST count, and
+  increments a staffCrossings stat. Staff are never silently dropped from
+  tracking: suppression would corrupt track association and hide occlusions.
+
+### Operator feedback loop
+- Runner polls GET {planner}/api/pipeline/runs/:id/feedback?since=<iso>
+  every ~3 s; for each open item it can act on:
+    false-match {personKeys:[a,b]}  → split: keep both keys, raise the pair's
+                                      internal distance (no auto-merge later)
+    duplicate   {personKeys:[a,b]}  → merge: b's embeddings fold into a,
+                                      unique count decremented once
+    mark-staff  {personKey, staffId?} → move embeddings to the staff store
+                                      (staffId if operator picked a roster
+                                      member; else an anonymous staff entry),
+                                      decrement unique count
+    missed / note                    → acknowledged only (audit trail)
+  After acting: PUT {planner}/api/feedback/:id {status:'applied'|'rejected'}.
+
+### Planner-side endpoints backing the above (server v6)
+- Devices: GET/POST /api/sites/:id/devices, PUT/DELETE /api/devices/:id;
+  GET /api/devices/:id/live?stream=<label>&fps=4 — ffmpeg RTSP→MJPEG proxy
+  (multipart/x-mixed-replace) so the browser can watch any channel.
+- Staff: CRUD under /api/sites/:id/staff; PUT /api/events/:id/staff.
+- Control proxy: POST /api/pipeline/control/start|stop → RUNNER_URL.

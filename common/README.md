@@ -15,7 +15,18 @@ the wire contract as code:
 - `heco_common.planner` — `PlannerClient`: `create_run` / `end_run` /
   `post_stats` / `post_samples` against the site-planner write side, with
   retry + sample batching (≤ 200 per POST) and an **injectable transport** so
-  tests never touch the network.
+  tests never touch the network. The v1 debug/feedback surface rides on the
+  same client, all **best-effort** (single-shot, swallow failures — a planner
+  hiccup never blocks or crashes the run loop, per CONTRACTS.md):
+  - `post_tap(stage, payload)` — one stage's structured output (boxes, track
+    ids+ages, face quality flags, match verdicts, counters).
+  - `post_frame(stage, jpeg)` — the stage's annotated JPEG, **multipart** via a
+    second injectable `file_transport` (omit it and framing is a clean no-op).
+  - `poll_feedback(since?)` / `resolve_feedback(id, status)` — the operator
+    correction loop.
+  - `report_enrolment(staffId, enrolledAt, sampleCount)` — confirm a staff
+    enrolment (`PUT /api/staff/:id`); this one retries (the samples are already
+    stored, so the report is worth a retry).
 
 **Run.** It is a library — nothing to run. Field names are deliberately
 camelCase to mirror the JSON wire format byte-for-byte.

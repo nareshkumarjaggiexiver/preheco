@@ -7,7 +7,7 @@ import httpx
 from heco_common.planner import PlannerClient
 
 from .config import Settings
-from .loop import RunLoop, httpx_transport
+from .loop import RunLoop, httpx_file_transport, httpx_transport
 
 
 class RunManager:
@@ -26,7 +26,11 @@ class RunManager:
         settings = self.settings
         planner_url = request.get("plannerUrl") or settings.planner_url
         client = httpx.Client(timeout=settings.request_timeout_s)
-        planner = PlannerClient(planner_url, transport=httpx_transport(client))
+        planner = PlannerClient(
+            planner_url,
+            transport=httpx_transport(client),
+            file_transport=httpx_file_transport(client),
+        )
         loop = RunLoop(run_id, request, settings, client, planner)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)
         with self._lock:
