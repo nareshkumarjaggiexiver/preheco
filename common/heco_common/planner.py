@@ -247,6 +247,30 @@ class PlannerClient:
         ok, _ = self._send_once("PUT", f"/api/feedback/{feedback_id}", {"status": status})
         return ok
 
+    # ------------------------------------------- staff erasure (v1)
+
+    def staff_tombstones(self, site_id: str) -> list[dict]:
+        """Return the site's open erasure tombstones (best-effort; [] on failure).
+
+        ``GET /api/staff-tombstones?siteId=`` — each item
+        ``{id, siteId, staffId, deletedAt}`` names a deleted roster member whose
+        face templates must be purged from the site staff store.  Best-effort
+        like the feedback poll: a planner hiccup returns [] and the next cycle
+        retries, because the tombstone stays open until confirmed.
+        """
+        path = "/api/staff-tombstones?" + urllib.parse.urlencode({"siteId": site_id})
+        ok, body = self._send_once("GET", path, None)
+        return body if ok and isinstance(body, list) else []
+
+    def confirm_tombstone(self, tombstone_id: str) -> bool:
+        """Confirm a purge: ``PUT /api/staff-tombstones/:id`` stamps purged_at.
+
+        A dropped confirmation is harmless — the tombstone stays open and the
+        purge re-runs next cycle; erasure is idempotent.
+        """
+        ok, _ = self._send_once("PUT", f"/api/staff-tombstones/{tombstone_id}", None)
+        return ok
+
     # ------------------------------------------- staff enrolment (v1)
 
     def report_enrolment(self, staff_id: int | str, enrolled_at: str, sample_count: int) -> dict:

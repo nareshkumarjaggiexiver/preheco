@@ -180,6 +180,27 @@ def staff_enrol(body: EnrolRequest) -> dict:
     return {"staffId": body.staffId, "sampleCount": n}
 
 
+class PurgeRequest(BaseModel):
+    """Erasure request relayed from the planner's staff tombstones."""
+
+    siteId: str
+    staffIds: list[str] = Field(min_length=1, max_length=200)
+
+
+@app.post("/staff/purge")
+def staff_purge(body: PurgeRequest) -> dict:
+    """Erase the given staff members' templates from the site staff store.
+
+    Idempotent: purging an id with no templates reports 0 removed and is
+    still success — the goal is the guarantee that nothing remains.
+    """
+    try:
+        removed = staff.purge(config.data_dir(), body.siteId, body.staffIds)
+    except staff.BadSiteIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"siteId": body.siteId, "removed": removed}
+
+
 @app.post("/merge")
 def merge(body: MergeRequest) -> dict:
     """Duplicate correction: fold ``drop`` into ``keep`` (count −1 if applied)."""
