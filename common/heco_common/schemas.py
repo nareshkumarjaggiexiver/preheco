@@ -1,4 +1,4 @@
-"""Pydantic v2 models for every inter-service message in CONTRACTS.md.
+"""Pydantic v2 models for the inter-service messages that are SHARED.
 
 Field names are deliberately camelCase so a model's ``model_dump()`` IS the
 wire JSON — no alias layer, nothing to keep in sync. One deviation from the
@@ -8,6 +8,20 @@ tracker brief owns that shape and the field name says its unit.
 
 Ports and stage names are also declared here so services and the runner share
 one source of truth instead of re-typing the contract.
+
+**Scope, stated honestly.** This module used to claim a model for *every*
+inter-service message. It never had one: persons, faces, embed and match each
+declare their own request models locally, and every handler returns a plain
+``dict`` rather than a response model. Five classes here (PersonDetections,
+FaceDetectRequest, FaceDetections, MatchResponse, RunConfig) were referenced by
+nothing at all, and had drifted away from what the services actually speak —
+``FaceDetectRequest.within`` was a single box where faces takes a list,
+``RunConfig.source`` was a string where the runner takes an object with a mode
+and a staffId. A schema nobody validates against is not a contract, it is a
+second, wrong description of one, and the wrong one is what a reader trusts.
+They are gone. What remains is what is genuinely shared: ingest's wire types
+(used by ingest and the runner), the tracker's (used by tracker and the
+runner), and the planner ingest models (used by the PlannerClient).
 """
 
 from typing import Literal
@@ -147,12 +161,6 @@ class DetectRequest(BaseModel):
     imageB64: str
 
 
-class PersonDetections(BaseModel):
-    """persons /detect response: body boxes with confidences."""
-
-    boxes: list[Box]
-
-
 # ----------------------------------------------------------------- tracker
 
 
@@ -192,17 +200,6 @@ class TrackResponse(BaseModel):
 # ------------------------------------------------------------------- faces
 
 
-class FaceDetectRequest(BaseModel):
-    """POST /detect body for faces: full frame plus optional search region.
-
-    ``within`` restricts detection to a body box (the stage-4 design: faces
-    are searched inside tracked person boxes, not the whole frame).
-    """
-
-    imageB64: str
-    within: Box | None = None
-
-
 class Face(BaseModel):
     """One detected face: box, 5 landmarks (YuNet order), confidence.
 
@@ -213,12 +210,6 @@ class Face(BaseModel):
     box: Box
     landmarks: list[tuple[float, float]] = Field(min_length=5, max_length=5)
     conf: float
-
-
-class FaceDetections(BaseModel):
-    """faces /detect response."""
-
-    faces: list[Face]
 
 
 # ------------------------------------------------------------------- embed
@@ -252,32 +243,6 @@ class MatchRequest(BaseModel):
     """POST /match body: one embedding to resolve against the gallery."""
 
     embedding: list[float] = Field(min_length=EMBEDDING_DIM, max_length=EMBEDDING_DIM)
-
-
-class MatchResponse(BaseModel):
-    """match response: gallery decision at the cosine operating point."""
-
-    personKey: str
-    isNew: bool
-    cosine: float
-
-
-# ------------------------------------------------------------------ runner
-
-
-class RunConfig(BaseModel):
-    """POST /runs body for the runner: what to count and where to report.
-
-    ``source`` is either an RTSP url or a file path — the runner passes it to
-    ingest's /open. ``plannerUrl`` defaults to the compose-network planner.
-    """
-
-    eventId: int | str
-    source: str
-    plannerUrl: str = "http://host.docker.internal:8787"
-    placementId: int | str | None = None
-    label: str | None = None
-    loop: bool = False
 
 
 # ------------------------------------------- planner ingest (write side)

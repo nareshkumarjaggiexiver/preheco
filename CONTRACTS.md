@@ -22,7 +22,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, owner?, takeover?}, POST /close {owner?} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
-| faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality}]} — YuNet (OpenCV zoo, MIT) |
+| faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
 | match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
@@ -396,3 +396,136 @@ A normal run now reads:
 runner: run=run-abc counting from rtsp://192.168.1.64:554/media/video1 (plannerRun=prun-1, site=exiverlabs)
 runner: run=run-abc settled failed: unique=3 frames=3 reason=source-stalled (gallery kept for a resume)
 ```
+
+
+## v2 addition — the quality gate is composite (2026-08-06)
+
+The gate is the pipeline's **only irreversible discard**: a face it rejects is
+never embedded, never matched, and therefore never counted. It was box width
+alone, which is the wrong axis in two directions at once.
+
+- Recognition size is honestly read in **inter-eye distance**, the measure FR
+  standards specify and the one SFace consumes after alignment. Our 56/80 px
+  width floor is only ~24/34 px IED, so the number in the config was not the
+  number deciding whether an embedding was usable.
+- Size is not the only thing that decides it. A wide face turned side-on has
+  little identity-bearing geometry left; a wide face smeared by a guest walking
+  past has no detail. `frontality` and `sharpness` see exactly those two
+  failures and width sees neither.
+
+`faces /detect` therefore emits three optional signals per face —
+`iedPx`, `frontality` and **`sharpness`** (variance of the Laplacian over the
+crop, resized to a fixed square so the number is about focus and not about how
+close the guest stood). `sharpness` is new: the service documented it and
+nothing computed it, so F1's composite had two of its signals, not three.
+
+The runner composes the gate from all four floors:
+
+| env | default | meaning |
+| --- | --- | --- |
+| `HECO_QUALITY_MIN_PX` | `56.0` | box-width floor (unchanged) |
+| `HECO_QUALITY_MIN_IED_PX` | `0.0` | inter-eye-distance floor; 0 = **not armed** |
+| `HECO_QUALITY_MIN_FRONTALITY` | `0.0` | 0..1 pose floor; 0 = **not armed** |
+| `HECO_QUALITY_MIN_SHARPNESS` | `0.0` | Laplacian-variance floor; 0 = **not armed** |
+
+**Every new floor defaults to unarmed, so the shipped gate is exactly the
+width-only gate it has always been.** No floor for the three has been measured
+— the eval harness that would price one does not exist yet — and a guessed
+floor on the only irreversible discard costs guests off an invoice. Arm them
+per camera once they can be priced. `sharpness` in particular is a *within-
+camera* ordering: it moves with exposure and contrast, so a value calibrated at
+one gate is not transferable to another.
+
+**A signal that could not be measured never rejects a face.** No landmarks
+means no `iedPx`; a degenerate crop means no `sharpness`. Absence is UNKNOWN,
+not BAD, and under-counting is this pipeline's dominant failure mode. Those
+faces are kept and *counted* instead, as `gatedUnmeasured` — an armed floor
+that silently evaluates nothing is worse than no floor at all.
+
+**Every rejection reports its reason.** A face carries `gateReason` (the FIRST
+floor it failed: width → ied → frontality → sharpness) into:
+
+- the `face-detect` tap payload — per row as `gate`, plus a per-frame
+  `gatedBy: {reason: n}` breakdown, and the signals themselves so the console
+  can show the evidence beside the verdict;
+- the annotated `face-detect` frame — a gated face draws **red whatever its
+  width**, labelled `120px frontality`;
+- the run status — `gatedByWidth` / `gatedByIed` / `gatedByFrontality` /
+  `gatedBySharpness` / `gatedUnmeasured`, and `gateArmed` naming the floors in
+  force.
+
+The reporting path READS that verdict and never recomputes it: a second
+implementation of the gate in the reporting path is a second gate.
+
+The run row's `config` records `qualityMinPx`, `qualityCanonPx`,
+`qualityMinIedPx`, `qualityMinFrontality`, `qualityMinSharpness` and
+`gateArmed`, because "which floors produced this number" has to be recoverable
+from the record months later, not inferred from today's environment.
+
+
+## v2 addition — an enrolment leaves a run record (2026-08-06)
+
+Enrolment used to create no `pipeline_run` at all, and that asymmetry was the
+defect: **erasure has a permanent ledger** (`staff_tombstones` keeps the row and
+its purge confirmation forever, on the argument that a withdrawal and the proof
+it was honoured are what an audit asks for) while **the capture that creates the
+biometric had none**. A re-enrolment silently overwrote the previous
+`enrolled_at`; a *failed* enrolment left zero trace anywhere; and no record said
+from which camera, at which event, or over how many frames a staff template was
+captured. Consent is only auditable if the capture is.
+
+`mode:'enrol'` now opens a run under the event, exactly like a count run:
+
+- `POST /api/pipeline/runs` with `label` = `enrol <staffId> <source_label>`
+  (credential-free — the planner slugs the label into the row's permanent id)
+  and `config` = `{source, mode:'enrol', siteId, staffId, enrolBestN, …gate,
+  geometry}`.
+- `PUT /api/pipeline/runs/:id` on settle with
+  `results = {sampleCount, facesSeen, frames, multiFaceFramesSkipped}`,
+  `endReason`, and a notes sentence naming the staff id and the source.
+- A **failed** enrolment settles the row `failed` with the operator-facing
+  reason in the notes. That is the event most worth recording: somebody walked
+  a roster member past a camera and the venue now believes they are enrolled
+  when they are not.
+
+The row is **best-effort in both directions**, which is the opposite trade from
+count mode. There, a failed `create_run` fails the run because the planner id
+keys the gallery. Here the deliverable is the staff-store write, the operator
+has already walked the member through, and refusing to enrol because the laptop
+was rebooting would be the worse outcome — so a planner outage costs the record
+only, and the walk-through proceeds as before.
+
+An enrol run releases only ingest's capture slot; it never opened tracker state
+or a gallery under that id. `PUT /api/staff/:id` (`enrolledAt`, `sampleCount`)
+is unchanged and still the operator-facing confirmation.
+
+Enrolment also applies the **same** quality gate as counting: a template
+captured from a face the count would have discarded is a template that will not
+match.
+
+
+## v2 addition — the run registry is bounded, and liveness is liveness (2026-08-06)
+
+`RunManager` held two dicts nothing ever deleted from, so a process that had run
+a night of gates retained, per run ever started, a dead `Thread` and a whole
+`RunLoop` — and a `RunLoop` pins the last frame's full base64 JPEG.
+
+The same unbounded memory was a correctness bug. "Do I know this run?" was a
+bare membership test, and that is the test deciding whether a 409 on ingest's
+capture slot means *a sibling is counting on this camera* (fail — seizing would
+corrupt that run's count) or *a corpse is holding the slot* (seize it). A run
+that settled without its `/close` landing — ingest down or restarting at that
+moment — therefore held the camera for the life of the process: the automatic
+seizure never fired, `stop` set an event on a thread that had already returned,
+and the refusal told the operator to stop a run that had already stopped. Only
+a manual ingest restart cleared it.
+
+- The test is now **liveness**: a run counts as live only while its state is
+  `starting`, `running` or `enrolling`.
+- Settled runs are **reaped** `HECO_RUN_RETENTION_S` (default 600 s) after
+  their thread returns, on every `POST /runs` and every status/stop lookup. The
+  window keeps `GET /runs/:id` answering for an operator whose run has just
+  finished; after that the planner row is the durable record.
+- **Thread liveness is the settle signal, not the status dict.** A loop wedged
+  mid-frame is still holding the camera whatever its last published status
+  said, and reaping it would hand that camera to the next run.

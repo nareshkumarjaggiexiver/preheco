@@ -20,6 +20,26 @@ subjects 2–3 m) yields ~64–85 px faces — deliberately below the production
 - `sub-canon` — 56 ≤ widthPx ≤ 79 (POC-accepted, must stay flagged in reports)
 - `reject` — widthPx < 56 (below the POC embedding floor)
 
+**Measured signals** (per face, emitted only when measurable): these are what
+the runner's composite quality gate is actually built from — the width flag
+above is the historical one and the weakest of the four.
+
+| key | what it is | why it is not width |
+| --- | --- | --- |
+| `iedPx` | inter-eye distance from YuNet's two eye landmarks | the size measure FR standards specify; our 56/80 px width floor is only ~24/34 px IED |
+| `frontality` | 0..1, how centred the nose sits between the eyes | a wide face turned side-on has little identity-bearing geometry left |
+| `sharpness` | variance of the Laplacian over the face crop, resized to a fixed square (`app/quality.py`) | a wide, square-on face smeared by a walking guest embeds badly and nothing else here can see it |
+
+`sharpness` is **relative, not absolute**: it moves with exposure, contrast and
+the camera's own sharpening, so it orders faces *within one camera* and its gate
+floor has to be calibrated against that camera's own footage. The resize is not
+optional — unnormalised Laplacian variance mostly measures how many pixels the
+crop has, which is what `iedPx` already measures honestly.
+
+A signal is **omitted when it cannot be measured** (no landmarks, a degenerate
+crop). Absence means unknown, and the runner is required to read it that way:
+rejecting a face for a signal nobody measured would drop a guest off an invoice.
+
 ## Model provenance & licence
 
 | file | source | licence |
@@ -43,7 +63,8 @@ make run      # uvicorn on :7104
 
 - `GET /health` → `{ok, model, version}`.
 - `POST /detect` `{imageB64, within?: [{x, y, w, h, ...}]}` →
-  `{faces: [{box, landmarks: [5×[x, y]], conf, widthPx, quality}], inferMs}`
+  `{faces: [{box, landmarks: [5×[x, y]], conf, widthPx, quality, iedPx?,
+  frontality?, sharpness?}], inferMs}`
   — frame coordinates; `within` boxes are clamped, degenerate/outside boxes
   skipped; extra keys on `within` boxes (e.g. `conf`) are ignored.
 
@@ -66,6 +87,7 @@ gets measured on pilot footage.
 | `FACES_TOP_K` | `5000` | YuNet top-K before NMS |
 | `FACES_CANON_PX` | `80` | quality "ok" boundary (production canon) |
 | `FACES_FLOOR_PX` | `56` | POC embedding floor ("sub-canon" lower bound) |
+| `FACES_SHARPNESS_NORM_PX` | `64` | square every crop is resized to before the Laplacian |
 | `FACES_MODEL` | `models/face_detection_yunet_2023mar.onnx` | weights path |
 
 ## CPU latency — measured on this machine

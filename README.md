@@ -29,8 +29,10 @@ with **56–79 px flagged "sub-canon"** in every report.
 | match   | 7106 | SQLite gallery, cosine threshold 0.363 | `services/match` |
 
 `common/` is a shared library (`heco_common`) installed **editable** into each
-service venv: pydantic schemas for every inter-service message, base64 JPEG
-helpers, config-from-env, and the planner client.
+service venv: pydantic schemas for the inter-service messages that more than
+one service speaks (ingest's, the tracker's, the planner ingest models), base64
+JPEG helpers, config-from-env, run logging, and the planner client. Services
+whose request model has exactly one speaker declare it locally.
 
 ## Layout & conventions
 

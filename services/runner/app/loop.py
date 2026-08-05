@@ -23,7 +23,9 @@ must cost nothing but a gap in the charts, which the next upsert repairs.
 
 ENROL MODE — a professional-enrolment walk-through: capture faces, keep the
 best ``enrol_best_n`` by quality, write them to the site staff store, and PUT
-the sample count back to the planner (no pipeline_run record, no counting).
+the sample count back to the planner.  No counting, but it DOES open a
+``mode:'enrol'`` pipeline run: erasure has a permanent ledger
+(``staff_tombstones``) and the capture that creates the biometric had none.
 
 End-of-source: ingest serves the LATEST frame with a monotonically increasing
 ``seq`` and never signals EOF explicitly — a **stalled seq** is the signal
@@ -50,7 +52,7 @@ from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 
-from . import annotate, taps
+from . import annotate, gate, taps
 from .config import Settings
 from .feedback import plan_action
 from .stats import SampleBuffer, StatsBoard
@@ -155,23 +157,30 @@ class RunLoop:
         settings: Settings,
         client: httpx.Client,
         planner: PlannerClient,
-        is_known_run=None,
+        is_live_run=None,
     ) -> None:
         """Prepare a run; `request` is the validated POST /runs body as a dict.
 
         `client` is injected so tests can pass an httpx.MockTransport-backed
         client and drive the loop against a fully fake pipeline; `planner`
         should speak through the same client (see httpx_transport).
-        ``is_known_run`` (run_id -> bool) is the registry's membership test,
-        used only to tell a STALE capture-slot holder (a corpse from a killed
-        runner process) from a live sibling run — see _open_source.
+        ``is_live_run`` (run_id -> bool) is the registry's LIVENESS test, used
+        only to tell a STALE capture-slot holder (a corpse from a killed runner
+        process, or a sibling that settled hours ago) from a run still counting
+        — see _open_source.  It asks "is that run still going?", never "have I
+        ever heard of it": a settled sibling that never managed its /close used
+        to hold the camera for the life of the process.
         """
         self.run_id = run_id
         self.request = request
         self.s = settings
         self.client = client
         self.planner = planner
-        self._is_known_run = is_known_run
+        self._is_live_run = is_live_run
+        # Resolved once: the gate's floors cannot change under a running run,
+        # and re-reading them per face would let a config reload move the
+        # discard threshold half way through a count.
+        self.gate = gate.GateThresholds.from_settings(settings)
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
@@ -220,6 +229,21 @@ class RunLoop:
             "multiFaceFramesSkipped": 0,
             "plannerReportErrors": 0,
             "tapRoundsAbandoned": 0,
+            # Whole-run gate accounting, one counter per reason a face was
+            # discarded.  A gate that only says "N faces dropped" cannot be
+            # audited: an operator who armed an IED floor and lost a third of a
+            # wedding needs to see WHICH floor did it, and
+            # ``gatedUnmeasured`` says how many faces passed an armed floor
+            # only because nobody could measure them.
+            "gatedByWidth": 0,
+            "gatedByIed": 0,
+            "gatedByFrontality": 0,
+            "gatedBySharpness": 0,
+            "gatedUnmeasured": 0,
+            # The floors this run is actually enforcing beyond width, so the
+            # status says what gate produced the number, not just the number.
+            # A tuple, because status() hands out a SHALLOW copy of this dict.
+            "gateArmed": self.gate.armed,
             "error": None,
         }
 
@@ -299,25 +323,29 @@ class RunLoop:
 
         The slot is single: without an owner a second run silently replaced a
         live run's camera and both loops read the wrong frames.  A 409 names
-        the holder; whether to fail depends on WHO that is:
+        the holder; whether to fail depends on whether that run is STILL
+        COUNTING:
 
-        - a run THIS runner knows -> a live sibling really is using the
-          camera; fail loudly, exactly as before (seizing it would corrupt
-          that run's count);
-        - a run this runner does NOT know -> a corpse: a killed runner never
-          sends /close, so its slot outlives it and every later start 409'd
-          until someone restarted ingest by hand (observed live).  Seize it
-          with takeover=true and note the seizure in the run status.
+        - a run this runner has LIVE -> a sibling really is using the camera;
+          fail loudly, exactly as before (seizing it would corrupt that run's
+          count);
+        - anything else -> a corpse.  Either a killed runner process (which
+          never sends /close, so its slot outlives it), or a run of THIS
+          process that settled without its /close landing — ingest was down or
+          restarting at that moment.  Both used to 409 every later start until
+          someone restarted ingest by hand, while the error message told the
+          operator to stop a run that had already stopped.  Seize it with
+          takeover=true and note the seizure in the run status.
         """
         body = {**self.request["source"], "owner": self.run_id}
         try:
             self._post(f"{self.s.ingest_url}/open", body)
             return
         except StageError as e:
-            if e.status_code != 409 or self._is_known_run is None:
+            if e.status_code != 409 or self._is_live_run is None:
                 raise
         holder = self._slot_holder()
-        if not holder or self._is_known_run(holder):
+        if not holder or self._is_live_run(holder):
             raise StageError(
                 f"capture slot is held by live run '{holder}' on this runner — "
                 "stop that run before starting another on the same camera",
@@ -374,8 +402,7 @@ class RunLoop:
                     "source": req["source"],
                     "mode": "count",
                     "siteId": req.get("siteId"),
-                    "qualityMinPx": self.s.quality_min_px,
-                    "qualityCanonPx": self.s.quality_canon_px,
+                    **self._gate_config(),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
                 },
             )
@@ -464,6 +491,25 @@ class RunLoop:
         )
         self._set(state=status, endReason=self._end_reason)
 
+    def _gate_config(self) -> dict:
+        """The gate this run enforced, for the run row's permanent config.
+
+        The count is an invoice figure, so "which floors were in force when
+        this number was produced" has to be recoverable from the record months
+        later — not inferred from whatever the environment happens to hold at
+        the time somebody asks.  Unarmed floors are recorded as 0.0 rather than
+        omitted, so a config with no IED key means an OLD run, not an unarmed
+        one.
+        """
+        return {
+            "qualityMinPx": self.s.quality_min_px,
+            "qualityCanonPx": self.s.quality_canon_px,
+            "qualityMinIedPx": self.s.quality_min_ied_px,
+            "qualityMinFrontality": self.s.quality_min_frontality,
+            "qualityMinSharpness": self.s.quality_min_sharpness,
+            "gateArmed": list(self.gate.armed),
+        }
+
     def _release_run_state(self, keep_gallery: bool = False) -> None:
         """Give back every piece of per-run state this run created downstream.
 
@@ -486,7 +532,12 @@ class RunLoop:
         planner_run_id = self.status().get("plannerRunId")
         with contextlib.suppress(Exception):
             self._post(f"{self.s.ingest_url}/close", {"owner": self.run_id})
-        if not planner_run_id:
+        if not planner_run_id or self.request.get("mode") == "enrol":
+            # An enrolment now has a planner row (so the capture that creates a
+            # biometric leaves a record) but it never created tracker state or
+            # a gallery under that id, so there is nothing else of ours to hand
+            # back.  Releasing them anyway would be a pair of pointless calls
+            # against ids that were never opened.
             return
         with contextlib.suppress(Exception):
             self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
@@ -558,23 +609,34 @@ class RunLoop:
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
             sample = {"faceBoxWPx": float(f["box"]["w"])}
-            # report-only quality signals (accuracy R&D F1): recognition size is
-            # honestly read in inter-eye distance, not box width.
-            if "iedPx" in f:
-                board.observe("face-detect", "faceIedPx", float(f["iedPx"]))
-                sample["faceIedPx"] = float(f["iedPx"])
-            if "frontality" in f:
-                board.observe("face-detect", "frontality", float(f["frontality"]))
-                sample["frontality"] = float(f["frontality"])
+            # The signals the gate is composed from (accuracy R&D F1):
+            # recognition size is honestly read in inter-eye distance, not box
+            # width, and size says nothing about pose or focus.  They are
+            # measured on every face whether or not their floors are armed, so
+            # a floor can be priced from a run that was not gated on it.
+            for key, metric in (
+                ("iedPx", "faceIedPx"),
+                ("frontality", "frontality"),
+                ("sharpness", "sharpness"),
+            ):
+                if key in f:
+                    board.observe("face-detect", metric, float(f[key]))
+                    sample[metric] = float(f[key])
             samples.add("face-detect", t_ms, sample)
 
-        # quality gate (local): floor 56 px; 56-79 px flagged sub-canon
+        # QUALITY GATE (local) — the pipeline's only irreversible discard.
+        # Width floor 56 px as always; the IED / frontality / sharpness floors
+        # ride alongside it and are unarmed by default (see app/gate.py), so
+        # this is today's behaviour until an operator opts in.  Every face is
+        # stamped with WHY it was rejected, for the taps and the overlay.
         tq = time.perf_counter()
-        kept = [f for f in faces if float(f["box"]["w"]) >= s.quality_min_px]
+        outcome = gate.gate_faces(faces, self.gate)
+        kept = outcome.kept
         board.frame("quality")
         board.observe("quality", "qualityMs", (time.perf_counter() - tq) * 1000.0)
         for f in kept:
             board.observe("quality", "faceBoxWPx", float(f["box"]["w"]))
+        self._count_gated(outcome)
 
         if not kept:
             self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, [])
@@ -634,6 +696,32 @@ class RunLoop:
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
+
+    #: gate reason -> the status counter that records it.
+    _GATE_COUNTER = {
+        "width": "gatedByWidth",
+        "ied": "gatedByIed",
+        "frontality": "gatedByFrontality",
+        "sharpness": "gatedBySharpness",
+    }
+
+    def _count_gated(self, outcome) -> None:
+        """Record this frame's rejections against their reasons.
+
+        The gate is where a guest stops being countable, so the run status has
+        to be able to answer "what did the gate cost us, and which floor did
+        it".  One counter per reason rather than a nested dict because
+        ``status()`` hands out a shallow copy and a nested dict would be shared
+        across threads.
+        """
+        if not outcome.gated_by and not outcome.unmeasured:
+            return
+        with self._lock:
+            for reason, n in outcome.gated_by.items():
+                key = self._GATE_COUNTER.get(reason)
+                if key:
+                    self._status[key] += n
+            self._status["gatedUnmeasured"] += outcome.unmeasured
 
     def _count_staff(self, verdict: dict) -> None:
         """Record one staff sighting: a face-frame always, a crossing sometimes.
@@ -912,9 +1000,23 @@ class RunLoop:
     def _run_enrol(self) -> None:
         """Capture a staff walk-through and write the best samples to the store.
 
-        No pipeline_run and no counting: the deliverable is the site staff
-        store plus a ``PUT /api/staff/:id`` reporting the sample count, so the
-        operator can confirm the enrolment in the UI before the next person.
+        No counting: the deliverable is the site staff store plus a
+        ``PUT /api/staff/:id`` reporting the sample count, so the operator can
+        confirm the enrolment in the UI before the next person.
+
+        **IT DOES LEAVE A RUN RECORD**, and used to leave none.  That asymmetry
+        was the defect: ``staff_tombstones`` gives ERASURE a permanent ledger,
+        while ENROLMENT — the act that creates the biometric in the first place
+        — wrote nothing but an ``enrolled_at`` timestamp that the next
+        re-enrolment silently overwrote.  A failed enrolment left no trace at
+        all, and no record anywhere said from which camera, at which event, or
+        over how many frames a staff template was captured.  Consent is only
+        auditable if the capture is.  So an enrolment opens a ``mode:'enrol'``
+        pipeline run and settles it with structured results.
+
+        The row is BEST-EFFORT in both directions: a planner outage must not
+        fail an enrolment (the samples are the deliverable and they are already
+        stored), and a failed capture must still settle its row.
 
         **SINGLE-SUBJECT RULE.** A frame contributes a sample only when EXACTLY
         ONE face passes the quality gate; frames with two or more are skipped
@@ -935,6 +1037,9 @@ class RunLoop:
         req = self.request
         site_id, staff_id = req["siteId"], req["staffId"]
         self._set(state="enrolling")
+        # BEFORE the camera is claimed, so a slot conflict or a dead source
+        # settles a row that exists rather than vanishing without trace.
+        self._open_enrol_run(site_id, staff_id)
         self._open_source()
 
         captured: list[tuple[float, list]] = []  # (score, embedding)
@@ -955,7 +1060,9 @@ class RunLoop:
                 f"{self.s.faces_url}/detect",
                 {"imageB64": image_b64, "within": boxes or None},
             ).get("faces", [])
-            kept = [f for f in faces if float(f["box"]["w"]) >= self.s.quality_min_px]
+            # The SAME gate as counting: a template captured from a face the
+            # count would have discarded is a template that will not match.
+            kept = gate.gate_faces(faces, self.gate).kept
             if len(kept) != 1:
                 if len(kept) > 1:
                     skipped += 1
@@ -979,19 +1086,22 @@ class RunLoop:
 
         self._release_run_state()  # capture is done: hand the camera back
         samples = [{"embedding": emb, "quality": q} for q, emb in captured[: self.s.enrol_best_n]]
+        tally = {
+            "facesSeen": faces_seen,
+            "frames": frames,
+            "multiFaceFramesSkipped": skipped,
+        }
         if not samples:
-            self._set(
-                state="failed",
-                sampleCount=0,
-                facesSeen=faces_seen,
-                frames=frames,
-                multiFaceFramesSkipped=skipped,
-                error=(
-                    f"enrolment captured no single-subject frames "
-                    f"({skipped} frame(s) had more than one face, {frames} seen) — "
-                    f"walk {staff_id} through alone and re-run the enrolment"
-                ),
+            error = (
+                f"enrolment captured no single-subject frames "
+                f"({skipped} frame(s) had more than one face, {frames} seen) — "
+                f"walk {staff_id} through alone and re-run the enrolment"
             )
+            self._set(state="failed", sampleCount=0, error=error, **tally)
+            # A failed enrolment used to leave nothing anywhere. Now it settles
+            # its own row with the reason, so "we tried and it did not work" is
+            # a fact somebody can find later.
+            self._end_enrol_run("failed", staff_id, 0, tally, error)
             return
         out = self._post(
             f"{self.s.match_url}/staff/enrol",
@@ -1002,13 +1112,84 @@ class RunLoop:
         # the enrolment itself — the samples are already stored).
         with contextlib.suppress(Exception):
             self.planner.report_enrolment(staff_id, _now_iso(), n)
-        self._set(
-            state="ended",
-            sampleCount=n,
-            facesSeen=faces_seen,
-            frames=frames,
-            multiFaceFramesSkipped=skipped,
+        self._set(state="ended", sampleCount=n, **tally)
+        self._end_enrol_run("ended", staff_id, n, tally, None)
+
+    def _open_enrol_run(self, site_id: str, staff_id: str) -> None:
+        """Open the planner run row that records this enrolment.
+
+        Best-effort ON PURPOSE.  In count mode a failed ``create_run`` fails
+        the run, because the planner id keys the gallery and there is no count
+        without it.  An enrolment has no such dependency: the deliverable is
+        the staff store write, the operator has already walked the member
+        through, and refusing to enrol because the laptop was rebooting would
+        be a worse outcome than an enrolment with a missing record.  So a
+        failure is logged, ``plannerRunId`` stays None, and the walk-through
+        proceeds exactly as it did before this record existed.
+        """
+        req = self.request
+        label = req.get("label") or f"enrol {staff_id} {source_label(req['source'])}"
+        try:
+            planner_run_id = str(
+                self.planner.create_run(
+                    req["eventId"],
+                    placement_id=req.get("placementId"),
+                    label=label,
+                    config={
+                        "source": req["source"],
+                        "mode": "enrol",
+                        "siteId": site_id,
+                        "staffId": staff_id,
+                        "enrolBestN": self.s.enrol_best_n,
+                        **self._gate_config(),
+                        "geometry": "poc-2.8mm-2.0m-close-zone",
+                    },
+                )
+            )
+        except Exception as e:  # noqa: BLE001 — the enrolment matters more
+            self.log.warning(
+                f"enrolling {staff_id} without a planner record: {safe(str(e))}"
+            )
+            return
+        self._set(plannerRunId=planner_run_id)
+        self.log.info(
+            f"enrolling {staff_id} from {source_label(req['source'])} "
+            f"(plannerRun={planner_run_id}, site={site_id})"
         )
+
+    def _end_enrol_run(
+        self, status: str, staff_id: str, sample_count: int, tally: dict, error: str | None
+    ) -> None:
+        """Settle the enrolment's run row with a structured, readable record.
+
+        ``results`` is the machine-readable half — how many templates this
+        walk-through actually created — and ``notes`` the human sentence beside
+        it.  Both are best-effort: the templates are already written, so a
+        planner that is down costs the record, never the enrolment.
+        """
+        if self.planner.run_id is None:
+            return
+        notes = (
+            f"enrol staffId={staff_id} samples={sample_count} "
+            f"facesSeen={tally['facesSeen']} frames={tally['frames']} "
+            f"multiFaceFramesSkipped={tally['multiFaceFramesSkipped']} "
+            f"source={source_label(self.request['source'])} "
+            f"endReason={self._end_reason}"
+        )
+        if error:
+            notes = f"{notes} — {safe(error)}"
+        results = {"sampleCount": float(sample_count)}
+        results.update({k: float(v) for k, v in tally.items()})
+        try:
+            self.planner.end_run(
+                status=status,
+                notes=notes,
+                results=results,
+                end_reason=self._end_reason,
+            )
+        except Exception as e:  # noqa: BLE001 — the templates are already stored
+            self._bump("plannerReportErrors")
+            self.log.warning(f"enrolment {status} but the planner was not told: {e}")
 
     # -------------------------------------------------------------- plumbing
 
