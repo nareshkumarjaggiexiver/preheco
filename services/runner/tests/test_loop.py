@@ -604,3 +604,12 @@ def test_the_final_count_is_reported_structurally_not_only_as_prose():
     assert results["frames"] == 3
     for key in ("staffCrossings", "manualAdditions", "matches"):
         assert key in results
+
+
+def test_the_end_reason_reaches_the_planner_as_a_field_not_only_prose():
+    """A substring in a notes sentence cannot be filtered or reported on."""
+    fake = FakePipeline(n_frames=3)
+    fake.stall_forever = True
+    make_loop(fake).run()
+    assert fake.run_ended["endReason"] == "source-stalled"
+    assert fake.run_ended["status"] == "failed"

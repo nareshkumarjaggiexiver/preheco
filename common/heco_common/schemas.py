@@ -341,3 +341,4 @@ class PlannerRunEnd(BaseModel):
     status: Literal["ended", "failed"]
     notes: str | None = None
     results: dict[str, float] | None = None
+    endReason: Literal["source-ended", "source-stalled", "operator-stopped"] | None = None
