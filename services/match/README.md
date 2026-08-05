@@ -93,8 +93,9 @@ never compared with anything except one frame.
 
 **What changed.** On a match, the sighting may be kept as an *additional* view
 of that identity, capped at `HECO_MATCH_TEMPLATES_PER_PERSON` (5) and evicting
-the lowest capture quality — so a guest accumulates their **best** views, not
-their most recent. Matching needs no new machinery: `VectorStore.search` is an
+the **least distinctive** view — so a guest accumulates the widest spread of
+views that fits, not their best photographs and not their most recent.
+Matching needs no new machinery: `VectorStore.search` is an
 argmax over rows, and max-over-rows equals max-over-per-identity-maxima, so the
 moment several rows share a key the returned cosine already *is* that
 identity's best template score (pinned by `test_search_is_per_identity_best`).

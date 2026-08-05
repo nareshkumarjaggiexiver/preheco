@@ -143,11 +143,27 @@ def _should_enrol(
        merges two guests into one.  Over-counting costs an argument about an
        invoice; silently merging two paying guests costs the same money and
        nobody can see it happen, so ambiguity is resolved by NOT learning.
-    5. If the identity is already at its cap, the sighting must be of better
-       capture quality than the worst view held — otherwise the insert would
-       be undone by :meth:`VectorStore.prune_to_cap` on the next line and we
-       would have churned the database for nothing.  A quality-less sighting
-       (no face width recorded) counts as the worst possible.
+    5. If the identity is already at its cap, the sighting must be MORE
+       DISTINCTIVE than the closest pair already held — i.e. ``best`` must sit
+       below :meth:`VectorStore.max_redundancy`.  Otherwise the newcomer is the
+       most redundant view in the set and :meth:`VectorStore.prune_redundant`
+       would delete it again on the next line, churning the database for
+       nothing.  Passing this test means some existing pair of views is closer
+       together than the newcomer is to anything, so one of THEM is evicted and
+       the identity's spread widens — the gallery improves its own coverage
+       every time it learns.
+
+       This clause used to compare capture QUALITY against the worst view held,
+       to match a quality-based eviction.  Both were wrong together, and the
+       corridor bench showed why: quality is face width, face width is
+       distance, so "keep the best five" resolved to "keep the five frames
+       where the guest was nearest the lens".  A walk toward the camera evicted
+       every far view in favour of a closer one, and one guest's five templates
+       ended up spanning TWO SECONDS of a 140-second crossing — all one
+       distance, all one pose.  The same man at 87 px then scored 0.294 against
+       a gallery that only knew him between 148 and 329 px, and was counted
+       twice.  Distinctiveness is what a template slot is for; quality only
+       breaks ties.
 
     What this deliberately does NOT do: change who counts as a match.  Every
     enrolled template was itself verified at or above the threshold against an
@@ -166,11 +182,9 @@ def _should_enrol(
     rival = store.runner_up(embedding, key)
     if rival is not None and (best - rival.cosine) < margin:
         return False
-    held = store.qualities_for(key)
-    if len(held) >= cap:
-        # qualities_for is best-first with NULLs last, so the worst is the tail.
-        worst = held[-1]
-        if quality is None or worst is None or quality <= worst:
+    if store.count_for(key) >= cap:
+        crowded = store.max_redundancy(key)
+        if crowded is None or best >= crowded:
             return False
     return True
 
@@ -235,7 +249,9 @@ def match(
             )
             if added:
                 store.add(hit.key, embedding, quality=quality, sub_canon=sub_canon)
-                store.prune_to_cap(hit.key, templates_per_person)
+                # Redundancy, NOT quality — see _should_enrol clause 5 for the
+                # measurement that killed the quality rule here.
+                store.prune_redundant(hit.key, templates_per_person)
             return MatchResult(
                 hit.key,
                 False,
