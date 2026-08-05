@@ -44,6 +44,7 @@ class FakePipeline:
         self.tracker_released: dict | None = None
         self.opened: dict | None = None
         self.closed: dict | None = None
+        self.slot_holder: str | None = None  # a pre-existing ingest slot owner
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Route one request to the scripted service behaviour."""
@@ -67,8 +68,17 @@ class FakePipeline:
 
         if host == "ingest":
             if path == "/open":
+                if (
+                    self.slot_holder
+                    and body.get("owner") != self.slot_holder
+                    and not body.get("takeover")
+                ):
+                    detail = f"capture slot is held by run '{self.slot_holder}'"
+                    return httpx.Response(409, json={"detail": detail})
                 self.opened = body
                 return httpx.Response(200, json={"ok": True})
+            if path == "/health":
+                return httpx.Response(200, json={"ok": True, "owner": self.slot_holder})
             if path == "/close":
                 self.closed = body
                 return httpx.Response(200, json={"ok": True, "released": True})
@@ -447,7 +457,7 @@ def test_best_effort_planner_calls_get_their_own_short_timeout(monkeypatch):
             timeouts.append(timeout)
 
     class DummyLoop:
-        def __init__(self, run_id, request, settings, client, planner):
+        def __init__(self, run_id, request, settings, client, planner, **kw):
             built["planner"] = planner
 
         def run(self):
@@ -494,3 +504,30 @@ def test_run_label_never_carries_source_credentials():
     # it at rest, and the loop needs it verbatim to open the stream.)
     assert "s3kret" not in fake.run_created["label"]
     assert fake.run_created["label"] == "runner rtsp://cam:554/media/video1"
+
+
+def test_stale_capture_slot_is_seized_when_the_holder_is_a_corpse():
+    """A killed runner never sends /close, so its ingest slot outlives it and
+    every later start 409'd until someone restarted ingest by hand. When the
+    named holder is unknown to THIS runner, the loop takes the slot over."""
+    fake = FakePipeline(n_frames=2)
+    fake.slot_holder = "run-corpse"
+    loop = make_loop(fake)
+    loop._is_known_run = lambda rid: False  # nobody this runner knows
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert fake.opened["takeover"] is True
+    assert final["seizedSlotFrom"] == "run-corpse"
+
+
+def test_live_siblings_slot_is_never_seized():
+    """The 409 guard exists to stop a second run stealing a LIVE run's
+    camera — a holder this runner knows fails the start, exactly as before."""
+    fake = FakePipeline(n_frames=2)
+    fake.slot_holder = "run-alive"
+    loop = make_loop(fake)
+    loop._is_known_run = lambda rid: rid == "run-alive"
+    final = loop.run()
+    assert final["state"] == "failed"
+    assert "run-alive" in final["error"]
+    assert fake.opened is None, "no takeover was attempted"

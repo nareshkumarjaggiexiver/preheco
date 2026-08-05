@@ -154,18 +154,23 @@ class RunLoop:
         settings: Settings,
         client: httpx.Client,
         planner: PlannerClient,
+        is_known_run=None,
     ) -> None:
         """Prepare a run; `request` is the validated POST /runs body as a dict.
 
         `client` is injected so tests can pass an httpx.MockTransport-backed
         client and drive the loop against a fully fake pipeline; `planner`
         should speak through the same client (see httpx_transport).
+        ``is_known_run`` (run_id -> bool) is the registry's membership test,
+        used only to tell a STALE capture-slot holder (a corpse from a killed
+        runner process) from a live sibling run — see _open_source.
         """
         self.run_id = run_id
         self.request = request
         self.s = settings
         self.client = client
         self.planner = planner
+        self._is_known_run = is_known_run
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
@@ -270,12 +275,41 @@ class RunLoop:
         """Claim ingest's exclusive capture slot for this run.
 
         The slot is single: without an owner a second run silently replaced a
-        live run's camera and both loops read the wrong frames.  A 409 here is
-        ingest telling us which run holds it — let it fail the run loudly.
+        live run's camera and both loops read the wrong frames.  A 409 names
+        the holder; whether to fail depends on WHO that is:
+
+        - a run THIS runner knows -> a live sibling really is using the
+          camera; fail loudly, exactly as before (seizing it would corrupt
+          that run's count);
+        - a run this runner does NOT know -> a corpse: a killed runner never
+          sends /close, so its slot outlives it and every later start 409'd
+          until someone restarted ingest by hand (observed live).  Seize it
+          with takeover=true and note the seizure in the run status.
         """
-        self._post(
-            f"{self.s.ingest_url}/open", {**self.request["source"], "owner": self.run_id}
-        )
+        body = {**self.request["source"], "owner": self.run_id}
+        try:
+            self._post(f"{self.s.ingest_url}/open", body)
+            return
+        except StageError as e:
+            if e.status_code != 409 or self._is_known_run is None:
+                raise
+        holder = self._slot_holder()
+        if not holder or self._is_known_run(holder):
+            raise StageError(
+                f"capture slot is held by live run '{holder}' on this runner — "
+                "stop that run before starting another on the same camera",
+                409,
+            )
+        self._post(f"{self.s.ingest_url}/open", {**body, "takeover": True})
+        self._set(seizedSlotFrom=holder)
+
+    def _slot_holder(self) -> str | None:
+        """Who ingest says owns the capture slot right now (its /health)."""
+        try:
+            r = self.client.get(f"{self.s.ingest_url}/health")
+            return (r.json() or {}).get("owner") if r.status_code < 400 else None
+        except Exception:  # noqa: BLE001 — a health probe must not mask the 409
+            return None
 
     # ------------------------------------------------------------- the loop
 
