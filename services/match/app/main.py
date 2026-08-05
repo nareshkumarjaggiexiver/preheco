@@ -12,7 +12,8 @@ Endpoints:
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
-    POST /merge  {runId, keep, drop}          -> {merged, galleryN}   (duplicate)
+    POST /merge  {runId, keep, drop, onlyIfSingleton?}
+        -> {merged, galleryN}                                         (duplicate)
     POST /split  {runId, a, b}                -> {ok, galleryN}       (false-match)
     POST /mark-staff {runId, personKey, siteId, staffId?}
         -> {moved, galleryN, staffKey}                                (mark-staff)
@@ -33,7 +34,7 @@ from pydantic import BaseModel, Field
 from . import config, gallery, staff
 from .store import close_all_stores
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -87,11 +88,21 @@ class EnrolRequest(BaseModel):
 
 
 class MergeRequest(BaseModel):
-    """Body of POST /merge — fold ``drop`` into ``keep`` (duplicate correction)."""
+    """Body of POST /merge — fold ``drop`` into ``keep`` (duplicate correction).
+
+    ``onlyIfSingleton`` marks a merge whose caller is a MACHINE (the runner's
+    track heal), not an operator.  A machine's evidence is weaker: it saw one
+    track match two keys and inferred a junk mint, whereas an operator looked
+    at two faces.  When true the merge is refused unless ``drop`` still holds
+    exactly one template — a key that has accumulated more views since the
+    mint has been independently re-sighted and is no longer safely foldable by
+    heuristic.  See :func:`app.gallery.merge`.
+    """
 
     runId: str
     keep: str
     drop: str
+    onlyIfSingleton: bool = False
 
 
 class SplitRequest(BaseModel):
@@ -273,6 +284,7 @@ def merge(body: MergeRequest) -> dict:
             body.keep,
             body.drop,
             config.templates_per_person(),
+            only_if_singleton=body.onlyIfSingleton,
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
