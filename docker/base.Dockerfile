@@ -12,6 +12,13 @@
 # fastapi/uvicorn/httpx (MIT/BSD), numpy (BSD) — all ship-clean.
 FROM python:3.12-slim
 
+# Build-time only: debconf must not attempt an interactive frontend.
+ARG DEBIAN_FRONTEND=noninteractive
+# Root pip inside a single-purpose image is the intended layout, and the pip
+# version is irrelevant to the pinned installs — silence both warnings.
+ENV PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 # libglib is the one system library the headless OpenCV wheel still links.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libglib2.0-0 \
