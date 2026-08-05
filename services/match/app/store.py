@@ -41,8 +41,14 @@ Storage
 -------
 * ``vectors``     one row per stored template: ``key``, the ``float32`` BLOB,
                   its ``dim``, the capture ``quality`` (face width px) and a
-                  ``sub_canon`` flag.  A person/staff member may own several
-                  rows (multi-template) after enrolment or a merge.
+                  ``sub_canon`` flag.  A person/staff member owns SEVERAL rows:
+                  staff from enrolment, guests from accumulating views as they
+                  are re-sighted (:func:`app.gallery.match`), either from a
+                  merge.  Two evictions bound how many, and they differ on
+                  purpose: :meth:`prune_to_cap` (after enrolment) drops the
+                  lowest quality, :meth:`prune_redundant` (after a merge) drops
+                  the least distinctive view — see that method for why keeping
+                  the quality rule there would undo the operator's correction.
 * ``cannot_link`` operator "these are two different people" constraints
                   (from a *false-match* correction), stored order-independent.
                   :meth:`merge` refuses to fold a constrained pair — that is
@@ -175,6 +181,7 @@ class VectorStore:
         # In-memory index, loaded lazily and kept write-through afterwards.
         # None means "not loaded / invalidated" — the next read reloads it.
         self._keys: list[str] | None = None
+        self._ids: list[int] = []  # SQLite rowid per index row, parallel to _keys
         self._manual: list[str] = []
         self._buf: np.ndarray | None = None  # (capacity, dim) float32
         self._n = 0  # rows of _buf in use
@@ -252,28 +259,36 @@ class VectorStore:
     def _invalidate(self) -> None:
         """Forget the in-memory index; the next read reloads it from SQLite."""
         self._keys = None
+        self._ids = []
         self._buf = None
         self._n = 0
         self._manual = []
 
     def _index(self) -> None:
-        """Load the key list + scan matrix from SQLite if not already held."""
+        """Load the key list + scan matrix from SQLite if not already held.
+
+        The rowid of each template is carried alongside its key, so a caller
+        that wants to delete *particular* templates (:meth:`prune_to_cap`) can
+        write the removal through to the resident matrix instead of dropping
+        the whole index and paying for a reload on the match hot path.
+        """
         if self._keys is not None:
             return
-        rows = self.conn.execute("SELECT key, vec, dim FROM vectors ORDER BY id").fetchall()
-        self._keys = [r[0] for r in rows]
+        rows = self.conn.execute("SELECT id, key, vec, dim FROM vectors ORDER BY id").fetchall()
+        self._keys = [r[1] for r in rows]
+        self._ids = [int(r[0]) for r in rows]
         self._manual = [
             r[0] for r in self.conn.execute("SELECT key FROM manual").fetchall()
         ]
         if not rows:
             self._buf, self._n, self._dim = None, 0, 0
             return
-        self._dim = int(rows[0][2])
-        mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
+        self._dim = int(rows[0][3])
+        mat = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float32)
         self._buf = mat.reshape(len(rows), self._dim).copy()  # writable, growable
         self._n = len(rows)
 
-    def _append_row(self, key: str, vec: np.ndarray) -> None:
+    def _append_row(self, key: str, vec: np.ndarray, row_id: int) -> None:
         """Write-through one new template into the in-memory index.
 
         Capacity doubles rather than reallocating per insert, so a run that
@@ -291,18 +306,31 @@ class VectorStore:
         self._buf[self._n] = vec
         self._n += 1
         self._keys.append(key)
+        self._ids.append(int(row_id))
+
+    def _keep_mask(self, mask: list[bool]) -> None:
+        """Write-through a row-level deletion described by a keep/drop mask."""
+        keep = np.array(mask, dtype=bool)
+        self._keys = [k for k, m in zip(self._keys, mask, strict=True) if m]
+        self._ids = [i for i, m in zip(self._ids, mask, strict=True) if m]
+        if self._buf is not None and self._n:
+            kept = self._buf[: self._n][keep]
+            self._buf = kept.copy() if kept.size else None
+            self._n = int(keep.sum())
 
     def _drop_rows(self, key: str) -> None:
         """Write-through the removal of every row belonging to ``key``."""
         self._index()
         if not self._keys:
             return
-        mask = np.array([k != key for k in self._keys], dtype=bool)
-        self._keys = [k for k in self._keys if k != key]
-        if self._buf is not None and self._n:
-            kept = self._buf[: self._n][mask]
-            self._buf = kept.copy() if kept.size else None
-            self._n = int(mask.sum())
+        self._keep_mask([k != key for k in self._keys])
+
+    def _drop_ids(self, doomed: set[int]) -> None:
+        """Write-through the removal of specific template rowids."""
+        self._index()
+        if not self._keys:
+            return
+        self._keep_mask([i not in doomed for i in self._ids])
 
     # ------------------------------------------------------------- reads
 
@@ -323,6 +351,36 @@ class VectorStore:
         sims = self._buf[: self._n] @ q
         i = int(np.argmax(sims))
         return Neighbour(key=self._keys[i], cosine=float(sims[i]))
+
+    def runner_up(self, embedding: list[float] | np.ndarray, key: str) -> Neighbour | None:
+        """Best-scoring template belonging to some key OTHER than ``key``.
+
+        The second opinion :meth:`search` deliberately does not give: "how close
+        was this probe to the nearest *rival* identity?".  A caller deciding
+        whether to enrol a probe as a new template needs it, because a probe
+        that sits almost equally close to two identities is the one sighting
+        that must NOT become a template — storing it builds a bridge between
+        two people (see :func:`app.gallery.match`).  Returns None when no other
+        key has a template.
+
+        Cost: one argsort of the already-computed similarity vector, then a walk
+        down it that stops at the first foreign key — at most (templates per
+        identity) steps.  This runs only on the enrol-decision path, never on
+        the plain match path.  If profiling ever puts the argsort on the budget,
+        the vectorised form is to keep an int32 key-code column parallel to the
+        scan matrix and take ``sims[codes != code].max()``.
+        """
+        self._index()
+        if not self._n:
+            return None
+        q = as_unit(embedding)
+        if q.size != self._dim:
+            raise ValueError(f"embedding dim {q.size} != store dim {self._dim}")
+        sims = self._buf[: self._n] @ q
+        for i in np.argsort(-sims):
+            if self._keys[i] != key:
+                return Neighbour(key=self._keys[i], cosine=float(sims[i]))
+        return None
 
     def distinct_count(self) -> int:
         """Distinct people in the store: matched keys plus manual additions.
@@ -352,9 +410,37 @@ class VectorStore:
         return [np.frombuffer(v, dtype=np.float32).reshape(d) for v, d in rows]
 
     def count_for(self, key: str) -> int:
-        """How many templates a single key owns."""
-        self._index()
-        return self._keys.count(key)
+        """How many templates a single key owns.
+
+        Answered from SQLite through ``idx_vectors_key`` rather than by counting
+        the resident key list: since M1 this runs on EVERY match (the verdict
+        reports how many views the identity now holds), and a Python-level scan
+        of one key list costs ~27 us at 2.5k templates against ~7 us indexed —
+        i.e. it grew with gallery size, which is the exact cost "open once, scan
+        in memory" was introduced to remove.  Reads on this connection see the
+        open transaction's own uncommitted writes, so the answer includes a
+        template inserted moments ago in the same match.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM vectors WHERE key = ?", (key,)
+        ).fetchone()
+        return int(row[0])
+
+    def qualities_for(self, key: str) -> list[float | None]:
+        """Capture quality (face width px) of each template a key owns.
+
+        Ordered best first, with quality-less templates (``NULL``, e.g. a
+        sample enrolled before quality was recorded) last — the same order
+        :meth:`prune_to_cap` keeps.  A caller can therefore read the WORST held
+        quality off the end of this list and decide, before paying for an
+        insert, whether a new sighting would survive eviction at all.
+        """
+        rows = self.conn.execute(
+            "SELECT quality FROM vectors WHERE key = ?"
+            " ORDER BY (quality IS NULL) ASC, quality DESC, id ASC",
+            (key,),
+        ).fetchall()
+        return [None if r[0] is None else float(r[0]) for r in rows]
 
     # ------------------------------------------------------------ writes
 
@@ -383,12 +469,12 @@ class VectorStore:
         """Store one template under an explicit key (used for staff ids)."""
         v = as_unit(embedding)
         self._index()  # load BEFORE the insert, or the load would see it twice
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (key, v.tobytes(), v.size, quality, int(sub_canon), _now()),
         )
-        self._append_row(key, v)
+        self._append_row(key, v, int(cur.lastrowid))
 
     def add_auto(
         self,
@@ -419,6 +505,103 @@ class VectorStore:
         )
         self._manual.append(key)
         return key
+
+    def prune_to_cap(self, key: str, cap: int) -> int:
+        """Evict a key's WORST templates until it holds at most ``cap``.
+
+        "Worst" is lowest capture quality (face width px), so an identity that
+        keeps being re-sighted accumulates its best views rather than its most
+        recent — a most-recent policy would let a run of bad frames flush the
+        good evidence out of a guest's record, and the count is an invoice
+        figure.  Ties, and templates with no recorded quality at all, break
+        towards the OLDEST row: the earliest template is the one the identity
+        was founded on, and keeping it anchors the identity against drift.
+
+        Returns how many templates were evicted (0 when already within cap).
+        """
+        if cap < 1:
+            raise ValueError("cap must be at least 1")
+        self._index()  # load BEFORE the delete, so the index still has the rows
+        rows = self.conn.execute(
+            "SELECT id FROM vectors WHERE key = ?"
+            " ORDER BY (quality IS NULL) ASC, quality DESC, id ASC",
+            (key,),
+        ).fetchall()
+        doomed = {int(r[0]) for r in rows[cap:]}
+        if not doomed:
+            return 0
+        self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in doomed])
+        self._drop_ids(doomed)
+        return len(doomed)
+
+    def prune_redundant(self, key: str, cap: int) -> int:
+        """Evict a key's most REDUNDANT templates until it holds at most ``cap``.
+
+        The rule :meth:`prune_to_cap` uses — drop the lowest capture quality —
+        is right for automatic enrolment, where every stored view already
+        matched the ones beside it and the only remaining question is which
+        picture is sharper.  After a MERGE it is wrong, and destructively so.
+
+        An operator merges two identities precisely because the pipeline could
+        NOT join them: their views are, by construction, the pair that failed to
+        match each other.  Evicting on quality there would keep whichever of the
+        two was photographed better and discard the very views that caused the
+        split — so the next crossing at that pose mints a fresh key and the
+        operator merges the same guest again, and again, every night.  A
+        correction that has to be re-applied is not a correction.
+
+        So this evicts the template that adds least: the one whose cosine to its
+        nearest surviving sibling is highest.  The survivor keeps the WIDEST
+        spread of views that fits in ``cap``, which is what the operator's merge
+        asserted this person looks like.  Ties break towards evicting the lower
+        quality and then the newer row, so the founding view — the anchor the
+        identity was minted on — is the last thing to go.
+
+        One eviction at a time, re-scoring in between, because redundancy is
+        relative to what is still there: drop two near-twins in one pass and the
+        pose they both covered disappears with them.
+
+        Returns how many templates were evicted (0 when already within cap).
+        """
+        if cap < 1:
+            raise ValueError("cap must be at least 1")
+        rows = self.conn.execute(
+            "SELECT id, vec, dim, quality FROM vectors WHERE key = ? ORDER BY id ASC",
+            (key,),
+        ).fetchall()
+        if len(rows) <= cap:
+            return 0
+        live = [
+            (
+                int(r[0]),
+                as_unit(np.frombuffer(r[1], dtype=np.float32).reshape(r[2])),
+                None if r[3] is None else float(r[3]),
+            )
+            for r in rows
+        ]
+        doomed: set[int] = set()
+        while len(live) > cap:
+            mat = np.stack([v for _, v, _ in live])
+            sims = mat @ mat.T
+            np.fill_diagonal(sims, -np.inf)
+            nearest = sims.max(axis=1)
+            # Most redundant first.  Tie-break keys are NEGATED quality (so the
+            # lower quality sorts higher = more evictable, and a quality-less
+            # row is the most evictable of all) then row id (newer goes first).
+            worst = max(
+                range(len(live)),
+                key=lambda i: (
+                    float(nearest[i]),
+                    -(live[i][2] if live[i][2] is not None else -1.0),
+                    live[i][0],
+                ),
+            )
+            doomed.add(live[worst][0])
+            live.pop(worst)
+        self._index()  # load BEFORE the delete, so the index still has the rows
+        self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in doomed])
+        self._drop_ids(doomed)
+        return len(doomed)
 
     # ------------------------------------- operator corrections (pure ops)
 
@@ -453,6 +636,11 @@ class VectorStore:
         when either key is unknown, or when they are the same key — the caller
         then leaves the unique count untouched and reports the correction
         rejected.
+
+        A pure op: the survivor inherits EVERY view both keys held and may now
+        exceed the template cap, because a cap is policy and this layer does not
+        hold it.  :func:`app.gallery.merge` prunes afterwards, in the same
+        transaction, via :meth:`prune_redundant`.
         """
         if keep == drop:
             return False

@@ -212,6 +212,11 @@ def render_comparison(comparison: Comparison) -> str:
     lines.append("")
     for reason in comparison.reasons:
         lines.append(f"  * {reason}")
+    # Concerns are printed even when the verdict is already a regression: the
+    # warning is usually the EARLIER symptom, and it is the one that tells the
+    # reader which way the failure came in.
+    for concern in comparison.concerns:
+        lines.append(f"  ? CONCERN  {concern}")
     lines.append("")
     lines.append(THIN)
     header = (
@@ -228,6 +233,8 @@ def render_comparison(comparison: Comparison) -> str:
         )
         for r in c.regressions:
             lines.append(f"      REGRESSION  {r}")
+        for w in c.concerns:
+            lines.append(f"      concern     {w}")
         for i in c.improvements:
             lines.append(f"      improvement {i}")
     agg = comparison.aggregate

@@ -6,10 +6,13 @@ the real server and asserts the harness refuses to call a five-fold throughput
 win an improvement when the pipeline stopped counting people.
 """
 
+import json
+
 import pytest
 from factories import clip, ingest_max_width_after, ingest_max_width_before, planner_run
 
 from eval.compare import compare_results
+from eval.compare import main as compare_main
 from eval.metrics import aggregate, score_run
 from eval.report import render_comparison
 
@@ -170,14 +173,213 @@ def test_a_new_critical_check_is_a_regression_on_its_own():
     assert any("match-ran" in r for r in comparison.reasons)
 
 
-def test_unpaired_clips_are_noted_and_not_compared():
-    """A clip missing from one side cannot be a delta; say so, do not guess."""
-    before = results("b", [score_run(clip("a", 100), planner_run(unique=99))])
-    after = results("a", [score_run(clip("b", 100), planner_run(unique=99))])
+def test_a_clip_added_only_in_the_after_set_is_a_note_not_a_verdict():
+    """New ground truth is welcome; it just cannot be a delta."""
+    a = clip("a", 100)
+    before = results("b", [score_run(a, planner_run(unique=99))])
+    after = results(
+        "a",
+        [score_run(a, planner_run(unique=99)), score_run(clip("new", 100), planner_run(unique=99))],
+    )
     comparison = compare_results(before, after)
-    assert comparison.verdict == "inconclusive"
-    assert any("BEFORE set only" in n for n in comparison.notes)
+    assert comparison.verdict == "neutral"
     assert any("AFTER set only" in n for n in comparison.notes)
+
+
+# ------------------------------- a deleted clip is not a way to pass (flaw 1)
+
+
+def test_deleting_the_failing_clip_from_the_after_set_is_a_regression():
+    """Otherwise `git rm the-clip-that-fails` is a valid way to pass the A/B.
+
+    Before: two clips, one of them counting badly. After: that clip is simply
+    not there. Everything remaining looks fine, and the aggregate improves. If
+    the harness calls that anything but a regression it is a guard rail with a
+    hole, and a guard rail with a hole is worse than none because it is
+    believed.
+    """
+    calm, bad = clip("calm", 100), clip("baraat-surge", 100, tags=("surge",))
+    before = results(
+        "b", [score_run(calm, planner_run(unique=99)), score_run(bad, planner_run(unique=60))]
+    )
+    after = results("a", [score_run(calm, planner_run(unique=100))])
+
+    comparison = compare_results(before, after)
+
+    assert comparison.verdict == "regression"
+    assert comparison.is_regression
+    joined = " | ".join(comparison.reasons)
+    assert "baraat-surge" in joined
+    assert "ABSENT from the AFTER set" in joined
+    assert comparison.aggregate["clipsMissingFromAfter"] == ["baraat-surge"]
+
+
+def test_deleting_every_clip_is_a_regression_and_not_an_empty_pass():
+    """The extreme case: an AFTER set with nothing in it must never exit clean."""
+    before = results("b", [score_run(clip("calm", 100), planner_run(unique=99))])
+    comparison = compare_results(before, results("a", []))
+    assert comparison.verdict == "regression"
+
+
+def test_a_missing_clip_can_be_waived_but_the_waiver_is_on_the_record():
+    """A clip genuinely retired is allowed — deliberately, in writing, by name."""
+    calm, gone = clip("calm", 100), clip("retired", 100)
+    before = results(
+        "b", [score_run(calm, planner_run(unique=99)), score_run(gone, planner_run(unique=99))]
+    )
+    after = results("a", [score_run(calm, planner_run(unique=99))])
+
+    comparison = compare_results(before, after, waive_missing=["retired"])
+
+    assert comparison.verdict == "neutral"
+    assert comparison.aggregate["clipsMissingFromAfter"] == []
+    assert comparison.aggregate["clipsMissingWaived"] == ["retired"]
+    assert any("WAIVED by hand" in n for n in comparison.notes)
+
+
+def test_a_waiver_names_one_clip_and_does_not_cover_the_next_one():
+    """A waiver is a statement about a clip, not a switch that turns the rule off."""
+    calm, gone, alsogone = clip("calm", 100), clip("retired", 100), clip("baraat-surge", 100)
+    before = results(
+        "b",
+        [
+            score_run(calm, planner_run(unique=99)),
+            score_run(gone, planner_run(unique=99)),
+            score_run(alsogone, planner_run(unique=60)),
+        ],
+    )
+    after = results("a", [score_run(calm, planner_run(unique=99))])
+    comparison = compare_results(before, after, waive_missing=["retired"])
+    assert comparison.verdict == "regression"
+    assert comparison.aggregate["clipsMissingFromAfter"] == ["baraat-surge"]
+
+
+def test_redefining_the_ground_truth_between_the_two_runs_is_not_comparable():
+    """Keeping the clip and moving the goalposts must not be softer than deleting it.
+
+    Both errors are relative to ``actualUnique``. Recount the clip 100 -> 60
+    and the same pipeline count reads -20% before and +33% after with nothing
+    in the pipeline having changed at all.
+    """
+    before = results("b", [score_run(clip("calm", 100), planner_run(unique=80))])
+    after = results("a", [score_run(clip("calm", 60), planner_run(unique=80))])
+    comparison = compare_results(before, after)
+    assert comparison.verdict == "regression"
+    assert any("count of record changed" in r for r in comparison.reasons)
+
+
+# --------------------------- a rate cannot see its own denominator (flaw 2)
+
+
+def test_a_gate_collapse_hidden_by_a_steady_pass_rate_is_still_a_regression():
+    """The rate is a RATIO, and a ratio is invariant to its own denominator.
+
+    Detection falls 400 -> 40 per run and the gate passes 200 -> 20: the
+    pass rate reads 50% both times, the count survives on this clip, and nine
+    tenths of the evidence has silently gone. Neither "gate count is zero" nor
+    "the rate halved" fires, which is precisely why they are not enough.
+    """
+    c = clip("calm", 100)
+    before = results(
+        "b",
+        [score_run(c, planner_run(unique=100, frames=400, faces_detected=400, gate_pass=200,
+                                  embeds=200, matches=200))],
+    )
+    after = results(
+        "a",
+        [score_run(c, planner_run(unique=100, frames=400, faces_detected=40, gate_pass=20,
+                                  embeds=20, matches=20))],
+    )
+
+    comparison = compare_results(before, after)
+
+    assert comparison.clips[0].gate_rate_before == comparison.clips[0].gate_rate_after
+    assert comparison.verdict == "regression"
+    joined = " | ".join(comparison.reasons)
+    assert "faces per frame" in joined
+    assert "faces DETECTED fell" in joined
+
+
+def test_the_funnel_rules_are_read_per_frame_so_a_shorter_run_is_not_a_regression():
+    """Raw rung counts are not comparable: the change under test moves the frame count.
+
+    This is the 2026-08-05 pair the RIGHT way round — reverting the downscale
+    gives a fifth of the frames and a fifth of the faces. Yield per frame is
+    unchanged, the gate recovers, and the harness must not shout at the fix.
+    """
+    c = clip("gate-a-arrivals", 9)
+    comparison = compare_results(
+        results("b", [score_run(c, ingest_max_width_after())]),
+        results("a", [score_run(c, ingest_max_width_before())]),
+    )
+    assert comparison.verdict == "improvement"
+    assert not any("per frame" in r for r in comparison.reasons)
+
+
+# -------------------------- a warning must be able to reach the verdict (flaw 3)
+
+
+def test_a_new_warning_sinks_an_improvement_claim():
+    """face-size-vs-floor is the LEADING indicator and it is only a warning.
+
+    48 px mean detected width against a 56 px floor fired before the count
+    collapsed. Here the unique count genuinely improves while that warning
+    starts firing: the honest verdict is inconclusive, not "improvement".
+    """
+    c = clip("calm", 100)
+    before = results("b", [score_run(c, planner_run(unique=80))])
+    after = results("a", [score_run(c, planner_run(unique=99, face_w=(19.0, 48.0, 55.0)))])
+
+    comparison = compare_results(before, after)
+
+    assert comparison.verdict == "inconclusive"
+    assert not comparison.is_regression
+    assert any("face-size-vs-floor" in w for w in comparison.concerns)
+    assert any("warning-level check(s) newly failed" in r for r in comparison.reasons)
+    assert "CONCERN" in render_comparison(comparison)
+
+
+def test_a_warning_that_was_already_failing_does_not_sink_anything():
+    """Only a NEW warning moves the verdict — otherwise nothing could ever improve."""
+    c = clip("calm", 100)
+    small = {"face_w": (19.0, 48.0, 55.0)}
+    before = results("b", [score_run(c, planner_run(unique=80, **small))])
+    after = results("a", [score_run(c, planner_run(unique=99, **small))])
+    comparison = compare_results(before, after)
+    assert comparison.verdict == "improvement"
+    assert comparison.concerns == ()
+
+
+def test_a_newly_failing_envelope_check_is_a_regression_not_a_warning():
+    """Severity 'fail' blocks as hard as 'critical' — metrics.failing treats them alike."""
+    c = clip("calm", 100)
+    before = results("b", [score_run(c, planner_run(unique=99))])
+    after = results("a", [score_run(c, planner_run(unique=80))])
+    comparison = compare_results(before, after)
+    assert comparison.verdict == "regression"
+    assert any("check 'unique-count-error' now fails" in r for r in comparison.reasons)
+
+
+# ------------------------------------------------------------- exit codes
+
+
+def test_the_exit_codes_distinguish_a_pass_from_a_verdict_nobody_can_check(tmp_path):
+    """Inconclusive must not exit 0: a claim that cannot be checked is not a pass."""
+    c = clip("calm", 100)
+    b_path, a_path = tmp_path / "b.json", tmp_path / "a.json"
+    b_path.write_text(json.dumps(results("b", [score_run(c, planner_run(unique=80))])))
+    a_path.write_text(
+        json.dumps(
+            results("a", [score_run(c, planner_run(unique=99, face_w=(19.0, 48.0, 55.0)))])
+        )
+    )
+    assert compare_main([str(b_path), str(a_path)]) == 3
+
+    a_path.write_text(json.dumps(results("a", [score_run(c, planner_run(unique=99))])))
+    assert compare_main([str(b_path), str(a_path)]) == 0
+
+    a_path.write_text(json.dumps(results("a", [score_run(c, planner_run(unique=40))])))
+    assert compare_main([str(b_path), str(a_path)]) == 2
 
 
 def test_tiny_movements_inside_the_tolerance_claim_nothing():

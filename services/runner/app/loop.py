@@ -690,6 +690,14 @@ class RunLoop:
                     "isNew": m.get("isNew"),
                     "isStaff": bool(m.get("isStaff", False)),
                     "subCanon": bool(m.get("subCanon", False)),
+                    # How many views the identity holds, and whether this
+                    # sighting became one.  A run's counts cannot be read
+                    # without them: most guests holding a single template
+                    # means the crossings are not supplying diverse views and
+                    # multi-template is doing nothing, which is worth knowing
+                    # BEFORE anyone blames the threshold.  None on a staff hit.
+                    "templateN": m.get("templateN"),
+                    "templateAdded": bool(m.get("templateAdded", False)),
                     "box": face.get("box"),
                 }
             )

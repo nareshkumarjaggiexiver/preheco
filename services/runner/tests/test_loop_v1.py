@@ -172,6 +172,9 @@ class V1Fake:
                 "personKey": f"p{self.guest_calls:05d}", "isNew": is_new,
                 "cosine": 0.3, "galleryN": self.guest_n, "subCanon": q < 80.0,
                 "isStaff": False, "staffId": None,
+                # M1 fields: how many views this identity now holds, and whether
+                # this sighting became one.
+                "templateN": 2, "templateAdded": True,
             })
         return httpx.Response(500, json={"error": f"unscripted match {path}"})
 
@@ -282,6 +285,31 @@ def test_taps_and_frames_posted_on_interval():
     stages_tapped = {t["stage"] for t in fake.taps}
     assert stages_tapped == {"ingest", "person-detect", "track", "face-detect", "match"}
     assert len(fake.frames_posted) >= 5  # five annotated stages per tapping frame
+
+
+def test_match_tap_carries_the_template_policy_fields():
+    """The match tap forwards templateN / templateAdded, as CONTRACTS.md states.
+
+    These were specified in the v2 contract but never wired: the match service
+    returned them and the runner dropped them on the floor, so the one place an
+    operator could have seen the template policy working was the one place it
+    was invisible.  A run's counts cannot be read without them — most guests
+    holding a single template means the crossings are not supplying diverse
+    views and multi-template is doing nothing, which is worth knowing before
+    anyone blames the threshold.
+    """
+    fake = V1Fake(n_frames=2, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request, tap_interval_s=0.0).run()
+    rows = [
+        row
+        for t in fake.taps
+        if t["stage"] == "match"
+        for row in t["payload"].get("matches", [])
+    ]
+    assert rows, "no match verdicts were tapped"
+    assert all(r["templateN"] == 2 for r in rows)
+    assert all(r["templateAdded"] is True for r in rows)
 
 
 def test_opaque_frame_taps_but_skips_frame_upload():

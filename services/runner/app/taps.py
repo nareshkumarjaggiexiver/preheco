@@ -151,6 +151,10 @@ def match_payload(
             "isNew": v.get("isNew"),
             "isStaff": bool(v.get("isStaff", False)),
             "subCanon": bool(v.get("subCanon", False)),
+            # Lets the console show a guest's views accumulating live, and
+            # shows an operator whether multi-template is actually engaging.
+            "templateN": v.get("templateN"),
+            "templateAdded": bool(v.get("templateAdded", False)),
         }
         for v in verdicts[:ROW_CAP]
     ]
