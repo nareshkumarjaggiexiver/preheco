@@ -197,11 +197,15 @@ class V1Fake:
                 self.closed = body
                 return httpx.Response(200, json={"ok": True, "released": True})
             if path == "/frame":
+                # A file source: seq stalls at EOF and `ended` goes true, which
+                # is how the runner tells a finished file from a blinking camera.
                 i = min(self.frame_i, self.n_frames - 1)
-                if self.frame_i < self.n_frames:
+                exhausted = self.frame_i >= self.n_frames
+                if not exhausted:
                     self.frame_i += 1
                 return httpx.Response(200, json={
-                    "imageB64": self.image_b64, "tMs": i * 100, "w": 160, "h": 120, "seq": i,
+                    "imageB64": self.image_b64, "tMs": i * 100, "w": 160, "h": 120,
+                    "seq": i, "ended": exhausted,
                 })
         if host == "persons" and path == "/detect":
             box = {"x": 10, "y": 20, "w": 40, "h": 110, "conf": 0.9}
