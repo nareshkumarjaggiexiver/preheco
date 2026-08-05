@@ -100,7 +100,7 @@ i.e. before the collapse.
 
 ```bash
 cd eval && make venv        # own venv, like every other directory here
-make test                   # 73 offline tests: metrics, filters, verdicts
+make test                   # 88 offline tests: metrics, filters, verdicts
 make lint
 ```
 
@@ -156,13 +156,21 @@ number can be traced back to the planner record months later. Re-running a
 label replaces that label's files and nothing else; `--resume` carries forward
 clips already scored (errored clips are always retried).
 
+`--resume` is bound to the **manifest content**, not just the label. A stored
+score is reused only when the entry that produced it is still the entry in
+front of it — same `path`, same `actualUnique`, same `tags`, same `--envelope`.
+Change any of them and that clip is re-run, because a label is only a name:
+editing a clip's path and resuming would otherwise report the old file's
+number, silently, under the new claim.
+
 Useful flags: `--dry-run`, `--check-paths` (stat clip files locally — only
 valid when ingest shares this filesystem), `--timeout` (per clip, default
 1800 s), `--envelope`, `--event-id`, `--site-id`, `--runner-url`,
 `--planner-url`, `--planner-token`.
 
 Exit code `0` when every clip scored and passed, `2` otherwise, `1` on a
-configuration error — so a commit can be gated on it.
+configuration error — so a commit can be gated on it. (`eval.compare` has its
+own table below.)
 
 ## The A/B
 
@@ -176,16 +184,46 @@ Prints per-clip and aggregate deltas and one verdict:
 `regression` / `improvement` / `neutral` / `inconclusive`. It is a
 **regression** — printed as a banner, exit code 2 — if on *any* clip:
 
-* the gate-pass count collapsed to zero, or the pass rate fell by half;
+* the gate-pass count collapsed to zero, or the pass **rate** fell by half;
+* the gate-pass or face-detection **yield per frame** fell by half;
 * the signed unique-count error worsened past the tolerance;
 * the count fell to zero where it previously counted people;
-* a critical check that used to pass now fails;
-* a clip that used to be scorable is now unscorable.
+* a check of blocking severity — `critical` **or** `fail` — that used to pass
+  now fails;
+* a clip that used to be scorable is now unscorable;
+* a clip that was measured BEFORE is **absent** AFTER;
+* a clip's `actualUnique` differs between the two files — the two errors are
+  measured against different denominators, so they are not the same
+  measurement and differencing them means nothing.
 
-"Improvement" additionally requires that **nothing** regressed on **any** clip.
-A change that improves the aggregate while wrecking the baraat surge is a
-conversation, not a ship (§5). The fps delta is printed underneath, labelled
-as taking no part in the verdict.
+**Why yield per frame as well as the pass rate.** A rate is a ratio, and a
+ratio is invariant to its own denominator. Detect 400 faces and pass 200, then
+detect 40 and pass 20: the pass rate reads 50 % both times while nine tenths of
+the evidence has gone. The rungs are therefore also compared per frame — per
+frame rather than raw, because the change under test moves the frame count
+itself (254 frames before the 2026-08-05 downscale, 1,261 after), and a rule on
+raw counts would shout at the change that *fixed* it.
+
+**Why a missing clip is a regression.** Otherwise deleting the failing clip
+from the manifest is a way to pass. A clip that disappears has not improved; it
+has stopped being measured. To retire one, say so on the record with
+`--waive-missing LABEL` (repeatable) — the waiver is printed and stored in the
+comparison JSON.
+
+**Warnings reach the verdict.** A warning-severity check that newly fails is a
+`CONCERN`: never a regression on its own, but enough to hold the verdict at
+`inconclusive`. `face-size-vs-floor` is a warning, it fired at 48 px against a
+56 px floor, and it fired *before* the count collapsed — an A/B that could not
+hear it would have blessed the change on its way down.
+
+"Improvement" therefore requires that **nothing** regressed on **any** clip and
+that no new warning fired. A change that improves the aggregate while wrecking
+the baraat surge is a conversation, not a ship (§5). The fps delta is printed
+underneath, labelled as taking no part in the verdict.
+
+Exit codes: `0` improvement or neutral, `2` regression, `3` inconclusive
+(nothing comparable, or a new warning — a claim nobody can check is not a
+pass), `1` on a usage error.
 
 ---
 

@@ -24,7 +24,10 @@ THE THREE RULES THIS FILE ENFORCES.
 3. **Idempotent and re-runnable.** Results are written per ``--label``, so
    re-running a label replaces that label's file and nothing else. ``--resume``
    carries forward clips already scored in that file, which matters when clip
-   twelve of fourteen dies on a wedged service at midnight.
+   twelve of fourteen dies on a wedged service at midnight — but ONLY where the
+   manifest entry that produced the stored score is still the manifest entry in
+   front of it. Same label, different file or different count of record, and
+   the clip is re-run rather than reported from memory.
 """
 
 import argparse
@@ -227,14 +230,31 @@ def evaluate(
 
     Sequential on purpose: ingest owns ONE capture slot, so two clips at once
     would fight over it and both counts would be wrong.
+
+    A clip is carried forward from ``previous`` only when the stored score was
+    taken from the SAME manifest entry — see :func:`_resume_mismatch`. A label
+    match alone is not enough to reuse a number.
     """
     carried = _scored_clips(previous) if previous else {}
+    if carried and previous is not None:
+        stale = _stale_envelope(previous, cfg)
+        if stale:
+            clip_runner.log.warning(f"resume: carrying nothing forward — {stale}")
+            carried = {}
     scores: list[ClipScore] = []
     for clip in manifest.clips:
-        if clip.label in carried:
-            clip_runner.log.info(f"{clip.label}: carried forward from the previous result file")
-            scores.append(ClipScore.from_dict(carried[clip.label]))
-            continue
+        stored = carried.get(clip.label)
+        if stored is not None:
+            mismatch = _resume_mismatch(clip, stored)
+            if mismatch is None:
+                clip_runner.log.info(
+                    f"{clip.label}: carried forward from the previous result file"
+                )
+                scores.append(ClipScore.from_dict(stored))
+                continue
+            clip_runner.log.warning(
+                f"{clip.label}: NOT carried forward and will be re-run — {mismatch}"
+            )
         scores.append(clip_runner.run_clip(clip, cfg))
     return scores
 
@@ -250,6 +270,61 @@ def _scored_clips(payload: dict) -> dict[str, dict]:
         for c in (payload.get("clips") or [])
         if isinstance(c, dict) and c.get("status") == "scored" and c.get("clip")
     }
+
+
+def _resume_mismatch(clip: Clip, stored: dict) -> str | None:
+    """Why this stored score may NOT stand in for this clip; None when it may.
+
+    ``--resume`` joins on the clip LABEL, and a label is only a name. Edit the
+    path or ``actualUnique`` in the manifest and the label still matches, so
+    the old score — taken from a different file, or measured against a
+    different count of record — would be reported as the new claim's result,
+    silently and with full confidence. The count is an invoice figure; a stored
+    score belongs to the manifest entry that produced it, and to no other.
+
+    Tags are bound too, because they are what the per-tag breakdown aggregates
+    on: a clip retagged from ``staff`` to ``surge`` and then resumed would file
+    its old number under the new heading.
+    """
+    stored_path = stored.get("path")
+    if stored_path != clip.path:
+        return (
+            f"the manifest now points at {clip.path!r} and the stored score was taken from "
+            f"{stored_path!r}"
+        )
+    stored_actual = stored.get("actualUnique")
+    if stored_actual != clip.actual_unique:
+        return (
+            f"the count of record is now {clip.actual_unique} and the stored score was "
+            f"measured against {stored_actual!r}"
+        )
+    stored_tags = tuple(stored.get("tags") or ())
+    if stored_tags != tuple(clip.tags):
+        return (
+            f"the tags are now {list(clip.tags)} and the stored score carries "
+            f"{list(stored_tags)}, so the per-tag breakdown would be filed wrongly"
+        )
+    return None
+
+
+def _stale_envelope(previous: dict, cfg: EvalConfig) -> str | None:
+    """Reason the whole previous file is unusable for resume; None when it is.
+
+    Same failure as :func:`_resume_mismatch` one level up: every stored check
+    was decided against the envelope in force when it ran, so carrying those
+    verdicts into a run with a different ``--envelope`` would mix two
+    acceptance standards inside one result file.
+
+    A file that records no envelope at all predates this field and is taken at
+    its word; re-running the batch is the way to be sure of one.
+    """
+    stored = previous.get("envelope")
+    if stored is None or stored == cfg.envelope:
+        return None
+    return (
+        f"the previous file was scored against an envelope of {stored} and this run uses "
+        f"{cfg.envelope}; every clip will be re-scored rather than mix two standards"
+    )
 
 
 def build_payload(

@@ -6,11 +6,13 @@ error rather than a score, and what the harness is allowed to stop.
 """
 
 import logging
+from dataclasses import replace
 
+import pytest
 from factories import clip, ingest_max_width_after, planner_run
 
 from eval.clients import EvalHttpError
-from eval.manifest import Manifest
+from eval.manifest import Clip, Manifest
 from eval.metrics import score_run
 from eval.run import ClipRunner, EvalConfig, build_payload, evaluate, exit_code, slug
 
@@ -194,6 +196,60 @@ def test_resume_re_runs_a_clip_that_errored_last_time():
     scores = evaluate(manifest_of(a), CFG, cr, {"clips": [failed.as_dict()]})
     assert scores[0].status == "scored"
     assert len(runner.started) == 1
+
+
+def test_resume_will_not_carry_a_score_taken_from_a_different_clip_file():
+    """The label is only a name. Repoint it at another file and the number is void.
+
+    Editing ``path`` and resuming used to report the OLD clip's result under
+    the NEW clip's claim, silently — the join was on the label alone.
+    """
+    a = clip("a", 100)
+    stored = score_run(a, planner_run(unique=98))
+    repointed = Clip(label="a", path="/srv/heco/clips/a-take-2.mp4", actual_unique=100)
+
+    cr, runner, _ = make([SETTLED], planner_run(unique=91))
+    scores = evaluate(manifest_of(repointed), CFG, cr, {"clips": [stored.as_dict()]})
+
+    assert [c["path"] for c in runner.started] == ["/srv/heco/clips/a-take-2.mp4"]
+    assert scores[0].pipeline_unique == 91, "the stored 98 belonged to a different file"
+    assert scores[0].path == "/srv/heco/clips/a-take-2.mp4"
+
+
+def test_resume_will_not_carry_a_score_measured_against_a_different_ground_truth():
+    """Correct the human count and the old error figure is arithmetic about nothing."""
+    stored = score_run(clip("a", 100), planner_run(unique=98))
+    recounted = Clip(label="a", path="/srv/heco/clips/a.mp4", actual_unique=50)
+
+    cr, runner, _ = make([SETTLED], planner_run(unique=98))
+    scores = evaluate(manifest_of(recounted), CFG, cr, {"clips": [stored.as_dict()]})
+
+    assert len(runner.started) == 1, "the clip must be re-scored against the new count"
+    assert scores[0].actual_unique == 50
+    assert scores[0].unique_count_error == pytest.approx(0.96)
+
+
+def test_resume_will_not_carry_a_score_filed_under_different_tags():
+    """Tags are what the per-tag breakdown aggregates on, so they are part of the claim."""
+    stored = score_run(clip("a", 100), planner_run(unique=98))
+    retagged = Clip(
+        label="a", path="/srv/heco/clips/a.mp4", actual_unique=100, tags=("surge",)
+    )
+    cr, runner, _ = make([SETTLED], planner_run(unique=98))
+    scores = evaluate(manifest_of(retagged), CFG, cr, {"clips": [stored.as_dict()]})
+    assert len(runner.started) == 1
+    assert scores[0].tags == ("surge",)
+
+
+def test_resume_will_not_mix_two_acceptance_envelopes_in_one_file():
+    """Stored checks were decided against the envelope in force when they ran."""
+    a = clip("a", 100)
+    stored = score_run(a, planner_run(unique=94), envelope=0.10)
+    previous = {"envelope": 0.10, "clips": [stored.as_dict()]}
+    cr, runner, _ = make([SETTLED], planner_run(unique=94))
+    scores = evaluate(manifest_of(a), replace(CFG, envelope=0.05), cr, previous)
+    assert len(runner.started) == 1
+    assert scores[0].verdict == "fail", "-6% is outside the 5% envelope this run committed to"
 
 
 def test_the_payload_records_everything_needed_to_re_read_it_later():

@@ -24,7 +24,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env) |
+| match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest (v2 below) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -529,3 +529,55 @@ a manual ingest restart cleared it.
 - **Thread liveness is the settle signal, not the status dict.** A loop wedged
   mid-frame is still holding the camera whatever its last published status
   said, and reaping it would hand that camera to the next run.
+
+## v2 addition — a guest is several views, not one (match, 2026-08-06)
+
+`/match` used to store a guest ONCE, on the sighting that minted their key, and
+compare every later face against that one arbitrary view. The corridor bench,
+ground truth **one man walking**, is what that costs: the gallery held **three**
+identities for him, pairwise cosines **0.347 / 0.307 / 0.296** against the
+0.363 threshold — every pair a near miss, the closest by 0.016. (The quality
+gate is not the problem: before it was armed the same measurement was mean
+0.172, spread −0.055 to 0.337.)
+
+- An identity now holds up to **`HECO_MATCH_TEMPLATES_PER_PERSON`** (default 5)
+  templates. On a match the sighting may be kept as an additional view; at the
+  cap the **lowest capture quality** is evicted, so a guest accumulates their
+  best views rather than their most recent.
+- A matched sighting is kept only if it clears the threshold by
+  `HECO_MATCH_TEMPLATE_CONFIDENCE` (0.05), beats the nearest **rival** identity
+  by `HECO_MATCH_TEMPLATE_MARGIN` (0.05), and is below
+  `HECO_MATCH_TEMPLATE_MAX_COSINE` (0.90). In order: do not learn from an
+  uncertain match; do not store a view that half-belongs to somebody else (it
+  becomes a bridge and merges two paying guests); do not spend a capped slot on
+  a near-duplicate.
+- **The 0.363 threshold is unchanged and stays unchanged.** A sighting must
+  clear it against an already-stored template to count as a re-sighting at all.
+  Lowering it trades over-counting for under-counting and is blocked on
+  impostor data the POC does not yet have.
+- **Matching and learning have DIFFERENT bars.** 0.363 decides matched; **0.413**
+  (threshold + `HECO_MATCH_TEMPLATE_CONFIDENCE`) decides kept as a template.
+  Between the two is a dead band where a sighting is counted as the same guest
+  but teaches the gallery nothing, so the identity does not grow towards it.
+  Read as "0.363 extends the chain" this is wrong by 0.05, which is the whole
+  margin the corridor bench was missing by.
+- **A merge is capped too.** The survivor of `POST /merge` inherits both
+  identities' templates and is pruned back to `HECO_MATCH_TEMPLATES_PER_PERSON`
+  — but by *redundancy*, evicting the least distinctive view, not by quality.
+  The quality rule would discard the merged-in views (they are the ones that
+  failed to match, which is why a human had to merge them) and the operator
+  would re-correct the same guest at every crossing.
+- `/match` gains two response fields: **`templateN`** (views the matched
+  identity now holds; `null` for a staff hit) and **`templateAdded`**. Both are
+  additive — existing consumers are unaffected — and both belong in the match
+  debug tap, because a run's counts cannot be read without knowing which
+  template policy produced them. `GET /health` reports all four knobs for the
+  same reason.
+- **Staff are untouched.** Staff templates come only from the operator-
+  supervised ENROL MODE walk-through; an unsupervised crossing never enrols
+  into `staff-<siteId>.db`, where a mis-tag would outlive the run and poison a
+  roster member across every future event at the site.
+- **Scope limit, stated because it will be misread otherwise.** Multi-template
+  bridges a crossing's extreme poses only when the crossing supplied the
+  intermediate poses that connect them. Three views 0.296–0.347 apart and
+  nothing between them still count as three people, correctly.

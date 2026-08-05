@@ -4,10 +4,11 @@ Stage 6 of the pipeline plus the staff whitelist and the operator-correction
 surface the runner drives from the feedback loop.
 
 Endpoints:
-    GET  /health -> {ok, model, version, threshold, canonPx}
+    GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?}
-        -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId}
+        -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
+            templateN, templateAdded}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -32,7 +33,7 @@ from pydantic import BaseModel, Field
 from . import config, gallery, staff
 from .store import close_all_stores
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -138,6 +139,12 @@ def health() -> dict:
         "version": VERSION,
         "threshold": config.threshold(),
         "canonPx": config.canon_px(),
+        # The bench must be able to read back which template policy produced a
+        # count: the same run with cap 1 and cap 5 is two different numbers.
+        "templatesPerPerson": config.templates_per_person(),
+        "templateConfidence": config.template_confidence(),
+        "templateMargin": config.template_margin(),
+        "templateMaxCosine": config.template_max_cosine(),
     }
 
 
@@ -176,6 +183,12 @@ def match(body: MatchRequest) -> dict:
                 "subCanon": sub_canon,
                 "isStaff": True,
                 "staffId": hit.key,
+                # Multi-template enrolment is a GUEST-gallery policy only: the
+                # staff store's templates come from the operator-supervised
+                # walk-through and must not grow from unsupervised crossings,
+                # so a staff hit never enrols. templateN is not applicable.
+                "templateN": None,
+                "templateAdded": False,
             }
 
     try:
@@ -186,6 +199,10 @@ def match(body: MatchRequest) -> dict:
             body.quality,
             threshold=threshold,
             canon_px=canon_px,
+            templates_per_person=config.templates_per_person(),
+            template_confidence=config.template_confidence(),
+            template_margin=config.template_margin(),
+            template_max_cosine=config.template_max_cosine(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -199,6 +216,8 @@ def match(body: MatchRequest) -> dict:
         "subCanon": r.sub_canon,
         "isStaff": False,
         "staffId": None,
+        "templateN": r.template_n,
+        "templateAdded": r.template_added,
     }
 
 
@@ -242,9 +261,19 @@ def staff_purge(body: PurgeRequest) -> dict:
 
 @app.post("/merge")
 def merge(body: MergeRequest) -> dict:
-    """Duplicate correction: fold ``drop`` into ``keep`` (count −1 if applied)."""
+    """Duplicate correction: fold ``drop`` into ``keep`` (count −1 if applied).
+
+    The cap is passed through because the survivor inherits both identities'
+    templates and would otherwise sit above it — see :func:`gallery.merge`.
+    """
     try:
-        merged, n = gallery.merge(config.data_dir(), body.runId, body.keep, body.drop)
+        merged, n = gallery.merge(
+            config.data_dir(),
+            body.runId,
+            body.keep,
+            body.drop,
+            config.templates_per_person(),
+        )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {"merged": merged, "galleryN": n}
