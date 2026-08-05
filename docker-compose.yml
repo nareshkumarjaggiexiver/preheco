@@ -54,6 +54,11 @@ services:
       args: { SERVICE: ingest, PORT: "7101" }
     image: heco-ingest
     ports: ["7101:7101"]
+    environment:
+      # Cap the longest edge before frames enter the pipeline. Empty = the
+      # camera's own size, which is the default. Face pixels scale with it —
+      # see services/ingest/README.md for the numbers before choosing.
+      INGEST_MAX_WIDTH: ${INGEST_MAX_WIDTH-}
     volumes:
       - source-media:/media   # drop test clips here; /open them by path
 
