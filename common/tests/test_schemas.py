@@ -31,7 +31,10 @@ def test_open_source_requires_exactly_one():
 def test_frame_wire_shape():
     """Frame dumps the exact contract keys."""
     f = S.Frame(tMs=120, imageB64="abc=", w=640, h=480, seq=7)
-    assert set(f.model_dump()) == {"tMs", "imageB64", "w", "h", "seq"}
+    # `ended` joined the contract so the runner can tell a finished FILE from a
+    # blinking CAMERA — both freeze `seq`, and only one means the count is done.
+    assert set(f.model_dump()) == {"tMs", "imageB64", "w", "h", "seq", "ended"}
+    assert f.ended is False, "a live source never claims to have ended"
 
 
 def test_track_shapes():

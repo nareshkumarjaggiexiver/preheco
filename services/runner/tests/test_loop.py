@@ -28,6 +28,9 @@ class FakePipeline:
     def __init__(self, n_frames=3, face_widths=(85.0, 64.0, 40.0), boxes_per_frame=1):
         """Serve n_frames frames; each has faces of the given widths."""
         self.n_frames = n_frames
+        # When True the fake never reports `ended`: a CAMERA that blinked
+        # rather than a file that finished.
+        self.stall_forever = False
         self.face_widths = face_widths
         self.boxes_per_frame = boxes_per_frame
         self.frame_i = 0
@@ -83,13 +86,20 @@ class FakePipeline:
                 self.closed = body
                 return httpx.Response(200, json={"ok": True, "released": True})
             if path == "/frame":
-                # Real-ingest semantics: latest frame only; seq stalls at EOF.
+                # Real-ingest semantics: latest frame only; seq stalls at EOF,
+                # AND `ended` goes true because this stands in for a FILE
+                # source. A live camera never sets it — that is the whole
+                # distinction the runner settles a run on.
                 i = min(self.frame_i, self.n_frames - 1)
-                if self.frame_i < self.n_frames:
+                exhausted = self.frame_i >= self.n_frames
+                if not exhausted:
                     self.frame_i += 1
                 return httpx.Response(
                     200,
-                    json={"imageB64": B64, "tMs": i * 100, "w": 320, "h": 240, "seq": i},
+                    json={
+                        "imageB64": B64, "tMs": i * 100, "w": 320, "h": 240, "seq": i,
+                        "ended": exhausted and not self.stall_forever,
+                    },
                 )
 
         if host == "persons" and path == "/detect":
@@ -531,3 +541,66 @@ def test_live_siblings_slot_is_never_seized():
     assert final["state"] == "failed"
     assert "run-alive" in final["error"]
     assert fake.opened is None, "no takeover was attempted"
+
+
+def test_a_blinking_camera_does_not_end_the_run_or_destroy_the_gallery():
+    """The failure that cost a wedding its count.
+
+    A finished FILE and a camera that blinked both freeze ingest's `seq`. The
+    runner used to treat both as end-of-source: it closed the run "ended" and
+    called match /reset, which DELETES the gallery of everyone already counted.
+    Restarting then re-counted every guest already through the gate.
+
+    A live camera never reports `ended` — ingest reconnects forever — so a
+    stalled seq without it is a stall, and must settle as `failed` with the
+    reason recorded, keeping the embeddings.
+    """
+    fake = FakePipeline(n_frames=3)
+    fake.stall_forever = True  # a camera, not a file: never reports `ended`
+    final = make_loop(fake).run()
+
+    assert final["state"] == "failed", "a stalled camera is not a complete count"
+    assert final["endReason"] == "source-stalled"
+    assert fake.run_ended["status"] == "failed"
+    assert "endReason=source-stalled" in fake.run_ended["notes"]
+
+    # THE POINT: the gallery survives, so a restart does not re-count the room.
+    # One /reset is the run's own start-up (it initialises the gallery); a
+    # SECOND would be the teardown that deletes it.
+    resets = [c for c in fake.calls if c.startswith("match") and c.endswith("/reset")]
+    assert len(resets) == 1, (
+        f"a stall must NOT delete this run's embeddings (saw {len(resets)} resets)"
+    )
+    # ...while the camera itself IS handed back, so the next run can claim it.
+    assert any(c.endswith("/close") for c in fake.calls if c.startswith("ingest"))
+
+
+def test_a_finished_file_still_ends_cleanly_and_releases_everything():
+    """The other side of the same fork: a genuine end is still a clean end."""
+    fake = FakePipeline(n_frames=3)
+    final = make_loop(fake).run()
+
+    assert final["state"] == "ended"
+    assert final["endReason"] == "source-ended"
+    assert fake.run_ended["status"] == "ended"
+    # A completed run's gallery is transient and IS reclaimed: start-up reset
+    # plus the teardown reset that removes the file.
+    resets = [c for c in fake.calls if c.startswith("match") and c.endswith("/reset")]
+    assert len(resets) == 2, f"a clean end reclaims the gallery (saw {len(resets)} resets)"
+
+
+def test_the_final_count_is_reported_structurally_not_only_as_prose():
+    """`results` gives the count a home that can be read back and exported.
+
+    It used to survive only inside the free-text `notes` sentence, so no report
+    could be regenerated from stored data — and this figure is an invoice.
+    """
+    fake = FakePipeline(n_frames=3)
+    make_loop(fake).run()
+
+    results = fake.run_ended.get("results")
+    assert results is not None, "the count must be reported structurally"
+    assert results["unique"] == 3
+    assert results["frames"] == 3
+    for key in ("staffCrossings", "manualAdditions", "matches"):
+        assert key in results

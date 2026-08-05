@@ -119,8 +119,15 @@ class CloseSource(BaseModel):
 class Frame(BaseModel):
     """GET /frame response: the latest frame, base64-JPEG in JSON.
 
-    ``seq`` increments per captured frame; a stalled ``seq`` means the source
-    ended or stalled. ``tMs`` is milliseconds since the source was opened.
+    ``seq`` increments per captured frame. A stalled ``seq`` alone is ambiguous
+    — a finished FILE and a blinking CAMERA both stop advancing it — so
+    ``ended`` disambiguates: it is True only when the source is genuinely
+    exhausted (a file played out with ``loop=false``). A live stream never sets
+    it, because capture reconnects forever.
+
+    That distinction decides whether a run settles as a complete count or as a
+    failure, and whether its gallery of face embeddings is safe to delete.
+    ``tMs`` is milliseconds since the source was opened.
     """
 
     tMs: int
@@ -128,6 +135,7 @@ class Frame(BaseModel):
     w: int = Field(gt=0)
     h: int = Field(gt=0)
     seq: int = Field(ge=0)
+    ended: bool = False
 
 
 # ----------------------------------------------------------------- persons
@@ -321,7 +329,15 @@ class PlannerRunCreate(BaseModel):
 
 
 class PlannerRunEnd(BaseModel):
-    """PUT /api/pipeline/runs/:id body — closes a run."""
+    """PUT /api/pipeline/runs/:id body — closes a run.
+
+    ``results`` is the STRUCTURED final count (``{unique, staffCrossings,
+    manualAdditions, frames, matches}``). The planner stores it in
+    pipeline_runs.results_json and serves it back. Without it the count
+    survived only as prose inside ``notes``, which cannot be read back,
+    compared, or regenerated into a report — and this figure is an invoice.
+    """
 
     status: Literal["ended", "failed"]
     notes: str | None = None
+    results: dict[str, float] | None = None

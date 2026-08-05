@@ -73,7 +73,17 @@ class Settings:
     # the real service).  The loop polls every source_poll_s while the seq is
     # unchanged and declares the source ended after source_stall_s of stall.
     source_poll_s: float = 0.02
-    source_stall_s: float = 5.0
+    # How long the frame sequence may stand still before the run gives up.
+    #
+    # This was 5 s, which is shorter than a single RTSP reconnect over venue
+    # Wi-Fi — so an ordinary blip mid-event ended the run. 45 s tolerates a
+    # PoE bounce or a reconnect cycle while still bounding how long a genuinely
+    # dead camera leaves a run open; the planner's own silence detector raises
+    # its alarm at 30 s, so the operator sees the problem before the runner
+    # acts on it. A stall no longer destroys the gallery either (see
+    # RunLoop._next_frame), so the cost of waiting is small and the cost of
+    # giving up early is a re-counted room.
+    source_stall_s: float = 45.0
 
 
 def from_env() -> Settings:

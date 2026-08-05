@@ -324,3 +324,40 @@ token on both sides.
   problem behind a wall of failed attempts.
 - With no token configured on either side (loopback development) nothing
   changes.
+
+
+## v2 addition — a stall is not an end (2026-08-05)
+
+`GET {ingest}/frame` now returns **`ended`** alongside `{tMs, imageB64, w, h,
+seq}`. It is the only thing that separates two situations that look identical
+to a consumer, because both freeze `seq`:
+
+- a **file** played out with `loop=false` — capture sets `ended`, the count is
+  complete;
+- a **live camera** that blinked (Wi-Fi dropout, PoE bounce, RTSP reconnect) —
+  capture retries forever and NEVER sets `ended`.
+
+The runner records which it was in `RunLoop._end_reason` (`source-ended`,
+`source-stalled`, `operator-stopped`) and settles accordingly:
+
+| Reason | Run status | Gallery |
+| --- | --- | --- |
+| source-ended | `ended` | deleted (transient, per-run) |
+| operator-stopped | `ended` | deleted |
+| **source-stalled** | **`failed`** | **KEPT** |
+
+A stall keeps the embeddings because they are the only record of who has
+already come through the gate: deleting them means a restart counts that whole
+room a second time. `match /gallery/sweep` remains the backstop that reclaims
+them later. The reason is appended to the run's notes as
+`endReason=<reason>` and set on the runner's status.
+
+`source_stall_s` default is now **45 s** (was 5 s, shorter than one RTSP
+reconnect over venue Wi-Fi). The planner's own silence detector alarms at 30 s,
+so the operator sees a stalled camera before the runner acts on it.
+
+`PUT /api/pipeline/runs/:id` now also carries **`results`** — the structured
+final count `{unique, staffCrossings, manualAdditions, frames, matches}` —
+which the planner stores in `pipeline_runs.results_json`. The count previously
+survived only as prose inside `notes`, so no report could be regenerated from
+stored data.

@@ -193,10 +193,21 @@ class PlannerClient:
         self.run_id = run_id
         return run_id
 
-    def end_run(self, status: str = "ended", notes: str | None = None) -> None:
-        """Flush pending samples, then close the run as ended|failed."""
+    def end_run(
+        self,
+        status: str = "ended",
+        notes: str | None = None,
+        results: dict[str, float] | None = None,
+    ) -> None:
+        """Flush pending samples, then close the run as ended|failed.
+
+        ``results`` gives the count a structured home the planner can read
+        back and export; ``notes`` keeps the human sentence beside it.
+        """
         self.flush()
-        payload = PlannerRunEnd(status=status, notes=notes).model_dump(exclude_none=True)
+        payload = PlannerRunEnd(
+            status=status, notes=notes, results=results,
+        ).model_dump(exclude_none=True)
         self._request("PUT", f"/api/pipeline/runs/{self._require_run()}", payload)
 
     def post_stats(

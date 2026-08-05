@@ -182,6 +182,9 @@ class RunLoop:
         self._last_tap: float = 0.0
         self._last_feedback: float = 0.0
         self._last_purge: float = 0.0
+        # Why the frame loop stopped; decides how the run settles and
+        # whether this run's embeddings are safe to delete.
+        self._end_reason: str = "source-ended"
         self._handled_feedback: set = set()
         # fid -> outcome we already carried out but could not tell the planner
         # about.  Without this a dropped PUT made the next poll re-execute an
@@ -247,29 +250,45 @@ class RunLoop:
         return r.json() if r.content else {}
 
     def _next_frame(self) -> dict | None:
-        """Poll ingest for a frame with a NEW seq; None once the source ends.
+        """Poll ingest for a frame with a NEW seq; None once the source stops.
 
-        503 (source warming up) and a stalled seq both retry every
-        ``source_poll_s`` until ``source_stall_s`` passes without progress.
+        Sets ``self._end_reason`` to WHY it stopped, because the three cases
+        are not the same event and must not be settled the same way:
+
+        * ``"source-ended"`` — ingest said so (204/404/410, ``ended``, or no
+          image). A file finished. The count is complete.
+        * ``"operator-stopped"`` — the stop flag. The count is complete as far
+          as anybody asked it to go.
+        * ``"source-stalled"`` — the frame sequence stopped advancing for
+          ``source_stall_s``. **This is not an end.** It is a camera that
+          blinked: a Wi-Fi dropout, a PoE bounce, an RTSP reconnect. Ingest is
+          still retrying in the background.
+
+        Collapsing the third into the first is how a five-second network blip
+        at a wedding used to close the run as "ended" and delete the gallery,
+        after which restarting re-counted every guest already through the gate.
         """
         deadline = time.monotonic() + self.s.source_stall_s
         while not self._stop.is_set() and time.monotonic() < deadline:
             r = self.client.get(f"{self.s.ingest_url}/frame")
             if r.status_code in (204, 404, 410):
-                return None  # stub-style explicit end
+                self._end_reason = "source-ended"  # stub-style explicit end
+                return None
             if r.status_code == 503:  # no frame decoded yet — retry
                 time.sleep(self.s.source_poll_s)
                 continue
             r.raise_for_status()
             body = r.json()
             if body.get("ended") or not body.get("imageB64"):
+                self._end_reason = "source-ended"
                 return None
             seq = body.get("seq")
             if seq is None or seq != self._last_seq:
                 self._last_seq = seq
                 return body
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
-        return None  # stalled past source_stall_s (or stopped): source ended
+        self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
+        return None
 
     def _open_source(self) -> None:
         """Claim ingest's exclusive capture slot for this run.
@@ -395,18 +414,37 @@ class RunLoop:
             f"subCanonShare={st['subCanonShare']:.2f} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
-        # Hand back the camera, the tracker state and the gallery file before
-        # the run is closed off in the planner.
-        self._release_run_state()
+        # A STALL IS NOT AN END. If the camera merely blinked, this run's
+        # embeddings are the only record of who has already come through the
+        # gate — deleting them means a restart counts every one of those guests
+        # a second time. So the gallery survives a stall, and the run settles
+        # as `failed` with the reason attached: a run that stopped because the
+        # camera vanished must not present itself as a complete count.
+        stalled = self._end_reason == "source-stalled"
+        notes = f"{notes} endReason={self._end_reason}"
+        self._release_run_state(keep_gallery=stalled)
+        status = "failed" if stalled else "ended"
+        results = {
+            "unique": st["unique"],
+            "staffCrossings": st["staffCrossings"],
+            "manualAdditions": st["manualAdditions"],
+            "frames": frames,
+            "matches": st["matches"],
+        }
         try:
-            self.planner.end_run(status="ended", notes=notes)
+            self.planner.end_run(status=status, notes=notes, results=results)
         except PlannerError as e:  # the count happened; only the report is lost
             self._bump("plannerReportErrors")
             self._set(error=f"run ended but the planner was not told: {e}")
-        self._set(state="ended")
+        self._set(state=status, endReason=self._end_reason)
 
-    def _release_run_state(self) -> None:
+    def _release_run_state(self, keep_gallery: bool = False) -> None:
         """Give back every piece of per-run state this run created downstream.
+
+        ``keep_gallery`` preserves this run's face embeddings — used when the
+        source only STALLED, so that resuming does not re-count every guest
+        already through the gate. The match service's /gallery/sweep remains
+        the backstop that eventually reclaims it.
 
         Nothing here can fail the run — it has already produced its number —
         so each call is independently best-effort.  Three owners:
@@ -426,8 +464,9 @@ class RunLoop:
             return
         with contextlib.suppress(Exception):
             self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
-        with contextlib.suppress(Exception):
-            self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
+        if not keep_gallery:
+            with contextlib.suppress(Exception):
+                self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
