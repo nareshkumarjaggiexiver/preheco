@@ -1,4 +1,4 @@
-
+"""The runner's settings-from-env: defaults, overrides, and empty values."""
 
 def test_an_empty_env_var_never_crashes_the_runner(monkeypatch):
     """Every knob compose can render empty must fall back, not raise.
