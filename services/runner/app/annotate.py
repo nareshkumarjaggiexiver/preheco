@@ -24,6 +24,12 @@ _AMBER = (0, 191, 255)  # sub-canon faces (below the 80 px production canon)
 _RED = (0, 0, 255)  # gated faces (below the 56 px embed floor)
 _YELLOW = (0, 255, 255)  # guest match labels
 _GREY = (150, 150, 150)  # staff (excluded from the guest count, still tracked)
+# Exclusion zones and the faces they ate. Deliberately unlike every colour
+# above — amber/red/green all mean QUALITY verdicts, and a zone exclusion is
+# not a quality verdict: the face may be perfectly good and simply behind a
+# frosted partition. The operator checking their polygon must never confuse
+# "too small" with "in the wrong place".
+_MAGENTA = (255, 0, 255)
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -75,6 +81,43 @@ def draw_tracks(img: np.ndarray, tracks: list[dict]) -> np.ndarray:
     return out
 
 
+def draw_zones(img: np.ndarray, zones: list[dict]) -> np.ndarray:
+    """Exclusion-zone polygons: translucent magenta fill plus a labelled outline.
+
+    The zones are the operator's own drawing (normalized 0..1 vertices, scaled
+    here by the frame's actual size), and this overlay is how they check it:
+    a face flagged as zone-eaten with no visible boundary around it cannot be
+    distinguished from a bug.  Translucent rather than opaque because the
+    operator specifically needs to see what is BEHIND the zone — the frosted
+    partition, the mirror, the TV screen — to judge whether the polygon covers
+    it.
+    """
+    if not zones:
+        return img.copy()
+    h, w = img.shape[:2]
+    overlay = img.copy()
+    polys = []
+    for z in zones:
+        pts = np.array(
+            [[int(round(p[0] * w)), int(round(p[1] * h))] for p in z.get("points", [])],
+            dtype=np.int32,
+        )
+        if len(pts) < 3:
+            continue
+        polys.append((pts, z.get("label")))
+        cv2.fillPoly(overlay, [pts], _MAGENTA)
+    out = cv2.addWeighted(overlay, 0.25, img, 0.75, 0.0)
+    for pts, label in polys:
+        cv2.polylines(out, [pts], isClosed=True, color=_MAGENTA, thickness=2)
+        if label:
+            x, y = int(pts[0][0]), int(pts[0][1])
+            cv2.putText(
+                out, str(label), (x, max(y - 6, 10)), _FONT, 0.5, _MAGENTA, 1,
+                cv2.LINE_AA,
+            )
+    return out
+
+
 def draw_faces(img: np.ndarray, faces: list[dict], min_px: float, canon_px: float) -> np.ndarray:
     """Face boxes coloured by gate verdict; rejected faces say WHY.
 
@@ -84,6 +127,10 @@ def draw_faces(img: np.ndarray, faces: list[dict], min_px: float, canon_px: floa
     box around a guest who was never counted.  Green/amber keep their meaning
     for kept faces: at or below the production canon.
 
+    A face the exclusion-zone filter ate is magenta, matching the zone overlay
+    that ate it, and labelled ``zone`` — it was never gated at all, so neither
+    red nor green would be telling the truth about it.
+
     The verdict is read from ``gateReason`` where the gate stamped one, falling
     back to the width comparison for callers that never ran the gate.
     """
@@ -91,6 +138,9 @@ def draw_faces(img: np.ndarray, faces: list[dict], min_px: float, canon_px: floa
     for f in faces:
         box = f.get("box", {})
         w = float(box.get("w", 0.0))
+        if f.get("excludedByZone"):
+            _rect(out, box, _MAGENTA, f"{w:.0f}px zone")
+            continue
         reason = reported_reason(f, min_px)
         colour = _RED if reason else (_GREEN if w >= canon_px else _AMBER)
         label = f"{w:.0f}px" if reason is None else f"{w:.0f}px {reason}"
@@ -127,6 +177,7 @@ def render(stage: str, img: np.ndarray, last: dict, min_px: float, canon_px: flo
     elif stage == "track":
         img = draw_tracks(img, last.get("tracks", []))
     elif stage == "face-detect":
+        img = draw_zones(img, last.get("zones", []))
         img = draw_faces(img, last.get("faces", []), min_px, canon_px)
     elif stage == "match":
         img = draw_matches(img, last.get("verdicts", []))

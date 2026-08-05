@@ -35,13 +35,21 @@ class V1Fake:
         image_b64="ZmFrZS1qcGVn",
         staff_width=None,
         feedback_items=None,
+        match_script=None,
     ):
-        """Serve n_frames; ``staff_width`` faces come back tagged as staff."""
+        """Serve n_frames; ``staff_width`` faces come back tagged as staff.
+
+        ``match_script`` replays exact verdicts: each /match call pops the
+        next dict and serves it (galleryN filled in), so a test can replay a
+        measured night — cosines and all — instead of the default alternating
+        new/match behaviour.
+        """
         self.n_frames = n_frames
         self.face_widths = face_widths
         self.image_b64 = image_b64
         self.staff_width = staff_width
         self.feedback_items = list(feedback_items or [])
+        self.match_script = list(match_script or [])
         self.frame_i = 0
         self.guest_n = 0
         self.guest_calls = 0
@@ -157,6 +165,11 @@ class V1Fake:
                 200, json={"staffId": body["staffId"], "sampleCount": len(body["samples"])}
             )
         if path == "/match":
+            if self.match_script:
+                v = self.match_script.pop(0)
+                if v.get("isNew"):
+                    self.guest_n += 1
+                return httpx.Response(200, json={"galleryN": self.guest_n, **v})
             q = body["quality"]
             if self.staff_width is not None and body.get("siteId") and q == self.staff_width:
                 return httpx.Response(200, json={
@@ -690,3 +703,240 @@ def test_tap_round_is_abandoned_when_its_budget_is_spent():
     assert fake.taps == [] and fake.frames_posted == []
     assert final["tapRoundsAbandoned"] >= 1
     assert final["state"] == "ended" and final["frames"] == 3  # counting unharmed
+
+
+# -------------------------------------------- track heal (2026-08-06 live bench)
+#
+# Tonight's bench: 3 real people, counted 5. p00002 was minted on a RE-ENTRY
+# frame at cosine 0.3084 (threshold 0.363) and the SAME physical track matched
+# the correct identity p00001 at 0.69 four seconds later. These tests replay
+# that geometry through the scripted fake. The face width is 60 px so the face
+# box centre (42, 61) sits inside the fake's track box — heal bookkeeping only
+# exists for faces a track contains.
+
+
+def scripted_verdict(key, is_new, cosine, staff=False):
+    """One /match reply for the script: the fields the loop actually reads."""
+    return {
+        "personKey": key, "isNew": is_new, "cosine": cosine, "subCanon": False,
+        "isStaff": staff, "staffId": key if staff else None,
+        "templateN": None if staff else 1, "templateAdded": False,
+    }
+
+
+TONIGHT_SCRIPT = [
+    scripted_verdict("p00001", True, None),      # the real guest's first sighting
+    scripted_verdict("p00002", True, 0.3084),    # the junk re-entry mint
+    scripted_verdict("p00001", False, 0.69),     # the same track disowns it
+]
+
+
+def test_track_heal_replays_tonight_and_folds_the_junk_mint():
+    """THE REPLAY: mint at 0.3084, same track matches p00001 at 0.69 — healed.
+
+    The heal must call /merge with onlyIfSingleton (machine evidence gets the
+    guard an operator's does not), step unique back down, count healedSplits,
+    and say so in the end-of-run notes.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00001", "drop": "p00002",
+        "onlyIfSingleton": True,
+    }]
+    assert final["unique"] == 1, "the folded mint must leave the count at truth"
+    assert final["healedSplits"] == 1
+    assert "healedSplits=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["healedSplits"] == 1
+    assert fake.run_ended["results"]["unique"] == 1
+
+
+def test_heal_refusal_changes_nothing_and_is_not_retried():
+    """merged=false (no longer a singleton, or an operator split) counts NOTHING.
+
+    The refusal is the system working: the gallery has evidence the machine
+    does not, so unique stays put, healedSplits stays 0, and the bookkeeping
+    entry is dropped — no second attempt on the next matching verdict.
+    """
+    script = list(TONIGHT_SCRIPT) + [scripted_verdict("p00001", False, 0.69)]
+    fake = V1Fake(n_frames=4, face_widths=(60.0,), match_script=script)
+    fake.merge_ok = False  # the match service refuses the fold
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert len(fake.merges) == 1, "a refused heal must not be retried"
+    assert final["unique"] == 2
+    assert final["healedSplits"] == 0
+    assert "healedSplits=0" in fake.run_ended["notes"]
+
+
+def test_heal_skipped_outside_the_window():
+    """A mint older than HECO_HEAL_WINDOW_S is beyond the heal's evidence.
+
+    The window is what keeps the residual tracker-swap risk short-lived; a
+    cross-key match minutes later says nothing about a mint made minutes ago.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, heal_window_s=1e-9).run()
+    assert fake.merges == []
+    assert final["unique"] == 2
+    assert final["healedSplits"] == 0
+
+
+def test_heal_skipped_below_the_cosine_floor():
+    """0.40 matches (threshold 0.363) but heals nothing (floor 0.45).
+
+    The measured impostor ceiling on this camera is 0.377 — two DIFFERENT
+    men's templates — so a cross-key match at 0.40 is within impostor range
+    and proves nothing about the mint. Counting stays; healing does not.
+    """
+    script = list(TONIGHT_SCRIPT)
+    script[2] = scripted_verdict("p00001", False, 0.40)
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert fake.merges == []
+    assert final["unique"] == 2
+    assert final["healedSplits"] == 0
+
+
+def test_heal_never_fires_into_a_staff_hit():
+    """A track whose later match is STAFF folds nothing (CONTRACTS.md scope).
+
+    Staff templates are operator-supervised evidence; folding a guest mint
+    into the staff store's orbit from track behaviour would shrink the guest
+    count against identities the heal has no business touching.
+    """
+    script = list(TONIGHT_SCRIPT)
+    script[2] = scripted_verdict("st-1", False, 0.69, staff=True)
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert fake.merges == []
+    assert final["unique"] == 2
+    assert final["healedSplits"] == 0
+
+
+# ------------------------------------------ exclusion zones (2026-08-06 bench)
+#
+# Tonight's p00004 was minted from an 87 px face seen THROUGH A FROSTED GLASS
+# PARTITION — inside an office, not at the gate, 0.3203 against its true
+# owner. No quality floor rejects a face for being in the wrong PLACE; the
+# operator draws polygons and the loop drops faces whose box centre falls
+# inside. The fake's frame is 160x120; the 60 px face centres at (42, 61) =
+# normalized (0.263, 0.508) and the 85 px face at (54.5, 77.25) = (0.341,
+# 0.644), so a zone over x in [0.20, 0.32] eats exactly the first.
+
+FROSTED_ZONE = {
+    "label": "frosted partition",
+    "points": [[0.20, 0.0], [0.32, 0.0], [0.32, 1.0], [0.20, 1.0]],
+}
+
+
+def test_zone_excluded_face_never_reaches_match_but_stays_visible():
+    """End to end: the zone face is dropped pre-gate, counted, and tapped.
+
+    Both faces pass the quality gate; only the one whose centre is outside
+    the polygon may be matched. The excluded one must still appear in the
+    face-detect tap flagged excludedByZone — the operator has to be able to
+    see what their polygon is eating.
+    """
+    fake = V1Fake(n_frames=2, face_widths=(60.0, 85.0))
+    request = {
+        "eventId": "ev-1", "source": {"path": "/x.mp4"},
+        "exclusionZones": [FROSTED_ZONE],
+    }
+    final = make_loop(fake, request, tap_interval_s=0.0).run()
+
+    assert final["matches"] == 2, "only the outside face may be matched (1/frame)"
+    assert fake.guest_calls == 2
+    assert final["excludedByZone"] == 2  # the 60 px face, both frames
+    assert final["zoneUnmeasured"] == 0
+    assert "excludedByZone=2" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["excludedByZone"] == 2
+
+    face_taps = [t["payload"] for t in fake.taps if t["stage"] == "face-detect"]
+    assert face_taps, "the face-detect tap must still go up"
+    rows = face_taps[-1]["faces"]
+    flagged = [r for r in rows if r.get("excludedByZone")]
+    assert len(flagged) == 1, "the eaten face must stay VISIBLE in the tap"
+    assert flagged[0]["widthPx"] == 60.0
+    assert flagged[0]["zone"] == "frosted partition"
+    assert face_taps[-1]["excludedByZone"] == 1
+    assert face_taps[-1]["kept"] == 1
+
+
+def test_zone_with_no_frame_dims_excludes_nothing_and_says_so():
+    """A dims-less frame cannot scale the polygons: no exclusion, honest counter.
+
+    Mirrors the gatedUnmeasured pattern — a filter that guessed at geometry
+    would silently cost guests; a filter that reports it could not run can be
+    fixed. Every face that passed untested is counted in zoneUnmeasured.
+    """
+
+    class DimlessFrames(V1Fake):
+        """Frames with no w/h metadata (an ingest build that predates them)."""
+
+        def handler(self, request):
+            if request.url.host == "ingest" and request.url.path == "/frame":
+                self.calls.append("ingest /frame")
+                i = min(self.frame_i, self.n_frames - 1)
+                exhausted = self.frame_i >= self.n_frames
+                if not exhausted:
+                    self.frame_i += 1
+                return httpx.Response(200, json={
+                    "imageB64": self.image_b64, "tMs": i * 100,
+                    "seq": i, "ended": exhausted,
+                })
+            return super().handler(request)
+
+    fake = DimlessFrames(n_frames=2, face_widths=(60.0,))
+    request = {
+        "eventId": "ev-1", "source": {"path": "/x.mp4"},
+        "exclusionZones": [FROSTED_ZONE],
+    }
+    final = make_loop(fake, request).run()
+
+    assert final["excludedByZone"] == 0
+    assert final["zoneUnmeasured"] == 2  # one untested face per frame
+    assert final["matches"] == 2, "an untestable zone must not cost a guest"
+
+
+def test_no_zones_means_no_zone_accounting():
+    """Without zones both counters stay zero — the filter is genuinely absent."""
+    fake = V1Fake(n_frames=2, face_widths=(60.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert final["excludedByZone"] == 0
+    assert final["zoneUnmeasured"] == 0
+
+
+def test_runs_rejects_malformed_zones_with_a_readable_422():
+    """The API edge is where zone shapes are policed, so the loop never is.
+
+    A polygon of two points, a coordinate outside 0..1 (pixels where the
+    contract says normalized), or a point that is not [x, y] must all be
+    refused before a run starts — a zone that silently failed to arm would
+    re-admit the frosted partition without anyone knowing.
+    """
+    from app.main import app as runner_app
+    from fastapi.testclient import TestClient
+
+    client = TestClient(runner_app)
+    base = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+
+    two_points = {"label": "z", "points": [[0.1, 0.1], [0.9, 0.9]]}
+    r = client.post("/runs", json={**base, "exclusionZones": [two_points]})
+    assert r.status_code == 422
+
+    pixels = {"label": "z", "points": [[0, 0], [160, 0], [160, 120]]}
+    r = client.post("/runs", json={**base, "exclusionZones": [pixels]})
+    assert r.status_code == 422
+    assert "normalized" in r.text, "the refusal must say what the contract wants"
+
+    not_a_pair = {"label": "z", "points": [[0.1], [0.9, 0.1], [0.5, 0.9]]}
+    r = client.post("/runs", json={**base, "exclusionZones": [not_a_pair]})
+    assert r.status_code == 422

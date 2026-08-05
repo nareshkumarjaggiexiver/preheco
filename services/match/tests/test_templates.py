@@ -814,3 +814,86 @@ def test_max_redundancy_needs_two_views(tmp_path):
         assert s.max_redundancy("p00001") is None
         s.add("p00001", arc(2, 30.0)[1], quality=70.0)
         assert s.max_redundancy("p00001") == pytest.approx(0.866, abs=1e-3)
+
+
+# ------------------------- /merge onlyIfSingleton (the track heal's guard rail)
+
+
+def _merge(client, run_id: str, keep: str, drop: str, **extra) -> dict:
+    """POST /merge and return its body; extra kwargs ride into the JSON."""
+    res = client.post(
+        "/merge", json={"runId": run_id, "keep": keep, "drop": drop, **extra}
+    )
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
+def test_only_if_singleton_folds_a_one_template_mint(client):
+    """The heal's happy path: a junk mint still holding ONE template folds.
+
+    Tonight's p00002 was minted on a re-entry frame at cosine 0.3084 and the
+    same track matched p00001 at 0.69 four seconds later; nothing had touched
+    the mint in between, so it was still a singleton and safely foldable.
+    """
+    a, b, _ = tonight_views()
+    first = _match(client, "run-heal", a)
+    junk = _match(client, "run-heal", b)  # cosine 0.347 vs a: a genuine miss, new key
+    assert junk["isNew"] is True and junk["templateN"] == 1
+
+    out = _merge(
+        client, "run-heal", first["personKey"], junk["personKey"], onlyIfSingleton=True
+    )
+    assert out == {"merged": True, "galleryN": 1}
+
+
+def test_only_if_singleton_refuses_a_re_sighted_key(client, tmp_path):
+    """A drop key that has accumulated a second view is no longer foldable.
+
+    More templates means the gallery independently re-sighted this identity
+    after the mint — the machine's "junk mint" theory has been contradicted by
+    evidence, and the merge must be refused with nothing changed.
+    """
+    views = arc(3, 35.0)
+    _match(client, "run-heal2", pose(150.0))  # p00001, the would-be keeper
+    grown = _walk(client, "run-heal2", views)  # p00002 accumulates 3 views
+    assert grown[0]["personKey"] == "p00002"
+    assert grown[-1]["templateN"] == 3
+
+    out = _merge(client, "run-heal2", "p00001", "p00002", onlyIfSingleton=True)
+    assert out == {"merged": False, "galleryN": 2}
+    assert len(_templates(tmp_path, "run-heal2", "p00002")) == 3, (
+        "a refused merge must leave the drop key's templates untouched"
+    )
+
+
+def test_without_the_flag_a_multi_template_merge_still_works(client):
+    """The operator flow is unchanged: no flag, no singleton requirement.
+
+    An operator merging a guest who has accumulated views is the ORIGINAL
+    /merge contract, and the heal's guard must not tighten it.
+    """
+    _match(client, "run-heal3", pose(150.0))  # p00001
+    _walk(client, "run-heal3", arc(3, 35.0))  # p00002, 3 views
+    out = _merge(client, "run-heal3", "p00001", "p00002")
+    assert out == {"merged": True, "galleryN": 1}
+
+
+def test_only_if_singleton_still_respects_cannot_link(client):
+    """An operator's split beats the heal even when the drop is a singleton.
+
+    The operator looked at two faces and said "different people"; the heal
+    inferred the opposite from track behaviour. Human evidence wins, and the
+    heal counts the refusal as the system working.
+    """
+    a = _match(client, "run-heal4", pose(0.0))
+    b = _match(client, "run-heal4", pose(150.0))
+    split = client.post(
+        "/split",
+        json={"runId": "run-heal4", "a": a["personKey"], "b": b["personKey"]},
+    )
+    assert split.status_code == 200
+
+    out = _merge(
+        client, "run-heal4", a["personKey"], b["personKey"], onlyIfSingleton=True
+    )
+    assert out == {"merged": False, "galleryN": 2}

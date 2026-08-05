@@ -1,8 +1,11 @@
 """The run loop: one thread driving the whole pipeline for one run.
 
 COUNT MODE — per frame: ingest /frame -> persons /detect -> tracker /track ->
-faces /detect (within the tracked boxes) -> local quality gate -> embed /embed
--> match /match per face -> unique count.  Every stage is timed; aggregates and
+faces /detect (within the tracked boxes) -> exclusion zones (operator-drawn
+no-count polygons; see :meth:`RunLoop._apply_zones`) -> local quality gate ->
+embed /embed -> match /match per face -> unique count, with the TRACK HEAL
+(:meth:`RunLoop._maybe_heal`) folding back a mint the same track disowns
+moments later.  Every stage is timed; aggregates and
 sampled raw rows flush to the planner every ``flush_interval_s`` seconds.  On
 top of that (CONTRACTS.md v1): annotated debug frames + structured taps go up
 every ``tap_interval_s``, and operator feedback is polled every
@@ -46,7 +49,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 import httpx
-from heco_common.geometry import dedupe_boxes
+from heco_common.geometry import dedupe_boxes, point_in_polygon
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
@@ -190,6 +193,15 @@ class RunLoop:
         # personKey -> how many templates that identity last reported holding.
         # Guarded by _lock, like _status, because the settle path reads it.
         self._template_n: dict[str, int] = {}
+        # Operator-drawn no-count polygons, validated at the API edge
+        # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
+        self.zones: list[dict] = list(request.get("exclusionZones") or [])
+        # TRACK-HEAL bookkeeping: track_id -> {key, cosine, at} recorded when a
+        # verdict on that track minted a NEW identity (isNew=true).  Guarded by
+        # _lock like _template_n.  Entries older than heal_window_s are pruned
+        # on every mint, so the dict is bounded by the tracks active within one
+        # window, not by the night's traffic.
+        self._minted: dict[int, dict] = {}
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
@@ -230,6 +242,20 @@ class RunLoop:
             "templatesEnrolled": 0,
             "singleTemplateGuests": 0,
             "templateNMax": 0,
+            # TRACK HEAL: mints this run folded back after the same track
+            # matched a different existing identity comfortably (see
+            # _maybe_heal).  Each one is a guest the delivered number would
+            # otherwise have over-counted by exactly one.
+            "healedSplits": 0,
+            # EXCLUSION ZONES.  excludedByZone counts faces whose box centre
+            # fell inside an operator-drawn no-count polygon — dropped before
+            # the gate, so they are never embedded or matched, but kept
+            # visible in the face-detect tap so the operator can see what the
+            # zone is eating.  zoneUnmeasured mirrors the gatedUnmeasured
+            # honesty pattern: faces that passed ARMED zones untested because
+            # the frame carried no dimensions to scale the polygons by.
+            "excludedByZone": 0,
+            "zoneUnmeasured": 0,
             "feedbackApplied": 0,
             "feedbackRejected": 0,
             "manualAdditions": 0,
@@ -472,6 +498,11 @@ class RunLoop:
             # pre-M1 and the split identities are NOT a threshold problem.
             f"singleTemplateGuests={st['singleTemplateGuests']}/{st['unique']} "
             f"templatesEnrolled={st['templatesEnrolled']} "
+            # Two corrections the loop applied ITSELF, so a report reading
+            # `unique` months later can see how much of the number the heal
+            # and the operator's zones shaped (CONTRACTS.md heal + zones).
+            f"healedSplits={st['healedSplits']} "
+            f"excludedByZone={st['excludedByZone']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. If the camera merely blinked, this run's
@@ -490,6 +521,8 @@ class RunLoop:
             "manualAdditions": st["manualAdditions"],
             "frames": frames,
             "matches": st["matches"],
+            "healedSplits": st["healedSplits"],
+            "excludedByZone": st["excludedByZone"],
         }
         try:
             self.planner.end_run(
@@ -640,13 +673,19 @@ class RunLoop:
                     sample[metric] = float(f[key])
             samples.add("face-detect", t_ms, sample)
 
+        # EXCLUSION ZONES — before the gate, so an excluded face is never
+        # gated, embedded or matched.  The face stays in `faces` (stamped
+        # excludedByZone) so the taps and the annotated frame can show the
+        # operator exactly what their polygon is eating.
+        countable = self._apply_zones(faces, frame)
+
         # QUALITY GATE (local) — the pipeline's only irreversible discard.
         # Width floor 56 px as always; the IED / frontality / sharpness floors
         # ride alongside it and are unarmed by default (see app/gate.py), so
         # this is today's behaviour until an operator opts in.  Every face is
         # stamped with WHY it was rejected, for the taps and the overlay.
         tq = time.perf_counter()
-        outcome = gate.gate_faces(faces, self.gate)
+        outcome = gate.gate_faces(countable, self.gate)
         kept = outcome.kept
         board.frame("quality")
         board.observe("quality", "qualityMs", (time.perf_counter() - tq) * 1000.0)
@@ -718,6 +757,11 @@ class RunLoop:
                 }
             )
             if m.get("isStaff"):
+                # A staff hit never records a mint and never heals INTO staff:
+                # the staff store is operator-supervised evidence, and folding
+                # a guest key into it from track behaviour would silently
+                # shrink the guest count against the strongest identities in
+                # the system (CONTRACTS.md heal scope).
                 self._count_staff(m)
                 continue
             with self._lock:
@@ -733,6 +777,15 @@ class RunLoop:
                 if m.get("templateAdded"):
                     st["templatesEnrolled"] += 1
                 self._note_templates(m.get("personKey"), m.get("templateN"))
+            # TRACK HEAL bookkeeping: only verdicts that can be pinned to a
+            # track participate (no containing track = no heal for this one).
+            track_id = self._track_for(face, tracks)
+            if track_id is None:
+                continue
+            if m.get("isNew"):
+                self._record_mint(track_id, m)
+            else:
+                self._maybe_heal(planner_run_id, track_id, m)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
@@ -762,6 +815,211 @@ class RunLoop:
                 if key:
                     self._status[key] += n
             self._status["gatedUnmeasured"] += outcome.unmeasured
+
+    # ------------------------------------------------ exclusion zones + heal
+
+    def _apply_zones(self, faces: list, frame: dict) -> list:
+        """Drop faces whose box CENTRE falls inside an operator-drawn zone.
+
+        Returns the faces that remain countable; excluded ones are stamped
+        ``excludedByZone`` in place and stay in the caller's list, because the
+        operator must be able to SEE what their polygon is eating (in the tap
+        and on the annotated frame) — an invisible filter on an invoice figure
+        is not correctable.
+
+        Why zones exist at all: the live bench minted p00004 from an 87 px
+        face seen THROUGH A FROSTED GLASS PARTITION — someone inside an
+        office, not at the gate, scoring 0.3203 against their true owner.  No
+        quality floor can reject a face for being in the wrong PLACE; only the
+        operator knows where the partitions, mirrors and TV screens are, so
+        they draw them and the loop enforces them here, before the gate, so an
+        excluded face is never embedded or matched.
+
+        The centre rule is deliberate: a box straddling a zone edge counts by
+        where its middle is, so a real guest walking PAST a partition (box
+        clipping the zone) is still counted while a face BEHIND it (centre
+        inside) is not.
+
+        Honesty when it cannot run: zone points are normalized 0..1 and need
+        the frame's pixel dimensions to scale by.  A frame that carries none
+        gets NO exclusion — under-counting is the dominant failure mode, and a
+        filter guessing at geometry is worse than a filter reporting it could
+        not run — and every face that passed untested is counted in
+        ``zoneUnmeasured``, mirroring the ``gatedUnmeasured`` pattern.
+        """
+        if not self.zones or not faces:
+            return faces
+        w = frame.get("w")
+        h = frame.get("h")
+        if not w or not h:
+            self._bump("zoneUnmeasured", len(faces))
+            return faces
+        w, h = float(w), float(h)
+        countable: list = []
+        excluded = 0
+        for f in faces:
+            box = f.get("box", {})
+            cx = float(box.get("x", 0.0)) + float(box.get("w", 0.0)) / 2.0
+            cy = float(box.get("y", 0.0)) + float(box.get("h", 0.0)) / 2.0
+            hit = next(
+                (
+                    z
+                    for z in self.zones
+                    if point_in_polygon(
+                        cx, cy, [[p[0] * w, p[1] * h] for p in z["points"]]
+                    )
+                ),
+                None,
+            )
+            if hit is None:
+                countable.append(f)
+            else:
+                f["excludedByZone"] = True
+                f["excludedZone"] = hit.get("label")
+                excluded += 1
+        if excluded:
+            self._bump("excludedByZone", excluded)
+        return countable
+
+    @staticmethod
+    def _track_for(face: dict, tracks: list) -> int | None:
+        """The track a face belongs to: box centre inside the track box.
+
+        Ties (overlapping tracks both containing the centre) go to the track
+        whose box CENTRE is nearest the face centre.  None when no track
+        contains it — a face with no track cannot carry heal bookkeeping,
+        because "the SAME track matched someone else" is the entire evidence
+        the heal acts on.
+        """
+        box = face.get("box") or {}
+        cx = float(box.get("x", 0.0)) + float(box.get("w", 0.0)) / 2.0
+        cy = float(box.get("y", 0.0)) + float(box.get("h", 0.0)) / 2.0
+        best_id: int | None = None
+        best_d = 0.0
+        for t in tracks:
+            tb = t.get("box") or {}
+            tx, ty = float(tb.get("x", 0.0)), float(tb.get("y", 0.0))
+            tw, th = float(tb.get("w", 0.0)), float(tb.get("h", 0.0))
+            if not (tx <= cx <= tx + tw and ty <= cy <= ty + th):
+                continue
+            d = (tx + tw / 2.0 - cx) ** 2 + (ty + th / 2.0 - cy) ** 2
+            if best_id is None or d < best_d:
+                best_id, best_d = t.get("id"), d
+        return best_id
+
+    def _record_mint(self, track_id: int, verdict: dict) -> None:
+        """Remember that this track just minted a new identity (heal evidence).
+
+        Expired entries are pruned here — the only growth point — so the
+        bookkeeping is bounded by the tracks active within one heal window.
+        """
+        if self.s.heal_window_s <= 0:
+            return  # healing disabled: record nothing rather than leak
+        now = time.monotonic()
+        with self._lock:
+            for tid in [
+                t for t, e in self._minted.items()
+                if now - e["at"] > self.s.heal_window_s
+            ]:
+                del self._minted[tid]
+            self._minted[track_id] = {
+                "key": verdict.get("personKey"),
+                "cosine": verdict.get("cosine"),
+                "at": now,
+            }
+
+    def _maybe_heal(self, planner_run_id: str, track_id: int, verdict: dict) -> None:
+        """Fold a junk mint back when its own track disowns it (TRACK HEAL).
+
+        The failure this kills, measured live: the bench (3 real people,
+        counted 5) minted p00002 on a re-entry frame at cosine 0.3084 — below
+        the 0.363 threshold, so a fresh key — and the SAME physical track
+        matched the correct identity p00001 at 0.69 four seconds later.  The
+        evidence that the mint was junk arrived almost immediately, and
+        nothing acted on it.  This does: when a track that recently minted a
+        new identity later matches a DIFFERENT existing identity comfortably
+        (cosine >= heal_min_cosine, within heal_window_s of the mint), the
+        mint is folded into the matched identity via ``POST /merge`` with
+        ``onlyIfSingleton: true`` and the unique count steps back down.
+
+        The guards, each load-bearing:
+
+        * ``onlyIfSingleton`` — the match service refuses (inside its own
+          transaction) if the mint has accumulated a second template, because
+          that means the gallery independently re-sighted it and the "junk"
+          theory is contradicted.  A ``merged=false`` (that, or an operator's
+          cannot-link split) drops the bookkeeping and counts NOTHING — the
+          refusal is the system working, not an error.
+        * the 0.45 cosine floor — above the 0.377 measured impostor ceiling
+          on this camera with margin (tonight's heal evidence was 0.69), so a
+          heal can only ride evidence stronger than any impostor pair we have
+          seen.  Same-person misses measured 0.294/0.308/0.361, i.e. the
+          impostor and genuine distributions OVERLAP and no match-threshold
+          value separates them — which is exactly why this is a heal on later
+          evidence and not a threshold tweak.
+        * the 20 s window and staff exemption (staff verdicts never reach
+          here — see the verdict loop).
+
+        KNOWN RESIDUAL RISK, documented rather than solved (CONTRACTS.md): a
+        tracker identity swap — two people crossing paths — can hand a track
+        from person A to person B.  If A's mint is still a singleton inside
+        the window and B matches at >= 0.45, the heal folds A into B: an
+        under-count of one.  The guards above bound how often that can happen
+        (singleton-only, 20 s, 0.45 floor, cannot_link respected); the hard
+        fix is track-quality gating and is out of scope tonight.  The reverse
+        ordering (track matches Y first, mints X later) is deliberately NOT
+        healed — the mint came after the evidence, so the evidence says
+        nothing about it.
+        """
+        if self.s.heal_window_s <= 0:
+            return
+        with self._lock:
+            entry = self._minted.get(track_id)
+        if entry is None:
+            return
+        now = time.monotonic()
+        if now - entry["at"] > self.s.heal_window_s:
+            with self._lock:
+                self._minted.pop(track_id, None)
+            return
+        matched_key = verdict.get("personKey")
+        minted_key = entry["key"]
+        if not matched_key or not minted_key or matched_key == minted_key:
+            return  # the track still resolves to its own mint — nothing to heal
+        cosine = verdict.get("cosine")
+        if cosine is None or float(cosine) < self.s.heal_min_cosine:
+            return  # not comfortable enough to outrank the impostor ceiling
+        try:
+            r = self._post(
+                f"{self.s.match_url}/merge",
+                {
+                    "runId": planner_run_id,
+                    "keep": matched_key,
+                    "drop": minted_key,
+                    "onlyIfSingleton": True,
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — a heal must never stop the count
+            # Transient (match hiccup): keep the bookkeeping; the next verdict
+            # on this track retries while the window lasts.
+            self.log.warning(f"heal attempt failed, will retry in-window: {e}")
+            return
+        with self._lock:
+            self._minted.pop(track_id, None)
+        if r.get("merged"):
+            self._dec_unique()
+            self._bump("healedSplits")
+            self.log.info(
+                f"healed split: track {track_id} minted {minted_key} "
+                f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
+                f"(cosine={_fmt(cosine)}) — mint folded, unique -1"
+            )
+        else:
+            self.log.info(
+                f"heal refused for track {track_id}: {minted_key} is no longer "
+                f"a singleton or is split from {matched_key} — count unchanged, "
+                "which is the refusal doing its job"
+            )
 
     def _note_templates(self, person_key: object, template_n: object) -> None:
         """Track how many views each guest holds, and summarise it in the status.
@@ -817,7 +1075,13 @@ class RunLoop:
         faces: list,
         verdicts: list,
     ) -> None:
-        """Store the last frame's outputs so a debug tap can render them."""
+        """Store the last frame's outputs so a debug tap can render them.
+
+        ``zones`` rides along so the annotated face-detect frame can draw the
+        exclusion polygons the excluded faces were dropped by — a flag with no
+        visible boundary would leave the operator unable to check their own
+        drawing.
+        """
         self._last = {
             "image_b64": image_b64,
             "seq": seq,
@@ -826,6 +1090,7 @@ class RunLoop:
             "tracks": tracks,
             "faces": faces,
             "verdicts": verdicts,
+            "zones": self.zones,
         }
 
     def _count_stage(self) -> None:
@@ -1286,6 +1551,11 @@ class RunLoop:
         except Exception:  # noqa: BLE001 — reporting must never stop counting
             self._bump("plannerReportErrors")
         self._set(samplesDropped=self.samples.dropped)
+
+
+def _fmt(x) -> str:
+    """A cosine for a log line; None-safe (a gallery's first mint has none)."""
+    return "none" if x is None else f"{float(x):.4f}"
 
 
 def _detail(response: httpx.Response) -> str:

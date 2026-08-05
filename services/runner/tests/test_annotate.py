@@ -98,3 +98,48 @@ def test_render_unknown_stage_falls_back_to_raw_frame():
     """An unexpected stage name never raises inside the best-effort loop."""
     data = annotate.render("count", _blank(), {}, 56.0, 80.0)
     assert data[:2] == b"\xff\xd8"
+
+
+def test_draw_zones_scales_normalized_points_and_labels():
+    """Zones draw from normalized 0..1 vertices scaled by the frame size.
+
+    The fill is translucent (the operator must see the partition BEHIND the
+    zone to judge their own drawing), so pixels inside the polygon are dim
+    magenta and pixels far outside stay black.
+    """
+    img = _blank(h=240, w=320)
+    zones = [{"label": "mirror", "points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]]}]
+    out = annotate.draw_zones(img, zones)
+    assert not img.any(), "drawn on a copy"
+    inside = out[60, 80]  # (0.25, 0.25) of the frame — inside the zone
+    assert inside[0] > 0 and inside[2] > 0, "translucent magenta fill (B and R)"
+    assert inside[1] == 0
+    assert not out[230, 310].any(), "far corner untouched"
+    assert not annotate.draw_zones(img, []).any(), "no zones: an untouched copy"
+
+
+def test_draw_faces_marks_a_zone_eaten_face_in_magenta():
+    """A zone-excluded face is neither red (gated) nor green (kept).
+
+    It may be a perfectly good face in the wrong PLACE — behind the frosted
+    partition the zone was drawn for — so it borrows the zone's own colour.
+    """
+    img = _blank()
+    box = {"x": 10, "y": 10, "w": 90, "h": 110}  # canon-wide: green if kept
+    out = annotate.draw_faces(
+        img, [{"box": box, "excludedByZone": True}], min_px=56.0, canon_px=80.0
+    )
+    px = out.reshape(-1, 3)[out.reshape(-1, 3).any(axis=1)]
+    assert (px[:, 0] > 0).any() and (px[:, 2] > 0).any(), "magenta: blue + red"
+    assert (px[:, 1] == 0).all(), "no green anywhere — this face was not kept"
+
+
+def test_render_face_detect_draws_zones_from_the_snapshot():
+    """The face-detect overlay carries the zone polygons the loop recorded."""
+    img = _blank()
+    last = {
+        "faces": [],
+        "zones": [{"label": "tv", "points": [[0.1, 0.1], [0.4, 0.1], [0.4, 0.4]]}],
+    }
+    data = annotate.render("face-detect", img, last, 56.0, 80.0)
+    assert data[:2] == b"\xff\xd8"

@@ -33,7 +33,7 @@ evidence (project hard rule: measure first).
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
 | POST | `/match` | `{runId, embedding, quality?, siteId?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
-| POST | `/merge` | `{runId, keep, drop}` | `{merged, galleryN}` — *duplicate* correction |
+| POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
@@ -61,6 +61,15 @@ says whether this sighting became one of them.
   are the only record of who that person is, so removing them with nowhere to
   put them destroys them and the person is counted as a brand-new guest at
   their next crossing — the correction silently undoing itself.
+- **`/merge` with `onlyIfSingleton: true` refuses unless `drop` holds exactly
+  one template**, checked inside the transaction (a template can be enrolled
+  between the caller's decision and the merge landing). The flag exists for
+  the runner's TRACK HEAL (CONTRACTS.md 2026-08-06): there the caller
+  asserting "this key is a junk mint" is a machine, and a machine's evidence
+  is weaker than an operator's — a drop key that has accumulated more views
+  has been independently re-sighted and is no longer safely foldable by
+  heuristic. Operator merges omit the flag and behave exactly as before; a
+  cannot-link split refuses the merge either way.
 - **`/count/manual` is the only lever that moves the count UP.** Under-counting
   is the dominant failure mode (open-set 1:N at a 1:1 verification threshold),
   so a *missed* correction mints an `m#####` person with NO embedding: counted,
@@ -159,7 +168,10 @@ persistence), the staff whitelist (enrol → staff-first match, exclusion from t
 guest count, mark-staff), the original match/reset/sub-canon behaviour, and
 `tests/test_templates.py` — multi-template, built on tonight's exact corridor
 geometry (Cholesky of the measured Gram matrix, so the cosines are the
-measurement rather than an approximation of it).
+measurement rather than an approximation of it), plus the `/merge
+onlyIfSingleton` guard: a singleton mint folds, a re-sighted key refuses with
+its templates untouched, the flag-less operator flow is unchanged, and a
+cannot-link split still wins.
 
 ## Tune
 

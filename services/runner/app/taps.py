@@ -80,12 +80,19 @@ _SIGNALS = ("iedPx", "frontality", "sharpness")
 def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
     """Face-detector output with the gate verdict that decides embedding.
 
-    ``kept`` are the faces that will be embedded; ``gated`` are the rest — the
-    ones the quality gate dropped before the expensive embed stage, which is
-    also where a guest stops being countable.  ``gatedBy`` breaks that number
-    down by reason and each row carries its own ``gate`` label, because "12
-    faces dropped" is not something an operator can act on and "9 for width, 3
-    for frontality" is.
+    ``kept`` are the faces that will be embedded; ``gated`` are the ones the
+    quality gate dropped before the expensive embed stage, which is also where
+    a guest stops being countable.  ``gatedBy`` breaks that number down by
+    reason and each row carries its own ``gate`` label, because "12 faces
+    dropped" is not something an operator can act on and "9 for width, 3 for
+    frontality" is.
+
+    Faces stamped ``excludedByZone`` (the loop's exclusion-zone filter, which
+    runs BEFORE the gate) are neither kept nor gated: they are reported in
+    their own ``excludedByZone`` count and their rows carry the flag, because
+    the operator who drew the polygon must be able to see every face it is
+    eating — an exclusion zone that hides its victims cannot be checked
+    against the frosted partition it was drawn for.
 
     The verdict is READ from the face (``gateReason``, stamped by app/gate.py),
     never recomputed here.  A second implementation of the gate in the
@@ -96,9 +103,28 @@ def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
     """
     rows = []
     kept = 0
+    excluded = 0
     gated_by: dict[str, int] = {}
     for f in faces:
         w = float(f.get("box", {}).get("w", 0.0))
+        if f.get("excludedByZone"):
+            excluded += 1
+            if len(rows) < ROW_CAP:
+                rows.append(
+                    {
+                        "box": _box(f.get("box", {})),
+                        "widthPx": _r(w),
+                        "quality": quality_band(w, min_px, canon_px),
+                        "conf": _r(f.get("conf"), 3),
+                        # Never gated (the zone filter runs first), so there is
+                        # no gate verdict to read — the zone label says WHICH
+                        # polygon ate it instead.
+                        "gate": "zone",
+                        "excludedByZone": True,
+                        "zone": f.get("excludedZone"),
+                    }
+                )
+            continue
         reason = reported_reason(f, min_px)
         if reason is None:
             kept += 1
@@ -121,7 +147,8 @@ def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
     return {
         "count": len(faces),
         "kept": kept,
-        "gated": len(faces) - kept,
+        "gated": len(faces) - kept - excluded,
+        "excludedByZone": excluded,
         "gatedBy": gated_by,
         "faces": rows,
     }

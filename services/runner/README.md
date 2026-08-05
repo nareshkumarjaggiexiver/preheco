@@ -3,12 +3,13 @@
 **What.** Owns the run lifecycle. In **count mode** it creates the planner-side
 run record (`heco_common.planner.PlannerClient`), resets the match gallery and
 tracker state, claims the source on ingest, then drives the loop —
-`frame → persons → tracker → faces (within tracked boxes) → quality gate →
-embed → match → unique count` — timing every stage. Aggregates
+`frame → persons → tracker → faces (within tracked boxes) → exclusion zones →
+quality gate → embed → match → unique count` — timing every stage. Aggregates
 (count/min/mean/max) and sampled raw rows are POSTed to the site-planner every
 2 s; the run releases its downstream state (camera, tracker, gallery) and ends
 with a `PUT … {status: ended, notes}` carrying the unique count, frame count,
-staff crossings, staff face-frames, manual additions and sub-canon share.
+staff crossings, staff face-frames, manual additions, healed splits,
+zone-excluded faces and sub-canon share.
 
 **The count is the product; reporting is secondary.** No planner call made from
 the frame loop can fail a run or stall it for long: errors are swallowed AND
@@ -33,6 +34,36 @@ off an invoice. A signal that could not be measured never rejects a face — it
 is counted as `gatedUnmeasured` instead. Every rejection carries the reason
 that caused it (`gateReason`) into the tap payload, the annotated frame and the
 run status, so the console can say *which* floor dropped a face.
+
+## v2: the track heal and exclusion zones
+
+The live bench (3 real people, counted 5) produced two phantom guests no
+threshold can fix — the measured impostor ceiling on this camera is 0.377
+while same-person misses measured 0.294/0.308/0.361, so the distributions
+overlap and `HECO_MATCH_THRESHOLD` stays at 0.363. Both fixes act on evidence
+a threshold cannot see (CONTRACTS.md "the track heal and exclusion zones"):
+
+- **Track heal.** Tonight's p00002 was minted on a re-entry frame at cosine
+  0.3084, and the SAME track matched the correct identity p00001 at 0.69 four
+  seconds later. When a track that recently minted a new identity later
+  matches a DIFFERENT existing identity at ≥ `HECO_HEAL_MIN_COSINE` within
+  `HECO_HEAL_WINDOW_S`, the loop folds the mint back via
+  `POST /merge {…, onlyIfSingleton: true}` — unique −1, `healedSplits` +1. A
+  refusal (the mint grew a second template, or an operator split the pair)
+  counts nothing and is the system working. **Residual risk, documented in
+  the loop and CONTRACTS.md:** a tracker identity swap inside the window can
+  fold a real person into the one they crossed paths with — an under-count
+  the guards bound but do not eliminate. Staff hits never heal; the reverse
+  ordering (match first, mint later) never heals.
+- **Exclusion zones.** Tonight's p00004 was an 87 px face seen through a
+  frosted glass partition — a real face in the wrong PLACE. The operator draws
+  polygons in the planner (normalized 0..1, forwarded by the control proxy as
+  `exclusionZones` on `POST /runs`); the loop drops any face whose box centre
+  falls inside one, BEFORE the gate, so it is never embedded or matched.
+  Excluded faces stay visible — counted in `excludedByZone`, flagged in the
+  face-detect tap, drawn magenta inside the translucent zone overlay — and a
+  frame with no dimensions to scale the polygons by excludes nothing and
+  counts `zoneUnmeasured` instead (the `gatedUnmeasured` honesty pattern).
 
 ## v1: staff, taps, feedback, enrol
 
@@ -87,8 +118,8 @@ run status, so the console can say *which* floor dropped a face.
 | method | path | body | returns |
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
-| POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?}` | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
+| POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -120,7 +151,12 @@ merge/split/mark-staff application, the enrol walk-through), and the v2
 regressions: a planner outage never failing a run, run-state release, capture
 slot conflicts, staff-crossing debounce, feedback status truthfulness, the
 `missed` +1 lever, single-subject enrolment, and the tap budget — all offline.
-The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
+The track heal replays tonight's measured bench (mint at 0.3084, same track at
+0.69 → folded; plus refusal, window, cosine-floor and staff-skip cases) and
+the exclusion zones run end to end (a zoned face never reaches `/match` but
+stays visible in the tap; a dims-less frame counts `zoneUnmeasured`; malformed
+zones 422 at `POST /runs`). The pure helpers (`taps`, `annotate`, `feedback`)
+are unit-tested directly.
 
 ## Tune
 
@@ -142,6 +178,8 @@ The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
 | `HECO_REPORT_TIMEOUT_S` | `2.0` | Best-effort planner calls (taps, frames, feedback) — bounds the stall a wedged planner can cause |
 | `HECO_TAP_BUDGET_S` | `3.0` | Ceiling for ONE tap round (5 payloads + 5 JPEGs); the rest is dropped |
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
+| `HECO_HEAL_WINDOW_S` | `20.0` | How long after a mint the same track's later match may fold it; `0` disables healing |
+| `HECO_HEAL_MIN_COSINE` | `0.45` | Heal evidence floor — above the 0.377 measured impostor ceiling with margin (tonight's heal evidence was 0.69); a cross-key match below it heals nothing |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |

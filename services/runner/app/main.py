@@ -3,7 +3,8 @@
 Endpoints (CONTRACTS.md):
     GET  /health          -> {ok, model, version}
     POST /runs            {eventId, placementId?, source:{url|path}, plannerUrl?,
-                           label?, mode?:'count'|'enrol', siteId?, staffId?}
+                           label?, mode?:'count'|'enrol', siteId?, staffId?,
+                           exclusionZones?:[{label, points:[[x,y],...]}]}
     GET  /runs/{runId}    -> live local status
     POST /runs/{runId}/stop
 
@@ -15,7 +16,7 @@ staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from . import config
 from .runs import RunManager
@@ -44,12 +45,47 @@ class Source(BaseModel):
         return self
 
 
+class ExclusionZone(BaseModel):
+    """One operator-drawn polygon where faces must NOT be counted.
+
+    The planner control proxy copies these from the device config; the shape
+    is the wire contract (CONTRACTS.md): ``points`` are ordered polygon
+    vertices NORMALIZED 0..1 relative to the full frame, minimum 3.  They
+    exist because the live bench minted p00004 from an 87 px face seen THROUGH
+    A FROSTED GLASS PARTITION — a real face, inside an office, not at the gate.
+    No quality floor can reject a face for being in the wrong place; only the
+    operator knows where the mirrors, partitions and TV screens are.
+
+    Validation is strict at this edge so the loop never has to be: a zone that
+    reaches the frame loop is guaranteed drawable and testable.
+    """
+
+    label: str
+    points: list[list[float]] = Field(min_length=3)
+
+    @model_validator(mode="after")
+    def _points_are_normalized_pairs(self) -> "ExclusionZone":
+        for i, p in enumerate(self.points):
+            if len(p) != 2:
+                raise ValueError(
+                    f"zone '{self.label}' point {i} must be [x, y], got {p!r}"
+                )
+            if not all(0.0 <= v <= 1.0 for v in p):
+                raise ValueError(
+                    f"zone '{self.label}' point {i} must be normalized 0..1 "
+                    f"relative to the frame, got {p!r}"
+                )
+        return self
+
+
 class RunRequest(BaseModel):
     """Body of POST /runs — what to run and where to report it.
 
     ``mode`` selects the counting loop (default) or the staff-enrolment
     walk-through.  ``siteId`` names the site whose staff store to check (count)
     or enrol into; ``staffId`` names the roster member being enrolled.
+    ``exclusionZones`` are the operator-drawn no-count polygons the loop
+    filters faces against (see :class:`ExclusionZone`).
     """
 
     eventId: str
@@ -60,6 +96,7 @@ class RunRequest(BaseModel):
     mode: Literal["count", "enrol"] = "count"
     siteId: str | None = None
     staffId: str | None = None
+    exclusionZones: list[ExclusionZone] | None = None
 
     @model_validator(mode="after")
     def _enrol_needs_site_and_staff(self) -> "RunRequest":
