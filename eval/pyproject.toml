@@ -1,0 +1,4 @@
+# pytest configuration only — eval/ is not an installable package, it is run
+# from the repo root as `python -m eval.run` so the `eval` package resolves.
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -41,3 +41,24 @@ def test_env_bool(monkeypatch):
     monkeypatch.setenv("HECO_T_B", "maybe")
     with pytest.raises(ValueError, match="HECO_T_B"):
         config.env_bool("HECO_T_B", False)
+
+
+def test_an_empty_value_counts_as_unset(monkeypatch):
+    """docker-compose renders `${VAR-}` as "" for a variable left out of .env.
+
+    Treating that as a parse error took ingest down completely: every /open
+    returned 500 and no run could start, the moment INGEST_MAX_WIDTH was
+    removed from .env after a trial. An empty env var means unset.
+    """
+    monkeypatch.setenv("HECO_T_INT", "")
+    assert config.env_int("HECO_T_INT", 7) == 7
+    monkeypatch.setenv("HECO_T_INT", "   ")
+    assert config.env_int("HECO_T_INT", 7) == 7
+
+    monkeypatch.setenv("HECO_T_FLOAT", "")
+    assert config.env_float("HECO_T_FLOAT", 1.5) == 1.5
+
+    # Genuine rubbish must still fail loudly — this is not a licence to guess.
+    monkeypatch.setenv("HECO_T_INT", "wide")
+    with pytest.raises(ValueError, match="HECO_T_INT"):
+        config.env_int("HECO_T_INT", 7)

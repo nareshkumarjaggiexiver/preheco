@@ -1,0 +1,6 @@
+# eval harness — runtime + dev, pinned to the fleet versions (Python 3.12).
+# heco-common (editable) brings the planner's bearer transport and the run
+# logger; the harness adds no HTTP dependency of its own.
+-e ../common
+pytest==9.1.1
+ruff==0.16.1
