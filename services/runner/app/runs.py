@@ -62,32 +62,45 @@ class RunManager:
         thread.start()
         return run_id
 
-    def _lookup(self, run_id: str) -> RunLoop | None:
-        """The loop for run_id — the runner's own id OR the planner's row id.
+    def _matching(self, run_id: str) -> list[RunLoop]:
+        """Every loop answering to run_id — the runner's own id OR the
+        planner's row id.
 
         The planner console only ever holds its row id (this runner creates
         that row and reports under it), so status and stop must answer to
-        both. With only the memory key, every stop from the console 404'd
+        both; with only the memory key, every stop from the console 404'd
         as "unknown run" while the loop kept counting.
+
+        A LIST, deliberately: more than one loop can end up bound to one
+        planner row (observed live — a double start), and resolving "the
+        first match" let an already-ended loop mask a live sibling, so the
+        console's stop stopped nothing while the pipeline kept pulling
+        frames.
         """
         with self._lock:
-            loop = self._runs.get(run_id)
-            if loop:
-                return loop
-            for candidate in self._runs.values():
-                if candidate.status().get("plannerRunId") == run_id:
-                    return candidate
-        return None
+            exact = self._runs.get(run_id)
+            if exact:
+                return [exact]
+            return [
+                loop for loop in self._runs.values()
+                if loop.status().get("plannerRunId") == run_id
+            ]
 
     def get(self, run_id: str) -> dict | None:
-        """Return the live status dict for a run, or None if unknown."""
-        loop = self._lookup(run_id)
-        return loop.status() if loop else None
+        """Return the live status dict for a run, or None if unknown.
+
+        When several loops share the id, the LIVE one answers — the console
+        is asking about the run it can still affect, not the corpse.
+        """
+        loops = self._matching(run_id)
+        if not loops:
+            return None
+        live = [x for x in loops if x.status().get("state") == "running"]
+        return (live[-1] if live else loops[-1]).status()
 
     def stop(self, run_id: str) -> bool:
-        """Signal a run to stop; True if the run exists."""
-        loop = self._lookup(run_id)
-        if not loop:
-            return False
-        loop.stop()
-        return True
+        """Signal EVERY loop answering to run_id; True if any exists."""
+        loops = self._matching(run_id)
+        for loop in loops:
+            loop.stop()
+        return bool(loops)
