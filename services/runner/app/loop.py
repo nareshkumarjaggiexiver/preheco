@@ -654,6 +654,19 @@ class RunLoop:
         board.frame("embed")
         samples.add("embed", t_ms, {"embedMs": self._last_ms})
         embeddings = embedded.get("embeddings", [])
+        # HOW MANY FACE CROPS ACTUALLY REACHED THE EMBEDDER — a funnel rung
+        # nothing else reports. The stage's own counter counts FRAMES, and the
+        # gate-survivor count is what was OFFERED, not what came back: the
+        # zip(strict=False) below silently drops any shortfall if the embedder
+        # returns fewer vectors than crops. Without this, an eval harness can
+        # see faces pass the gate and matches happen but cannot say whether the
+        # embed stage ran at all, which is precisely the rung that went to zero
+        # when ingest was downscaled and the pipeline stopped counting anyone.
+        # Width (not a new metric name) so the same key means the same thing at
+        # face-detect, quality and embed, and the size of what was embedded is
+        # priced alongside the size of what was seen.
+        for face in kept[: len(embeddings)]:
+            board.observe("embed", "faceBoxWPx", float(face["box"]["w"]))
 
         # match (one call per embedding; gallery keyed by the planner run id;
         # staff checked first when the run carries a siteId)

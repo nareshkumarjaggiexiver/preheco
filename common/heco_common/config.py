@@ -18,9 +18,17 @@ def env_str(name: str, default: str) -> str:
 
 
 def env_int(name: str, default: int) -> int:
-    """Return env var ``name`` as int; ValueError names the variable."""
+    """Return env var ``name`` as int; ValueError names the variable.
+
+    An EMPTY value counts as unset, because that is what an unset variable
+    looks like by the time it reaches the process: docker-compose renders
+    ``${VAR-}`` as an empty string, so a knob simply left out of .env arrives
+    as "" rather than absent. Treating that as a parse error took the whole
+    ingest service down — every /open returned 500 and no run could start —
+    the moment INGEST_MAX_WIDTH was removed from .env after a trial.
+    """
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
         return int(raw)
@@ -29,9 +37,12 @@ def env_int(name: str, default: int) -> int:
 
 
 def env_float(name: str, default: float) -> float:
-    """Return env var ``name`` as float; ValueError names the variable."""
+    """Return env var ``name`` as float; ValueError names the variable.
+
+    Empty counts as unset, for the same reason as :func:`env_int`.
+    """
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     try:
         return float(raw)

@@ -248,6 +248,24 @@ def test_quality_gate_and_sub_canon_share():
     assert final["unique"] == 2  # fake match alternates isNew
 
 
+def test_embed_stage_reports_how_many_faces_were_actually_embedded():
+    """The funnel rung between the gate and the matcher, per FACE not per frame.
+
+    ``frames`` on the embed stage counts frames, so a run where the embedder
+    silently stopped producing vectors would still show a healthy-looking
+    stage. The eval harness reads this count to tell "the embedder ran on
+    everything the gate passed" from "the embedder ran on nothing".
+    """
+    fake = FakePipeline(n_frames=2, face_widths=(85.0, 64.0, 40.0))
+    make_loop(fake).run()
+    embed = [s for s in fake.stats if s["stage"] == "embed"][-1]
+    # 2 frames x 2 gate survivors (the 40 px face never reaches embed).
+    assert embed["metrics"]["faceBoxWPx"] == {
+        "count": 4, "min": 64.0, "mean": 74.5, "max": 85.0,
+    }
+    assert embed["frames"] == 2, "frames still counts frames, not faces"
+
+
 def test_stat_aggregation_maths():
     """Box heights 100, 110, 120 across frames aggregate to mean 110."""
     fake = FakePipeline(n_frames=3)

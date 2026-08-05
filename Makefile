@@ -9,10 +9,20 @@
 
 PYTHON ?= python3.12
 
-SERVICE_DIRS := $(patsubst %/Makefile,%,$(wildcard services/*/Makefile))
-ALL_DIRS := common $(SERVICE_DIRS)
+# Accuracy harness defaults (override on the command line). The example
+# manifest ships with placeholder paths — point MANIFEST at a real one.
+MANIFEST ?= eval/manifest.example.json
+LABEL ?= baseline
 
-.PHONY: venv-all test-all lint models-all clean-venvs help
+SERVICE_DIRS := $(patsubst %/Makefile,%,$(wildcard services/*/Makefile))
+# The accuracy harness (eval/) is not a service, but it owns a venv and a test
+# suite like one, so it joins venv-all / test-all / lint on the same terms.
+EVAL_DIR := $(patsubst %/Makefile,%,$(wildcard eval/Makefile))
+ALL_DIRS := common $(SERVICE_DIRS) $(EVAL_DIR)
+
+# `eval` is also a DIRECTORY, so without .PHONY make would call the target
+# up to date and do nothing.
+.PHONY: venv-all test-all lint models-all clean-venvs eval eval-compare help
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -34,6 +44,12 @@ lint: ## ruff check everywhere (root ruff.toml is the single config)
 		echo "==> lint: $$d"; \
 		$(MAKE) -C $$d lint || exit 1; \
 	done
+
+eval: ## Score ground-truth clips: make eval MANIFEST=eval/clips.json LABEL=baseline
+	@eval/.venv/bin/python -m eval.run --manifest $(MANIFEST) --label $(LABEL)
+
+eval-compare: ## A/B two result files: make eval-compare BEFORE=a.json AFTER=b.json
+	@eval/.venv/bin/python -m eval.compare $(BEFORE) $(AFTER)
 
 models-all: ## Download pinned model weights for services that need them
 	@for d in $(SERVICE_DIRS); do \

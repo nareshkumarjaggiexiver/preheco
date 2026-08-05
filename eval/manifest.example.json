@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "description": "EXAMPLE manifest. Copy it, point the paths at your own clips, and put the human count of record in actualUnique. The clips themselves are guests' faces and are never committed to this repository; this file is the only part that is.",
+  "eventId": "replace-with-a-real-planner-event-id",
+  "siteId": null,
+  "clips": [
+    {
+      "label": "gate-a-steady-arrivals",
+      "path": "/srv/heco/clips/gate-a-steady-arrivals.mp4",
+      "actualUnique": 38,
+      "tags": [],
+      "notes": "Baseline case: unhurried arrivals, one or two people in frame at a time, daylight. If this clip is not inside the envelope, nothing else is worth reading."
+    },
+    {
+      "label": "baraat-surge",
+      "path": "/srv/heco/clips/baraat-surge.mp4",
+      "actualUnique": 61,
+      "tags": ["surge"],
+      "notes": "The crush. Heavy occlusion, people entering three abreast. This is where person-box NMS and tracker coasting show up. A change that improves the aggregate and worsens this clip is a conversation, not a ship."
+    },
+    {
+      "label": "veiled-guests",
+      "path": "/srv/heco/clips/veiled-guests.mp4",
+      "actualUnique": 22,
+      "tags": ["veil"],
+      "notes": "Ghoonghat, dupatta and niqab. Expect deflation: the funnel should show faces detected but few passing the gate, not zero detections."
+    },
+    {
+      "label": "children-and-staff",
+      "path": "/srv/heco/clips/children-and-staff.mp4",
+      "actualUnique": 17,
+      "tags": ["children", "staff"],
+      "notes": "Short guests and repeated staff walk-throughs. actualUnique counts GUESTS only; enrolled staff must appear as staffCrossings and stay out of the count."
+    },
+    {
+      "label": "evening-decorative-light",
+      "path": "/srv/heco/clips/evening-decorative-light.mp4",
+      "actualUnique": 44,
+      "tags": ["evening-light"],
+      "notes": "Warm, flickering decorative light after sunset — the real pilot condition. Watch the face-size and frontality distributions here, not just the count."
+    }
+  ]
+}
