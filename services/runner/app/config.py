@@ -81,6 +81,32 @@ class Settings:
     # is the SAME crossing, not a new one (see loop._pipeline_step).
     staff_cooldown_s: float = 5.0
 
+    # TRACK HEAL (see loop._maybe_heal). The live bench (3 real people, counted
+    # 5) minted p00002 on a re-entry frame at cosine 0.3084 against a 0.363
+    # threshold — and the SAME physical track matched the correct identity
+    # p00001 at 0.69 four seconds later. The evidence that the mint was junk
+    # arrived almost immediately; the heal is the loop acting on it: when a
+    # track that recently minted a new identity later matches a DIFFERENT
+    # existing identity comfortably, the mint is folded back (singleton-only,
+    # via /merge onlyIfSingleton).
+    #
+    # heal_window_s bounds how long after a mint the same track's later match
+    # may fold it. Tonight's heal evidence arrived in ~4 s; 20 s covers a slow
+    # walk through the frame with margin while keeping the bookkeeping small
+    # and the residual risk (a tracker identity swap inside the window — see
+    # loop._maybe_heal) short-lived. 0 disables healing entirely.
+    heal_window_s: float = 20.0
+    # heal_min_cosine is the "comfortably" in the trigger. The measured
+    # impostor ceiling on this camera is 0.377 (two DIFFERENT men's templates),
+    # while same-person misses measured 0.294/0.308/0.361 — the distributions
+    # OVERLAP, so no value of the match threshold separates them and 0.363
+    # stays where it is. The heal does not need to separate them: it only needs
+    # its own evidence to sit clear of any measured impostor, so the floor is
+    # 0.45 — above 0.377 with margin, and far below tonight's 0.69 heal
+    # evidence. A cross-identity match below this floor proves nothing and
+    # heals nothing.
+    heal_min_cosine: float = 0.45
+
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
@@ -135,6 +161,8 @@ def from_env() -> Settings:
         report_timeout_s=env_float("HECO_REPORT_TIMEOUT_S", s.report_timeout_s),
         tap_budget_s=env_float("HECO_TAP_BUDGET_S", s.tap_budget_s),
         staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
+        heal_window_s=env_float("HECO_HEAL_WINDOW_S", s.heal_window_s),
+        heal_min_cosine=env_float("HECO_HEAL_MIN_COSINE", s.heal_min_cosine),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),

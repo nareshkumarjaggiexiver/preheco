@@ -133,6 +133,12 @@ services:
       HECO_QUALITY_MIN_IED_PX: ${HECO_QUALITY_MIN_IED_PX-}
       HECO_QUALITY_MIN_FRONTALITY: ${HECO_QUALITY_MIN_FRONTALITY-}
       HECO_QUALITY_MIN_SHARPNESS: ${HECO_QUALITY_MIN_SHARPNESS-}
+      # Track heal (see services/runner/README.md): window 20 s, cosine floor
+      # 0.45 — above the 0.377 measured impostor ceiling; tonight's heal
+      # evidence was 0.69. Unset renders as "" which env_float reads as
+      # "use the default"; HECO_HEAL_WINDOW_S=0 disables healing.
+      HECO_HEAL_WINDOW_S: ${HECO_HEAL_WINDOW_S-}
+      HECO_HEAL_MIN_COSINE: ${HECO_HEAL_MIN_COSINE-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

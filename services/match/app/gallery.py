@@ -286,11 +286,27 @@ def merge(
     keep: str,
     drop: str,
     templates_per_person: int = 0,
+    only_if_singleton: bool = False,
 ) -> tuple[bool, int]:
     """Fold ``drop`` into ``keep`` (a *duplicate* correction).
 
     Returns ``(merged, galleryN)``; ``merged`` is False (and the count
     unchanged) when a cannot-link constraint or an unknown key blocks it.
+
+    ``only_if_singleton`` additionally refuses the merge unless ``drop`` holds
+    EXACTLY one template.  It exists for the runner's track heal, and the
+    asymmetry with the operator flow is the point: the caller asserting "this
+    key is a junk mint" there is a MACHINE, and a machine's evidence is weaker
+    than an operator's.  The heal saw one track mint a key and then match a
+    different key; an operator saw two faces.  A drop key that has since
+    accumulated more templates has been independently re-sighted — the gallery
+    accepted further evidence that this identity is real — so it is no longer
+    safely foldable by heuristic, and the refusal (``merged=False``, count
+    unchanged) is the correct answer, not an error.  The check runs INSIDE the
+    transaction, against the same uncommitted view :meth:`VectorStore.count_for`
+    reads, because a template can be enrolled between the runner's decision and
+    this merge arriving — checked outside, the heal would fold a key the
+    gallery had just re-validated.
 
     THE CAP APPLIES HERE TOO.  The survivor inherits both identities' views, so
     a merge is the one path that can carry an identity past
@@ -311,6 +327,8 @@ def merge(
     """
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():
+        if only_if_singleton and store.count_for(drop) != 1:
+            return False, store.distinct_count()
         merged = store.merge(keep, drop)
         if merged and templates_per_person > 1:
             store.prune_redundant(keep, templates_per_person)

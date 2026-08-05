@@ -110,3 +110,23 @@ def test_row_cap_and_budget():
     assert p["count"] == 200  # exact
     assert len(p["boxes"]) == taps.ROW_CAP  # capped
     assert taps.within_budget(p) is True
+
+
+def test_face_payload_zone_excluded_faces_are_visible_but_uncounted():
+    """A zone-eaten face rides the tap flagged, outside kept/gated entirely.
+
+    The operator who drew the polygon audits it from this payload: hiding the
+    face would make the zone unfalsifiable, and counting it as gated would
+    blame the quality gate for a placement decision.
+    """
+    faces = [
+        {"box": {"x": 0, "y": 0, "w": 90.0, "h": 110}, "gateReason": None},
+        {"box": {"x": 100, "y": 0, "w": 60.0, "h": 75},
+         "excludedByZone": True, "excludedZone": "frosted partition"},
+    ]
+    f = taps.face_payload(faces, min_px=56.0, canon_px=80.0)
+    assert (f["count"], f["kept"], f["gated"], f["excludedByZone"]) == (2, 1, 0, 1)
+    row = f["faces"][1]
+    assert row["excludedByZone"] is True
+    assert row["zone"] == "frosted partition"
+    assert row["gate"] == "zone"

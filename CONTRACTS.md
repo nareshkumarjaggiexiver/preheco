@@ -585,3 +585,95 @@ gate is not the problem: before it was armed the same measurement was mean
   bridges a crossing's extreme poses only when the crossing supplied the
   intermediate poses that connect them. Three views 0.296–0.347 apart and
   nothing between them still count as three people, correctly.
+
+## v2 addition — the track heal and exclusion zones (2026-08-06)
+
+The live bench: **3 real people, counted 5**. Both phantom guests were minted
+by mechanisms no threshold can fix, because the measured impostor ceiling on
+this camera is **0.377** (two DIFFERENT men's templates scoring above the
+0.363 threshold) while same-person misses measured **0.294 / 0.308 / 0.361** —
+the impostor and genuine distributions OVERLAP, so **no value of
+`HECO_MATCH_THRESHOLD` separates them and 0.363 stays where it is.** The two
+fixes act on evidence a threshold cannot see: what the same track did next,
+and where in the frame the face was.
+
+### The track heal (runner)
+
+Tonight's p00002 was minted on a RE-ENTRY frame at cosine **0.3084**, and the
+SAME physical track matched the correct identity p00001 at **0.69** four
+seconds later. The evidence that the mint was junk arrived almost immediately;
+the heal is the loop acting on it.
+
+- **Trigger.** A verdict on a track that recently minted a new identity, with
+  `isNew=false`, `isStaff=false`, `personKey != mintedKey`,
+  `cosine >= HECO_HEAL_MIN_COSINE`, within `HECO_HEAL_WINDOW_S` of the mint.
+- **Action.** `POST {match}/merge {runId, keep: matchedKey, drop: mintedKey,
+  onlyIfSingleton: true}` — the same endpoint the operator duplicate
+  correction uses, with one extra guard (below). On `merged=true`: unique −1,
+  `healedSplits` +1, logged with both keys and both cosines. On
+  `merged=false`: nothing is counted and the bookkeeping is dropped — **the
+  refusal is the system working**, not an error.
+- **Knobs.** `HECO_HEAL_WINDOW_S` (default 20.0; 0 disables healing) and
+  `HECO_HEAL_MIN_COSINE` (default **0.45** — above the 0.377 measured impostor
+  ceiling with margin; tonight's heal evidence was 0.69).
+- **Scope, stated so nobody widens it quietly.** The heal never fires INTO a
+  staff hit (staff verdicts are skipped; the staff store is
+  operator-supervised evidence). The reverse ordering — a track that matches Y
+  first and mints X later — is NOT healed: the mint came after the evidence,
+  so the evidence says nothing about it.
+
+**`POST /merge` gains `onlyIfSingleton: bool = false`.** When true the merge
+is REFUSED (`merged=false`, count unchanged) unless the drop key holds exactly
+one template, checked INSIDE the transaction (a template can be enrolled
+between the runner's decision and the merge landing). The asymmetry with the
+operator flow is the point: the caller asserting "this key is a junk mint"
+here is a MACHINE, and a machine's evidence is weaker than an operator's — a
+key that has accumulated more templates has been independently re-sighted and
+is no longer safely foldable by heuristic. Operator merges are unchanged.
+
+**KNOWN RESIDUAL RISK, documented rather than solved.** A tracker identity
+swap — two people crossing paths — can hand a track from person A to person B.
+If A's mint is still a singleton inside the window and B then matches at
+≥ 0.45, the heal folds A into B: an **under-count of one**. The guards bound
+it (singleton-only, the 20 s window, the 0.45 floor, and an operator's
+cannot-link split always wins), but they do not eliminate it; the hard fix is
+track-quality gating and is out of scope tonight. An operator reading
+`healedSplits` beside a count that looks one short should know this is where
+to look.
+
+### Exclusion zones (planner UI → runner filter)
+
+Tonight's p00004 was minted from an **87 px face seen THROUGH A FROSTED GLASS
+PARTITION** — someone inside an office, not at the gate, scoring 0.3203
+against their true owner. No quality floor can reject a face for being in the
+wrong PLACE; only the operator knows where the partitions, mirrors and TV
+screens are, so the operator draws them.
+
+- **Wire shape.** The planner device config gains
+  `exclusionZones: [{label: string, points: [[x, y], ...]}]` — ordered polygon
+  vertices, minimum 3, NORMALIZED 0..1 relative to the full frame. The
+  planner's control proxy copies `device.config.exclusionZones` into the
+  runner run request as the top-level field `exclusionZones`, same shape. The
+  runner validates at `POST /runs` (readable 422 on a short polygon, an
+  out-of-range coordinate, or a point that is not `[x, y]`).
+- **The centre rule.** The runner excludes a face when the CENTRE of its face
+  box (pixels) falls inside any polygon after scaling the normalized points by
+  the actual frame width/height. Centre, not overlap: a guest walking PAST a
+  partition clips the zone and is still counted; a face BEHIND it is not.
+- **Excluded faces are never gated, embedded or matched** — the filter runs
+  before the quality gate — but they stay VISIBLE: counted in
+  `excludedByZone`, flagged `excludedByZone: true` (with the zone's label) in
+  the face-detect tap, and drawn magenta inside the translucent magenta
+  polygon on the annotated face-detect frame, so the operator can check their
+  own drawing against what it is eating.
+- **Honesty counter.** Zone points are normalized and need the frame's pixel
+  dimensions to scale by; a frame that carries none gets NO exclusion and
+  every face that passed untested is counted in `zoneUnmeasured` — the
+  `gatedUnmeasured` pattern applied to placement.
+
+### Run status / results fields
+
+Added to `GET runner /runs/:id`, to `results` on the closing
+`PUT /api/pipeline/runs/:id`, and to the end-of-run notes as
+`healedSplits=N excludedByZone=N`: **`healedSplits`**, **`excludedByZone`**
+(plus `zoneUnmeasured` in the status).
