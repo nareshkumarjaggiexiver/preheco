@@ -2,16 +2,20 @@
 
 Contract (CONTRACTS.md):
     POST /detect {imageB64, within?: [{x, y, w, h, ...}]}
-        -> {faces: [{box, landmarks: [5x[x, y]], conf, widthPx, quality}], inferMs}
+        -> {faces: [{box, landmarks: [5x[x, y]], conf, widthPx, quality,
+                     iedPx?, frontality?, sharpness?}], inferMs}
     GET  /health -> {ok, model, version}
 
 With `within`, detection runs per person-box crop and coordinates are mapped
-back to frame space; `quality` is the POC flag defined in app/quality.py.
+back to frame space; `quality` is the POC flag defined in app/quality.py.  The
+three optional signals are what the runner's composite quality gate is built
+from — see :func:`_with_quality`.
 """
 
 import logging
 import time
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from heco_common.geometry import dedupe_boxes
 from pydantic import BaseModel, Field
@@ -20,7 +24,7 @@ from . import __version__
 from .codec import b64_to_bgr
 from .detector import MODEL_PATH, FaceDetector
 from .mapping import clamp_box, offset_face
-from .quality import classify_width
+from .quality import classify_width, crop_sharpness
 
 log = logging.getLogger("faces")
 
@@ -58,28 +62,39 @@ class DetectRequest(BaseModel):
     within: list[WithinBox] | None = None
 
 
-def _with_quality(face: dict) -> dict:
-    """Attach quality signals to a detected face.
+def _with_quality(face: dict, img: np.ndarray) -> dict:
+    """Attach every measured quality signal to a detected face.
 
-    ``widthPx`` and the POC ``quality`` flag remain the gate (unchanged). We
-    ALSO emit, report-only, the signals the FR literature says actually predict
-    match success, so the pilot can set an evidence-based floor and calibrate
-    the match threshold (accuracy R&D finding F1):
+    ``widthPx`` and the POC ``quality`` flag are unchanged.  Beside them go the
+    three signals the FR literature says actually predict match success, so the
+    runner's gate can be composed from them and the pilot can price each floor
+    against measured outcomes (accuracy R&D finding F1):
 
-    - ``iedPx``  inter-eye distance from YuNet's two eye landmarks. This is the
+    - ``iedPx`` inter-eye distance from YuNet's two eye landmarks.  This is the
       size measure recognition standards use; our box-width floor of 56/80 px
       maps to only ~24/34 px IED, which is why size should be read in IED.
-    - ``sharpness`` a relative focus proxy (variance of the landmark spread is
-      unavailable here without the crop, so this is the eye-to-mouth span used
-      as a rough scale-normalised proxy; the runner adds Laplacian sharpness
-      where it still holds the crop).
     - ``frontality`` 0..1 from how centred the nose sits between the eyes.
+    - ``sharpness`` variance of the Laplacian over the face crop, normalised
+      for crop size (see :func:`crop_sharpness`).  Size and pose can both be
+      perfect while the crop is smeared by a walking guest, and no other signal
+      here can see that.
 
-    Nothing here changes a decision; the gate stays width-only until pilot data
-    justifies moving it.
+    ``img`` is the image the face's box coordinates refer to — the FULL frame
+    on both paths, because the ``within`` path offsets crop-space boxes back to
+    frame space before this is called.  Getting that pairing wrong would
+    silently measure the sharpness of some other part of the picture, so the
+    image is a required argument rather than an optional convenience.
+
+    Signals are emitted whenever they can be measured and omitted when they
+    cannot (no landmarks, a degenerate box).  Absence means UNKNOWN, and the
+    runner's gate is required to read it that way: rejecting a face for a
+    signal nobody managed to measure would drop a guest from an invoice.
     """
     width_px = face["box"]["w"]
     out = {**face, "widthPx": width_px, "quality": classify_width(width_px)}
+    sharp = crop_sharpness(img, face["box"])
+    if sharp is not None:
+        out["sharpness"] = sharp
     lm = face.get("landmarks")
     if lm and len(lm) >= 3:
         # Only the nose's x matters for a yaw proxy; its y would speak to
@@ -120,7 +135,7 @@ def detect(req: DetectRequest) -> dict:
     t0 = time.perf_counter()
     faces: list[dict] = []
     if req.within is None:
-        faces = [_with_quality(f) for f in det.detect(img)]
+        faces = [_with_quality(f, img) for f in det.detect(img)]
     else:
         for box in req.within:
             clamped = clamp_box(box.model_dump(), w, h)
@@ -129,7 +144,9 @@ def detect(req: DetectRequest) -> dict:
             cx, cy, cw, ch = clamped
             crop = img[cy : cy + ch, cx : cx + cw]
             for face in det.detect(crop):
-                faces.append(_with_quality(offset_face(face, cx, cy)))
+                # offset FIRST: _with_quality measures sharpness against `img`,
+                # so the box handed to it must already be in frame space.
+                faces.append(_with_quality(offset_face(face, cx, cy), img))
         # Overlapping person crops (e.g. a raw box and its track box, or two
         # people cropped together) can surface the SAME physical face twice.
         # Collapse boxes that coincide, keeping the higher-confidence one, so a

@@ -33,6 +33,21 @@ class Settings:
     quality_min_px: float = 56.0
     quality_canon_px: float = 80.0
 
+    # COMPOSITE QUALITY GATE (see app/gate.py).  Box width was the entire
+    # gate, and it is the wrong axis twice over: recognition size is read in
+    # inter-eye distance (our 56/80 px width floor is only ~24/34 px IED), and
+    # size alone cannot see a face turned side-on or smeared by a walking
+    # guest.  These three floors add those axes.
+    #
+    # EVERY ONE DEFAULTS TO 0.0 = NOT ARMED, so the shipped gate is exactly the
+    # width-only gate it has always been.  That is deliberate: the gate is the
+    # pipeline's only irreversible discard, we have no measured floor for any
+    # of the three yet, and a guessed floor costs guests off an invoice.  Arm
+    # them per camera once the eval harness can price them.
+    quality_min_ied_px: float = 0.0
+    quality_min_frontality: float = 0.0
+    quality_min_sharpness: float = 0.0
+
     flush_interval_s: float = 2.0  # planner stats/samples cadence
     sample_batch_max: int = 200  # planner ingest contract: batch <= 200 rows
 
@@ -68,6 +83,13 @@ class Settings:
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
 
+    # How long a SETTLED run stays in the process registry before it is reaped
+    # (see RunManager._reap).  Long enough that an operator whose run just
+    # finished can still read its final status from GET /runs/:id; short enough
+    # that a night of runs cannot accumulate one dead RunLoop each — every one
+    # of which pins its last frame's full base64 JPEG.
+    run_retention_s: float = 600.0
+
     # Ingest serves the LATEST frame with a monotonically increasing `seq`;
     # a stalled seq is the end-of-source signal (there is no `ended` flag on
     # the real service).  The loop polls every source_poll_s while the seq is
@@ -101,6 +123,16 @@ def from_env() -> Settings:
         planner_token=os.environ.get("HECO_TOKEN") or s.planner_token,
         quality_min_px=float(os.environ.get("HECO_QUALITY_MIN_PX", s.quality_min_px)),
         quality_canon_px=float(os.environ.get("HECO_QUALITY_CANON_PX", s.quality_canon_px)),
+        quality_min_ied_px=float(
+            os.environ.get("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px)
+        ),
+        quality_min_frontality=float(
+            os.environ.get("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality)
+        ),
+        quality_min_sharpness=float(
+            os.environ.get("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness)
+        ),
+        run_retention_s=float(os.environ.get("HECO_RUN_RETENTION_S", s.run_retention_s)),
         flush_interval_s=float(os.environ.get("HECO_FLUSH_INTERVAL_S", s.flush_interval_s)),
         request_timeout_s=float(os.environ.get("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s)),
         planner_timeout_s=float(os.environ.get("HECO_PLANNER_TIMEOUT_S", s.planner_timeout_s)),

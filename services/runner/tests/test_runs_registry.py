@@ -28,10 +28,19 @@ class StubLoop:
         self.stopped = True
 
 
-def make_manager_with(runs):
+class DeadThread:
+    """A thread handle that has already returned (a settled run)."""
+
+    def is_alive(self):
+        """Stand in for threading.Thread.is_alive on a finished run."""
+        return False
+
+
+def make_manager_with(runs, threads=None, **settings_kw):
     """A RunManager with stub loops injected under given memory keys."""
-    mgr = RunManager(Settings())
+    mgr = RunManager(Settings(**settings_kw))
     mgr._runs.update(runs)
+    mgr._threads.update(threads or {})
     return mgr
 
 
@@ -81,3 +90,91 @@ def test_shared_planner_id_stops_every_loop_and_answers_with_the_live_one():
     assert mgr.stop("prun-1") is True
     assert ended.stopped is True
     assert alive.stopped is True
+
+
+# ------------------------------------- liveness, not membership (point C)
+
+
+def test_a_settled_run_is_not_a_live_sibling():
+    """The test that decides whether a camera can be taken back.
+
+    Regression: this was a bare `run_id in self._runs`, so a run that settled
+    hours ago still read as a live sibling. That is the test a loop uses to
+    tell ingest's 409 "a sibling is counting on this camera" (fail, correctly
+    — seizing would corrupt that run's count) from "a corpse is holding the
+    slot" (seize it). A run whose /close never landed — ingest down or
+    restarting at the moment it settled — therefore held the camera for the
+    life of the runner process: the automatic seizure never fired, `stop` set
+    an event on a thread that had already returned, and the refusal told the
+    operator to stop a run that had already stopped. Only a manual ingest
+    restart cleared it.
+    """
+    mgr = make_manager_with({
+        "run-live": StubLoop("prun-1", state="running"),
+        "run-starting": StubLoop("prun-2", state="starting"),
+        "run-enrolling": StubLoop("prun-3", state="enrolling"),
+        "run-ended": StubLoop("prun-4", state="ended"),
+        "run-failed": StubLoop("prun-5", state="failed"),
+    })
+    assert mgr._is_live("run-live") is True
+    assert mgr._is_live("run-starting") is True, "a run mid-startup owns its camera"
+    assert mgr._is_live("run-enrolling") is True
+    assert mgr._is_live("run-ended") is False, "a settled run holds nothing"
+    assert mgr._is_live("run-failed") is False
+    assert mgr._is_live("run-never-heard-of") is False
+
+
+def test_settled_runs_are_reaped_so_the_registry_stays_bounded():
+    """Nothing ever deleted from _runs/_threads, and a RunLoop is not small.
+
+    Each retained loop pins `_last` — the last frame's full base64 JPEG — so a
+    venue running gates all night accumulated hundreds of kilobytes per
+    finished run, and `_matching` walked every run the process had ever seen
+    on every console poll.
+    """
+    mgr = make_manager_with(
+        {"run-old": StubLoop("prun-1", state="ended"),
+         "run-live": StubLoop("prun-2", state="running")},
+        threads={"run-old": DeadThread()},   # settled: its thread has returned
+        run_retention_s=0.0,                 # retention window already expired
+    )
+    # A live run has no thread handle here, so pin the survivor on the loop
+    # that IS still threaded rather than on the accident of an empty dict.
+    mgr._threads["run-live"] = type("Alive", (), {"is_alive": lambda self: True})()
+
+    assert mgr.reap() == ["run-old"]
+    assert set(mgr._runs) == {"run-live"}
+    assert set(mgr._threads) == {"run-live"}
+    assert mgr._settled_at == {}
+
+
+def test_a_settled_run_survives_its_retention_window():
+    """An operator whose run has just finished must still be able to read its
+    final status from GET /runs/:id — the reap is housekeeping, not a race."""
+    mgr = make_manager_with(
+        {"run-just-done": StubLoop("prun-1", state="ended")},
+        threads={"run-just-done": DeadThread()},
+        run_retention_s=600.0,
+    )
+    assert mgr.reap() == []
+    assert mgr.get("run-just-done")["state"] == "ended"
+    # ...and it goes once the window has passed (monotonic clock injected).
+    assert mgr.reap(now=mgr._settled_at["run-just-done"] + 601.0) == ["run-just-done"]
+    assert mgr.get("run-just-done") is None
+
+
+def test_a_wedged_run_is_never_reaped_even_if_its_status_looks_settled():
+    """Thread liveness is the settle signal, not the status dict.
+
+    A loop blocked mid-frame is still holding the camera whatever its last
+    published status said, and reaping it would hand that camera to the next
+    run — two loops, one stream, a silently wrong invoice.
+    """
+    alive = type("Alive", (), {"is_alive": lambda self: True})()
+    mgr = make_manager_with(
+        {"run-wedged": StubLoop("prun-1", state="ended")},
+        threads={"run-wedged": alive},
+        run_retention_s=0.0,
+    )
+    assert mgr.reap() == []
+    assert "run-wedged" in mgr._runs

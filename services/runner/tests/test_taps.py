@@ -41,6 +41,39 @@ def test_face_payload_kept_vs_gated():
     assert [row["widthPx"] for row in f["faces"]] == [90.0, 64.0, 40.0]
 
 
+def test_face_payload_reads_the_gate_verdict_rather_than_recomputing_it():
+    """The reporting path must not be a second implementation of the gate.
+
+    While the gate was width-only in two places the two agreed by luck; the
+    moment either grew a signal they would disagree about the same frame, and
+    the console's number is the one an operator argues an invoice from.
+    """
+    faces = [
+        {"box": {"x": 0, "y": 0, "w": 90.0, "h": 110}, "gateReason": None,
+         "iedPx": 44.0, "frontality": 0.9},
+        # Comfortably wide, and still rejected — only the verdict knows why.
+        {"box": {"x": 0, "y": 0, "w": 120.0, "h": 150}, "gateReason": "frontality",
+         "frontality": 0.05},
+        {"box": {"x": 0, "y": 0, "w": 40.0, "h": 50}, "gateReason": "width"},
+    ]
+    f = taps.face_payload(faces, min_px=56.0, canon_px=80.0)
+    assert (f["count"], f["kept"], f["gated"]) == (3, 1, 2)
+    assert f["gatedBy"] == {"frontality": 1, "width": 1}
+    assert [row["gate"] for row in f["faces"]] == ["kept", "frontality", "width"]
+    # The evidence travels with the verdict, or the operator cannot check it.
+    assert f["faces"][0]["iedPx"] == 44.0
+    assert f["faces"][1]["frontality"] == 0.05
+
+
+def test_face_payload_falls_back_to_width_for_an_ungated_caller():
+    """An unstamped face list keeps the historical width-only reading."""
+    faces = [{"box": {"x": 0, "y": 0, "w": 64.0, "h": 80}},
+             {"box": {"x": 0, "y": 0, "w": 40.0, "h": 50}}]
+    f = taps.face_payload(faces, min_px=56.0, canon_px=80.0)
+    assert (f["kept"], f["gated"]) == (1, 1)
+    assert f["gatedBy"] == {"width": 1}
+
+
 def test_match_payload_counters_and_staff_flag():
     """Verdicts carry personKey/cosine/staff; live counters ride alongside."""
     verdicts = [

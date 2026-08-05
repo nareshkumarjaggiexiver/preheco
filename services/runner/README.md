@@ -16,9 +16,23 @@ latency is bounded. A planner restart mid-event used to fail the run, and a
 restarted run gets a fresh planner id and therefore a fresh EMPTY gallery — so
 a five-second hiccup re-counted every guest already counted.
 
-The quality gate lives here: faces below **56 px** width never reach the
-embedder; **56–79 px** pass but are flagged *sub-canon* (POC geometry: 2.8 mm
-camera at 2.0 m, faces ~64–85 px — see CONTRACTS.md).
+The quality gate lives here (`app/gate.py`), and it is the pipeline's only
+irreversible discard: a face it rejects is never embedded, never matched and
+therefore never counted. Faces below **56 px** width never reach the embedder;
+**56–79 px** pass but are flagged *sub-canon* (POC geometry: 2.8 mm camera at
+2.0 m, faces ~64–85 px — see CONTRACTS.md).
+
+The gate is **composite**: three further floors — inter-eye distance,
+frontality and Laplacian sharpness, all measured by the faces service — sit
+beside box width, because width is neither the size measure recognition uses
+(56 px of box is ~24 px of IED) nor able to see a face turned side-on or
+smeared by a walking guest. **All three default to unarmed**, so the shipped
+gate is exactly the width-only gate it has always been; no floor has been
+measured yet, and guessing one on the only irreversible discard costs guests
+off an invoice. A signal that could not be measured never rejects a face — it
+is counted as `gatedUnmeasured` instead. Every rejection carries the reason
+that caused it (`gateReason`) into the tap payload, the annotated frame and the
+run status, so the console can say *which* floor dropped a face.
 
 ## v1: staff, taps, feedback, enrol
 
@@ -48,7 +62,12 @@ camera at 2.0 m, faces ~64–85 px — see CONTRACTS.md).
 - **Enrol mode** (`mode:'enrol'`, requires `siteId` + `staffId`). A staff
   walk-through: capture faces, keep the best `enrol_best_n` by
   `iedPx × frontality`, write them to the site staff store (`/staff/enrol`),
-  and `PUT /api/staff/:id` with the sample count. No pipeline_run, no counting.
+  and `PUT /api/staff/:id` with the sample count. No counting — but it DOES
+  open a `mode:'enrol'` pipeline run and settle it with structured results
+  (`sampleCount`, `facesSeen`, `frames`, `multiFaceFramesSkipped`), including
+  on the failure path. Erasure already had a permanent ledger while the capture
+  that CREATES the biometric had none; the run row is best-effort, so a planner
+  outage costs the record and never the enrolment.
   **Single subject only**: a frame contributes a sample only when exactly one
   face passes the gate (others are counted in `multiFaceFramesSkipped`), and an
   enrolment that captured nothing FAILS with an instruction to redo the
@@ -111,6 +130,9 @@ The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
 | `PLANNER_URL` | `http://host.docker.internal:8787` | The site-planner app |
 | `HECO_QUALITY_MIN_PX` | `56` | Quality-gate floor: narrower faces never embed |
 | `HECO_QUALITY_CANON_PX` | `80` | Below this, matched faces are flagged sub-canon |
+| `HECO_QUALITY_MIN_IED_PX` | `0.0` | Inter-eye-distance floor; **0 = not armed** (ships unarmed) |
+| `HECO_QUALITY_MIN_FRONTALITY` | `0.0` | Pose floor 0..1; **0 = not armed** |
+| `HECO_QUALITY_MIN_SHARPNESS` | `0.0` | Laplacian-variance floor; **0 = not armed**, and calibrate per camera |
 | `HECO_FLUSH_INTERVAL_S` | `2.0` | Planner stats/samples cadence |
 | `HECO_TAP_INTERVAL_S` | `2.0` | Debug frame + tap cadence (best-effort) |
 | `HECO_FEEDBACK_POLL_S` | `3.0` | Operator-feedback poll cadence (best-effort) |
@@ -121,7 +143,8 @@ The pure helpers (`taps`, `annotate`, `feedback`) are unit-tested directly.
 | `HECO_TAP_BUDGET_S` | `3.0` | Ceiling for ONE tap round (5 payloads + 5 JPEGs); the rest is dropped |
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
-| `HECO_SOURCE_STALL_S` | `5.0` | Stalled-seq duration treated as end-of-source |
+| `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
+| `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |
 
 ## Notes
 

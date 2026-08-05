@@ -14,6 +14,8 @@ per-frame counts are always exact even when the row list is truncated.
 
 import json
 
+from .gate import reported_reason
+
 #: Max rows kept in any tap list — keeps payloads well under the 32 KB ceiling.
 ROW_CAP = 40
 
@@ -70,28 +72,59 @@ def track_payload(tracks: list[dict]) -> dict:
     return {"count": len(tracks), "tracks": rows}
 
 
-def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
-    """Face-detector output with the quality band that decides embedding.
+#: Report-only signals carried through to the console beside each face, so an
+#: operator can see the evidence a rejection was made on and not just its name.
+_SIGNALS = ("iedPx", "frontality", "sharpness")
 
-    ``kept`` are faces at/above the embed floor; ``gated`` are the rest — the
-    number the quality gate dropped before the expensive embed stage.
+
+def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
+    """Face-detector output with the gate verdict that decides embedding.
+
+    ``kept`` are the faces that will be embedded; ``gated`` are the rest — the
+    ones the quality gate dropped before the expensive embed stage, which is
+    also where a guest stops being countable.  ``gatedBy`` breaks that number
+    down by reason and each row carries its own ``gate`` label, because "12
+    faces dropped" is not something an operator can act on and "9 for width, 3
+    for frontality" is.
+
+    The verdict is READ from the face (``gateReason``, stamped by app/gate.py),
+    never recomputed here.  A second implementation of the gate in the
+    reporting path is a second gate, and the two would drift the moment either
+    grew a signal — which is exactly what happened while the gate was
+    width-only in two places.  The width comparison survives only as the
+    fallback for a caller that did not run the gate at all.
     """
     rows = []
     kept = 0
+    gated_by: dict[str, int] = {}
     for f in faces:
         w = float(f.get("box", {}).get("w", 0.0))
-        if w >= min_px:
+        reason = reported_reason(f, min_px)
+        if reason is None:
             kept += 1
+        else:
+            gated_by[reason] = gated_by.get(reason, 0) + 1
         if len(rows) < ROW_CAP:
-            rows.append(
-                {
-                    "box": _box(f.get("box", {})),
-                    "widthPx": _r(w),
-                    "quality": quality_band(w, min_px, canon_px),
-                    "conf": _r(f.get("conf"), 3),
-                }
-            )
-    return {"count": len(faces), "kept": kept, "gated": len(faces) - kept, "faces": rows}
+            row = {
+                "box": _box(f.get("box", {})),
+                "widthPx": _r(w),
+                "quality": quality_band(w, min_px, canon_px),
+                "conf": _r(f.get("conf"), 3),
+                "gate": reason or "kept",
+            }
+            for key in _SIGNALS:
+                if key in f:
+                    row[key] = _r(f[key], 3)
+            if f.get("gateUnmeasured"):
+                row["gateUnmeasured"] = list(f["gateUnmeasured"])
+            rows.append(row)
+    return {
+        "count": len(faces),
+        "kept": kept,
+        "gated": len(faces) - kept,
+        "gatedBy": gated_by,
+        "faces": rows,
+    }
 
 
 def match_payload(
