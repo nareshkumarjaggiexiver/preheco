@@ -77,3 +77,27 @@ after warmup, full `detect()` path (letterbox + inference + decode + NMS):
 (Frame size barely matters — the network always runs at 416×416.) Live HTTP
 sanity check on a real 548×342 photo returned the expected person boxes at
 `inferMs` ≈ 11 ms. These are this-machine numbers, not a product benchmark.
+
+
+## Threading
+
+`PERSONS_THREADS` (default 8) sets onnxruntime's intra-op thread count; the
+inter-op pool is fixed at 1, because one image goes through one graph and there
+is nothing to run in parallel between nodes.
+
+It is explicit for two reasons. Left implicit, ORT counts the machine's cores
+from `/proc` — 64 on the dual-socket T440 — spawns a pool that size, and PINS
+each thread to a chosen CPU. Once the compose file confines the container to one
+NUMA node, half of those CPUs are outside its cpuset and every pin fails:
+
+```
+pthread_setaffinity_np failed for thread: 93, index: 15, mask: {1, 33, },
+error code: 22 ... Specify the number of threads explicitly so the affinity is not set.
+```
+
+Second, the graph is small. YOLOX-nano at 416x416 saturates a few cores; past
+that the synchronisation costs more than the parallelism returns. The measured
+live run used about 2.8 cores while ORT had thirty threads spawned.
+
+The effective value is `min(cpus this process may use, PERSONS_THREADS)`, read
+via `sched_getaffinity`, so it follows the cpuset rather than the hardware.
