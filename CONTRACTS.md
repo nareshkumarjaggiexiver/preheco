@@ -361,3 +361,38 @@ final count `{unique, staffCrossings, manualAdditions, frames, matches}` —
 which the planner stores in `pipeline_runs.results_json`. The count previously
 survived only as prose inside `notes`, so no report could be regenerated from
 stored data.
+
+
+## v2 addition — the runner keeps a log (2026-08-05)
+
+The runner had **no logging at all**, and fourteen places swallowed an
+exception to keep a live count alive. The instinct was right — a planner
+hiccup must never stop the counting — but the reason went nowhere, so an
+operator whose numbers looked wrong at midnight had "it just stopped" as the
+entire diagnostic record.
+
+`heco_common.logs` provides `setup_logging(service)` and `RunLog(logger,
+run_id)`. Three rules it enforces:
+
+1. **Every line carries `run=<id>`.** A venue runs several gates and a night
+   runs several runs; without it the logs cannot be separated back into the
+   runs that produced them.
+2. **Nothing logs a credential.** `safe()` scrubs `//user:pass@` from anything
+   written, and source URLs are logged through `source_label()` anyway.
+3. **Swallowed is not silent.** Every best-effort failure now logs at WARNING
+   saying what it was attempting.
+
+Level comes from `HECO_LOG_LEVEL` (default INFO). httpx/httpcore/urllib3 are
+pinned to WARNING: the runner makes ~11 HTTP calls per frame, so at 15 fps
+their INFO chatter is ~165 lines a second and buries everything else.
+
+`setup_logging` uses `basicConfig` WITHOUT `force`, so it installs a handler
+when the process has none and stands aside when uvicorn or pytest has already
+configured logging.
+
+A normal run now reads:
+
+```
+runner: run=run-abc counting from rtsp://192.168.1.64:554/media/video1 (plannerRun=prun-1, site=exiverlabs)
+runner: run=run-abc settled failed: unique=3 frames=3 reason=source-stalled (gallery kept for a resume)
+```

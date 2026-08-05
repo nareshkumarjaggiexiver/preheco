@@ -198,6 +198,7 @@ class PlannerClient:
         status: str = "ended",
         notes: str | None = None,
         results: dict[str, float] | None = None,
+        end_reason: str | None = None,
     ) -> None:
         """Flush pending samples, then close the run as ended|failed.
 
@@ -206,7 +207,7 @@ class PlannerClient:
         """
         self.flush()
         payload = PlannerRunEnd(
-            status=status, notes=notes, results=results,
+            status=status, notes=notes, results=results, endReason=end_reason,
         ).model_dump(exclude_none=True)
         self._request("PUT", f"/api/pipeline/runs/{self._require_run()}", payload)
 

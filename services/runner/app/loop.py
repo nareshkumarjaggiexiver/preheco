@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 import httpx
 from heco_common.geometry import dedupe_boxes
 from heco_common.imaging import decode_jpeg_b64
+from heco_common.logs import RunLog, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 
@@ -185,6 +186,9 @@ class RunLoop:
         # Why the frame loop stopped; decides how the run settles and
         # whether this run's embeddings are safe to delete.
         self._end_reason: str = "source-ended"
+        # Every line this run writes carries its id, so a night running
+        # several gates can be read back one run at a time.
+        self.log = RunLog(setup_logging("runner"), run_id)
         self._handled_feedback: set = set()
         # fid -> outcome we already carried out but could not tell the planner
         # about.  Without this a dropped PUT made the next poll re-execute an
@@ -319,6 +323,10 @@ class RunLoop:
                 "stop that run before starting another on the same camera",
                 409,
             )
+        self.log.warning(
+            f"seized the capture slot from stale run '{holder}' — if that run is "
+            "actually alive, two runs are now fighting for one camera"
+        )
         self._post(f"{self.s.ingest_url}/open", {**body, "takeover": True})
         self._set(seizedSlotFrom=holder)
 
@@ -327,7 +335,8 @@ class RunLoop:
         try:
             r = self.client.get(f"{self.s.ingest_url}/health")
             return (r.json() or {}).get("owner") if r.status_code < 400 else None
-        except Exception:  # noqa: BLE001 — a health probe must not mask the 409
+        except Exception as e:  # noqa: BLE001 — a health probe must not mask the 409
+            self.log.warning(f"could not ask ingest who holds the slot: {e}")
             return None
 
     # ------------------------------------------------------------- the loop
@@ -340,6 +349,7 @@ class RunLoop:
             else:
                 self._run()
         except Exception as e:  # noqa: BLE001 — a run must always settle
+            self.log.error(f"run failed: {type(e).__name__}: {e}")
             self._set(state="failed", error=f"{type(e).__name__}: {e}")
             self._release_run_state()
             if self.planner.run_id is not None:
@@ -371,6 +381,10 @@ class RunLoop:
 
         # Fresh per-run state downstream, then open the source.
         self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
+        self.log.info(
+            f"counting from {source_label(self.request['source'])} "
+            f"(plannerRun={planner_run_id}, site={self.request.get('siteId') or 'none'})"
+        )
         # Honour any pending consent withdrawals BEFORE the first frame is
         # matched: purge tombstoned staff from the site store now, so a member
         # deleted while the pipeline was off never matches again.
@@ -432,10 +446,19 @@ class RunLoop:
             "matches": st["matches"],
         }
         try:
-            self.planner.end_run(status=status, notes=notes, results=results)
+            self.planner.end_run(
+                status=status, notes=notes, results=results,
+                end_reason=self._end_reason,
+            )
         except PlannerError as e:  # the count happened; only the report is lost
+            self.log.error(f"counted {st['unique']} but the planner was not told: {e}")
             self._bump("plannerReportErrors")
             self._set(error=f"run ended but the planner was not told: {e}")
+        self.log.info(
+            f"settled {status}: unique={st['unique']} frames={frames} "
+            f"reason={self._end_reason}"
+            + (" (gallery kept for a resume)" if stalled else "")
+        )
         self._set(state=status, endReason=self._end_reason)
 
     def _release_run_state(self, keep_gallery: bool = False) -> None:
@@ -734,7 +757,8 @@ class RunLoop:
             self._last_purge = now
         try:
             tombs = self.planner.staff_tombstones(site_id)
-        except Exception:  # noqa: BLE001 - erasure must never kill the loop
+        except Exception as e:  # noqa: BLE001 - erasure must never kill the loop
+            self.log.warning(f"could not poll the erasure ledger: {e}")
             return
         # A rejected token makes the poll look like "nothing to erase" forever.
         # Erasure silently not happening is the exact failure this whole chain
@@ -748,7 +772,8 @@ class RunLoop:
             return
         try:
             r = self._post(f"{self.s.match_url}/staff/purge", {"siteId": site_id, "staffIds": ids})
-        except Exception:  # noqa: BLE001 - match hiccup: tombstones stay open, retried
+        except Exception as e:  # noqa: BLE001 - match hiccup: tombstones stay open, retried
+            self.log.warning(f"staff purge failed, tombstones stay open: {e}")
             return
         removed = r.get("removed", {})
         with self._lock:
@@ -856,7 +881,8 @@ class RunLoop:
             # staff store, a malformed key) — retrying cannot help, settle it
             # as rejected.  5xx: the service is unwell; leave the item open.
             return False if 400 <= e.status_code < 500 else None
-        except Exception:  # noqa: BLE001 — match hiccup: retry on the next poll
+        except Exception as e:  # noqa: BLE001 — match hiccup: retry on the next poll
+            self.log.warning(f"could not apply a correction, will retry: {e}")
             return None
 
     def _dec_unique(self) -> None:
