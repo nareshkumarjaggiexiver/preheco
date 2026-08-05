@@ -187,6 +187,9 @@ class RunLoop:
         self._lock = threading.Lock()
         self._last_seq: int | None = None
         self._last_ms: float = 0.0
+        # personKey -> how many templates that identity last reported holding.
+        # Guarded by _lock, like _status, because the settle path reads it.
+        self._template_n: dict[str, int] = {}
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
@@ -219,6 +222,14 @@ class RunLoop:
             "staffFaceFrames": 0,
             "subCanonMatches": 0,
             "subCanonShare": 0.0,
+            # Is multi-template actually doing anything?  Without these the
+            # only way to answer was to open the gallery by hand.  A run where
+            # every guest ends on ONE template means the crossings never
+            # supplied a second usable view, and no threshold change will fix
+            # that; a healthy run shows most guests holding several.
+            "templatesEnrolled": 0,
+            "singleTemplateGuests": 0,
+            "templateNMax": 0,
             "feedbackApplied": 0,
             "feedbackRejected": 0,
             "manualAdditions": 0,
@@ -456,6 +467,11 @@ class RunLoop:
             f"staffFaceFrames={st['staffFaceFrames']} "
             f"manualAdditions={st['manualAdditions']} "
             f"subCanonShare={st['subCanonShare']:.2f} "
+            # Read this beside `unique`. Guests stuck on one template mean the
+            # crossings supplied no second view, so the gallery is effectively
+            # pre-M1 and the split identities are NOT a threshold problem.
+            f"singleTemplateGuests={st['singleTemplateGuests']}/{st['unique']} "
+            f"templatesEnrolled={st['templatesEnrolled']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. If the camera merely blinked, this run's
@@ -714,6 +730,9 @@ class RunLoop:
                 st["subCanonShare"] = (
                     st["subCanonMatches"] / st["matches"] if st["matches"] else 0.0
                 )
+                if m.get("templateAdded"):
+                    st["templatesEnrolled"] += 1
+                self._note_templates(m.get("personKey"), m.get("templateN"))
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
@@ -743,6 +762,28 @@ class RunLoop:
                 if key:
                     self._status[key] += n
             self._status["gatedUnmeasured"] += outcome.unmeasured
+
+    def _note_templates(self, person_key: object, template_n: object) -> None:
+        """Track how many views each guest holds, and summarise it in the status.
+
+        The point is to make a silent failure loud.  Multi-template only helps
+        when a crossing supplies a SECOND usable view of the same person; when
+        it does not, every guest ends the run on one template, the gallery is
+        no better than it was before M1, and the counts look exactly the same
+        as if the threshold were at fault.  ``singleTemplateGuests`` is that
+        distinction, reported on every run rather than discovered by opening a
+        SQLite file at midnight.
+
+        Called with the lock already held (from the verdict path).  A staff hit
+        reports ``templateN: null`` by contract and is not a guest, so both are
+        ignored rather than counted as a one-template person.
+        """
+        if not isinstance(person_key, str) or not isinstance(template_n, int):
+            return
+        self._template_n[person_key] = template_n
+        st = self._status
+        st["singleTemplateGuests"] = sum(1 for n in self._template_n.values() if n <= 1)
+        st["templateNMax"] = max(self._template_n.values())
 
     def _count_staff(self, verdict: dict) -> None:
         """Record one staff sighting: a face-frame always, a crossing sometimes.
