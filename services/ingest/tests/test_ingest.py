@@ -191,3 +191,73 @@ def test_a_failed_open_never_quotes_the_camera_password(monkeypatch):
     assert "admin" not in str(caught.value)
     # ...while still naming the camera, or the message would be useless.
     assert "192.168.1.64" in str(caught.value)
+
+
+def test_downscale_is_off_by_default_and_exact_when_armed(monkeypatch):
+    """INGEST_MAX_WIDTH must change nothing until an operator sets it.
+
+    Face pixels scale with the frame, so a silent downscale would quietly move
+    every quality threshold the site survey was planned against.
+    """
+    import cv2
+    import numpy as np
+    from app.capture import CaptureWorker
+
+    class Stub:
+        """Enough of cv2.VideoCapture for construction; a file source probes FPS."""
+
+        def isOpened(self): return True          # noqa: N802, E704
+        def release(self): pass                  # noqa: E704
+        def get(self, _prop): return 25.0        # noqa: E704
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: Stub())
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    monkeypatch.delenv("INGEST_MAX_WIDTH", raising=False)
+    off = CaptureWorker(source="/x.mp4", is_file=True)
+    assert off._fit(frame).shape == (2160, 3840, 3), "default must not resize"
+
+    monkeypatch.setenv("INGEST_MAX_WIDTH", "1920")
+    on = CaptureWorker(source="/x.mp4", is_file=True)
+    out = on._fit(frame)
+    assert out.shape == (1080, 1920, 3), "aspect ratio is preserved"
+
+    # A frame already smaller than the cap is left alone, not upscaled.
+    small = np.zeros((576, 704, 3), dtype=np.uint8)
+    assert on._fit(small).shape == (576, 704, 3)
+
+
+def test_an_unread_frame_is_grabbed_not_retrieved(monkeypatch):
+    """The expensive half of read() is retrieve(); skip it for frames the
+    drop-not-queue slot is going to discard anyway."""
+    import cv2
+    import numpy as np
+    from app.capture import CaptureWorker
+
+    calls = {"grab": 0, "read": 0}
+
+    class Cap:
+        def isOpened(self): return True                                  # noqa: N802, E704
+        def release(self): pass                                          # noqa: E704
+        def get(self, _prop): return 25.0                                # noqa: E704
+        def grab(self):
+            calls["grab"] += 1
+            return True
+        def read(self):
+            calls["read"] += 1
+            return True, np.zeros((8, 8, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: Cap())
+    w = CaptureWorker(source="/x.mp4", is_file=True)
+
+    # Nothing in the slot yet -> must retrieve, so there is something to serve.
+    assert not w._slot_unread()
+
+    # Once a frame is sitting unread, the loop's choice is grab.
+    w._latest = (1, 0, np.zeros((8, 8, 3), dtype=np.uint8))
+    w._unread = True
+    assert w._slot_unread()
+
+    # ...and taking the frame clears the flag, so the next one is retrieved.
+    w.latest()
+    assert not w._slot_unread()

@@ -16,6 +16,20 @@ name: heco-pipeline
 x-heco-service: &heco-service
   restart: unless-stopped
   init: true
+  # KEEP THE WHOLE CHAIN ON ONE SOCKET.
+  #
+  # The T440 is dual-socket: node 0 owns the EVEN cpus, node 1 the odd, and
+  # numactl reports remote memory at 21 against 10 local — about 2.1x. Left
+  # unpinned, the seven services scattered across both (measured: ingest n0,
+  # persons n1, tracker n0, faces n1, embed n1, match n0, runner n1), so a
+  # single frame crossed the socket boundary five times carrying a ~600 KB
+  # base64 JPEG on each hop.
+  #
+  # 32 threads on one node is far more than a single-camera pipeline uses —
+  # the box was 90% idle at 1.59 fps — so this costs nothing and removes the
+  # crossings. Override with HECO_CPUSET when the topology differs; set it
+  # empty to let the scheduler roam.
+  cpuset: ${HECO_CPUSET-0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62}
   healthcheck:
     test:
       - CMD
