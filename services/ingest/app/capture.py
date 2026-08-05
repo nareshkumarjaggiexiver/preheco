@@ -24,7 +24,7 @@ import time
 
 import cv2
 import numpy as np
-from heco_common.config import env_bool, env_float
+from heco_common.config import env_bool, env_float, env_int
 from heco_common.logs import safe
 
 
@@ -47,6 +47,11 @@ class CaptureWorker(threading.Thread):
         self.is_file = is_file
         self.loop = loop
         self.ended = False  # file fully played, loop=False
+        # True while the slot holds a frame nobody has taken yet. The loop
+        # grabs (cheap) rather than retrieves (expensive) while it is set.
+        self._unread = False
+        # Longest edge to analyse at, 0 = the camera's own size. See _fit.
+        self._max_width = env_int("INGEST_MAX_WIDTH", 0)
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
         self._latest: tuple[int, int, np.ndarray] | None = None  # (seq, tMs, frame)
@@ -62,6 +67,7 @@ class CaptureWorker(threading.Thread):
         a fresh array per decoded frame), so no copy is taken here.
         """
         with self._lock:
+            self._unread = False
             return self._latest
 
     def stop(self, join_timeout_s: float = 5.0) -> None:
@@ -78,7 +84,24 @@ class CaptureWorker(threading.Thread):
         seq = 0
         try:
             while not self._stop_evt.is_set():
-                ok, frame = self._cap.read()
+                # DECODE ONLY WHAT SOMEBODY WILL READ.
+                #
+                # `read()` is grab + retrieve, and retrieve is the expensive
+                # half: it converts the decoded picture to a BGR numpy array —
+                # ~25 MB at 4K. This loop runs at the CAMERA's rate (20 fps on
+                # the UNV), while a consumer that is doing real work per frame
+                # takes far fewer. Measured on the PowerEdge: ingest burned 3.2
+                # cores while the pipeline consumed 1.59 fps, so ~90% of that
+                # conversion was thrown away by the drop-not-queue slot.
+                #
+                # grab() still pulls and decodes the packet — H.264 needs that
+                # to keep its reference frames — but skips the conversion. So
+                # an unconsumed frame costs the decode and not the copy.
+                if self._slot_unread():
+                    ok = self._cap.grab()
+                    frame = None
+                else:
+                    ok, frame = self._cap.read()
                 if not ok:
                     if self.is_file and self.loop:
                         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -96,13 +119,52 @@ class CaptureWorker(threading.Thread):
                         continue  # keep retrying until stopped
                     continue
                 seq += 1
+                if frame is None:
+                    continue  # grabbed only: the slot still holds an unread frame
                 t_ms = int((time.monotonic() - t0) * 1000)
                 with self._lock:
-                    self._latest = (seq, t_ms, frame)
+                    self._latest = (seq, t_ms, self._fit(frame))
+                    self._unread = True
                 if self._pace_s and self._stop_evt.wait(self._pace_s):
                     return
         finally:
             self._cap.release()
+
+    def _slot_unread(self) -> bool:
+        """Is the slot still holding a frame nobody has taken?"""
+        with self._lock:
+            return self._unread and self._latest is not None
+
+    def _fit(self, frame):
+        """Optionally shrink the frame before it enters the pipeline.
+
+        ``INGEST_MAX_WIDTH`` (0 = off, the default: nothing changes unless an
+        operator opts in) caps the longest edge. Everything downstream then
+        moves and decodes a smaller image — the frame travels to persons,
+        faces and embed as base64 JPEG, so halving the width quarters the
+        bytes and the decode at every one of those hops.
+
+        THE TRADE, AND IT IS NOT SUBTLE: face pixels scale with the frame.
+        On the POC geometry a face measures ~176 px at 3840x2160, so
+
+            INGEST_MAX_WIDTH=1920  ->  ~88 px   (above the 80 px canon)
+            INGEST_MAX_WIDTH=1280  ->  ~59 px   (above the 56 px floor only)
+             704 px sub-stream     ->  ~47 px   (BELOW the floor — unusable)
+
+        The camera's own sub-streams are D1 and CIF, which is why this exists
+        as a downscale of the main stream rather than a stream choice. The
+        served frame reports its true w/h, so the quality gate and the taps
+        measure what was actually analysed, not what the camera sent.
+        """
+        if not self._max_width:
+            return frame
+        h, w = frame.shape[:2]
+        if w <= self._max_width:
+            return frame
+        scale = self._max_width / float(w)
+        return cv2.resize(
+            frame, (self._max_width, int(round(h * scale))), interpolation=cv2.INTER_AREA
+        )
 
     # ---------------------------------------------------------- internals
 

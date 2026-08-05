@@ -62,3 +62,38 @@ make lint
 Read failures on a live stream trigger release → 1 s pause → reopen, forever,
 until a new `/open` or shutdown. Opening a source that cannot be opened at
 all fails the `/open` call itself with 400.
+
+
+## Tuning for a 4K camera
+
+Measured on the PowerEdge T440 against the UNV at 3840x2160/20fps: the whole
+pipeline ran at **1.59 fps while the box sat 90% idle**, and ingest alone burned
+**3.2 cores**. It was decoding every frame the camera sent and converting it to
+a 25 MB BGR array, while the consumer took roughly one frame in twelve.
+
+Two knobs, both off by default:
+
+| env | default | what it does |
+| --- | --- | --- |
+| `INGEST_MAX_WIDTH` | `0` (off) | Caps the longest edge before the frame enters the pipeline. |
+| — | — | Decode-on-demand is automatic: while the slot holds an unread frame the loop `grab()`s instead of `read()`ing, skipping the BGR conversion for frames the drop-not-queue slot would discard anyway. |
+
+**`INGEST_MAX_WIDTH` scales face pixels, so choose it against the floor, not by
+taste.** On the POC geometry a face measures ~176 px at 4K:
+
+| setting | face px | verdict |
+| --- | --- | --- |
+| unset (3840) | ~176 | today |
+| **1920** | **~88** | **above the 80 px canon — recommended** |
+| 1280 | ~59 | above the 56 px floor, below canon |
+| the camera's own sub-stream (704x576) | ~47 | **below the floor — unusable** |
+
+Measured saving at 1920, per frame: JPEG encode 21.1 -> 5.5 ms, payload 584 ->
+169 KB, and the decode paid at each of the three downstream hops 127.6 -> 27.9
+ms. About **112 ms a frame**, against a 629 ms measured budget.
+
+> [!NOTE]
+> This is a downscale of the MAIN stream, not a stream swap, because this
+> camera's sub-streams are D1 (704x576) and CIF (352x288) — both below the face
+> floor. The served frame reports its true `w`/`h`, so the quality gate and the
+> taps measure what was actually analysed.
