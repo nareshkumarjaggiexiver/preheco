@@ -25,6 +25,7 @@ import time
 import cv2
 import numpy as np
 from heco_common.config import env_bool, env_float
+from heco_common.logs import safe
 
 
 class CaptureError(RuntimeError):
@@ -113,7 +114,10 @@ class CaptureWorker(threading.Thread):
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened():
             cap.release()
-            raise CaptureError(f"could not open source: {self.source}")
+            # NEVER the raw source: it embeds rtsp://user:pass@ and this
+            # message travels into the runner's StageError, the planner's
+            # permanent run notes, the browser and the export.
+            raise CaptureError(f"could not open source: {safe(self.source)}")
         return cap
 
     def _pacing_interval(self) -> float:

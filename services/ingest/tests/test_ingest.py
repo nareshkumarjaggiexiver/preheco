@@ -160,3 +160,34 @@ def test_unowned_open_keeps_the_old_replace_anything_behaviour(client, synthetic
     client.post("/open", json={"path": synthetic_video, "loop": True})
     _wait_frame(client)
     assert client.post("/open", json={"path": synthetic_video, "loop": True}).status_code == 200
+
+
+def test_a_failed_open_never_quotes_the_camera_password(monkeypatch):
+    """The message from a failed open travels a long way.
+
+    ingest -> the runner's StageError -> the planner's PERMANENT run notes ->
+    the browser -> the export. So it must not carry rtsp://user:pass@.
+    """
+    import cv2
+    from app.capture import CaptureError, CaptureWorker
+
+    class Unopenable:
+        """A VideoCapture that refuses to open, without touching the network."""
+
+        def isOpened(self):  # noqa: N802 — mirrors cv2's API
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: Unopenable())
+    # The constructor opens the source, so the failure happens right here.
+    with pytest.raises(CaptureError) as caught:
+        CaptureWorker(
+            source="rtsp://admin:Hunter2@192.168.1.64:554/media/video1", is_file=False,
+        )
+
+    assert "Hunter2" not in str(caught.value), "a failed open leaked the camera password"
+    assert "admin" not in str(caught.value)
+    # ...while still naming the camera, or the message would be useless.
+    assert "192.168.1.64" in str(caught.value)
