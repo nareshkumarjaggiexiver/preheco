@@ -50,10 +50,10 @@ def _dist(dist: dict | None, unit: str = "px") -> str:
 def _funnel_line(funnel: dict | None) -> str:
     """The funnel on one line, in attrition order."""
     if not funnel:
-        return "    funnel: not recorded"
+        return "      not recorded"
     embeds = "unknown" if funnel.get("embeds") is None else _num(funnel.get("embeds"))
     return (
-        f"    frames {_num(funnel.get('frames'))}"
+        f"      frames {_num(funnel.get('frames'))}"
         f"  ->  person boxes {_num(funnel.get('personBoxes'))}"
         f"  ->  faces {_num(funnel.get('facesDetected'))}"
         f"  ->  gate {_num(funnel.get('facesPassingGate'))}"

@@ -493,7 +493,12 @@ def check_embed_ran(funnel: Funnel) -> Check:
             "critical",
             "embed count not reported by this build — rung skipped (unknown, not zero)",
         )
-    failed = funnel.faces_passing_gate > 0 and funnel.embeds == 0
+    if funnel.faces_passing_gate == 0:
+        # Nothing was offered, so nothing being embedded is not this check's
+        # failure — the gate-pass collapse owns it, and one cause should not be
+        # reported as four failures.
+        return Check("embed-ran", True, "critical", "not applicable (nothing passed the gate)")
+    failed = funnel.embeds == 0
     detail = (
         f"{funnel.faces_passing_gate} faces passed the gate but the embedder ran on "
         "NONE of them — the embed stage is broken or unreachable"
@@ -506,7 +511,9 @@ def check_embed_ran(funnel: Funnel) -> Check:
 def check_match_ran(funnel: Funnel) -> Check:
     """Something was embedded but the matcher never decided anything."""
     upstream = funnel.embeds if funnel.embeds is not None else funnel.faces_passing_gate
-    failed = upstream > 0 and funnel.matches == 0
+    if upstream == 0:
+        return Check("match-ran", True, "critical", "not applicable (nothing was embedded)")
+    failed = funnel.matches == 0
     detail = (
         f"{upstream} embeddings were produced but the matcher was never called — "
         "no gallery decision was ever made, so the count cannot move"
