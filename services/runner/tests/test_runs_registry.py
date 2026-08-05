@@ -14,13 +14,14 @@ from app.runs import RunManager
 class StubLoop:
     """Just enough of RunLoop for the registry: status() and stop()."""
 
-    def __init__(self, planner_run_id):
+    def __init__(self, planner_run_id, state="running"):
         self.planner_run_id = planner_run_id
+        self.state = state
         self.stopped = False
 
     def status(self):
-        """The one field the registry reads, shaped like RunLoop.status()."""
-        return {"plannerRunId": self.planner_run_id, "state": "running"}
+        """The fields the registry reads, shaped like RunLoop.status()."""
+        return {"plannerRunId": self.planner_run_id, "state": self.state}
 
     def stop(self):
         """Record the signal the registry is expected to deliver."""
@@ -65,3 +66,18 @@ def test_memory_key_wins_over_a_colliding_planner_id():
     assert mgr.stop("run-bbb22222") is True
     assert b.stopped is True
     assert a.stopped is False
+
+
+def test_shared_planner_id_stops_every_loop_and_answers_with_the_live_one():
+    """Two loops bound to ONE planner row (a double start, observed live):
+    stop must signal both — the first-match answer let an ended loop mask
+    the live one, so the console's stop stopped nothing — and status must
+    describe the loop the operator can still affect."""
+    ended = StubLoop("prun-1", state="ended")
+    alive = StubLoop("prun-1", state="running")
+    mgr = make_manager_with({"run-aaaaaaaa": ended, "run-bbbbbbbb": alive})
+
+    assert mgr.get("prun-1")["state"] == "running", "the live loop answers, not the corpse"
+    assert mgr.stop("prun-1") is True
+    assert ended.stopped is True
+    assert alive.stopped is True
