@@ -25,6 +25,29 @@ INPUT_SIZE = int(os.environ.get("PERSONS_INPUT_SIZE", "416"))
 CONF_MIN = float(os.environ.get("PERSONS_CONF_MIN", "0.30"))
 NMS_IOU = float(os.environ.get("PERSONS_NMS_IOU", "0.45"))
 
+def _default_threads() -> int:
+    """How many intra-op threads onnxruntime should use.
+
+    Left to itself, ORT counts the machine's cores from /proc — 64 on the
+    T440 — spawns a thread pool that size and PINS each thread to a chosen
+    CPU. Once the container is confined to one NUMA node, half those CPUs are
+    outside its cpuset and every pin fails:
+
+        pthread_setaffinity_np failed ... mask: {1, 33, }, error code: 22
+        Specify the number of threads explicitly so the affinity is not set.
+
+    `sched_getaffinity` reports what this process may ACTUALLY use, so it
+    respects the cpuset rather than the hardware. The cap is deliberate on top
+    of that: YOLOX-nano at 416x416 is a small graph, and past a handful of
+    threads the synchronisation costs more than the parallelism returns — the
+    measured run used about 2.8 cores while ORT had spawned thirty.
+    """
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        available = os.cpu_count() or 1
+    return max(1, min(available, int(os.environ.get("PERSONS_THREADS", "8"))))
+
 
 class PersonDetector:
     """Loads the YOLOX-nano ONNX graph once and serves thread-safe detection."""
@@ -39,8 +62,15 @@ class PersonDetector:
 
         self.model_name = model_path.name
         self.input_size = (input_size, input_size)
+        # Explicit thread counts: stops ORT pinning threads to CPUs the
+        # container does not own, and stops it oversubscribing a small graph.
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = _default_threads()
+        # One image at a time through one graph — there is nothing to run in
+        # parallel BETWEEN nodes, so an inter-op pool is pure overhead.
+        opts.inter_op_num_threads = 1
         self._session = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
+            str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._input_name = self._session.get_inputs()[0].name
         self._lock = threading.Lock()
