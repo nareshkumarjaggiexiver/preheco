@@ -54,13 +54,20 @@ class RunManager:
             file_transport=httpx_file_transport(report_http),
             token=settings.planner_token,
         )
-        loop = RunLoop(run_id, request, settings, client, planner)
+        loop = RunLoop(run_id, request, settings, client, planner, is_known_run=self._is_known)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)
         with self._lock:
             self._runs[run_id] = loop
             self._threads[run_id] = thread
         thread.start()
         return run_id
+
+    def _is_known(self, run_id: str) -> bool:
+        """Is run_id one of THIS process's runs?  The loops use this to tell
+        a stale ingest slot holder (a corpse from a killed runner) from a
+        live sibling before seizing the camera."""
+        with self._lock:
+            return run_id in self._runs
 
     def _matching(self, run_id: str) -> list[RunLoop]:
         """Every loop answering to run_id — the runner's own id OR the
