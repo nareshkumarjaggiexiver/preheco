@@ -62,16 +62,31 @@ class RunManager:
         thread.start()
         return run_id
 
-    def get(self, run_id: str) -> dict | None:
-        """Return the live status dict for a run, or None if unknown."""
+    def _lookup(self, run_id: str) -> RunLoop | None:
+        """The loop for run_id — the runner's own id OR the planner's row id.
+
+        The planner console only ever holds its row id (this runner creates
+        that row and reports under it), so status and stop must answer to
+        both. With only the memory key, every stop from the console 404'd
+        as "unknown run" while the loop kept counting.
+        """
         with self._lock:
             loop = self._runs.get(run_id)
+            if loop:
+                return loop
+            for candidate in self._runs.values():
+                if candidate.status().get("plannerRunId") == run_id:
+                    return candidate
+        return None
+
+    def get(self, run_id: str) -> dict | None:
+        """Return the live status dict for a run, or None if unknown."""
+        loop = self._lookup(run_id)
         return loop.status() if loop else None
 
     def stop(self, run_id: str) -> bool:
         """Signal a run to stop; True if the run exists."""
-        with self._lock:
-            loop = self._runs.get(run_id)
+        loop = self._lookup(run_id)
         if not loop:
             return False
         loop.stop()

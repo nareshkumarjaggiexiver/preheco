@@ -464,3 +464,33 @@ def test_best_effort_planner_calls_get_their_own_short_timeout(monkeypatch):
     assert report_t < planner_t < stage_t, "reporting must be bounded well below a stage call"
     planner = built["planner"]
     assert planner.best_effort_transport is not planner.transport
+
+
+def test_run_label_never_carries_source_credentials():
+    """The planner slugs the label into the run row's PERMANENT id, so a
+    credentialed RTSP URL in the label would bake the camera password into
+    every run URL and export. The label must reduce to host+path."""
+    from app.loop import source_label
+
+    assert (
+        source_label({"url": "rtsp://admin:s3kret%40x@cam.local:554/media/video1"})
+        == "rtsp://cam.local:554/media/video1"
+    )
+    assert source_label({"url": "rtsp://cam.local/media/video1"}) == "rtsp://cam.local/media/video1"
+    assert source_label({"path": "/media/clip.mp4"}) == "/media/clip.mp4"
+    assert source_label({}) == "unknown source"
+
+    # End to end: the label that actually reaches the planner is clean.
+    fake = FakePipeline(n_frames=1)
+    settings_loop = make_loop(fake)
+    settings_loop.request["source"] = {
+        "url": "rtsp://admin:s3kret@cam:554/media/video1",
+        "loop": False,
+    }
+    settings_loop.run()
+    assert fake.run_created is not None
+    # The LABEL is what the planner slugs into the permanent row id — it must
+    # be clean. (config.source still carries the real URL; the planner redacts
+    # it at rest, and the loop needs it verbatim to open the stream.)
+    assert "s3kret" not in fake.run_created["label"]
+    assert fake.run_created["label"] == "runner rtsp://cam:554/media/video1"

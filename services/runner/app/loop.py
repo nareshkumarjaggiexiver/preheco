@@ -41,6 +41,7 @@ import contextlib
 import threading
 import time
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import httpx
 from heco_common.geometry import dedupe_boxes
@@ -52,6 +53,25 @@ from . import annotate, taps
 from .config import Settings
 from .feedback import plan_action
 from .stats import SampleBuffer, StatsBoard
+
+
+def source_label(source: dict) -> str:
+    """A human label for a source that NEVER carries credentials.
+
+    The planner slugs this label into the run row's PERMANENT id, so a
+    userinfo'd RTSP URL here would bake the camera password into every run
+    URL and export forever (the planner redacts the stored config, but the
+    label reaches it first). URLs reduce to scheme://host[:port]/path;
+    file sources pass through as their path.
+    """
+    url = (source or {}).get("url")
+    if url:
+        p = urlsplit(str(url))
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme}://{host}{port}{p.path}"
+    path = (source or {}).get("path")
+    return str(path) if path else "unknown source"
 
 
 class StageError(RuntimeError):
@@ -278,7 +298,7 @@ class RunLoop:
 
     def _run(self) -> None:
         req = self.request
-        label = req.get("label") or f"runner {req['source']}"
+        label = req.get("label") or f"runner {source_label(req['source'])}"
         planner_run_id = str(
             self.planner.create_run(
                 req["eventId"],
