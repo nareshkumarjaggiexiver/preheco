@@ -32,6 +32,10 @@ class FakePipeline:
         # rather than a file that finished.
         self.stall_forever = False
         self.face_widths = face_widths
+        # Extra quality signals every face carries (iedPx / frontality /
+        # sharpness), for the composite-gate tests. Empty by default, which is
+        # also a real case: a detector reply without landmarks.
+        self.face_signals: dict = {}
         self.boxes_per_frame = boxes_per_frame
         self.frame_i = 0
         self.match_calls = 0
@@ -134,6 +138,7 @@ class FakePipeline:
                     "landmarks": [[1, 1]] * 5,
                     "conf": 0.8,
                     "widthPx": w,
+                    **self.face_signals,
                 }
                 for w in self.face_widths
             ]
@@ -523,7 +528,7 @@ def test_stale_capture_slot_is_seized_when_the_holder_is_a_corpse():
     fake = FakePipeline(n_frames=2)
     fake.slot_holder = "run-corpse"
     loop = make_loop(fake)
-    loop._is_known_run = lambda rid: False  # nobody this runner knows
+    loop._is_live_run = lambda rid: False  # nothing this runner has live
     final = loop.run()
     assert final["state"] == "ended"
     assert fake.opened["takeover"] is True
@@ -536,7 +541,7 @@ def test_live_siblings_slot_is_never_seized():
     fake = FakePipeline(n_frames=2)
     fake.slot_holder = "run-alive"
     loop = make_loop(fake)
-    loop._is_known_run = lambda rid: rid == "run-alive"
+    loop._is_live_run = lambda rid: rid == "run-alive"
     final = loop.run()
     assert final["state"] == "failed"
     assert "run-alive" in final["error"]
@@ -613,3 +618,92 @@ def test_the_end_reason_reaches_the_planner_as_a_field_not_only_prose():
     make_loop(fake).run()
     assert fake.run_ended["endReason"] == "source-stalled"
     assert fake.run_ended["status"] == "failed"
+
+
+# ------------------------------------------- the composite gate (point #6)
+
+
+def test_the_composite_gate_is_inert_until_an_operator_arms_it():
+    """End to end: adding three signals must not move a single count.
+
+    The gate is the pipeline's only irreversible discard and no floor for the
+    new signals has been measured yet, so shipping them armed would change
+    every count in the field on a guess. This is the same run as
+    test_quality_gate_and_sub_canon_share, driven through faces that carry all
+    three signals at values that would fail any sane floor.
+    """
+    fake = FakePipeline(n_frames=2, face_widths=(85.0, 64.0, 40.0))
+    fake.face_signals = {"iedPx": 5.0, "frontality": 0.05, "sharpness": 0.5}
+    final = make_loop(fake).run()
+
+    assert fake.embed_face_counts == [2, 2], "only the 40 px face may be gated"
+    assert final["unique"] == 2
+    assert final["gatedByWidth"] == 2  # the 40 px face, both frames
+    assert final["gatedByIed"] == final["gatedByFrontality"] == 0
+    assert final["gatedBySharpness"] == 0
+    assert final["gateArmed"] == ()
+
+
+def test_an_armed_ied_floor_gates_faces_the_width_floor_lets_through():
+    """The point of the change: box width is not recognition size.
+
+    An 85 px box carrying only ~20 px between the eyes has far too little of
+    the geometry SFace consumes, and the width-only gate embedded it happily.
+    """
+    fake = FakePipeline(n_frames=2, face_widths=(85.0, 64.0))
+    fake.face_signals = {"iedPx": 20.0, "frontality": 0.95}
+    final = make_loop(fake, quality_min_ied_px=30.0).run()
+
+    assert fake.embed_face_counts == [], "no face reached the embedder"
+    assert final["unique"] == 0
+    assert final["gatedByIed"] == 4  # two faces, two frames
+    assert final["gatedByWidth"] == 0
+    assert final["gateArmed"] == ("ied",)
+
+
+def test_an_armed_floor_never_rejects_a_face_it_could_not_measure():
+    """A detector reply without landmarks must not become a lost guest.
+
+    Under-counting is this pipeline's dominant failure mode, so an unmeasured
+    signal is reported, not enforced — but it IS reported, because an armed
+    floor that silently evaluates nothing is worse than no floor at all.
+    """
+    fake = FakePipeline(n_frames=2, face_widths=(85.0,))  # no signals emitted
+    final = make_loop(fake, quality_min_ied_px=30.0).run()
+
+    assert fake.embed_face_counts == [1, 1], "unmeasured is not rejected"
+    assert final["gatedByIed"] == 0
+    assert final["gatedUnmeasured"] == 2
+
+
+def test_the_gate_in_force_is_recorded_on_the_run_row():
+    """The count is an invoice figure: which floors produced it must be
+    recoverable from the record, not from whatever the environment holds
+    whenever somebody later asks."""
+    fake = FakePipeline(n_frames=1)
+    make_loop(fake, quality_min_ied_px=30.0, quality_min_sharpness=12.5).run()
+    config = fake.run_created["config"]
+    assert config["qualityMinPx"] == 56.0
+    assert config["qualityMinIedPx"] == 30.0
+    assert config["qualityMinSharpness"] == 12.5
+    assert config["qualityMinFrontality"] == 0.0
+    assert config["gateArmed"] == ["ied", "sharpness"]
+
+
+def test_the_reason_a_face_was_gated_reaches_the_console():
+    """"12 faces dropped" is not something an operator can act on.
+
+    The rejection reason rides the face into the tap payload, per face and as a
+    per-frame breakdown, so the console can say which floor did it.
+    """
+    fake = FakePipeline(n_frames=2, face_widths=(85.0, 40.0))
+    fake.face_signals = {"iedPx": 20.0}
+    loop = make_loop(fake, quality_min_ied_px=30.0, tap_interval_s=0.0)
+    loop.run()
+
+    from app import taps
+    payload = taps.build_payloads(loop._last, 56.0, 80.0, unique=0, staff_crossings=0)
+    faces = payload["face-detect"]
+    assert faces["gatedBy"] == {"ied": 1, "width": 1}
+    assert [row["gate"] for row in faces["faces"]] == ["ied", "width"]
+    assert faces["faces"][0]["iedPx"] == 20.0, "the evidence travels with the verdict"

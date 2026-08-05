@@ -38,6 +38,32 @@ def test_draw_faces_colours_by_quality_band():
     assert len(colours) >= 3
 
 
+def test_draw_faces_marks_a_wide_face_the_gate_rejected():
+    """A face can be comfortably wide and still not be counted.
+
+    Colouring on width alone would draw a reassuring green box around a guest
+    the gate discarded for pose or focus — the overlay exists precisely so an
+    operator can see who was not counted and why.
+    """
+    img = _blank()
+    box = {"x": 10, "y": 10, "w": 120, "h": 150}  # far above the 80 px canon
+
+    def drawn(faces):
+        """Non-black pixels of the overlay (antialiased text included)."""
+        out = annotate.draw_faces(img, faces, min_px=56.0, canon_px=80.0)
+        return out.reshape(-1, 3)[out.reshape(-1, 3).any(axis=1)]
+
+    rejected = drawn([{"box": box, "gateReason": "frontality"}])
+    # BGR: pure red means the blue and green channels are untouched.
+    assert (rejected[:, 0] == 0).all() and (rejected[:, 1] == 0).all(), (
+        "a gated face is red whatever its width"
+    )
+
+    # ...and the same box, kept, is green — not a warning at all.
+    kept = drawn([{"box": box, "gateReason": None}])
+    assert (kept[:, 1] > 0).any() and not (kept[:, 2] > 0).any()
+
+
 def test_draw_tracks_and_matches_run():
     """Track and match overlays draw ids/labels without raising."""
     img = _blank()

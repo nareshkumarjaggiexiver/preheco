@@ -15,6 +15,8 @@ each other.
 import cv2
 import numpy as np
 
+from .gate import reported_reason
+
 # BGR palette.
 _GREEN = (0, 200, 0)  # person boxes / canon-quality faces
 _CYAN = (200, 200, 0)  # track boxes
@@ -74,13 +76,25 @@ def draw_tracks(img: np.ndarray, tracks: list[dict]) -> np.ndarray:
 
 
 def draw_faces(img: np.ndarray, faces: list[dict], min_px: float, canon_px: float) -> np.ndarray:
-    """Face boxes coloured by quality band: canon green, sub-canon amber, gated red."""
+    """Face boxes coloured by gate verdict; rejected faces say WHY.
+
+    Red is "this face was not counted", and the label names the floor that
+    dropped it (``72px ied``) — a face can now be comfortably wide and still be
+    discarded for pose or focus, so colouring on width alone would draw a green
+    box around a guest who was never counted.  Green/amber keep their meaning
+    for kept faces: at or below the production canon.
+
+    The verdict is read from ``gateReason`` where the gate stamped one, falling
+    back to the width comparison for callers that never ran the gate.
+    """
     out = img.copy()
     for f in faces:
         box = f.get("box", {})
         w = float(box.get("w", 0.0))
-        colour = _GREEN if w >= canon_px else _AMBER if w >= min_px else _RED
-        _rect(out, box, colour, f"{w:.0f}px")
+        reason = reported_reason(f, min_px)
+        colour = _RED if reason else (_GREEN if w >= canon_px else _AMBER)
+        label = f"{w:.0f}px" if reason is None else f"{w:.0f}px {reason}"
+        _rect(out, box, colour, label)
     return out
 
 

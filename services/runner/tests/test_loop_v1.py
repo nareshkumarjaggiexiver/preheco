@@ -61,6 +61,7 @@ class V1Fake:
         self.manual_counts: list[dict] = []
         self.opened: dict | None = None
         self.closed: dict | None = None
+        self.run_created: dict | None = None
         self.run_ended: dict | None = None
         self.drop_resolve = 0  # PUT /api/feedback/:id to swallow (dropped reply)
         self.merge_ok = True  # False once the drop key no longer exists
@@ -70,6 +71,7 @@ class V1Fake:
 
     def _planner(self, request, path, body):
         if path == "/api/pipeline/runs" and request.method == "POST":
+            self.run_created = body
             return httpx.Response(200, json={"id": "prun-1"})
         if path == "/api/pipeline/runs/prun-1" and request.method == "PUT":
             self.run_ended = body
@@ -329,8 +331,8 @@ def test_enrol_mode_writes_best_samples_and_reports():
     assert final["sampleCount"] == 5
     # Reported to the planner via PUT /api/staff/:id.
     assert fake.enrol_report["id"] == "st-1" and fake.enrol_report["sampleCount"] == 5
-    # Enrol does not create a pipeline run or reset the gallery.
-    assert "match /reset" not in fake.calls and "planner /api/pipeline/runs" not in fake.calls
+    # Enrol still has no gallery of its own — it counts nobody.
+    assert "match /reset" not in fake.calls
 
 
 def test_tombstoned_staff_purged_at_run_start_and_confirmed():
@@ -547,6 +549,103 @@ def test_enrol_hands_the_camera_back():
     make_loop(fake, request).run()
     assert fake.opened["owner"] == "run-local"
     assert fake.closed == {"owner": "run-local"}
+
+
+# ------------------------------------------ the enrolment record (point #13)
+
+
+def test_an_enrolment_leaves_a_run_record():
+    """Enrolment CREATES the biometric, so the capture must leave a ledger.
+
+    Intent change, deliberate: this behaviour was previously pinned the other
+    way ("Enrol does not create a pipeline run"), and that pin was wrong about
+    what mattered. Erasure already had a permanent ledger — `staff_tombstones`
+    keeps a row and its purge confirmation forever, on the argument that a
+    consent withdrawal and the proof it was honoured are what an audit asks
+    for. The act that CREATES the biometric had nothing: a re-enrolment
+    silently overwrote the previous `enrolled_at`, and no record anywhere said
+    from which camera, at which event, or over how many frames a staff
+    template was captured. Consent is only auditable if the capture is.
+    """
+    fake = V1Fake(n_frames=6, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    final = make_loop(fake, request, enrol_best_n=5).run()
+
+    assert final["state"] == "ended"
+    assert final["plannerRunId"] == "prun-1", "the enrolment must be addressable"
+
+    # WHO, WHEN, HOW MANY, FROM WHICH SOURCE — the four questions an audit asks.
+    assert fake.run_ended["status"] == "ended"
+    assert fake.run_ended["results"]["sampleCount"] == 5      # how many
+    assert fake.run_ended["results"]["frames"] == 6
+    assert "staffId=st-1" in fake.run_ended["notes"]          # who
+    assert "source=/walk.mp4" in fake.run_ended["notes"]      # from where
+    assert fake.run_ended["endReason"] == "source-ended"
+
+
+def test_a_failed_enrolment_also_leaves_a_record():
+    """The loud-failure path used to leave zero trace anywhere at all.
+
+    An enrolment that captured nothing is exactly the event worth recording:
+    it means somebody walked a roster member past a camera and the venue now
+    believes they are enrolled when they are not.
+    """
+    fake = V1Fake(n_frames=5, face_widths=(85.0, 82.0))  # two faces: ambiguous
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["state"] == "failed"
+    assert fake.enrolled is None
+    assert fake.run_ended["status"] == "failed"
+    assert fake.run_ended["results"]["sampleCount"] == 0
+    assert fake.run_ended["results"]["multiFaceFramesSkipped"] == 5
+    assert "more than one face" in fake.run_ended["notes"]
+
+
+def test_an_enrolment_survives_a_planner_that_cannot_take_the_record():
+    """The record is worth having; it is not worth an enrolment.
+
+    The samples are the deliverable and the operator has already walked the
+    member through. A planner outage must cost the record only — the opposite
+    trade from count mode, where create_run failing legitimately fails the run
+    because the planner id keys the gallery.
+    """
+
+    class NoRuns(V1Fake):
+        """A planner that refuses to open a run but is otherwise healthy."""
+
+        def _planner(self, request, path, body):
+            if path == "/api/pipeline/runs" and request.method == "POST":
+                return httpx.Response(503, json={"error": "planner restarting"})
+            return super()._planner(request, path, body)
+
+    fake = NoRuns(n_frames=6, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "mode": "enrol", "siteId": "site-1",
+               "staffId": "st-1", "source": {"path": "/walk.mp4"}}
+    loop = make_loop(fake, request, enrol_best_n=5)
+    loop.planner._sleep = lambda _s: None  # no retry backoff in a unit test
+    final = loop.run()
+
+    assert final["state"] == "ended", "a planner outage must not fail an enrolment"
+    assert final["sampleCount"] == 5
+    assert fake.enrolled is not None, "the templates must still be written"
+    assert final["plannerRunId"] is None
+    assert fake.run_ended is None  # nothing to settle: no row was ever opened
+
+
+def test_an_enrolment_run_label_never_carries_source_credentials():
+    """The planner slugs the label into the run row's PERMANENT id."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,))
+    request = {
+        "eventId": "ev-1", "mode": "enrol", "siteId": "site-1", "staffId": "st-1",
+        "source": {"url": "rtsp://admin:s3kret@cam:554/media/video1"},
+    }
+    make_loop(fake, request).run()
+    label = fake.run_created["label"]
+    assert "s3kret" not in label
+    assert label == "enrol st-1 rtsp://cam:554/media/video1"
 
 
 def test_tap_round_is_abandoned_when_its_budget_is_spent():

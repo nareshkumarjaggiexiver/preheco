@@ -69,7 +69,13 @@ def test_detect_face_fields_when_any_found():
     r = TestClient(app).post("/detect", json={"imageB64": _b64(_face_frame())})
     assert r.status_code == 200
     for face in r.json()["faces"]:  # shape-checked only if the crude face fires
-        assert set(face) == {"box", "landmarks", "conf", "widthPx", "quality"}
+        # The four always-present keys, plus the measured signals, which are
+        # emitted only when measurable (see _with_quality).
+        assert {"box", "landmarks", "conf", "widthPx", "quality"} <= set(face)
+        assert set(face) <= {
+            "box", "landmarks", "conf", "widthPx", "quality",
+            "iedPx", "frontality", "sharpness",
+        }
         assert len(face["landmarks"]) == 5
         assert face["quality"] in {"ok", "sub-canon", "reject"}
         assert face["widthPx"] == face["box"]["w"]
@@ -104,14 +110,35 @@ def test_detect_rejects_bad_base64():
 def test_ied_and_frontality_emitted():
     """F1: a face with landmarks reports inter-eye distance and frontality."""
     from app.main import _with_quality
+    img = _face_frame(320, 240)
     face = {
         "box": {"x": 0, "y": 0, "w": 100, "h": 120},
         "landmarks": [[30, 40], [70, 40], [50, 60], [35, 80], [65, 80]],
         "conf": 0.9,
     }
-    out = _with_quality(face)
+    out = _with_quality(face, img)
     assert out["iedPx"] == 40.0            # |70-30| horizontally
     assert out["frontality"] == 1.0        # nose dead-centre between the eyes
     # a face with no landmarks still gets width + quality, no IED keys
-    bare = _with_quality({"box": {"x": 0, "y": 0, "w": 60, "h": 70}, "conf": 0.8})
+    bare = _with_quality({"box": {"x": 0, "y": 0, "w": 60, "h": 70}, "conf": 0.8}, img)
     assert bare["widthPx"] == 60 and "iedPx" not in bare
+
+
+def test_sharpness_emitted_beside_the_other_signals():
+    """The docstring used to promise `sharpness` and nothing computed it.
+
+    Regression for a claim, not a crash: a reader ticked "IED + Laplacian
+    sharpness" off as shipped, and the gate that was meant to use it had only
+    two of its signals to compose from.
+    """
+    from app.main import _with_quality
+    box = {"x": 40, "y": 30, "w": 100, "h": 120}
+    face = {"box": box, "conf": 0.9}
+
+    sharp = _with_quality(face, _face_frame(320, 240))
+    blurred = _with_quality(face, cv2.GaussianBlur(_face_frame(320, 240), (11, 11), 0))
+    assert sharp["sharpness"] > blurred["sharpness"]
+
+    # Unmeasurable stays absent, so the gate can tell "blurred" from "unknown".
+    off_frame = _with_quality({"box": {"x": 900, "y": 900, "w": 40, "h": 40}}, _face_frame())
+    assert "sharpness" not in off_frame
