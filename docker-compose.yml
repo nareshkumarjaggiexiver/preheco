@@ -117,6 +117,16 @@ services:
 
   runner:
     <<: *heco-service
+    environment:
+      # The quality gate. Every one defaults to TODAY'S BEHAVIOUR when unset,
+      # so the pipeline only tightens when an operator deliberately arms a
+      # floor. Width alone is not enough: a 133 px face seen in pure profile
+      # passes a width gate and is unrecognisable — measured on this camera,
+      # IED 10.6 px at frontality 0.00.
+      HECO_QUALITY_MIN_PX: ${HECO_QUALITY_MIN_PX-}
+      HECO_QUALITY_MIN_IED_PX: ${HECO_QUALITY_MIN_IED_PX-}
+      HECO_QUALITY_MIN_FRONTALITY: ${HECO_QUALITY_MIN_FRONTALITY-}
+      HECO_QUALITY_MIN_SHARPNESS: ${HECO_QUALITY_MIN_SHARPNESS-}
     build:
       context: .
       dockerfile: docker/service.Dockerfile

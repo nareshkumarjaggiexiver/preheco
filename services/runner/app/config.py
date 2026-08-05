@@ -7,6 +7,8 @@ bare-metal run (the e2e smoke script points them all at localhost).
 import os
 from dataclasses import dataclass, replace
 
+from heco_common.config import env_float, env_int
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -121,27 +123,21 @@ def from_env() -> Settings:
         match_url=os.environ.get("HECO_MATCH_URL", s.match_url),
         planner_url=os.environ.get("PLANNER_URL", s.planner_url),
         planner_token=os.environ.get("HECO_TOKEN") or s.planner_token,
-        quality_min_px=float(os.environ.get("HECO_QUALITY_MIN_PX", s.quality_min_px)),
-        quality_canon_px=float(os.environ.get("HECO_QUALITY_CANON_PX", s.quality_canon_px)),
-        quality_min_ied_px=float(
-            os.environ.get("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px)
-        ),
-        quality_min_frontality=float(
-            os.environ.get("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality)
-        ),
-        quality_min_sharpness=float(
-            os.environ.get("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness)
-        ),
-        run_retention_s=float(os.environ.get("HECO_RUN_RETENTION_S", s.run_retention_s)),
-        flush_interval_s=float(os.environ.get("HECO_FLUSH_INTERVAL_S", s.flush_interval_s)),
-        request_timeout_s=float(os.environ.get("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s)),
-        planner_timeout_s=float(os.environ.get("HECO_PLANNER_TIMEOUT_S", s.planner_timeout_s)),
-        report_timeout_s=float(os.environ.get("HECO_REPORT_TIMEOUT_S", s.report_timeout_s)),
-        tap_budget_s=float(os.environ.get("HECO_TAP_BUDGET_S", s.tap_budget_s)),
-        staff_cooldown_s=float(os.environ.get("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s)),
-        source_poll_s=float(os.environ.get("HECO_SOURCE_POLL_S", s.source_poll_s)),
-        source_stall_s=float(os.environ.get("HECO_SOURCE_STALL_S", s.source_stall_s)),
-        tap_interval_s=float(os.environ.get("HECO_TAP_INTERVAL_S", s.tap_interval_s)),
-        feedback_poll_s=float(os.environ.get("HECO_FEEDBACK_POLL_S", s.feedback_poll_s)),
-        enrol_best_n=int(os.environ.get("HECO_ENROL_BEST_N", s.enrol_best_n)),
+        quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
+        quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),
+        quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),
+        quality_min_frontality=env_float("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality),
+        quality_min_sharpness=env_float("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness),
+        run_retention_s=env_float("HECO_RUN_RETENTION_S", s.run_retention_s),
+        flush_interval_s=env_float("HECO_FLUSH_INTERVAL_S", s.flush_interval_s),
+        request_timeout_s=env_float("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s),
+        planner_timeout_s=env_float("HECO_PLANNER_TIMEOUT_S", s.planner_timeout_s),
+        report_timeout_s=env_float("HECO_REPORT_TIMEOUT_S", s.report_timeout_s),
+        tap_budget_s=env_float("HECO_TAP_BUDGET_S", s.tap_budget_s),
+        staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
+        source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
+        source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
+        tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
+        feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
+        enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
     )
