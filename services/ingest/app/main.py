@@ -5,7 +5,7 @@ Endpoints (CONTRACTS.md):
 * ``POST /open``  {url|path, loop, owner?, takeover?} — start capturing.
   The capture slot is EXCLUSIVE: see "one slot, one owner" below.
 * ``POST /close`` {owner?, force?} — release the slot at end of run.
-* ``GET /frame``  → {tMs, imageB64, w, h, seq} — the LATEST frame only
+* ``GET /frame``  → {tMs, imageB64, w, h, seq, ended} — the LATEST frame only
   (drop-not-queue; see app.capture for the policy).
 * ``GET /health`` → {ok, model, version, owner}.
 
@@ -157,7 +157,14 @@ def get_frame() -> Frame:
     seq, t_ms, img = latest
     h, w = img.shape[:2]
     quality = env_int("INGEST_JPEG_QUALITY", 85)
-    return Frame(tMs=t_ms, imageB64=encode_jpeg_b64(img, quality=quality), w=w, h=h, seq=seq)
+    # `ended` is the only signal that separates a played-out file from a camera
+    # that blinked: both freeze `seq`. The worker knows which it is (it retries
+    # a live stream forever and only sets ended for a finished file), and until
+    # now it kept that to itself.
+    return Frame(
+        tMs=t_ms, imageB64=encode_jpeg_b64(img, quality=quality),
+        w=w, h=h, seq=seq, ended=bool(getattr(worker, "ended", False)),
+    )
 
 
 @app.get("/health")
