@@ -46,7 +46,7 @@ from urllib.parse import urlsplit
 import httpx
 from heco_common.geometry import dedupe_boxes
 from heco_common.imaging import decode_jpeg_b64
-from heco_common.logs import RunLog, setup_logging
+from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 
@@ -356,7 +356,10 @@ class RunLoop:
                 # Best effort: the planner may be down too; local status
                 # already says failed either way.
                 with contextlib.suppress(Exception):
-                    self.planner.end_run(status="failed", notes=str(e))
+                    # safe(): a stage's reply can quote the source URL, and
+                    # these notes are permanent, served to the browser, and
+                    # exported. Belt and braces with ingest's own redaction.
+                    self.planner.end_run(status="failed", notes=safe(str(e)))
         return self.status()
 
     def _run(self) -> None:
