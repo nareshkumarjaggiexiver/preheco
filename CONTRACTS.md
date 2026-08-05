@@ -542,8 +542,12 @@ gate is not the problem: before it was armed the same measurement was mean
 
 - An identity now holds up to **`HECO_MATCH_TEMPLATES_PER_PERSON`** (default 5)
   templates. On a match the sighting may be kept as an additional view; at the
-  cap the **lowest capture quality** is evicted, so a guest accumulates their
-  best views rather than their most recent.
+  cap the **least distinctive** view is evicted, so a guest accumulates the
+  widest spread of views that fits — not their best photographs, and not their
+  most recent. Eviction by capture quality was measured and rejected: quality
+  is face width, face width is distance, so it collapsed one guest's five
+  templates into a two-second window at one distance and counted him twice
+  when he reappeared further away.
 - A matched sighting is kept only if it clears the threshold by
   `HECO_MATCH_TEMPLATE_CONFIDENCE` (0.05), beats the nearest **rival** identity
   by `HECO_MATCH_TEMPLATE_MARGIN` (0.05), and is below

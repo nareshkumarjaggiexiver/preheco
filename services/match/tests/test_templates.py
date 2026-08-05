@@ -70,6 +70,18 @@ def bridge(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return _unit(x + y)
 
 
+def pose(degrees: float) -> np.ndarray:
+    """One view at a stated angle on the same great circle :func:`arc` walks.
+
+    Lets a test place views at chosen, uneven separations — a huddle of similar
+    looks plus one that sits well away from them — which a fixed-step arc
+    cannot express and which is where the eviction policies actually differ.
+    """
+    e1, e2 = np.zeros(DIM), np.zeros(DIM)
+    e1[0], e2[1] = 1.0, 1.0
+    return np.cos(np.radians(degrees)) * e1 + np.sin(np.radians(degrees)) * e2
+
+
 def arc(steps: int, degrees: float) -> list[np.ndarray]:
     """A pose sweep: ``steps`` unit vectors ``degrees`` apart on a great circle.
 
@@ -227,29 +239,68 @@ def test_prune_evicts_quality_less_templates_first(tmp_path):
         assert s.qualities_for("p00001") == [90.0, 80.0]
 
 
-def test_gallery_respects_the_cap_and_keeps_the_best_views(client, tmp_path, monkeypatch):
-    """Over a long sweep the guest holds 5 views — the best-quality 5."""
+def test_gallery_respects_the_cap_and_keeps_the_widest_spread(client, tmp_path, monkeypatch):
+    """Over a long sweep the guest holds 5 views — the most DISTINCT 5.
+
+    This test used to assert the best-quality five (``[95, 92, 90, 88, 85]``,
+    the 60 px frame evicted).  That was the policy, and the policy was wrong:
+    quality is face width, face width is distance, so keeping the best five
+    keeps the five frames nearest the camera and the gallery stops knowing what
+    the guest looks like from anywhere else.  The 2026-08-06 bench measured the
+    cost — five templates spanning two seconds of a 140-second walk, and the
+    same man counted twice when he reappeared at 87 px.
+
+    So the assertion is now about COVERAGE of the sweep, and a poorly-captured
+    but distinctive view is expected to survive a well-captured near-duplicate.
+    Quality has not become irrelevant — it breaks ties between equally
+    redundant views — it has stopped being the thing that decides.
+    """
     monkeypatch.setenv("HECO_MATCH_TEMPLATES_PER_PERSON", "5")
     qualities = [90.0, 60.0, 95.0, 88.0, 92.0, 85.0]
-    verdicts = _walk(client, "run-cap", arc(6, 35.0), qualities)
+    views = arc(6, 35.0)
+    verdicts = _walk(client, "run-cap", views, qualities)
     key = verdicts[0]["personKey"]
     assert {v["personKey"] for v in verdicts} == {key}, "one sweep, one guest"
     assert verdicts[-1]["galleryN"] == 1
     assert verdicts[-1]["templateN"] == 5
-    held = _templates(tmp_path, "run-cap", key)
-    assert held == [95.0, 92.0, 90.0, 88.0, 85.0]
-    assert 60.0 not in held, "the worst view was evicted"
-    assert max(held) == 95.0, "the best view was never evicted"
+
+    s = store.open_store(gallery.db_path(tmp_path, "run-cap"))
+    with s.reading():
+        kept = [_unit(v) for v in s.vectors_for(key)]
+    assert len(kept) == 5
+    # Every view held must be genuinely different from every other: no slot is
+    # spent on a duplicate, which is the whole reason the cap exists.
+    tightest = max(
+        float(np.dot(a, b)) for i, a in enumerate(kept) for b in kept[i + 1 :]
+    )
+    assert tightest < 0.90, f"a capped slot went to a near-duplicate ({tightest:.3f})"
+    # And the sweep's extremes both survive — a gallery that keeps only the
+    # middle of a walk cannot recognise its beginning or its end.
+    for extreme, label in ((views[0], "first"), (views[-1], "last")):
+        near = max(float(np.dot(_unit(extreme), k)) for k in kept)
+        assert near > 0.99, f"the {label} view of the sweep was evicted"
 
 
-def test_a_worse_view_does_not_displace_a_better_one_at_cap(client, tmp_path, monkeypatch):
-    """At the cap, a low-quality sighting is refused rather than churned in."""
+def test_a_redundant_view_does_not_churn_the_gallery_at_cap(client, tmp_path, monkeypatch):
+    """At the cap, a sighting no more distinctive than what is held is refused.
+
+    The sweep steps 35 deg, so the three held views sit at cosine 0.819 from
+    their neighbours and the newcomer sits 0.819 from the nearest of them: it is
+    exactly as redundant as the tightest pair already stored, so storing it
+    would evict it again on the next line.  Refusing is the same outcome without
+    the write.
+
+    (This test previously read as "a LOW-QUALITY sighting is refused".  It was
+    passing for the wrong reason once eviction stopped being quality-based —
+    the 40 px width is now incidental, and the redundancy is the point.)
+    """
     monkeypatch.setenv("HECO_MATCH_TEMPLATES_PER_PERSON", "3")
     views = arc(5, 35.0)
     _walk(client, "run-worse", views[:3], [90.0, 91.0, 92.0])
     out = _match(client, "run-worse", views[3], quality=40.0)
     assert out["templateAdded"] is False
-    assert _templates(tmp_path, "run-worse", out["personKey"]) == [92.0, 91.0, 90.0]
+    assert out["templateN"] == 3, "nothing stored, nothing evicted"
+    assert sorted(_templates(tmp_path, "run-worse", out["personKey"])) == [90.0, 91.0, 92.0]
 
 
 def test_eviction_survives_a_reopen_and_leaves_the_index_honest(tmp_path):
@@ -667,3 +718,99 @@ def test_prune_redundant_is_a_no_op_within_the_cap(tmp_path):
         assert s.count_for("p00001") == 3
         with pytest.raises(ValueError):
             s.prune_redundant("p00001", 0)
+
+
+# ------------------------------- enrolment keeps SPREAD, not the best photos
+
+
+def test_a_distinctive_but_badly_captured_view_outlives_a_well_captured_twin(client, tmp_path):
+    """The policy change, stated as the only thing that actually differs.
+
+    Quality-based eviction keeps a guest's best PHOTOGRAPHS.  Redundancy-based
+    eviction keeps their widest COVERAGE.  The two disagree exactly when a
+    view is distinctive and badly captured at the same time — which is the
+    common case at a gate, because the distinctive views are the ones taken far
+    from the lens or at its edge, and those are the small, soft ones.
+
+    Here five well-captured views sit in a huddle and one poorly-captured view
+    sits well away from them.  Under the old rule the odd one out is the first
+    thing evicted, because it is the worst picture; the gallery keeps five
+    variations on one look and forgets the sixth entirely.
+    """
+    huddle = [pose(0.0), pose(28.0), pose(56.0), pose(84.0), pose(112.0), pose(140.0)]
+    odd_one_out = pose(168.0)
+    _walk(
+        client,
+        "run-anticorr",
+        [*huddle, odd_one_out],
+        [300.0, 290.0, 280.0, 270.0, 260.0, 250.0, 90.0],  # the outlier is the worst shot
+    )
+
+    s = store.open_store(gallery.db_path(tmp_path, "run-anticorr"))
+    with s.reading():
+        kept = [_unit(v) for v in s.vectors_for("p00001")]
+    near = max(float(np.dot(_unit(odd_one_out), k)) for k in kept)
+    assert near > 0.99, (
+        "the one view that covered ground no other view covered was evicted "
+        f"for being the worst photograph (nearest survivor {near:.3f})"
+    )
+
+
+def test_the_gallery_recognises_the_view_it_nearly_forgot(client, tmp_path):
+    """And the consequence: that guest is recognised with margin, not by luck.
+
+    Same setup, then the guest reappears in the pose the gallery nearly threw
+    away. What matters is not just the verdict but the MARGIN — tonight's real
+    miss was 0.294 against a 0.363 threshold, so a policy that leaves this
+    sighting scraping the line has not really fixed anything.
+    """
+    huddle = [pose(0.0), pose(28.0), pose(56.0), pose(84.0), pose(112.0), pose(140.0)]
+    odd_one_out = pose(168.0)
+    _walk(
+        client,
+        "run-anticorr2",
+        [*huddle, odd_one_out],
+        [300.0, 290.0, 280.0, 270.0, 260.0, 250.0, 90.0],
+    )
+    again = _match(client, "run-anticorr2", odd_one_out, quality=88.0)
+    assert again["isNew"] is False, "the guest was counted twice"
+    assert again["galleryN"] == 1
+    assert again["cosine"] > 0.90, (
+        f"recognised, but only barely ({again['cosine']:.3f}) — the view that "
+        "covers this pose is gone and something else answered for it"
+    )
+
+
+def test_at_cap_a_near_duplicate_is_refused_and_a_distinctive_view_is_taken(tmp_path):
+    """Clause 5: at the cap, only a view MORE distinctive than the closest pair.
+
+    Otherwise the insert is deleted again by the eviction on the next line —
+    pure churn.  Passing means some existing pair is tighter than the newcomer,
+    so one of THEM goes and the identity's coverage widens.
+    """
+    with store.VectorStore(tmp_path / "s.db") as s:
+        for v in arc(4, 30.0):
+            s.add("p00001", v, quality=70.0)
+        s.add("p00001", arc(2, 1.0)[1], quality=70.0)  # a near-twin of view 0
+        crowded = s.max_redundancy("p00001")
+        assert crowded > 0.99, "the twin should be the tightest pair held"
+        assert s.count_for("p00001") == 5
+
+        # A view further from everything than that twin pair is: acceptable.
+        assert gallery._should_enrol(
+            s, "p00001", arc(5, 30.0)[4], 70.0, 0.5, THRESHOLD, 5, 0.05, 0.05, 0.90
+        ), "a distinctive view must be allowed to evict the twin"
+        # A view closer than the tightest pair: refused, it would evict itself.
+        assert not gallery._should_enrol(
+            s, "p00001", arc(5, 30.0)[4], 70.0, 0.999, THRESHOLD, 5, 0.05, 0.05, 0.90
+        )
+
+
+def test_max_redundancy_needs_two_views(tmp_path):
+    """Nothing to be redundant with below two templates — None, not a crash."""
+    with store.VectorStore(tmp_path / "s.db") as s:
+        assert s.max_redundancy("p00001") is None
+        s.add("p00001", arc(1, 30.0)[0], quality=70.0)
+        assert s.max_redundancy("p00001") is None
+        s.add("p00001", arc(2, 30.0)[1], quality=70.0)
+        assert s.max_redundancy("p00001") == pytest.approx(0.866, abs=1e-3)

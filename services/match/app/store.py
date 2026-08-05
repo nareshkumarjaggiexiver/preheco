@@ -44,11 +44,13 @@ Storage
                   ``sub_canon`` flag.  A person/staff member owns SEVERAL rows:
                   staff from enrolment, guests from accumulating views as they
                   are re-sighted (:func:`app.gallery.match`), either from a
-                  merge.  Two evictions bound how many, and they differ on
-                  purpose: :meth:`prune_to_cap` (after enrolment) drops the
-                  lowest quality, :meth:`prune_redundant` (after a merge) drops
-                  the least distinctive view — see that method for why keeping
-                  the quality rule there would undo the operator's correction.
+                  merge.  :meth:`prune_redundant` bounds how many, dropping the
+                  least distinctive view so an identity keeps the widest spread
+                  it can hold.  :meth:`prune_to_cap` is the older quality-based
+                  eviction, kept for callers that genuinely want "the best N
+                  photographs"; it is NOT used on the enrolment path any more,
+                  because quality is face width and face width is distance —
+                  see :meth:`prune_redundant` for the measurement.
 * ``cannot_link`` operator "these are two different people" constraints
                   (from a *false-match* correction), stored order-independent.
                   :meth:`merge` refuses to fold a constrained pair — that is
@@ -509,13 +511,22 @@ class VectorStore:
     def prune_to_cap(self, key: str, cap: int) -> int:
         """Evict a key's WORST templates until it holds at most ``cap``.
 
-        "Worst" is lowest capture quality (face width px), so an identity that
-        keeps being re-sighted accumulates its best views rather than its most
-        recent — a most-recent policy would let a run of bad frames flush the
-        good evidence out of a guest's record, and the count is an invoice
-        figure.  Ties, and templates with no recorded quality at all, break
-        towards the OLDEST row: the earliest template is the one the identity
-        was founded on, and keeping it anchors the identity against drift.
+        "Worst" is lowest capture quality (face width px).  Ties, and templates
+        with no recorded quality at all, break towards the OLDEST row.
+
+        NOT THE ENROLMENT RULE ANY MORE.  This looks like the obvious policy —
+        keep a guest's best photographs — and it is wrong for a gallery, which
+        :meth:`prune_redundant` now handles instead.  Quality here is face
+        width, and face width is distance from the lens, so "keep the best
+        five" resolves to "keep the five frames where they stood nearest the
+        camera": five near-duplicates of one moment, and no record of the same
+        person further away.  Measured on the corridor bench — one guest's five
+        surviving templates spanned two seconds of a 140-second walk.
+
+        Retained because "the best N captures" is still the right question
+        somewhere (an operator-supervised enrolment picking presentable
+        samples, say), and because deleting a tested, documented primitive to
+        express a policy change would leave the reasoning nowhere.
 
         Returns how many templates were evicted (0 when already within cap).
         """
@@ -533,6 +544,29 @@ class VectorStore:
         self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in doomed])
         self._drop_ids(doomed)
         return len(doomed)
+
+    def max_redundancy(self, key: str) -> float | None:
+        """The highest nearest-sibling cosine among a key's templates.
+
+        In other words: how close together the two most similar views this
+        identity holds actually are.  It is the number :func:`app.gallery.
+        _should_enrol` compares an incoming sighting against to decide whether
+        storing it would be churn — if the newcomer sits FURTHER from its
+        nearest sibling than this, then some existing pair is more redundant
+        than it is, so :meth:`prune_redundant` will evict one of them and the
+        newcomer survives.  If it sits closer, the newcomer is itself the most
+        redundant view and would be deleted on the next line.
+
+        ``None`` when the key holds fewer than two templates — nothing to be
+        redundant with, so no sighting can be rejected on these grounds.
+        """
+        vecs = self.vectors_for(key)
+        if len(vecs) < 2:
+            return None
+        mat = np.stack([as_unit(v) for v in vecs])
+        sims = mat @ mat.T
+        np.fill_diagonal(sims, -np.inf)
+        return float(sims.max())
 
     def prune_redundant(self, key: str, cap: int) -> int:
         """Evict a key's most REDUNDANT templates until it holds at most ``cap``.
