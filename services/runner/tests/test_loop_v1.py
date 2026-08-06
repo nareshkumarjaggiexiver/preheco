@@ -55,6 +55,7 @@ class V1Fake:
         self.guest_calls = 0
         self.calls: list[str] = []
         self.taps: list[dict] = []
+        self.stats: list[dict] = []  # every /stats flush body, in post order
         self.frames_posted: list[str] = []  # stage of each multipart frame POST
         self.feedback_polls = 0
         self.resolved: list[tuple[str, str]] = []  # (feedbackId, status)
@@ -84,7 +85,10 @@ class V1Fake:
         if path == "/api/pipeline/runs/prun-1" and request.method == "PUT":
             self.run_ended = body
             return httpx.Response(200, json={"ok": True})
-        if path.endswith("/stats") or path.endswith("/samples"):
+        if path.endswith("/stats"):
+            self.stats.append(body)
+            return httpx.Response(200, json={"ok": True})
+        if path.endswith("/samples"):
             return httpx.Response(200, json={"ok": True})
         if path.endswith("/taps"):
             self.taps.append(body)
@@ -837,12 +841,15 @@ FROSTED_ZONE = {
 
 
 def test_zone_excluded_face_never_reaches_match_but_stays_visible():
-    """End to end: the zone face is dropped pre-gate, counted, and tapped.
+    """End to end: the zone face is dropped pre-gate, counted, tapped, audited.
 
     Both faces pass the quality gate; only the one whose centre is outside
     the polygon may be matched. The excluded one must still appear in the
     face-detect tap flagged excludedByZone — the operator has to be able to
-    see what their polygon is eating.
+    see what their polygon is eating — AND in the face-detect stats flush as
+    the faceZoneExcluded aggregate, because the tap is the sampled film strip
+    while the planner's funnel is built only from the audited aggregates (the
+    live 2026-08-05 run's excludedByZone=41 vs unique=1 was invisible there).
     """
     fake = V1Fake(n_frames=2, face_widths=(60.0, 85.0))
     request = {
@@ -867,6 +874,18 @@ def test_zone_excluded_face_never_reaches_match_but_stays_visible():
     assert flagged[0]["zone"] == "frosted partition"
     assert face_taps[-1]["excludedByZone"] == 1
     assert face_taps[-1]["kept"] == 1
+
+    # The audited account: stats are upserted growing aggregates, so the LAST
+    # face-detect flush carries the whole-run totals. COUNT is the zone-
+    # excluded total; the width stats say what the polygon ate (the 60 px
+    # face, both frames — never the 85 px one).
+    fd_stats = [s for s in fake.stats if s["stage"] == "face-detect"]
+    assert fd_stats, "the face-detect aggregates must be flushed"
+    agg = fd_stats[-1]["metrics"]["faceZoneExcluded"]
+    assert agg["count"] == 2
+    assert agg["min"] == 60.0
+    assert agg["max"] == 60.0
+    assert agg["mean"] == 60.0
 
 
 def test_zone_with_no_frame_dims_excludes_nothing_and_says_so():
@@ -906,12 +925,22 @@ def test_zone_with_no_frame_dims_excludes_nothing_and_says_so():
 
 
 def test_no_zones_means_no_zone_accounting():
-    """Without zones both counters stay zero — the filter is genuinely absent."""
+    """Without zones both counters stay zero — the filter is genuinely absent.
+
+    That absence must reach the stats too: no flush may carry a
+    faceZoneExcluded metric at all. Runs recorded before zones existed have
+    no such key, so an absent metric means "no zones were armed" — a
+    count-0 entry would collapse that into "zones armed, nothing excluded"
+    and quietly rewrite the meaning of every old run's funnel.
+    """
     fake = V1Fake(n_frames=2, face_widths=(60.0,))
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
     assert final["excludedByZone"] == 0
     assert final["zoneUnmeasured"] == 0
+    fd_stats = [s for s in fake.stats if s["stage"] == "face-detect"]
+    assert fd_stats, "face-detect aggregates still flush without zones"
+    assert all("faceZoneExcluded" not in s["metrics"] for s in fd_stats)
 
 
 def test_runs_rejects_malformed_zones_with_a_readable_422():
