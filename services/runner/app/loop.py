@@ -1524,6 +1524,18 @@ class RunLoop:
             manual_additions=st["manualAdditions"],
             mints=mints,
         )
+        # ENFORCE the CONTRACTS.md 32 KB tap ceiling.  within_budget existed
+        # from v1 but nothing ever CALLED it outside tests (found in the
+        # 2026-08-06 review) — the ledger and row caps keep normal payloads
+        # near ~20 KB, but a contract nothing enforces is a comment.  The
+        # match payload is the only one with two independently-growing lists,
+        # so it degrades in the order that loses least: ledger window first
+        # (older mints already rode earlier rounds), then verdict rows.
+        mp = payloads.get("match")
+        if mp is not None and not taps.within_budget(mp):
+            mp["mints"] = mp.get("mints", [])[-20:]
+            if not taps.within_budget(mp):
+                mp["matches"] = mp.get("matches", [])[:10]
         for stage, payload in payloads.items():
             if time.monotonic() >= deadline:
                 self._bump("tapRoundsAbandoned")
