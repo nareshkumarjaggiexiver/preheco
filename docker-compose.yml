@@ -123,6 +123,7 @@ services:
       # stored appearance is not kept as an extra template. Verdicts are never
       # changed. Default 0.50 (reasoned, uncalibrated); 0 disables.
       HECO_MATCH_APPEARANCE_CLASH: ${HECO_MATCH_APPEARANCE_CLASH-}
+      HECO_MATCH_NEARMISS_FLOOR: ${HECO_MATCH_NEARMISS_FLOOR-}
 
   runner:
     <<: *heco-service
@@ -153,6 +154,7 @@ services:
       # with the healing frame's is refused. Default 0.50 (reasoned,
       # uncalibrated); 0 disables the veto. Agreement never loosens the heal.
       HECO_HEAL_APPEARANCE_CLASH: ${HECO_HEAL_APPEARANCE_CLASH-}
+      HECO_TAP_DUTY_FACTOR: ${HECO_TAP_DUTY_FACTOR-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
