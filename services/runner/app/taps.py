@@ -16,6 +16,27 @@ import json
 
 from .gate import reported_reason
 
+
+def _near_miss(v: dict) -> dict | None:
+    """Compact a verdict's nearMiss for the tap row (rounded, shape preserved).
+
+    The match service flags a MINT whose best face cosine landed just under
+    the threshold against an existing guest — measured tonight: the same
+    person split at face 0.3464 (threshold 0.363) with clothing intersection
+    0.562, found only by eye.  The console renders this as a one-click merge
+    SUGGESTION; it is information for the operator, never behaviour, so the
+    tap carries it verbatim (rounded like every other float here).  None
+    passes through untouched — most verdicts carry no flag.
+    """
+    nm = v.get("nearMiss")
+    if not nm:
+        return None
+    return {
+        "key": nm.get("key"),
+        "cosine": _r(nm.get("cosine"), 4),
+        "appearanceSim": _r(nm.get("appearanceSim"), 4),
+    }
+
 #: Max rows kept in any tap list — keeps payloads well under the 32 KB ceiling.
 ROW_CAP = 40
 
@@ -186,6 +207,9 @@ def match_payload(
             # stored descriptors (4 dp, None for staff/new/descriptor-less —
             # absent is not zero).  Visibility only: it never moves a verdict.
             "appearanceSim": _r(v.get("appearanceSim"), 4),
+            # A mint that near-missed an existing guest ({key, cosine,
+            # appearanceSim} or None) — the operator's one-click-merge cue.
+            "nearMiss": _near_miss(v),
         }
         for v in verdicts[:ROW_CAP]
     ]

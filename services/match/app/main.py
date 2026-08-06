@@ -8,7 +8,8 @@ Endpoints:
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?, appearance?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
-            templateN, templateAdded, appearanceSim, appearanceVetoed}
+            templateN, templateAdded, appearanceSim, appearanceVetoed,
+            nearMiss: {key, cosine, appearanceSim} | null}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -48,7 +49,7 @@ def _env_s(name: str, default: float) -> float:
         return default
     return float(raw)
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -239,6 +240,9 @@ def health() -> dict:
         # refused at clash 0.50 and one refused at 0.30 are different policies,
         # and 0 here means the veto was off for the whole run.
         "appearanceClash": config.appearance_clash(),
+        # ...and the near-miss band's floor: a bench reading nearMissMints
+        # must know which band produced them (0 = the flag was off).
+        "nearMissFloor": config.nearmiss_floor(),
     }
 
 
@@ -288,6 +292,8 @@ def match(body: MatchRequest) -> dict:
                 # so there is nothing to compare and nothing to veto.
                 "appearanceSim": None,
                 "appearanceVetoed": False,
+                # ...and no near-miss flag either: a staff hit is not a mint.
+                "nearMiss": None,
             }
 
     try:
@@ -304,6 +310,7 @@ def match(body: MatchRequest) -> dict:
             template_max_cosine=config.template_max_cosine(),
             appearance=body.appearance,
             appearance_clash=config.appearance_clash(),
+            nearmiss_floor=config.nearmiss_floor(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -321,6 +328,10 @@ def match(body: MatchRequest) -> dict:
         "templateAdded": r.template_added,
         "appearanceSim": r.appearance_sim,
         "appearanceVetoed": r.appearance_vetoed,
+        # Only ever non-null on a MINT that near-missed an existing guest —
+        # a one-click-merge suggestion for the operator, never behaviour
+        # (see gallery.match: impostors measured face 0.377 / clothes 0.503).
+        "nearMiss": r.near_miss,
     }
 
 

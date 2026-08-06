@@ -1,7 +1,13 @@
 """Unit tests for the cv2 frame-annotation helpers (synthetic frames only)."""
 
+import cv2
 import numpy as np
 from app import annotate
+
+
+def _decode(data: bytes) -> np.ndarray:
+    """JPEG bytes back to a BGR image, for size assertions."""
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
 
 def _blank(h: int = 240, w: int = 320) -> np.ndarray:
@@ -143,3 +149,44 @@ def test_render_face_detect_draws_zones_from_the_snapshot():
     }
     data = annotate.render("face-detect", img, last, 56.0, 80.0)
     assert data[:2] == b"\xff\xd8"
+
+
+# ------------------------------- tap-frame downscale (the 4K death spiral, P1)
+
+
+def test_render_downscales_a_4k_frame_to_console_width():
+    """Every stage's tap frame leaves render() at most 1280 px wide.
+
+    A tap round used to annotate and JPEG-encode FIVE full 3840x2160 frames —
+    ~1-1.5 s per round on the T440, the entire gap between healthy stage
+    timings and the observed 0.4 fps lock-in — for a console that displays
+    them small.  Aspect must be preserved: 3840x2160 -> 1280x720.
+    """
+    img = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    last = {
+        "boxes": [{"x": 400, "y": 300, "w": 600, "h": 1200, "conf": 0.9}],
+        "tracks": [],
+        "faces": [{"box": {"x": 420, "y": 320, "w": 85, "h": 110}}],
+        "verdicts": [],
+    }
+    for stage in annotate.STAGES:
+        out = _decode(annotate.render(stage, img, last, 56.0, 80.0))
+        assert out.shape[1] == 1280, stage
+        assert out.shape[0] == 720, f"{stage}: aspect must be preserved"
+
+
+def test_render_never_upscales_a_small_frame():
+    """A frame already under the cap passes through at its own size.
+
+    Upscaling would blur the source and spend encode time buying nothing.
+    """
+    out = _decode(annotate.render("ingest", _blank(h=240, w=320), {}, 56.0, 80.0))
+    assert out.shape[:2] == (240, 320)
+
+
+def test_downscale_is_exact_at_the_cap_and_identity_below_it():
+    """The helper itself: 1280 stays 1280 (no work), 1281 shrinks to 1280."""
+    at_cap = np.zeros((100, 1280, 3), dtype=np.uint8)
+    assert annotate.downscale(at_cap) is at_cap  # untouched, not even copied
+    over = annotate.downscale(np.zeros((100, 1281, 3), dtype=np.uint8))
+    assert over.shape[1] == 1280

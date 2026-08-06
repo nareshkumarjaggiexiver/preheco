@@ -24,7 +24,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker (v2 below) |
+| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -805,3 +805,76 @@ Empty string means unset for both (the compose `${VAR-}` rendering).
   `appearanceSim: null`.
 - Never treat an absent descriptor as a zero histogram: absent means NO veto,
   anywhere.
+
+
+## v2 addition — the tap round pays for itself (runner, 2026-08-06)
+
+The debug tap round annotated and JPEG-encoded FIVE full 3840×2160 frames and
+uploaded them — **~1–1.5 s per round** on the T440 — and fired whenever
+≥ `tap_interval_s` (~2 s) had passed. That trigger has **two stable states**,
+both measured: frames at ~0.43 s → a round every ~5th frame → **2.3 fps**;
+but ANY transient stall (a docker build ran on the box, both times it
+happened) pushes one frame past ~2 s, after which EVERY frame triggers a full
+round → ~2.5 s/frame, **locked at 0.4 fps forever**. The stage timings were
+identical in both states (ingest 42 ms, persons 76, faces 58, embed 74,
+match 4): the stages were innocent, and the untimed round was the entire gap.
+Three fixes, each independently sufficient to have caught or killed it:
+
+- **Tap frames are downscaled.** Every annotated tap frame (the raw ingest
+  frame included) leaves `annotate.render` at most **1280 px wide** (aspect
+  preserved; annotations are drawn at native resolution first, then the
+  overlay is resized with `INTER_AREA`). The console displays these small —
+  4K tap frames were pure cost, ~9× the encoded pixels for nothing. These
+  uploads are the runner's ONLY frame path: there is **no separate keyframe
+  path** in this repo, so nothing keeps full resolution and nothing loses
+  evidence.
+- **The duty-cycle guard.** A round fires only when BOTH hold: (a) the
+  interval has passed, AND (b) at least `HECO_TAP_DUTY_FACTOR` (default
+  **3**, empty-unset, 0 disables) × the PREVIOUS round's measured cost has
+  elapsed since that round ENDED. A 1 s round forces ≥ 3 s of counting before
+  the next, bounding the round at ~25% of loop time — and the every-frame
+  lock-in becomes **impossible by construction**, because the trigger can
+  never outrun the cost it just measured. A postponed round increments
+  **`tapRoundsDeferred`** in the run status — a NEW counter, deliberately not
+  `tapRoundsAbandoned`: an abandoned round *started* and lost taps to the
+  budget; a deferred round never started and lost nothing. The interval clock
+  restarts on a deferral, so the counter counts rounds, not frames.
+- **The round is finally instrumented.** Each round's wall cost is observed
+  as **`tapRoundMs`** on the `count` stage board, and every acquired frame
+  observes **`frameWaitMs`** on the `ingest` board — how long the loop stood
+  idle because the source had no new frame yet (0.0 when the first poll was
+  fresh). Together they split "the source is slow" from "the loop is slow"
+  from the console: the death spiral would have shown frameWaitMs ~0 with
+  tapRoundMs ~1500 while the frame period read 2500 ms.
+
+## v2 addition — a near-miss mint is flagged to the operator (match + runner, 2026-08-06)
+
+Measured tonight: the same person split at **face cosine 0.3464** against the
+0.363 threshold with **clothing intersection 0.562** — new guest p00005,
+almost certainly p00004 — and the operator found it BY EYE, because the
+signal surfaced nowhere. The mint that near-misses an existing identity while
+strongly agreeing on clothing is now flagged at mint time, as a **one-click
+merge suggestion**.
+
+- **Wire.** On a MINT (`isNew: true`) whose best face cosine against the
+  pre-existing gallery lands in **[`HECO_MATCH_NEARMISS_FLOOR` (default
+  0.29, empty-unset, 0 disables) .. threshold)**, the `/match` response gains
+  `nearMiss: {key, cosine, appearanceSim}` — the near-missed identity, the
+  best score, and the torso intersection against THAT identity's stored
+  descriptors (`null` when either side lacks one; absent is not zero).
+  Otherwise `nearMiss` is `null`. Matched verdicts and staff hits **never**
+  carry it. The floor sits just below the measured same-person misses
+  (0.294 / 0.308 / 0.346 / 0.361). `GET /health` reports `nearMissFloor`.
+  Match service **0.6.0 → 0.7.0**.
+- **THE VERDICT IS STILL A MINT — never an automatic merge.** The measured
+  reason: an IMPOSTOR pair on the same camera sits at **face 0.377 with
+  clothing 0.503** — two different men, near-threshold face AND agreeing
+  clothes. Auto-merging on this evidence folds real strangers into one
+  invoice line invisibly. The flag is information for a human; **the count
+  must not move without the operator clicking** (their click arrives as the
+  ordinary `duplicate` feedback → `/merge`).
+- **Runner.** The flag rides each match tap row verbatim (`nearMiss` beside
+  `appearanceSim`; `null` on unflagged rows), is counted as
+  **`nearMissMints`** in the run status, the end-of-run notes
+  (`nearMissMints=N`) and the structured `results`, and logs one INFO line
+  per flag (both keys, both scores) so the night is greppable.

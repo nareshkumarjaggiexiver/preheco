@@ -57,6 +57,14 @@ class MatchResult:
     # descriptor clashed.  Never set on the verdict path: appearance vetoes
     # WRITES, not verdicts.
     appearance_vetoed: bool = False
+    # Set ONLY on a mint whose best cosine against the pre-existing gallery
+    # landed inside the near-miss band [nearmiss_floor .. threshold):
+    # {"key": the near-missed identity, "cosine": that best score,
+    #  "appearanceSim": torso intersection vs that identity's stored
+    #  descriptors, None when either side lacks one}.  Information for the
+    #  operator, never behaviour — is_new stays True and nothing is merged
+    #  (see match() for the measured impostor pair that forbids it).
+    near_miss: dict | None = None
 
 
 def db_path(data_dir: Path, run_id: str) -> Path:
@@ -211,6 +219,7 @@ def match(
     template_max_cosine: float = 1.0,
     appearance: list[float] | None = None,
     appearance_clash: float = 0.0,
+    nearmiss_floor: float = 0.0,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -268,10 +277,31 @@ def match(
     a WRITE, never make or unmake a match.  ``appearance_clash <= 0`` is the
     off switch, and an absent descriptor on either side never vetoes.
 
+    THE NEAR-MISS FLAG (v2, 2026-08-06).  A mint whose best cosine against
+    the pre-existing gallery lands in ``[nearmiss_floor .. threshold)`` gets
+    ``near_miss = {key, cosine, appearanceSim}`` — the identity it almost
+    was, the score, and the torso intersection against THAT identity's stored
+    descriptors (None when either side lacks one; absent is not zero).
+    Measured tonight, and the reason this exists: the same person split at
+    face 0.3464 against the 0.363 threshold with clothing intersection 0.562
+    — new guest p00005 vs p00004, likely the same person — and the operator
+    found it BY EYE because the signal surfaced nowhere.  Now it rides the
+    response so the console can offer a one-click merge.
+
+    **THE VERDICT IS STILL A MINT.**  The flag is a suggestion to a human,
+    never an automatic merge, because the measurement runs both ways: an
+    IMPOSTOR pair on the same camera sits at face 0.377 with clothing
+    intersection 0.503 — two different men, near-threshold face AND agreeing
+    clothes.  Auto-merging on this evidence would fold real strangers into
+    one invoice line invisibly; the count must not move without the operator
+    clicking.  Out-of-band mints (best < floor, or an empty gallery) carry
+    ``near_miss = None``; matched verdicts and staff hits never carry it at
+    all.  ``nearmiss_floor <= 0`` is the off switch.
+
     The defaults here are the pre-M1 behaviour (cap 1, no enrolment, no
-    appearance veto); the service passes the real values from
-    :mod:`app.config`, so a caller that only wants the old semantics gets
-    them by leaving the knobs alone.
+    appearance veto, no near-miss flag); the service passes the real values
+    from :mod:`app.config`, so a caller that only wants the old semantics
+    gets them by leaving the knobs alone.
     """
     sub_canon = quality is not None and quality < canon_px
     store = open_store(db_path(data_dir, run_id))
@@ -331,11 +361,28 @@ def match(
                 appearance_sim=appearance_sim,
                 appearance_vetoed=vetoed,
             )
+        # NEAR-MISS: judged BEFORE this mint writes anything, against the
+        # near-missed identity's already-stored descriptors — the same
+        # before-the-write discipline as appearance_sim above.  hit is the
+        # best of the PRE-EXISTING gallery and on this branch always sits
+        # below the threshold, so the band check only needs the floor.
+        near_miss = None
+        if hit is not None and 0 < nearmiss_floor <= hit.cosine:
+            near_miss = {
+                "key": hit.key,
+                "cosine": hit.cosine,
+                "appearanceSim": best_intersection(
+                    appearance, store.appearances_for(hit.key)
+                ),
+            }
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
         )
         best = hit.cosine if hit is not None else None
-        return MatchResult(key, True, best, store.distinct_count(), sub_canon, 1, False)
+        return MatchResult(
+            key, True, best, store.distinct_count(), sub_canon, 1, False,
+            near_miss=near_miss,
+        )
 
 
 def add_manual(data_dir: Path, run_id: str, note: str | None = None) -> tuple[str, int]:

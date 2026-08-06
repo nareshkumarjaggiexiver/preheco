@@ -9,7 +9,8 @@ quality gate → embed → match → unique count` — timing every stage. Aggre
 2 s; the run releases its downstream state (camera, tracker, gallery) and ends
 with a `PUT … {status: ended, notes}` carrying the unique count, frame count,
 staff crossings, staff face-frames, manual additions, healed splits, the two
-appearance-veto tallies, zone-excluded faces and sub-canon share.
+appearance-veto tallies, near-miss mints, zone-excluded faces and sub-canon
+share.
 
 **The count is the product; reporting is secondary.** No planner call made from
 the frame loop can fail a run or stall it for long: errors are swallowed AND
@@ -129,6 +130,32 @@ carries information.
   a structured payload (`app/taps.py`, capped ≤ 32 KB). A planner hiccup or an
   opaque/undecodable frame never blocks the loop — the image upload is simply
   skipped and the structured payload still goes up.
+  **Tap frames are ≤ 1280 px wide** (aspect preserved, drawn at native
+  resolution then `INTER_AREA`-resized): a round used to encode five FULL
+  3840×2160 frames, ~1–1.5 s on the T440, for a console that shows them
+  small — and these are the runner's only frame uploads (no separate
+  keyframe path exists).
+  **The duty-cycle guard** (`HECO_TAP_DUTY_FACTOR`, default 3) additionally
+  requires ≥ K × the previous round's measured cost to elapse since that
+  round ENDED before the next fires. The interval alone had two measured
+  stable states on the T440 (2.3 fps healthy; one transient stall → EVERY
+  frame taps → 0.4 fps locked forever, stage timings identical in both):
+  the guard bounds the round at ~25% of loop time and makes the lock-in
+  impossible by construction. Postponed rounds count `tapRoundsDeferred`
+  (distinct from `tapRoundsAbandoned`, which means a STARTED round ran out
+  of `HECO_TAP_BUDGET_S` and lost taps). Each round's cost is observed as
+  `tapRoundMs` (count board) and each frame's acquisition wait as
+  `frameWaitMs` (ingest board; 0.0 when the source had a fresh frame), so
+  the next stall is diagnosable from the console: loop-bound reads
+  frameWaitMs ~0 with tapRoundMs high.
+- **Near-miss mints reach the operator.** A mint the match service flags as a
+  near miss of an existing guest (`nearMiss: {key, cosine, appearanceSim}` —
+  measured tonight: face 0.3464 vs the 0.363 threshold with clothing 0.562,
+  found only by eye) rides the match tap row verbatim, is counted in
+  `nearMissMints` (status, notes, results) and logged. It is a one-click
+  merge SUGGESTION for the operator, never behaviour: an impostor pair
+  measured face 0.377 with clothing 0.503, so the count moves only when the
+  operator's `duplicate` correction arrives through the feedback loop.
 - **Operator feedback** (every `feedback_poll_s`, best-effort). The runner polls
   the planner and applies each open correction to the live gallery via the
   match service — `duplicate → /merge` (unique −1), `false-match → /split`,
@@ -167,7 +194,7 @@ carries information.
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, healVetoedByAppearance, enrolVetoedByAppearance, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, healVetoedByAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -203,7 +230,15 @@ The track heal replays tonight's measured bench (mint at 0.3084, same track at
 0.69 → folded; plus refusal, window, cosine-floor and staff-skip cases) and
 the exclusion zones run end to end (a zoned face never reaches `/match` but
 stays visible in the tap; a dims-less frame counts `zoneUnmeasured`; malformed
-zones 422 at `POST /runs`). The torso-appearance tests cover the descriptor
+zones 422 at `POST /runs`). The tap-round economics are pinned end to end: a
+2560×1440 source's posted JPEGs decode ≤ 1280 px wide, the duty guard defers
+inside K × the measured cost and fires after (mutation-checked), the
+every-frame lock-in replay taps once and defers the rest with counting
+unharmed, factor 0 restores interval-only, and `tapRoundMs` / `frameWaitMs`
+reach the stats flush (a stuttering source shows `frameWaitMs > 0`, a ready
+one 0.0). The near-miss replay (mint at 0.3464 vs p00004, clothes 0.562)
+checks the flag reaches counter, notes, results and the tap row while
+`unique` still steps UP. The torso-appearance tests cover the descriptor
 contract on synthetic frames (red vs blue clash < 0.5, identical → 1.0, tiny
 crop / dark frame / no person box → None), the `/match` `appearance` field
 being sent only when computable, the heal veto replay (clashing frames refuse
@@ -230,6 +265,7 @@ match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
 | `HECO_PLANNER_TIMEOUT_S` | `5.0` | Retrying planner calls (run record, stats, samples) |
 | `HECO_REPORT_TIMEOUT_S` | `2.0` | Best-effort planner calls (taps, frames, feedback) — bounds the stall a wedged planner can cause |
 | `HECO_TAP_BUDGET_S` | `3.0` | Ceiling for ONE tap round (5 payloads + 5 JPEGs); the rest is dropped |
+| `HECO_TAP_DUTY_FACTOR` | `3.0` | Duty-cycle guard: a round fires only after this × the previous round's measured cost has passed since it ENDED (~25% duty at 3 — the every-frame 0.4 fps lock-in is impossible by construction). `0` disables; deferred rounds count `tapRoundsDeferred` |
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
 | `HECO_HEAL_WINDOW_S` | `20.0` | How long after a mint the same track's later match may fold it; `0` disables healing |
 | `HECO_HEAL_MIN_COSINE` | `0.45` | Heal evidence floor — above the 0.377 measured impostor ceiling with margin (tonight's heal evidence was 0.69); a cross-key match below it heals nothing |

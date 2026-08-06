@@ -98,6 +98,21 @@ DEFAULT_TEMPLATE_MAX_COSINE = 0.90
 DEFAULT_APPEARANCE_CLASH = 0.50
 
 
+# ------------------------------------------------ near-miss flag on a mint (v2)
+#
+# Floor of the band [floor .. threshold) in which a MINT's best cosine against
+# the existing gallery earns a `nearMiss` flag in the /match response — a
+# suggestion to the operator that the fresh key may be a split of that
+# existing guest (see app.gallery.match).  The verdict is still a mint.
+#
+# 0.29 sits just below the measured same-person misses on this camera (0.294 /
+# 0.308 / 0.346 / 0.361 against the 0.363 threshold): every split we have
+# actually watched happen would have been flagged, while mints further out are
+# genuinely new faces and flagging them would train the operator to ignore the
+# cue.  0 disables the flag entirely (the codebase's off-switch convention).
+DEFAULT_NEARMISS_FLOOR = 0.29
+
+
 def _env_f(name: str, default: float) -> float:
     """Read a float knob where an EMPTY string means unset.
 
@@ -150,6 +165,18 @@ def template_max_cosine() -> float:
     Env HECO_MATCH_TEMPLATE_MAX_COSINE.
     """
     return float(os.environ.get("HECO_MATCH_TEMPLATE_MAX_COSINE", DEFAULT_TEMPLATE_MAX_COSINE))
+
+
+def nearmiss_floor() -> float:
+    """Cosine floor of the near-miss band on a mint (env HECO_MATCH_NEARMISS_FLOOR).
+
+    A mint whose best cosine vs the existing gallery lands in
+    ``[floor .. threshold)`` carries a ``nearMiss`` flag — operator
+    information, never behaviour (see :func:`app.gallery.match`).  **0
+    disables the flag**; empty string means unset (the compose ``${VAR-}``
+    rendering), like every knob in this service.
+    """
+    return _env_f("HECO_MATCH_NEARMISS_FLOOR", DEFAULT_NEARMISS_FLOOR)
 
 
 def appearance_clash() -> float:
