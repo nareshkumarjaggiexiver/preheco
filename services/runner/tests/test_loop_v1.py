@@ -2043,24 +2043,22 @@ def test_two_guests_in_one_track_box_are_never_folded_together():
     binding outright.  Two faces, one track, one frame: no merge, both guests
     stand.
     """
-    class TwoFacesOneTrack(V1Fake):
+    class TwoFacesOneTrack(Bodies):
+        """Two BODIES the tracker lumps into one track box.
+
+        Two people get two person boxes from the detector — that is what makes
+        them two people — while one wide track box can still contain both face
+        centres and hand them the same track id. That combination is the
+        dangerous one, and the only one that should refuse a fold.
+        """
+
         def handler(self, request):
             host, path = request.url.host, request.url.path
-            if host == "persons" and path == "/detect":
-                self.calls.append("persons /detect")
-                # ONE person box wide enough to contain both face centres.
-                return httpx.Response(200, json={"boxes": [
-                    {"x": 0, "y": 0, "w": 150, "h": 115, "conf": 0.9},
-                ]})
-            if host == "faces" and path == "/detect":
-                self.calls.append("faces /detect")
-                return httpx.Response(200, json={"faces": [
-                    {"box": {"x": 10, "y": 10, "w": 60, "h": 60},
-                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
-                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
-                    {"box": {"x": 80, "y": 10, "w": 60, "h": 60},
-                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
-                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+            if host == "tracker" and path == "/track":
+                self.calls.append("tracker /track")
+                return httpx.Response(200, json={"tracks": [
+                    {"id": 1, "box": {"x": 0, "y": 0, "w": 200, "h": 130},
+                     "ageFrames": 9, "hits": 9},
                 ]})
             return super().handler(request)
 
@@ -2068,7 +2066,7 @@ def test_two_guests_in_one_track_box_are_never_folded_together():
         scripted_verdict("p00001", False, 0.70),  # guest A: matches, binds the lock
         scripted_verdict("p00050", True, 0.10),   # guest B: a genuinely new guest
     ]
-    fake = TwoFacesOneTrack(n_frames=1, face_widths=(60.0,), match_script=script)
+    fake = TwoFacesOneTrack(n_bodies=2, n_frames=1, match_script=script)
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
 
@@ -2130,6 +2128,42 @@ CO_PRESENT_SCRIPT = [
     scripted_verdict("p00007", True, 0.360),   # the operator, in the alley
     scripted_verdict("p00002", True, 0.316),   # the guest standing beside him
 ]
+
+
+class Bodies(V1Fake):
+    """V1Fake serving N SEPARATE person boxes, one face inside each.
+
+    Co-presence is about BODIES, not faces: two faces in one person box are a
+    guest and the phone/mirror they are holding, two faces in two boxes are two
+    people.  V1Fake's default single box could only model the former, so every
+    genuinely-two-people test needs this.
+    """
+
+    def __init__(self, n_bodies=2, **kw):
+        super().__init__(**kw)
+        self.n_bodies = n_bodies
+
+    def handler(self, request):
+        """Serve n_bodies person boxes, each holding exactly one face."""
+        host, path = request.url.host, request.url.path
+        if host == "persons" and path == "/detect":
+            self.calls.append("persons /detect")
+            return httpx.Response(200, json={"boxes": [
+                {"x": 10 + i * 70, "y": 20, "w": 60, "h": 110, "conf": 0.9}
+                for i in range(self.n_bodies)
+            ]})
+        if host == "faces" and path == "/detect":
+            self.calls.append("faces /detect")
+            return httpx.Response(200, json={"faces": [
+                # 60 px wide: above the 56 px quality floor, so these faces
+                # actually reach the matcher (a 40 px face is gated and the
+                # frame produces no verdicts at all).
+                {"box": {"x": 20 + i * 70, "y": 30, "w": 60, "h": 78},
+                 "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                 "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0}
+                for i in range(self.n_bodies)
+            ]})
+        return super().handler(request)
 
 
 def test_two_identities_in_one_frame_assert_one_sorted_cannot_link():
@@ -2211,7 +2245,10 @@ def test_three_identities_in_one_frame_assert_all_three_pairs():
         scripted_verdict("p00002", True, 0.316),
         scripted_verdict("p00009", True, 0.28),
     ]
-    fake = V1Fake(n_frames=1, face_widths=(60.0, 70.0, 85.0), match_script=script)
+    # THREE BODIES, not three faces in one box: co-presence is about bodies,
+    # and three faces inside a single person box would be one guest holding
+    # two screens, which asserts nothing.
+    fake = Bodies(n_bodies=3, n_frames=1, match_script=script)
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
 
@@ -2287,23 +2324,20 @@ def test_co_presence_is_asserted_before_any_fold_can_contradict_it():
     fold read it.  A fold whose TARGET was matched by another face of the same
     frame is refused, whatever the tracker believes about the box.
     """
-    class TwoFacesOneTrack(V1Fake):
+    class TwoBodiesOneTrack(Bodies):
+        """Two people (two person boxes) that the TRACKER lumps into one track.
+
+        This is the dangerous real shape: YOLOX separates them, so they are
+        provably two bodies, while one wide track box contains both faces and
+        _track_for hands them the same track id.
+        """
+
         def handler(self, request):
-            host, path = request.url.host, request.url.path
-            if host == "persons" and path == "/detect":
-                self.calls.append("persons /detect")
-                return httpx.Response(200, json={"boxes": [
-                    {"x": 0, "y": 0, "w": 150, "h": 115, "conf": 0.9},
-                ]})
-            if host == "faces" and path == "/detect":
-                self.calls.append("faces /detect")
-                return httpx.Response(200, json={"faces": [
-                    {"box": {"x": 10, "y": 10, "w": 60, "h": 60},
-                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
-                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
-                    {"box": {"x": 80, "y": 10, "w": 60, "h": 60},
-                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
-                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+            if request.url.host == "tracker" and request.url.path == "/track":
+                self.calls.append("tracker /track")
+                return httpx.Response(200, json={"tracks": [
+                    {"id": 1, "box": {"x": 0, "y": 0, "w": 200, "h": 130},
+                     "ageFrames": 9, "hits": 9},
                 ]})
             return super().handler(request)
 
@@ -2318,7 +2352,7 @@ def test_co_presence_is_asserted_before_any_fold_can_contradict_it():
         scripted_verdict("p00050", True, 0.10),
         scripted_verdict("p00001", False, 0.70),
     ]
-    fake = TwoFacesOneTrack(n_frames=2, face_widths=(60.0,), match_script=script)
+    fake = TwoBodiesOneTrack(n_bodies=2, n_frames=2, match_script=script)
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
 
@@ -2342,7 +2376,7 @@ def test_co_present_pairs_are_published_for_the_console():
         scripted_verdict("p00001", False, 0.70),
         scripted_verdict("p00002", False, 0.70),
     ]
-    fake = V1Fake(n_frames=1, face_widths=(60.0, 61.0), match_script=script)
+    fake = Bodies(n_bodies=2, n_frames=1, match_script=script)
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
 
@@ -2350,3 +2384,50 @@ def test_co_present_pairs_are_published_for_the_console():
     assert payload["coPresent"] == [["p00001", "p00002"]], (
         "the console suppresses banners for pairs proven distinct"
     )
+
+
+def test_a_phone_showing_your_own_face_is_still_one_person():
+    """ONE body wearing two faces asserts nothing and blocks nothing.
+
+    The 2026-08-06 bench: a man held a phone showing his own face.  Both faces
+    sat inside HIS person box — one body — and the heal correctly folded the
+    screen face away without the operator lifting a finger.  Co-presence must
+    not undo that: a pair inside one box is a guest and the thing they are
+    holding, not two guests, so no cannot_link is asserted and no fold is
+    refused.  Two faces in TWO boxes is the case that means two people.
+    """
+    class OneBodyTwoFaces(V1Fake):
+        def handler(self, request):
+            host, path = request.url.host, request.url.path
+            if host == "persons" and path == "/detect":
+                self.calls.append("persons /detect")
+                return httpx.Response(200, json={"boxes": [
+                    {"x": 0, "y": 0, "w": 160, "h": 120, "conf": 0.9},
+                ]})
+            if host == "faces" and path == "/detect":
+                self.calls.append("faces /detect")
+                return httpx.Response(200, json={"faces": [
+                    {"box": {"x": 10, "y": 10, "w": 60, "h": 78},   # his face
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                    {"box": {"x": 85, "y": 10, "w": 60, "h": 78},   # the phone
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                ]})
+            return super().handler(request)
+
+    script = [
+        scripted_verdict("p00001", True, None),    # frame 1: he is counted
+        scripted_verdict("p00001", False, 0.70),
+        scripted_verdict("p00001", False, 0.70),   # frame 2: binds the track
+        scripted_verdict("p00002", True, 0.31),    # the phone: a fresh mint
+    ]
+    fake = OneBodyTwoFaces(n_frames=2, match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.splits == [], "one body cannot be two people"
+    assert final["coPresenceSplits"] == 0
+    # And the fold is NOT blocked: the phone mint folds back into him.
+    assert final["lockedTrackFolds"] == 1, "the screen face folds away as it always did"
+    assert final["unique"] == 1, "one man, one guest — the phone counted nobody"
