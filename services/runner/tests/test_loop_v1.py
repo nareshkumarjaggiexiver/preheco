@@ -1064,7 +1064,7 @@ def solid_jpeg_b64(bgr, w=160, h=240) -> str:
 
 
 def test_torso_descriptor_is_48_floats_l1_normalized():
-    """The wire contract: 12x4 H x S bins, flattened, summing to 1."""
+    """The wire contract: 48 floats summing to 1 (v2 partition inside)."""
     d = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
     assert d is not None
     assert len(d) == 48
@@ -1593,3 +1593,54 @@ def test_the_mint_ledger_rides_every_match_tap():
     assert flagged["nearMiss"] == {"key": "p00001", "cosine": 0.3204, "appearanceSim": 0.8154}, (
         "the rider must survive into the ledger — it is the banner's whole payload"
     )
+
+
+def test_v2_a_light_shirt_is_stable_across_exposure_drift():
+    """THE MEASURED v1 FAILURE, killed: same white shirt, sims 0.48..0.88.
+
+    A light shirt is nearly desaturated, and the hue of a desaturated pixel
+    is noise — v1 binned that noise by hue, so the same shirt scattered
+    differently every frame; v1's V-mask (<=240) also DISCARDED the shirt's
+    brightest pixels.  v2 bins achromatic pixels by brightness in ~37-unit-
+    wide bins, so two sightings of one shirt under auto-exposure drift agree
+    near-perfectly.
+    """
+    shirt_a = solid_image((205, 205, 205))  # light grey shirt, V=205
+    shirt_b = solid_image((218, 218, 218))  # same shirt, exposure drifted +13
+    da = torso_descriptor(shirt_a, FACE_BOX, PERSON_BOX)
+    db = torso_descriptor(shirt_b, FACE_BOX, PERSON_BOX)
+    assert da is not None and db is not None, (
+        "v1 masked V>240 and could return None on bright cloth; v2 must measure it"
+    )
+    assert intersection(da, db) > 0.8, (
+        "one shirt, one story, whatever the exposure (soft binning: a 13-unit "
+        "V drift moves a little mass between bins, never all of it — hard "
+        "binning scored this exact pair 0.0 on the adjacent-bin cliff)"
+    )
+    # Structural proof the hue-noise path is CLOSED: a desaturated crop puts
+    # NO mass in the chromatic bins, so hue cannot scatter it by construction.
+    assert sum(da[:36]) == 0.0
+    assert sum(da[36:39]) > 0.99
+    assert sum(da[39:]) == 0.0, "reserved bins stay empty"
+
+
+def test_v2_white_and_dark_clothes_still_clash():
+    """The split must not cost discrimination among achromatic clothes:
+    a white shirt and a charcoal kurta are both desaturated and must still
+    disagree — they live in far-apart brightness bins."""
+    white = torso_descriptor(solid_image((230, 230, 230)), FACE_BOX, PERSON_BOX)
+    charcoal = torso_descriptor(solid_image((60, 60, 60)), FACE_BOX, PERSON_BOX)
+    assert white is not None and charcoal is not None
+    assert intersection(white, charcoal) < 0.05
+
+
+def test_v2_chromatic_vs_achromatic_clash_and_chromatic_stability():
+    """A red kurta vs a white shirt: disjoint partitions, near-zero overlap —
+    and the red kurta stays stable across brightness (chromatic bins still
+    deliberately ignore V, the v1 property worth keeping)."""
+    red_dim = torso_descriptor(solid_image((0, 0, 160)), FACE_BOX, PERSON_BOX)
+    red_lit = torso_descriptor(solid_image((40, 40, 235)), FACE_BOX, PERSON_BOX)
+    white = torso_descriptor(solid_image((230, 230, 230)), FACE_BOX, PERSON_BOX)
+    assert red_dim is not None and red_lit is not None and white is not None
+    assert intersection(red_dim, red_lit) > 0.9, "same red cloth, dim vs lit"
+    assert intersection(red_dim, white) < 0.05, "cloth with colour vs cloth without"
