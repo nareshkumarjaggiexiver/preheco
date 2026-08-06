@@ -230,6 +230,7 @@ _BAND_EPS = 1e-6
 
 def _near_miss(
     store: VectorStore,
+    key: str,
     hit: Neighbour | None,
     appearance: list[float] | None,
     nearmiss_floor: float,
@@ -238,11 +239,17 @@ def _near_miss(
 ) -> dict | None:
     """Should this mint carry a near-miss suggestion, and on WHOSE evidence?
 
-    Called on the MINT branch only, BEFORE the mint writes anything, so the
-    torso comparison runs against the near-missed identity's already-stored
-    descriptors and never against the sighting itself.  ``hit`` is the best of
-    the pre-existing gallery and on that branch always sits below the match
-    threshold, so each band only needs its floor.
+    Called on the MINT branch only.  ``key`` is the identity the rider would be
+    attached to — the key this mint has just taken — and ``hit`` is the best of
+    the PRE-EXISTING gallery, read before anything was written, so on this
+    branch it always sits below the match threshold and each band only needs
+    its floor.
+
+    Ordering note: the torso comparison below reads ONLY ``hit.key``'s stored
+    descriptors, and a freshly minted key is by construction never ``hit.key``,
+    so this returns exactly what it returned when it ran before the insert.  It
+    runs after the mint for one reason: the suppression below has to know whose
+    banner this would be, and the key does not exist until it is minted.
 
     TWO BANDS, one shape, and a ``basis`` field naming which one spoke:
 
@@ -283,6 +290,52 @@ def _near_miss(
     weak band at all, rather than entering it on an assumed clash or an
     assumed agreement.
 
+    A SETTLED PAIR IS NEVER ASKED ABOUT AGAIN (2026-08-06).  A near-miss rider
+    is a QUESTION put to the operator — "is this new guest actually that one?"
+    — and :meth:`VectorStore.cannot_link` is the ANSWER already on file for
+    that pair.  It gets there two ways, and both are answers: the operator's
+    own *false-match* correction, and now the runner asserting CO-PRESENCE —
+    two faces at different positions in ONE frame are two different people,
+    which is about as certain as machine evidence gets.  Re-asking a settled
+    question is precisely the noise that trains an operator to click banners
+    away, so a constrained pair returns ``None`` here.  The check sits AFTER
+    the band-range early-out — most mints of a real event leave there for free
+    — and BEFORE the torso comparison, which is the cheaper order: one indexed
+    primary-key lookup against ``appearances_for``'s row read plus a histogram
+    intersection.
+
+    THE MEASURED CASE, run 05b3b7 (2026-08-06), ground truth THREE people and
+    THREE counted — the count was RIGHT and the banners were wrong:
+
+        p00002: "minted 0.316 from p00001" — clothing agreement 0.94
+        p00007: "minted 0.360 from p00002" — clothing agreement 0.57
+
+    p00001 and p00002 walked in through the main door TOGETHER; p00007 (the
+    operator) stood in the alley with p00002, and one tap round matched
+    **p00002 and p00007 in the same frame**.  The pipeline held proof that
+    each pair was two people and argued with itself anyway.
+
+    No threshold move fixes this, which is why it is answered with an
+    independent signal rather than a knob: both riders sat at 0.316 and 0.360
+    against a 0.363 threshold — INSIDE the ordinary face near-miss band — while
+    the measured same-person misses on this camera are 0.294 / 0.308 / 0.361
+    and the closest measured impostor pair is 0.377.  The genuine and impostor
+    distributions overlap right there; clothing did not save it either (0.94
+    and 0.57 on the two false riders).  Co-presence is the only CERTAIN signal
+    available, and it is independent of both.
+
+    This is the THIRD thing ``cannot_link`` governs — :meth:`VectorStore.merge`
+    refuses a constrained pair, :func:`_overlap_after_write` withholds the
+    overlap banner, and now the near-miss rider is withheld too — so the
+    constraint is becoming the gallery's single record of "known different",
+    which is exactly what it should be: one fact, asserted by a human or by the
+    machine, honoured everywhere.
+
+    No knob here on purpose: the suppression is INHERENT to cannot_link (a
+    banner that contradicts a recorded fact has no defensible reading), and the
+    off switch belongs at the source — the runner's ``HECO_COPRESENCE_SPLIT=0``
+    stops co-presence being asserted at all.
+
     Off switches: ``nearmiss_floor <= 0`` disables BOTH bands (the weak band
     is defined as the region under that floor, so without a floor there is no
     region), ``nearmiss_weak_floor <= 0`` disables only the weak one.  A
@@ -296,6 +349,11 @@ def _near_miss(
     if hit.cosine < lowest - _BAND_EPS:
         # Far outside both bands: skip the torso comparison entirely.  Most
         # mints of a real event land here and this is the quiet path.
+        return None
+    if store.cannot_link(key, hit.key):
+        # Settled: an operator or the runner's co-presence assertion has
+        # already recorded that these two are different people.  The banner
+        # would be the pipeline arguing with a fact it holds (run 05b3b7).
         return None
     appearance_sim = best_intersection(appearance, store.appearances_for(hit.key))
     if hit.cosine >= nearmiss_floor - _BAND_EPS:
@@ -420,6 +478,18 @@ def match(
     switches off both bands; ``nearmiss_weak_floor <= 0`` switches off only
     the clothing one.
 
+    AND A PAIR UNDER CANNOT-LINK CARRIES NO RIDER AT ALL (2026-08-06), on
+    either basis.  The rider asks the operator a question; the constraint is
+    the answer already on file — from their own *false-match* correction, or
+    from the runner asserting co-presence (two faces at different positions in
+    one frame are two people).  Run 05b3b7 raised two such banners, at 0.316
+    and 0.360 against the 0.363 threshold, between people the pipeline had
+    already seen standing side by side.  The suppression is per-pair and
+    changes nothing else: ``is_new``, ``person_key``, ``cosine`` and
+    ``gallery_n`` are byte-identical with and without the constraint, because
+    cannot-link must never change WHO someone is — only what is suggested
+    about them.  :func:`_near_miss` carries the full argument.
+
     The defaults here are the pre-M1 behaviour (cap 1, no enrolment, no
     appearance veto, no near-miss flag of either basis); the service passes
     the real values from :mod:`app.config`, so a caller that only wants the
@@ -486,14 +556,19 @@ def match(
                 appearance_vetoed=vetoed,
                 overlap=overlap,
             )
-        # NEAR-MISS: judged BEFORE this mint writes anything, against the
-        # near-missed identity's already-stored descriptors — the same
-        # before-the-write discipline as appearance_sim above.
-        near_miss = _near_miss(
-            store, hit, appearance, nearmiss_floor, nearmiss_weak_floor, nearmiss_clothes
-        )
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
+        )
+        # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
+        # BEFORE this mint wrote anything — and against the near-missed
+        # identity's already-stored descriptors, the same before-the-write
+        # discipline as appearance_sim above.  It is evaluated AFTER the insert
+        # only because the settled-pair suppression needs the minted key to ask
+        # the store whether this pair is already known-different; the insert
+        # touches no row _near_miss reads (a fresh key is never hit.key), so
+        # the rider is identical either way.
+        near_miss = _near_miss(
+            store, key, hit, appearance, nearmiss_floor, nearmiss_weak_floor, nearmiss_clothes
         )
         # A mint can NEVER create overlap, by construction: on this branch the
         # best pre-write cosine sits below the threshold, and the nearest
@@ -533,9 +608,12 @@ def _overlap_after_write(
     clothes to agree before it speaks).  The torso intersection rides along
     for the operator's judgement.
 
-    An operator's cannot-link split silences the pair for good: they have
-    already looked at these two and said "different people", and a banner
-    that keeps arguing with them is noise.  Overlap created by merge()
+    A cannot-link constraint silences the pair for good: someone has already
+    said "different people" — the operator by clicking *false-match*, or the
+    runner by asserting co-presence (two faces in one frame) — and a banner
+    that keeps arguing with a recorded fact is noise.  :func:`_near_miss` now
+    withholds its rider on the same test, so the constraint governs all three
+    of merge refusal, this banner and that one.  Overlap created by merge()
     re-pointing rows is deliberately not detected here — a merge is itself an
     operator act, and its survivor is pruned back through prune_redundant.
 
@@ -628,7 +706,29 @@ def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
     """Record a *false-match* do-not-merge constraint; returns galleryN.
 
     Both keys keep their templates, so the distinct count is unchanged — the
-    effect is forward-looking (a later :func:`merge` of the pair is refused).
+    effect is forward-looking, and it is now THREE effects: a later
+    :func:`merge` of the pair is refused, the gallery-overlap banner is
+    withheld (:func:`_overlap_after_write`), and a near-miss rider naming the
+    pair is withheld (:func:`_near_miss`).  One constraint, one meaning: these
+    two are known-different.
+
+    TWO WRITERS, same door.  The operator's *false-match* click is one.  The
+    other is the runner asserting CO-PRESENCE: every distinct non-staff pair of
+    personKeys seen in ONE frame is posted here once (``HECO_COPRESENCE_SPLIT``
+    in the runner is that source's off switch), because two faces at different
+    positions in a single frame are two different people.  The machine's
+    assertion goes through the operator's primitive rather than growing new
+    machinery, which is why the three effects above came for free.
+
+    THE KNOWN COST, stated not hidden: a person holding a PHONE showing their
+    own face — or a mirror, or a printed photo — puts one real person's face in
+    the frame twice, and co-presence will assert those are two people.  That
+    blocks a fold which would have been correct (it blocked exactly such a
+    phone-face heal on the 2026-08-06 bench).  The trade is deliberate and is
+    this project's standing asymmetry: a blocked fold OVER-counts, which is
+    visible and an operator can merge; a wrong fold UNDER-counts silently and
+    nobody ever sees a guest who was erased.  Fixed mirrors and screens are
+    handled by exclusion zones; a hand-held phone is the residual.
     """
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():

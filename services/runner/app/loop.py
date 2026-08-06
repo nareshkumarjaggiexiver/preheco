@@ -9,7 +9,12 @@ moments later and the TRACK IDENTITY LOCK
 (:meth:`RunLoop._maybe_lock_fold`) folding one back the moment a track that
 has ALREADY resolved to an identity mints another — the case the heal cannot
 reach, because it waits for a second comfortable match that on bench 6e1a5d
-never arrived.  Every stage is timed; aggregates and
+never arrived.  Alongside them, CO-PRESENCE
+(:meth:`RunLoop._assert_co_presence`) asserts the one thing about identity
+this pipeline can be CERTAIN of — two faces at different positions in one
+frame are two different people — as a gallery ``cannot_link``, which both
+silences a wrong "likely duplicate" banner and stops either fold above from
+merging two people who were standing together.  Every stage is timed; aggregates and
 sampled raw rows flush to the planner every ``flush_interval_s`` seconds.  On
 top of that (CONTRACTS.md v1): annotated debug frames + structured taps go up
 every ``tap_interval_s``, and operator feedback is polled every
@@ -218,6 +223,10 @@ class RunLoop:
         # key sampled once before it was folded would otherwise haunt the
         # register forever (see _retire_key).  Guarded by _lock.
         self._retired: list[dict] = []
+        # Pairs proven distinct by sharing a frame.  Published on every match
+        # tap so the console can retire suggestions that were raised before
+        # the proof existed (see _send_co_presence_split).  Guarded by _lock.
+        self._copresence_pairs: list[list[str]] = []
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
@@ -245,6 +254,16 @@ class RunLoop:
         # this set rides the status, the notes and the results so the shatter
         # is readable beside `unique`.  Guarded by _lock.
         self._track_ids: set = set()
+        # CO-PRESENCE bookkeeping (:meth:`_assert_co_presence`): the unordered
+        # identity pairs this run has already asserted as cannot_link because
+        # they were seen in ONE frame.  Stored as "a|b" with a and b sorted, so
+        # (x, y) and (y, x) are one entry and a pair is never re-sent.
+        # Loop-thread only, like _frame_no and _last — every read and write
+        # happens inside _pipeline_step.  Capped (_COPRESENCE_CAP).
+        self._copresence_sent: set[str] = set()
+        # Whether the cap has already been reported; the warning is worth
+        # saying once and worthless once per frame.
+        self._copresence_capped: bool = False
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
@@ -303,6 +322,18 @@ class RunLoop:
             # arrive, and on bench 6e1a5d p00005/p00006 survived precisely
             # because it never did.
             "lockedTrackFolds": 0,
+            # CO-PRESENCE SPLITS: cannot_link assertions this run sent because
+            # two identities were matched in the SAME FRAME (see
+            # :meth:`_assert_co_presence`).  One per unordered pair for the
+            # whole run, never re-sent.  Read it as "how much certain evidence
+            # the run had that a threshold could not see": run 05b3b7 raised
+            # two false "likely duplicate" banners (0.316 and 0.360 against a
+            # 0.363 threshold, clothing 0.94 and 0.57) while its own tap ledger
+            # held p00002 and p00007 in one frame — the fact that settles the
+            # question, unused.  Each assertion both silences the banner and
+            # makes /merge refuse, so a fold can never erase one of two
+            # co-present guests.
+            "coPresenceSplits": 0,
             # How many DISTINCT track ids the tracker reported all run.  Read
             # it beside `unique`: bench 6e1a5d put ONE person on SIX ids, which
             # is the whole reason the lock and the longer tracker max-age
@@ -627,6 +658,15 @@ class RunLoop:
             # makes both readable: 6 tracks against 1 real guest (bench 6e1a5d)
             # is the shatter these mechanisms are compensating for.
             f"lockedTrackFolds={st['lockedTrackFolds']} "
+            # Cannot_link assertions the machine made from co-presence: two
+            # identities matched in ONE frame are two different people.  Read
+            # beside the banner counters — run 05b3b7 raised two false "likely
+            # duplicate" suggestions (0.316 / 0.360 against a 0.363 threshold,
+            # clothing 0.94 / 0.57) while holding p00002 and p00007 in one
+            # frame.  Each assertion silences a wrong banner AND stops a heal
+            # or lock fold erasing one of the two, which is the silent
+            # under-count this loop fears most.
+            f"coPresenceSplits={st['coPresenceSplits']} "
             f"distinctTracks={st['distinctTracks']} "
             # The advisory appearance signal's two vetoes (app/appearance.py):
             # heal folds refused as suspected tracker swaps, and sightings the
@@ -669,6 +709,7 @@ class RunLoop:
             "matches": st["matches"],
             "healedSplits": st["healedSplits"],
             "lockedTrackFolds": st["lockedTrackFolds"],
+            "coPresenceSplits": st["coPresenceSplits"],
             "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "healUncertainAppearance": st["healUncertainAppearance"],
@@ -899,6 +940,14 @@ class RunLoop:
         # match (one call per embedding; gallery keyed by the planner run id;
         # staff checked first when the run carries a siteId)
         verdicts: list[dict] = []
+        # TWO PASSES, deliberately.  Pass one asks the matcher about every face
+        # and NOTHING else; only then is the frame's full set of identities
+        # known, so co-presence can be asserted BEFORE any fold decision reads
+        # it.  A single pass folded on the first frame two guests shared —
+        # matching one, minting the other, and folding the mint into the guest
+        # standing right beside it — because the constraint that forbids it was
+        # written at the end of the frame, after the fold had already happened.
+        decided: list[tuple] = []
         for face, emb in zip(kept, embeddings, strict=False):
             w = float(face["box"]["w"])
             # ONCE per face: the descriptor rides the /match body (advisory —
@@ -959,6 +1008,22 @@ class RunLoop:
                     "box": face.get("box"),
                 }
             )
+            decided.append((face, m, face_desc))
+
+        # CO-PRESENCE, asserted between the passes: every distinct pair of
+        # guests THIS FRAME held is two different people, certainly — and the
+        # folds in pass two must not be able to contradict it.
+        self._assert_co_presence(planner_run_id, verdicts)
+        # The keys this frame actually held, for the fold guard below: a fold
+        # whose TARGET is visibly elsewhere in this same frame is folding two
+        # co-present people together, whatever the tracker believes.
+        frame_keys = {
+            v.get("personKey")
+            for v in verdicts
+            if v.get("personKey") and not v.get("isStaff")
+        }
+
+        for face, m, face_desc in decided:
             if m.get("isStaff"):
                 # A staff hit never records a mint and never heals INTO staff:
                 # the staff store is operator-supervised evidence, and folding
@@ -1044,14 +1109,180 @@ class RunLoop:
                 # back NOW; only a mint that survives that (no lock, refused,
                 # or clothing-clashed) is remembered for a later heal, because
                 # a key that has just been merged away is nothing to cure.
-                if not self._maybe_lock_fold(planner_run_id, track_id, m, face_desc):
+                if not self._maybe_lock_fold(
+                    planner_run_id, track_id, m, face_desc, frame_keys
+                ):
                     self._record_mint(track_id, m, face_desc)
             else:
-                self._maybe_heal(planner_run_id, track_id, m, face_desc)
+                self._maybe_heal(planner_run_id, track_id, m, face_desc, frame_keys)
                 self._note_lock(track_id, m, face_desc)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
+
+    #: How many co-presence pairs one run remembers having asserted.  A pair
+    #: costs one short string, so this is kilobytes, not megabytes — the cap
+    #: exists because the pair count grows with the SQUARE of how many guests
+    #: ever share a frame, and a busy night of hundreds of guests must not be
+    #: able to grow this without limit.  Past the cap the loop stops asserting
+    #: new pairs (and says so once): the alternative — asserting without
+    #: remembering — would re-POST the same pairs every frame for the rest of
+    #: the night, spending the frame loop's budget on facts the gallery already
+    #: holds, and the count is the product.
+    _COPRESENCE_CAP = 4000
+
+    def _assert_co_presence(self, planner_run_id: str, verdicts: list[dict]) -> None:
+        """Tell the gallery that everyone seen in ONE frame is a different person.
+
+        THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
+        counted THREE).  The count was RIGHT; the noise was wrong.  Two "likely
+        duplicate" merge suggestions were raised between people who are
+        demonstrably different — p00002 banner "Minted 0.316 from p00001 —
+        clothing agreement 0.94", p00007 (the operator) banner "Minted 0.360
+        from p00002 — clothing agreement 0.57".  p00001 and p00002 had walked
+        in through the main door TOGETHER; p00007 and p00002 stood in the alley
+        TOGETHER.  Both false suggestions sat INSIDE the ordinary face
+        near-miss band (0.316 / 0.360 against the 0.363 threshold) and clothing
+        agreement did not save them — 0.94 agreement on the first pair.
+
+        NO THRESHOLD FIXES IT.  On this camera the impostor and genuine face
+        distributions OVERLAP: a measured impostor pair reached 0.377 while
+        same-person misses measured 0.294 / 0.308 / 0.361.  Genuinely different
+        people simply land in the near-miss band here, so moving 0.363 trades
+        one error for the other and nothing more.
+
+        CO-PRESENCE IS AN INDEPENDENT SIGNAL AND THE ONLY CERTAIN ONE.  That
+        same run's tap ledger holds one tap round in which **p00002 and p00007
+        were matched in the SAME FRAME**.  Two faces at different positions in
+        one frame are two different people — about as certain as machine
+        evidence gets — and the pipeline had that fact and did nothing with it.
+
+        HOW IT IS ASSERTED — through the door that already exists.  The gallery
+        already holds ``cannot_link``: an operator's "false-match" correction
+        records that two keys are different people, and it ALREADY (a) makes
+        ``/merge`` refuse the pair and (b) suppresses the near-miss / overlap
+        banner.  Co-presence is the same assertion made by the machine, so it
+        goes through the same ``POST /split {runId, a, b}`` rather than growing
+        new machinery.
+
+        WHAT THIS BUYS BEYOND SILENCE.  Because ``cannot_link`` also makes
+        ``/merge`` refuse, a heal (:meth:`_maybe_heal`) or a track-lock fold
+        (:meth:`_maybe_lock_fold`) can no longer fold two co-present people
+        together — the SILENT under-count (a real paying guest erased) that
+        every guard in this loop exists to prevent.  Noise reduction and
+        accuracy protection are the same change here.
+
+        STAFF ARE EXCLUDED.  A staff hit is not a guest identity and the staff
+        store is a different key space entirely, so a staff verdict beside a
+        guest asserts nothing.
+
+        THE KNOWN COST, documented rather than hidden: a person holding a
+        PHONE showing their own face — or a mirror, or a printed photo — puts
+        ONE real person's face in the frame twice, and co-presence will assert
+        those two keys are different people.  That blocks the heal which
+        correctly folded exactly such a phone-face on the 2026-08-06 bench.
+        The trade is deliberate and follows the asymmetry this whole project
+        runs on: a blocked fold OVER-counts, which is VISIBLE and which an
+        operator can merge away; a wrong fold UNDER-counts SILENTLY and nobody
+        ever sees it.  Fixed mirrors and screens are the operator's exclusion
+        zones to draw; a hand-held phone is not, and that is the residual.
+
+        BEST EFFORT, always — the count is the product, and a co-presence
+        assertion must never fail it.  A 5xx or a transport error leaves the
+        pair unrecorded so the next frame the two are still together retries
+        it; a 4xx means the match service understood and refused (a malformed
+        key), which retrying cannot fix, so the pair is recorded as done and
+        never re-sent.  Same 4xx/5xx reading as :meth:`_execute_action`.
+
+        A key folded during THIS frame (a lock fold or a heal) can still appear
+        in ``verdicts``; the split that follows writes a constraint about a key
+        the gallery has already retired.  That row is inert — merged keys are
+        never re-issued (the gallery's keys are monotonic) and a retired key
+        can never be a rival in a banner — so it costs one dead row and no
+        behaviour, which is cheaper than teaching this method the fold history.
+        """
+        if self.s.copresence_split <= 0:
+            return  # off: record nothing, send nothing
+        keys = sorted({
+            v["personKey"]
+            for v in verdicts
+            if v.get("personKey") and not v.get("isStaff")
+        })
+        if len(keys) < 2:
+            return  # one guest (or none) in frame: co-presence says nothing
+        for i, a in enumerate(keys):
+            for b in keys[i + 1:]:
+                pair = f"{a}|{b}"  # keys are sorted, so the pair is unordered
+                if pair in self._copresence_sent:
+                    continue
+                if len(self._copresence_sent) >= self._COPRESENCE_CAP:
+                    if not self._copresence_capped:
+                        self._copresence_capped = True
+                        self.log.warning(
+                            f"co-presence pair memory is full "
+                            f"({self._COPRESENCE_CAP} pairs) — no further "
+                            "co-presence splits will be asserted this run; "
+                            "pairs already asserted keep their cannot_link"
+                        )
+                    return
+                if self._send_co_presence_split(planner_run_id, a, b):
+                    self._bump("coPresenceSplits")
+                    self.log.info(
+                        f"co-presence split: {a} and {b} were matched in the "
+                        f"same frame (#{self._frame_no}) — two faces at "
+                        "different positions in one frame are two different "
+                        "people, so the pair is now cannot_link: no merge "
+                        "suggestion, and no fold can erase either of them"
+                    )
+
+    def _send_co_presence_split(self, planner_run_id: str, a: str, b: str) -> bool:
+        """POST one co-presence cannot_link; True when the pair is settled.
+
+        Split out of :meth:`_assert_co_presence` so the "did it land?" question
+        has one answer with one meaning: True = stop asking about this pair
+        (either the gallery took it, or it refused in a way retrying cannot
+        fix), False = transient, try again while the two are still in frame.
+        Only a genuine acceptance returns True *and* is counted — the caller
+        bumps ``coPresenceSplits`` only on the True-from-success path, so the
+        counter stays a tally of assertions the gallery actually holds.
+        """
+        try:
+            self._post(
+                f"{self.s.match_url}/split",
+                {"runId": planner_run_id, "a": a, "b": b},
+            )
+        except StageError as e:
+            if 400 <= e.status_code < 500:
+                # Understood and refused: retrying cannot help, so stop asking.
+                self._copresence_sent.add(f"{a}|{b}")
+                self.log.warning(
+                    f"co-presence split for {a}/{b} refused by match "
+                    f"(HTTP {e.status_code}): {e} — not retried"
+                )
+                return False
+            self.log.warning(
+                f"co-presence split for {a}/{b} failed, will retry while they "
+                f"share a frame: {e}"
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 — an assertion must never stop the count
+            self.log.warning(
+                f"co-presence split for {a}/{b} failed, will retry while they "
+                f"share a frame: {e}"
+            )
+            return False
+        self._copresence_sent.add(f"{a}|{b}")
+        with self._lock:
+            # PUBLISH, not just constrain.  cannot_link stops a FUTURE merge,
+            # but the false banner the operator complained about was attached
+            # to a mint that happened BEFORE the pair was ever seen together —
+            # the rider is judged at mint time, when no constraint can exist
+            # yet, and it then rides that guest's card for the rest of the run.
+            # So the console needs the pair list to suppress retroactively,
+            # exactly as it needs the retirement list to drop folded keys.
+            self._copresence_pairs.append([a, b])
+            del self._copresence_pairs[:-500]
+        return True
 
     #: gate reason -> the status counter that records it.
     _GATE_COUNTER = {
@@ -1332,6 +1563,7 @@ class RunLoop:
         track_id: int,
         verdict: dict,
         face_desc: list[float] | None = None,
+        frame_keys: set | None = None,
     ) -> None:
         """Fold a junk mint back when its own track disowns it (TRACK HEAL).
 
@@ -1422,7 +1654,14 @@ class RunLoop:
             # own mints, which is exactly the double-mint case: mint A, mint B
             # one blurry second later, then match B strongly.  B is where the
             # track settled; A is the phantom to fold.
-            doomed = [e for e in live if e["key"] and e["key"] != matched_key]
+            # CO-PRESENCE BEATS THE TRACKER: a mint whose key was matched by
+            # ANOTHER face of this same frame belongs to somebody standing
+            # elsewhere right now, so folding it here would erase a real guest.
+            doomed = [
+                e for e in live
+                if e["key"] and e["key"] != matched_key
+                and not (frame_keys and e["key"] in frame_keys)
+            ]
             kept = [e for e in live if not e["key"] or e["key"] == matched_key]
             if kept:
                 self._minted[track_id] = kept
@@ -1613,6 +1852,7 @@ class RunLoop:
         track_id: int,
         verdict: dict,
         face_desc: list[float] | None = None,
+        frame_keys: set | None = None,
     ) -> bool:
         """Fold a fresh mint into the identity its own track is locked to.
 
@@ -1677,10 +1917,17 @@ class RunLoop:
         minted_key = verdict.get("personKey")
         if not minted_key:
             return False
+        # CO-PRESENCE BEATS THE TRACKER.  If the identity this fold would fold
+        # INTO was matched by another face of this same frame, that person is
+        # visibly standing elsewhere right now and cannot also be this mint.
+        # Whatever the track box says, two faces at two positions are two
+        # people — the one certain identity signal available.
         now = time.monotonic()
         with self._lock:
             self._prune_locks(now)
             lock = self._locks.get(track_id)
+            if lock is not None and frame_keys and lock["key"] in frame_keys:
+                lock = None  # co-present this frame: not the same person
             # SAME-FRAME BINDING IS NOT EVIDENCE (see the docstring): a lock
             # bound by an earlier face of THIS frame means two faces landed on
             # one track box — two guests standing close, not one guest over
@@ -1892,6 +2139,7 @@ class RunLoop:
         with self._lock:
             mints = list(self._mints)
             retired = list(self._retired)
+            co_present = list(self._copresence_pairs)
         payloads = taps.build_payloads(
             last, self.s.quality_min_px, self.s.quality_canon_px,
             st["unique"], st["staffCrossings"],
@@ -1899,6 +2147,7 @@ class RunLoop:
             manual_additions=st["manualAdditions"],
             mints=mints,
             retired=retired,
+            co_present=co_present,
         )
         # ENFORCE the CONTRACTS.md 32 KB tap ceiling.  within_budget existed
         # from v1 but nothing ever CALLED it outside tests (found in the

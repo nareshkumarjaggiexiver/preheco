@@ -15,7 +15,7 @@ Endpoints:
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
     POST /merge  {runId, keep, drop, onlyIfSingleton?}
         -> {merged, galleryN}                                         (duplicate)
-    POST /split  {runId, a, b}                -> {ok, galleryN}       (false-match)
+    POST /split  {runId, a, b}   -> {ok, galleryN}   (false-match / co-presence)
     POST /mark-staff {runId, personKey, siteId, staffId?}
         -> {moved, galleryN, staffKey}                                (mark-staff)
     POST /count/manual {runId, note?}
@@ -49,7 +49,11 @@ def _env_s(name: str, default: float) -> float:
         return default
     return float(raw)
 
-VERSION = "0.9.0"
+#: 0.10.0 (2026-08-06): a pair under cannot_link no longer earns a near-miss
+#: rider — the constraint is now the gallery's single record of "known
+#: different" and governs merge refusal, the overlap banner and this one.  No
+#: field changed shape; some riders simply stop being emitted.
+VERSION = "0.10.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -417,7 +421,21 @@ def merge(body: MergeRequest) -> dict:
 
 @app.post("/split")
 def split(body: SplitRequest) -> dict:
-    """False-match correction: record a do-not-merge constraint for the pair."""
+    """Record a do-not-merge constraint: these two keys are different people.
+
+    Two callers, one meaning.  The OPERATOR posts it as a *false-match*
+    correction.  The RUNNER posts it as a CO-PRESENCE assertion — every
+    distinct non-staff pair of personKeys appearing in ONE frame, once per pair
+    (its ``HECO_COPRESENCE_SPLIT=0`` is that source's off switch) — because two
+    faces at different positions in a single frame are two people, which is
+    about as certain as machine evidence gets.
+
+    The constraint governs three things and the count is not one of them:
+    ``/merge`` refuses the pair (so no heal or track-lock fold can silently
+    erase a paying guest), and neither duplicate-suggestion banner —
+    gallery-overlap or near-miss — is raised for it again.  ``galleryN`` comes
+    back unchanged, always.
+    """
     try:
         n = gallery.split(config.data_dir(), body.runId, body.a, body.b)
     except gallery.BadRunIdError as e:

@@ -542,7 +542,7 @@ def test_health_reports_both_weak_band_knobs(client, monkeypatch):
     "which bar was this run using" is a question that will be asked.
     """
     body = client.get("/health").json()
-    assert body["version"] == "0.9.0"
+    assert body["version"] == "0.10.0"
     assert body["nearMissWeakFloor"] == pytest.approx(config.DEFAULT_NEARMISS_WEAK_FLOOR)
     assert body["nearMissClothes"] == pytest.approx(config.DEFAULT_NEARMISS_CLOTHES)
     assert pytest.approx(0.15) == config.DEFAULT_NEARMISS_WEAK_FLOOR
@@ -552,6 +552,142 @@ def test_health_reports_both_weak_band_knobs(client, monkeypatch):
     monkeypatch.setenv("HECO_MATCH_NEARMISS_CLOTHES", "")
     assert config.nearmiss_weak_floor() == pytest.approx(0.15), "empty means unset"
     assert config.nearmiss_clothes() == pytest.approx(0.78), "empty means unset"
+
+
+# ------------- a SETTLED pair is never asked about again (v3, 2026-08-06)
+#
+# Run 05b3b7, ground truth THREE people, counted THREE — the count was right
+# and the banners were wrong:
+#
+#     p00002: "minted 0.316 from p00001", clothing agreement 0.94
+#     p00007: "minted 0.360 from p00002", clothing agreement 0.57
+#
+# p00001 and p00002 came in through the main door TOGETHER; p00007 (the
+# operator) stood in the alley with p00002, and one tap round matched p00002
+# and p00007 IN THE SAME FRAME.  Two faces at different positions in one frame
+# are two people — the pipeline held the proof and argued with itself anyway.
+#
+# No threshold move fixes it: 0.316 and 0.360 sit inside the ordinary face
+# band against a 0.363 threshold, the same-person misses on this camera are
+# 0.294/0.308/0.361 and the closest impostor pair is 0.377 — the distributions
+# overlap right there, and clothing (0.94, 0.57) did not separate them either.
+# So the answer is an independent signal recorded through the primitive that
+# already exists: the runner posts co-presence to /split, and cannot_link —
+# which already refuses /merge and silences the overlap banner — now silences
+# the near-miss rider too.  A rider is a QUESTION; the constraint is the
+# ANSWER already on file.
+
+
+def _split(client, run_id, a, b):
+    """Record the do-not-merge constraint the operator (or co-presence) asserts."""
+    res = client.post("/split", json={"runId": run_id, "a": a, "b": b})
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
+def test_settled_pair_carries_no_face_basis_rider(client):
+    """THE 05b3b7 REPLAY: a face-band mint against a known-different key is silent.
+
+    Same geometry as the original face-band replay (0.3464 against the seed),
+    with one difference — the pair is already recorded as two people.  The
+    verdict is untouched (still a mint, still a fresh key, count still up);
+    only the suggestion disappears, because it has already been answered.
+    """
+    seed = _match_full(client, "run-cl1", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    assert seed["personKey"] == "p00001"
+    _split(client, "run-cl1", "p00001", "p00002")
+
+    out = _match_full(
+        client, "run-cl1", _at_cosine(0.3464), appearance=_desc({0: 0.94, 1: 0.06})
+    )
+    assert out["personKey"] == "p00002"
+    assert out["isNew"] is True, "the verdict is untouched — cannot-link is not a merge"
+    assert out["galleryN"] == 2, "the count is untouched too"
+    assert out["cosine"] == pytest.approx(0.3464, abs=1e-5)
+    assert out["nearMiss"] is None, (
+        "0.3464 with clothing 0.94 is exactly the 05b3b7 banner — and the pair "
+        "is already on file as two different people, so there is nothing to ask"
+    )
+
+
+def test_settled_pair_carries_no_clothing_basis_rider(client):
+    """The weak band is silenced by the same constraint, on the same reasoning.
+
+    The clothing basis is the thinnest evidence in the system (its bar clears
+    the worst measured impostor by 0.033), so it is the LAST thing that should
+    keep arguing with a recorded fact.
+    """
+    seed = _match_full(client, "run-cl2", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    assert seed["personKey"] == "p00001"
+    _split(client, "run-cl2", "p00001", "p00002")
+
+    out = _match_full(
+        client, "run-cl2", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert out["personKey"] == "p00002"
+    assert out["isNew"] is True and out["galleryN"] == 2
+    assert out["nearMiss"] is None, "bench 6e1a5d's clothing rider, settled and silent"
+
+
+def test_the_suppression_is_per_pair_not_a_global_gag(client):
+    """One settled pair silences that pair ONLY — every other pair still speaks.
+
+    Two ways of being unrelated are checked: a LATER mint that near-misses the
+    same constrained identity (the constraint is about a pair, not about
+    p00001), and a mint that near-misses an entirely different seed.  A
+    constraint that gagged a key wholesale would hide the real duplicates this
+    banner exists to catch, which is the failure the near-miss band was added
+    to fix in the first place.
+    """
+    a = _match_full(client, "run-cl3", _e(0).tolist())
+    b = _match_full(client, "run-cl3", _e(5).tolist())
+    assert (a["personKey"], b["personKey"]) == ("p00001", "p00002")
+    _split(client, "run-cl3", "p00001", "p00003")
+
+    settled = _match_full(client, "run-cl3", _at_cosine(0.3464, ortho=1))
+    assert settled["personKey"] == "p00003"
+    assert settled["nearMiss"] is None
+
+    # A different mint, the SAME near-missed identity: unconstrained, so asked.
+    other_mint = _match_full(client, "run-cl3", _at_cosine(0.3464, ortho=2))
+    assert other_mint["personKey"] == "p00004"
+    assert other_mint["nearMiss"] is not None
+    assert other_mint["nearMiss"]["key"] == "p00001"
+    assert other_mint["nearMiss"]["basis"] == "face"
+
+    # An entirely unrelated pair: also asked.
+    elsewhere = _match_full(
+        client, "run-cl3", _unit(0.3464 * _e(5) + math.sqrt(1 - 0.3464**2) * _e(3))
+    )
+    assert elsewhere["personKey"] == "p00005"
+    assert elsewhere["nearMiss"] is not None
+    assert elsewhere["nearMiss"]["key"] == "p00002"
+
+
+def test_cannot_link_changes_the_suggestion_and_nothing_else(client):
+    """The verdict is IDENTICAL with and without the constraint, field for field.
+
+    cannot-link must never change WHO someone is — only what is suggested
+    about them.  Two runs are driven with byte-identical inputs and differ in
+    exactly one thing: one has the constraint recorded first.  Every other
+    field of the /match response must match, including `cosine` (the rider's
+    suppression must not be implemented by hiding the score) and `galleryN`
+    (a suppressed suggestion must never quietly move the count).
+    """
+    probe = _at_cosine(0.3464)
+    outfit, worn = _desc({0: 1.0}), _desc({0: 0.94, 1: 0.06})
+
+    _match_full(client, "run-cl4", _e(0).tolist(), appearance=outfit)
+    loud = _match_full(client, "run-cl4", probe, appearance=worn)
+
+    _match_full(client, "run-cl5", _e(0).tolist(), appearance=outfit)
+    _split(client, "run-cl5", "p00001", "p00002")
+    quiet = _match_full(client, "run-cl5", probe, appearance=worn)
+
+    assert loud["nearMiss"] is not None and quiet["nearMiss"] is None
+    assert {k: v for k, v in loud.items() if k != "nearMiss"} == {
+        k: v for k, v in quiet.items() if k != "nearMiss"
+    }
 
 
 # ------------------------------------------------------- gallery overlap flag

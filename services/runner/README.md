@@ -101,6 +101,54 @@ even a banner fired.
   heal. The tracker's longer coast (`HECO_TRACKER_MAX_AGE`, now 30 frames)
   widens the swap window, so the two changes are read together.
 
+## v4: co-presence — the one certain identity signal (run 05b3b7, 2026-08-06)
+
+Ground truth **three people, counted three**. The count was right; the *noise*
+was wrong. Two "likely duplicate" merge suggestions were raised between people
+who are demonstrably different:
+
+| banner | face cosine | clothing | reality |
+| --- | --- | --- | --- |
+| p00002: "Minted 0.316 from p00001" | 0.316 | 0.94 | walked in the main door **together** |
+| p00007: "Minted 0.360 from p00002" | 0.360 | 0.57 | stood in the alley **together** |
+
+- **No threshold fixes this.** Both sat *inside* the ordinary near-miss band
+  against the 0.363 threshold, and clothing agreement — 0.94 on the first pair
+  — did not save them. The impostor and genuine face distributions overlap on
+  this camera (impostor pair 0.377; same-person misses 0.294 / 0.308 / 0.361),
+  so genuinely different people simply land there. Moving 0.363 trades one
+  error for the other.
+- **Co-presence is independent, and certain.** That same run's tap ledger holds
+  one round matching **p00002 and p00007 in the SAME FRAME**. Two faces at
+  different positions in one frame are two different people — about as certain
+  as machine evidence gets — and the pipeline had that fact and did nothing
+  with it.
+- **It goes through the door that already exists.** For every frame, the loop
+  collects the distinct non-staff `personKey`s among that frame's verdicts and
+  asserts each unordered pair once via `POST /split {runId, a, b}` — the same
+  endpoint an operator's *false-match* correction uses. `cannot_link` already
+  (a) makes `/merge` refuse the pair and (b) suppresses the near-miss / overlap
+  banner, so no new machinery is grown. Best-effort (a 5xx retries while the
+  two share a frame; a 4xx is not retried), counted as `coPresenceSplits` in
+  the status, the notes and the results, staff excluded (a staff hit is not a
+  guest identity and the staff store is a different key space), and bounded by
+  a 4000-pair memory that stops asserting — and says so once — rather than
+  re-POSTing pairs the gallery already holds.
+- **What it buys beyond silence.** Because `cannot_link` also makes `/merge`
+  refuse, a heal or a track-lock fold can no longer fold two co-present people
+  together — the SILENT under-count (a real paying guest erased) that every
+  guard here exists to prevent. Noise reduction and accuracy protection are the
+  same change.
+- **The known cost, stated not hidden.** A person holding a **phone** showing
+  their own face — or a mirror, or a printed photo — puts one real person's
+  face in the frame twice, and co-presence asserts they are two different
+  people. That blocks the heal which correctly folded exactly such a phone-face
+  on the 2026-08-06 bench. The trade follows this project's asymmetry: a
+  blocked fold OVER-counts, which is visible and an operator can merge; a wrong
+  fold UNDER-counts silently and nobody ever sees it. Fixed mirrors and screens
+  are exclusion-zone work; a hand-held phone is not, and that is the residual.
+  `HECO_COPRESENCE_SPLIT=0` turns the whole mechanism off.
+
 ## Torso appearance: an advisory veto, never a verdict
 
 Clothing is constant within one event, so the loop computes a cheap
@@ -243,7 +291,7 @@ carries information.
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, coPresenceSplits, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -321,6 +369,7 @@ match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
 | `HECO_TRACK_LOCK_MIN_COSINE` | `0.45` | Track identity lock: a verdict matching an existing identity at ≥ this binds the track to it, and a LATER mint on that same track is folded back at once (`lockedTrackFolds` +1). Same floor as the heal, above the 0.377 measured impostor ceiling. **0 = lock off**; it is also off whenever healing is (the lock expires on the heal window) |
 | `HECO_HEAL_APPEARANCE_CLASH` | `0.35` | Clothing guard on both folds (heal and lock): below this histogram intersection is a CLEAR clash and the fold is refused as a suspected tracker swap (`healVetoedByAppearance`). **Was 0.50**, which vetoed a probably-correct fold at 0.4991. Reasoned, uncalibrated; **0 = refusal off**; absent descriptors never veto |
 | `HECO_HEAL_APPEARANCE_UNSURE` | `0.55` | Upper edge of the UNCERTAIN band: a reading in `[clash, unsure)` lets the fold proceed but counts `healUncertainAppearance`, so an operator can see how often the system acted on weak corroboration. Agreement never loosens a cosine floor (an impostor pair measured clothing 0.747) |
+| `HECO_COPRESENCE_SPLIT` | `1` | Co-presence: every unordered pair of distinct non-staff identities matched in ONE frame is asserted to the gallery as a `cannot_link` via `POST /split` (`coPresenceSplits` +1, once per pair per run). Two faces at different positions in one frame are two different people — the only CERTAIN identity signal here, and run 05b3b7 had it and ignored it while raising two false banners at 0.316/0.360 (clothing 0.94/0.57) against a 0.363 threshold. Silences the wrong banner AND stops a heal or lock fold erasing one of the two. **0 = off**; the residual is a hand-held phone showing its owner's face (one person asserted as two — an over-count, which is visible) |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |
