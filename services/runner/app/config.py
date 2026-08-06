@@ -181,6 +181,45 @@ class Settings:
     heal_appearance_clash: float = 0.35
     heal_appearance_unsure: float = 0.55
 
+    # CO-PRESENCE SPLITS (see loop._assert_co_presence).  1 = on, 0 = off.
+    #
+    # THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
+    # counted THREE — the COUNT was right and the NOISE was wrong).  Two
+    # "likely duplicate" banners were raised between people who are
+    # demonstrably different: p00002 carried "Minted 0.316 from p00001 —
+    # clothing agreement 0.94" and p00007 (the operator) carried "Minted 0.360
+    # from p00002 — clothing agreement 0.57".  p00001 and p00002 walked in
+    # through the main door together; p00007 and p00002 stood in the alley
+    # together.  Both banners sat INSIDE the ordinary face near-miss band
+    # (0.316 and 0.360 against the 0.363 threshold) and clothing agreement —
+    # 0.94 on the first pair — did not save them.
+    #
+    # NO THRESHOLD FIXES THIS.  The impostor and genuine face distributions
+    # overlap on this camera: a measured impostor pair reached 0.377 while
+    # same-person misses measured 0.294 / 0.308 / 0.361.  Moving 0.363
+    # anywhere trades one error for the other.
+    #
+    # CO-PRESENCE IS INDEPENDENT AND CERTAIN.  The tap ledger for that run
+    # holds a single round in which p00002 and p00007 were matched in the SAME
+    # FRAME.  Two faces at different positions in one frame are two different
+    # people — about as certain as machine evidence gets — and the pipeline
+    # had that fact and did nothing with it.  With this on, every unordered
+    # pair of distinct non-staff identities seen in one frame is asserted to
+    # the gallery as a cannot_link via POST /split, which both silences the
+    # near-miss banner for the pair AND makes /merge refuse it, so no heal or
+    # track-lock fold can ever erase one of two co-present guests.
+    #
+    # THE KNOWN COST, stated rather than hidden: a person holding a PHONE
+    # showing their own face (or a mirror, or a printed photo) puts ONE real
+    # person's face in the frame twice, and co-presence will assert they are
+    # two different people — blocking a fold that was correct.  That is the
+    # deliberate side of this project's asymmetry: a blocked fold OVER-counts,
+    # which is VISIBLE and an operator can merge; a wrong fold UNDER-counts
+    # SILENTLY and nobody ever sees it.  Fixed mirrors and screens are handled
+    # by exclusion zones; a hand-held phone is not, and that is the residual.
+    # 0 turns the mechanism off completely: nothing recorded, nothing sent.
+    copresence_split: int = 1
+
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
@@ -247,6 +286,7 @@ def from_env() -> Settings:
         heal_appearance_unsure=env_float(
             "HECO_HEAL_APPEARANCE_UNSURE", s.heal_appearance_unsure
         ),
+        copresence_split=env_int("HECO_COPRESENCE_SPLIT", s.copresence_split),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
