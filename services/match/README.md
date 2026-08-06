@@ -29,9 +29,9 @@ evidence (project hard rule: measure first).
 
 | method | path | body | returns |
 | --- | --- | --- | --- |
-| GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash, nearMissFloor}` |
+| GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash, nearMissFloor, nearMissWeakFloor, nearMissClothes}` |
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
-| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss}` |
+| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss: {key, cosine, appearanceSim, basis} \| null}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
@@ -50,10 +50,12 @@ below; any other present length is a 422); `appearanceSim` is its best
 histogram intersection against the matched identity's stored descriptors
 (`null` for staff hits, new mints, or when either side lacks one) and
 `appearanceVetoed` says an enrolment was refused on a clash. `nearMiss` is
-non-null only on a MINT whose best cosine landed in
-`[HECO_MATCH_NEARMISS_FLOOR .. threshold)`: `{key, cosine, appearanceSim}` —
-the identity it almost was, the score, and the torso intersection against
-that identity's stored descriptors (see the near-miss section below).
+non-null only on a MINT that landed in one of the two near-miss bands:
+`{key, cosine, appearanceSim, basis}` — the identity it almost was, the score,
+the torso intersection against that identity's stored descriptors, and which
+signal spoke (`"face"` for `[HECO_MATCH_NEARMISS_FLOOR .. threshold)`,
+`"clothing"` for the weak band under it). A missing/null `basis` is the
+pre-0.9.0 shape and means `"face"`. See the near-miss section below.
 
 - **Multiple templates per guest (M1).** A guest is represented by up to five
   views, not by whichever frame happened to be first. See below.
@@ -203,18 +205,18 @@ descriptor-less, and absent is not zero.
 Opening an older gallery or staff file ALTERs the column in, so every
 pre-existing file keeps working; its rows read as descriptor-absent.
 
-## The near-miss flag on a mint (v2, 0.7.0)
+## The near-miss flag on a mint (v2, 0.7.0; two-signal since 0.9.0)
 
-**The measurement it exists for.** Tonight the same person split at **face
-cosine 0.3464** against the 0.363 threshold with **clothing intersection
-0.562** — new guest p00005, almost certainly p00004 — and the operator found
-it by eye, because the signal surfaced nowhere. A mint whose best cosine
-against the pre-existing gallery lands in `[HECO_MATCH_NEARMISS_FLOOR
-(0.29) .. threshold)` now carries `nearMiss: {key, cosine, appearanceSim}` in
-the `/match` response, so the console can offer the operator a one-click
-merge. The floor sits just below every same-person miss measured on this
-camera (0.294 / 0.308 / 0.346 / 0.361); mints further out are genuinely new
-faces, and flagging them would teach the operator to ignore the cue.
+**The measurement it exists for.** The same person split at **face cosine
+0.3464** against the 0.363 threshold with **clothing intersection 0.562** —
+new guest p00005, almost certainly p00004 — and the operator found it by eye,
+because the signal surfaced nowhere. A mint whose best cosine against the
+pre-existing gallery lands in `[HECO_MATCH_NEARMISS_FLOOR (0.29) ..
+threshold)` carries `nearMiss: {key, cosine, appearanceSim, basis}` in the
+`/match` response, so the console can offer the operator a one-click merge.
+That floor sits just below every same-person miss measured on this camera
+(0.294 / 0.308 / 0.346 / 0.361); mints further out are genuinely new faces,
+and flagging them would teach the operator to ignore the cue.
 
 **The verdict is still a mint — never an automatic merge.** The measurement
 runs both ways: an IMPOSTOR pair on the same camera sits at **face 0.377
@@ -225,6 +227,48 @@ only when the operator's `duplicate` correction arrives via `/merge`.
 Out-of-band mints carry `nearMiss: null`; matched verdicts and staff hits
 never carry it; `0` disables the flag and `/health` reports the active
 `nearMissFloor`.
+
+### The weak (clothing) band — 0.9.0
+
+**The 0.29 floor was blind to the splits that actually cost a count.** Bench
+run 6e1a5d, ground truth ONE person walking out of frame, back in, then
+sitting: one person, **six tracker ids**. Three extra mints healed back; two
+survived, and this is how they read against `p00001`:
+
+| survivor | face cosine | clothing intersection | flagged before 0.9.0? |
+| --- | --- | --- | --- |
+| `p00005` | 0.212 | 0.797 | no — under the 0.29 floor |
+| `p00006` | 0.228 | 0.875 | no — under the 0.29 floor |
+
+The face signal had almost nothing to work with while the clothing signal was
+reading 0.80–0.88. Seated and turned-away re-entries at this camera's angles
+land exactly there. So the rider has a second, weaker entry route, and a
+`basis` field naming which signal spoke:
+
+- **`basis: "face"`** — cosine in `[HECO_MATCH_NEARMISS_FLOOR .. threshold)`.
+  The original band, unchanged; clothing is reported, never required.
+- **`basis: "clothing"`** — cosine in `[HECO_MATCH_NEARMISS_WEAK_FLOOR (0.15)
+  .. HECO_MATCH_NEARMISS_FLOOR (0.29))` **and** `appearanceSim` present and
+  `>= HECO_MATCH_NEARMISS_CLOTHES (0.78)`. Absent is not zero: a sighting
+  with no torso descriptor never enters this band.
+- A **missing or null `basis`** is the pre-0.9.0 rider shape and means
+  `"face"` — consumers must read it that way.
+
+**Be honest about 0.78: it is a hair, not a margin.** The worst measured
+impostor clothing reading on this camera is **0.747** — two genuinely
+different men — so the bar clears the worst impostor we have actually
+measured by **0.033**. This is the thinnest evidence in the system, and it is
+defensible for exactly one reason: a near-miss is a **suggestion a human
+confirms, never a merge**. `isNew` stays `true`, the count moves only on an
+operator click, and the existing verdict invariants are untouched. Said
+plainly: **at a venue with uniformed staff, a dress code or similar
+traditional dress, this band is expected to produce wrong suggestions, and it
+is the first knob to turn off** — set `HECO_MATCH_NEARMISS_WEAK_FLOOR=0`,
+which silences the clothing band and leaves the face band exactly as it was.
+`HECO_MATCH_NEARMISS_FLOOR=0` remains the master switch for both, because the
+weak band is defined as the region *under* that floor. `/health` reports
+`nearMissWeakFloor` and `nearMissClothes` so a disputed suggestion can always
+be traced to the bar that made it.
 
 ## Run
 
@@ -254,12 +298,21 @@ including the old-file ALTER migration, the enrol veto (fires on clash, not
 on agreement, not at the boundary, never on an absent descriptor), the
 verdict never moving because of clothing (including the two-white-shirts
 no-rescue rule), the 422 on a wrong-length descriptor, and `appearanceSim`
-being null for staff hits and first mints. The near-miss flag replays
-tonight's measured pair (mint at 0.3464 with torso 0.562 → flagged, verdict
-still a mint, gallery grows), plus: out-of-band and empty-gallery mints null,
-band edges, `appearanceSim` null when either side lacks a descriptor,
-matched verdicts and staff hits never flagged, floor 0 disabling, and
-`/health` naming the band.
+being null for staff hits and first mints. The near-miss flag replays the
+measured pair (mint at 0.3464 with torso 0.562 → flagged, verdict still a
+mint, gallery grows), plus: out-of-band and empty-gallery mints null, band
+edges, `appearanceSim` null when either side lacks a descriptor, matched
+verdicts and staff hits never flagged, floor 0 disabling, and `/health`
+naming the band. The **weak (clothing) band** replays bench 6e1a5d's two
+surviving survivors verbatim (0.212/0.797 and 0.228/0.875 → `basis:
+"clothing"`, verdict still a mint, count still up), and pins: clothing 0.60
+at the same face score stays silent, a descriptor-less sighting never enters
+the band at all, a 0.31 mint is `basis: "face"` whether its clothes clash or
+are missing, every floor and the clothes bar are inclusive (asserted at
+binary-exact knob values, because a descriptor authored as 0.78 round-trips
+through `float32` as 0.77999997), weak floor 0 silences only the clothing
+band, floor 0 silences both, matched verdicts and staff hits carry no rider
+even in identical clothes, and `/health` reports both new knobs.
 
 ## Tune
 
@@ -273,7 +326,9 @@ matched verdicts and staff hits never flagged, floor 0 disabling, and
 | `HECO_MATCH_TEMPLATE_MARGIN` | `0.05` | How far ahead of the nearest rival identity it must land. |
 | `HECO_MATCH_TEMPLATE_MAX_COSINE` | `0.90` | Near-duplicate ceiling: above this the view adds no coverage. |
 | `HECO_MATCH_APPEARANCE_CLASH` | `0.50` | Torso-intersection floor for the enrolment veto (below = clash). **Reasoned, not calibrated** — like the M1 margins — and **0 disables the veto**. Empty string means unset. |
-| `HECO_MATCH_NEARMISS_FLOOR` | `0.29` | Floor of the near-miss band on a mint: best cosine in `[floor .. threshold)` earns the `nearMiss` flag (operator suggestion, never a merge — impostors measured face 0.377 / clothes 0.503). Just below the measured same-person misses (0.294/0.308/0.346/0.361). **0 disables**; empty string means unset. |
+| `HECO_MATCH_NEARMISS_FLOOR` | `0.29` | Floor of the FACE near-miss band on a mint: best cosine in `[floor .. threshold)` earns `nearMiss` with `basis: "face"` (operator suggestion, never a merge — impostors measured face 0.377 / clothes 0.503). Just below the measured same-person misses (0.294/0.308/0.346/0.361). **0 disables both bands** (the weak band lives under this floor); empty string means unset. |
+| `HECO_MATCH_NEARMISS_WEAK_FLOOR` | `0.15` | Floor of the WEAK (clothing) band: cosine in `[weak floor .. near-miss floor)` **plus** clothing at or above the bar below earns `nearMiss` with `basis: "clothing"`. Exists because bench 6e1a5d measured one person splitting at face 0.212/clothing 0.797 and face 0.228/clothing 0.875 — both invisible to the face band. **0 disables the weak band only**; empty string means unset. |
+| `HECO_MATCH_NEARMISS_CLOTHES` | `0.78` | Torso-intersection bar the weak band requires. **0.033 above the worst measured impostor clothing reading (0.747, two genuinely different men)** — a hair, not a margin, which is why this band only ever suggests. Expect wrong suggestions at venues with uniforms or a dress code; turn the band off there via the weak floor. Empty string means unset. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
 operator-supervised walk-through, never from a crossing, and staff flows
@@ -287,6 +342,14 @@ carry no appearance handling at all.
   count. The confidence + rival-margin gates and the cap of 5 bound it, and
   `test_two_near_miss_people_do_not_merge` holds a 0.30-apart pair apart, but
   the real number needs impostor pairs from the venue.
+- **The weak near-miss band is the thinnest evidence in the system.** Its
+  0.78 clothing bar clears the worst measured impostor clothing reading
+  (0.747) by 0.033 — one bad outfit coincidence away from pointing at the
+  wrong guest. It is survivable only because it suggests and never merges,
+  and it will misfire at any venue with uniforms, a dress code or similar
+  traditional dress. `HECO_MATCH_NEARMISS_WEAK_FLOOR=0` is the intended
+  response there, and a labelled set of impostor torso pairs from a real
+  event is what should either raise the bar or retire the band.
 - **The gates' defaults are reasoned, not measured.** 0.05 / 0.05 / 0.90 come
   from the geometry above, not from a labelled bench set; they are env-tunable
   precisely because the first impostor data should move them. The appearance

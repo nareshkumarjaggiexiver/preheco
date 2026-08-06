@@ -49,10 +49,36 @@ _runs: dict[str, SortLite] = {}
 _last_used: dict[str, float] = {}
 
 
+#: Frames a track may coast unmatched before it is dropped.  30, not the
+#: original 15, because of bench 6e1a5d (2026-08-06): ONE person — out of
+#: frame, back in, then seated — produced SIX tracker ids (2, 5, 6, 7, 8, 12)
+#: at 3.97 fps, where 15 frames is only 3.75 s of coasting and every seated
+#: detector gap longer than that minted a fresh id.  30 frames is ~7.5 s.  See
+#: SortLite.__init__ for the full measurement AND the caveat: this treats the
+#: symptom (the disease is YOLOX-nano losing seated bodies), and a longer coast
+#: widens the window in which a ghost track can latch onto a DIFFERENT person.
+DEFAULT_MAX_AGE = 30
+
+
+def _max_age() -> int:
+    """Frames of coasting, from ``HECO_TRACKER_MAX_AGE`` (default 30).
+
+    Two names are read on purpose.  ``HECO_TRACKER_MAX_AGE`` is the knob the
+    pipeline's compose file plumbs through and the one to use; ``TRACKER_MAX_AGE``
+    is the name this service shipped with and documented, so an existing
+    deployment that set it by hand keeps working rather than having its
+    explicit choice silently replaced by the new default — a knob that stops
+    being obeyed without saying so is the worst way to change behaviour.  The
+    HECO_-prefixed name wins when both are set.
+    """
+    legacy = env_int("TRACKER_MAX_AGE", DEFAULT_MAX_AGE)
+    return env_int("HECO_TRACKER_MAX_AGE", legacy)
+
+
 def _new_tracker() -> SortLite:
     """Build a SortLite from env (read per call so /reset picks up changes)."""
     return SortLite(
-        max_age=env_int("TRACKER_MAX_AGE", 15),
+        max_age=_max_age(),
         min_hits=env_int("TRACKER_MIN_HITS", 3),
         iou_min=env_float("TRACKER_IOU_MIN", 0.2),
         vel_smooth=env_float("TRACKER_VEL_SMOOTH", 0.5),

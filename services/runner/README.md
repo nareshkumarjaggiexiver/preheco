@@ -66,6 +66,41 @@ a threshold cannot see (CONTRACTS.md "the track heal and exclusion zones"):
   frame with no dimensions to scale the polygons by excludes nothing and
   counts `zoneUnmeasured` instead (the `gatedUnmeasured` honesty pattern).
 
+## v3: the track identity lock (bench 6e1a5d, 2026-08-06)
+
+Ground truth: **ONE person**, walking out of frame, back in, then sitting
+down. The tracker gave that one person **six ids** — track 2 (53 frames), 5
+(24), 6 (8), 7 (6), 8 (6), 12 (7) — at 3.97 fps, where the old 15-frame
+max-age dies after 3.75 s and every gap while the person sat (the detector
+losing a seated body) outlasted it. Three of the resulting mints were healed
+back into p00001. **Two survived:** p00005 (face 0.212 vs p00001, clothing
+0.797) and p00006 (0.228 / 0.875), both under the 0.29 near-miss floor so not
+even a banner fired.
+
+- **Why the heal could not reach them.** The heal is a *cure*: it needs a
+  LATER comfortable match on the same track to disown the mint. On a subject
+  the detector keeps losing, that match never comes.
+- **The lock prevents instead.** Once a verdict on a track matches an existing
+  identity at ≥ `HECO_TRACK_LOCK_MIN_COSINE` (0.45 — the heal's floor, above
+  the 0.377 measured impostor ceiling), that track is *bound* to that identity
+  for `HECO_HEAL_WINDOW_S`. A later `isNew` verdict on the same track is
+  folded straight back via `POST /merge {…, onlyIfSingleton: true}` — unique
+  −1, `lockedTrackFolds` +1, on the spot. `merged=false` counts nothing.
+  Locks are per track id (never across ids), expire with the heal window,
+  and staff verdicts neither set nor use one.
+- **`distinctTracks`.** How many track ids the run ever saw, in the status,
+  the notes and the results. Six ids against one real guest is the signal that
+  motivated all of this, and it was previously discoverable only by querying
+  the run's SQLite by hand.
+- **The asymmetry that governs the switch.** A wrong split over-counts and
+  somebody argues about the invoice; a wrong MERGE under-counts *silently* and
+  nobody ever sees it. The lock makes track identity more authoritative, which
+  amplifies exactly that failure if the tracker swaps people — so
+  `HECO_TRACK_LOCK_MIN_COSINE=0` turns it off entirely, its folds are counted
+  apart from `healedSplits`, and it carries the same clothing guard as the
+  heal. The tracker's longer coast (`HECO_TRACKER_MAX_AGE`, now 30 frames)
+  widens the swap window, so the two changes are read together.
+
 ## Torso appearance: an advisory veto, never a verdict
 
 Clothing is constant within one event, so the loop computes a cheap
@@ -89,20 +124,34 @@ carries information.
   box, fewer than 100 unmasked pixels remain, or the frame does not decode —
   and an absent descriptor never vetoes anything, the codebase-wide
   absent-is-not-zero convention (`gatedUnmeasured` / `zoneUnmeasured`).
-- **Heal veto — the tracker-swap detector.** The heal's documented residual
-  risk is a tracker identity swap: two people cross paths, the track is handed
-  from person A to person B, B matches at ≥ 0.45 inside the window, and A's
+- **Fold guard — the tracker-swap detector, in three bands not one cliff.**
+  The residual risk of BOTH folds (the heal and the identity lock) is a
+  tracker identity swap: two people cross paths, the track is handed from
+  person A to person B, B matches at ≥ 0.45 inside the window, and A's
   singleton mint is folded into B — an under-count of one. A swapped track
-  shows A's clothes on the mint frame and B's on the healing frame, so before
-  each `/merge` the loop compares the mint frame's remembered descriptor with
-  the current frame's: histogram intersection below
-  `HECO_HEAL_APPEARANCE_CLASH` (default **0.50** — reasoned, uncalibrated;
-  `0` disables) refuses the fold — no merge, `unique` untouched,
-  `healVetoedByAppearance` +1, an info log with both keys and the similarity.
-  This SHRINKS the residual risk; it does not eliminate it (same-colour
-  swaps are invisible to it — that is what track-quality gating remains for).
-  Appearance agreement never lowers the 0.45 cosine floor: v1 never loosens
-  anything.
+  shows A's clothes on the earlier frame and B's on the folding frame, so
+  before each `/merge` the loop compares the remembered descriptor with the
+  current frame's and bands the histogram intersection:
+
+  | band | reading | what happens |
+  | --- | --- | --- |
+  | clash | `< HECO_HEAL_APPEARANCE_CLASH` (**0.35**) | fold refused, `healVetoedByAppearance` +1, info log with both keys and the similarity |
+  | uncertain | `[clash, HECO_HEAL_APPEARANCE_UNSURE)` (**0.55**) | fold **proceeds**, `healUncertainAppearance` +1 |
+  | corroborated | `≥ unsure` | proceeds silently |
+
+  **Why the cliff went.** The single 0.50 floor VETOED a fold at intersection
+  **0.4991** on bench 6e1a5d — nine ten-thousandths, on a fold that was
+  probably correct (track 2 had linked p00001 and p00005, and the pipeline
+  threw that evidence away). The same run bounds what a mid-range reading can
+  mean: the same man's surviving splits read 0.797 and 0.875 while two
+  genuinely different men reached 0.747 and another impostor pair 0.503. A
+  number in between separates nobody, so only a genuine disagreement blocks
+  and everything else is recorded rather than acted on. Both numbers remain
+  reasoned, not calibrated. `0` in CLASH disables the refusal; absent
+  descriptors on either side veto nothing and count nothing. This SHRINKS the
+  residual risk; it does not eliminate it (same-colour swaps are invisible to
+  it — that is what track-quality gating remains for). Appearance agreement
+  never lowers a cosine floor: the signal only ever fails to object.
 - **Enrolment veto (match-side, reported here).** The descriptor rides every
   `/match` body as `appearance`; the matcher may refuse to keep a clashing
   sighting as an *additional template* (anti-poison,
@@ -194,7 +243,7 @@ carries information.
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, healVetoedByAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -269,7 +318,9 @@ match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
 | `HECO_HEAL_WINDOW_S` | `20.0` | How long after a mint the same track's later match may fold it; `0` disables healing |
 | `HECO_HEAL_MIN_COSINE` | `0.45` | Heal evidence floor — above the 0.377 measured impostor ceiling with margin (tonight's heal evidence was 0.69); a cross-key match below it heals nothing |
-| `HECO_HEAL_APPEARANCE_CLASH` | `0.50` | Heal appearance veto: a fold whose mint-frame torso descriptor scores below this (histogram intersection) against the healing frame's is refused as a suspected tracker swap. Reasoned, uncalibrated; **0 = veto off**; absent descriptors never veto |
+| `HECO_TRACK_LOCK_MIN_COSINE` | `0.45` | Track identity lock: a verdict matching an existing identity at ≥ this binds the track to it, and a LATER mint on that same track is folded back at once (`lockedTrackFolds` +1). Same floor as the heal, above the 0.377 measured impostor ceiling. **0 = lock off**; it is also off whenever healing is (the lock expires on the heal window) |
+| `HECO_HEAL_APPEARANCE_CLASH` | `0.35` | Clothing guard on both folds (heal and lock): below this histogram intersection is a CLEAR clash and the fold is refused as a suspected tracker swap (`healVetoedByAppearance`). **Was 0.50**, which vetoed a probably-correct fold at 0.4991. Reasoned, uncalibrated; **0 = refusal off**; absent descriptors never veto |
+| `HECO_HEAL_APPEARANCE_UNSURE` | `0.55` | Upper edge of the UNCERTAIN band: a reading in `[clash, unsure)` lets the fold proceed but counts `healUncertainAppearance`, so an operator can see how often the system acted on weak corroboration. Agreement never loosens a cosine floor (an impostor pair measured clothing 0.747) |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |

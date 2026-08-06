@@ -309,6 +309,251 @@ def test_near_miss_floor_zero_disables_and_health_reports_it(client, monkeypatch
     assert config.nearmiss_floor() == pytest.approx(0.29), "empty means unset"
 
 
+# ------------------- the WEAK (clothing) near-miss band (v2 two-signal, 0.9.0)
+#
+# Bench run 6e1a5d (2026-08-06), ground truth ONE person who walked out of
+# frame, came back, and sat down.  That one person produced SIX tracker ids;
+# three mints healed back, and TWO survived as extra guests:
+#
+#     p00005: face 0.212 vs p00001, clothing 0.797
+#     p00006: face 0.228 vs p00001, clothing 0.875
+#
+# Both sat BELOW the 0.29 face floor, so no banner fired and the operator was
+# never asked — while the torso descriptor was reading 0.80-0.88.  The weak
+# band flags exactly that shape: cosine in [0.15 .. 0.29) AND clothing >= 0.78.
+#
+# 0.78 clears the worst measured IMPOSTOR clothing reading (0.747, two
+# genuinely different men) by 0.033.  That hair is why the rider is a
+# suggestion a human confirms, never a merge — pinned below by asserting the
+# verdict and the count on every one of these.
+
+
+def test_weak_band_replays_bench_6e1a5d_p00005(client):
+    """THE REPLAY: face 0.212 with clothing 0.797 is flagged on basis clothing.
+
+    The face signal alone could not see this split (0.212 is nowhere near the
+    0.29 floor); the clothing signal was shouting.  The rider must name the
+    identity, the face score, the torso agreement, and that it is speaking on
+    CLOTHING evidence — while the verdict stays a mint and the count moves up,
+    because clothing never merges anyone (impostors measured at 0.747).
+    """
+    seed = _match_full(client, "run-wb", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    out = _match_full(
+        client, "run-wb", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert out["isNew"] is True, "the verdict is STILL a mint — clothing never merges"
+    assert out["personKey"] != seed["personKey"]
+    assert out["galleryN"] == 2, "the count moved UP; only an operator click folds it"
+    nm = out["nearMiss"]
+    assert nm is not None, "0.212 with clothing 0.797 was invisible before 0.9.0"
+    assert nm["basis"] == "clothing"
+    assert nm["key"] == seed["personKey"]
+    assert nm["cosine"] == pytest.approx(0.212, abs=1e-5)
+    assert nm["appearanceSim"] == pytest.approx(0.797, abs=1e-5)
+
+
+def test_weak_band_replays_bench_6e1a5d_p00006(client):
+    """The second survivor: face 0.228 with clothing 0.875, same person, flagged."""
+    seed = _match_full(client, "run-wb2", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    out = _match_full(
+        client, "run-wb2", _at_cosine(0.228, ortho=2), appearance=_desc({0: 0.875, 1: 0.125})
+    )
+    assert out["isNew"] is True and out["galleryN"] == 2
+    nm = out["nearMiss"]
+    assert nm is not None and nm["basis"] == "clothing"
+    assert nm["key"] == seed["personKey"]
+    assert nm["cosine"] == pytest.approx(0.228, abs=1e-5)
+    assert nm["appearanceSim"] == pytest.approx(0.875, abs=1e-5)
+
+
+def test_weak_band_stays_silent_when_the_clothes_disagree(client):
+    """Same face score, clothing 0.60: no rider — the bar is the whole guard.
+
+    Without the clothes bar the weak band would flag every mint above 0.15,
+    which at a wedding is most of them, and a banner that fires constantly
+    trains the operator to click it away.
+    """
+    _match_full(client, "run-wb3", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    out = _match_full(
+        client, "run-wb3", _at_cosine(0.212), appearance=_desc({0: 0.60, 1: 0.40})
+    )
+    assert out["isNew"] is True
+    assert out["nearMiss"] is None, "0.60 clothing is below the 0.78 bar"
+
+
+def test_weak_band_needs_a_descriptor_absent_is_not_zero(client):
+    """No descriptor on either side means no weak-band rider — never an assumed one.
+
+    Absent is not zero and absent is not agreement: a sighting with no person
+    box (or an old gallery row) simply has no clothing evidence, so the weak
+    band — which rests on nothing else — must not speak.  Both directions.
+    """
+    # Probe has no descriptor.
+    _match_full(client, "run-wb4", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    out = _match_full(client, "run-wb4", _at_cosine(0.212))
+    assert out["isNew"] is True and out["nearMiss"] is None
+
+    # Seed has no descriptor.
+    _match_full(client, "run-wb5", _e(0).tolist())
+    out = _match_full(
+        client, "run-wb5", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert out["isNew"] is True and out["nearMiss"] is None
+
+
+def test_face_band_is_labelled_face_whatever_the_clothes_say(client):
+    """A mint at 0.31 is the ORIGINAL band: basis "face", clothing irrelevant.
+
+    Above the 0.29 floor the face is the evidence and the clothing figure only
+    rides along for the operator's judgement — so a clashing torso must not
+    suppress the rider, and a missing one must not either.  This is also the
+    old rider shape, now merely labelled.
+    """
+    seed = _match_full(client, "run-wb6", _e(0).tolist(), appearance=_desc({0: 1.0}))
+
+    clash = _match_full(
+        client, "run-wb6", _at_cosine(0.31), appearance=_desc({0: 0.10, 5: 0.90})
+    )
+    assert clash["nearMiss"]["basis"] == "face"
+    assert clash["nearMiss"]["key"] == seed["personKey"]
+    assert clash["nearMiss"]["appearanceSim"] == pytest.approx(0.10, abs=1e-5), (
+        "the clothing figure is reported, never required, above the face floor"
+    )
+
+    bare = _match_full(client, "run-wb6", _at_cosine(0.31, ortho=2))
+    assert bare["nearMiss"]["basis"] == "face"
+    assert bare["nearMiss"]["appearanceSim"] is None
+
+
+def test_near_miss_band_edges_are_inclusive_at_every_floor(client, monkeypatch):
+    """Both floors and the clothes bar are inclusive; just under each is silent.
+
+    The knobs are moved to binary-exact values (0.25 / 0.125 / 0.75) on
+    purpose: templates and descriptors are stored as float32, so a value
+    authored as 0.29 or 0.78 can land a fraction BELOW itself after the round
+    trip (float32(0.78) == 0.7799999713897705).  Testing the comparison at
+    values every float represents exactly measures the band's inclusivity
+    rather than the storage format's rounding.
+    """
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_FLOOR", "0.25")
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_WEAK_FLOOR", "0.125")
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_CLOTHES", "0.75")
+    seed = _match_full(client, "run-wb7", _e(0).tolist(), appearance=_desc({0: 1.0}))
+
+    # Exactly at the FACE floor: in band, on face evidence.
+    at_floor = _match_full(client, "run-wb7", _at_cosine(0.25, ortho=1))
+    assert at_floor["nearMiss"] is not None
+    assert at_floor["nearMiss"]["basis"] == "face"
+    assert at_floor["nearMiss"]["key"] == seed["personKey"]
+
+    # Exactly at the WEAK floor, with clothing exactly at the bar: in band.
+    at_weak = _match_full(
+        client, "run-wb7", _at_cosine(0.125, ortho=2), appearance=_desc({0: 0.75, 1: 0.25})
+    )
+    assert at_weak["nearMiss"] is not None
+    assert at_weak["nearMiss"]["basis"] == "clothing"
+    assert at_weak["nearMiss"]["appearanceSim"] == pytest.approx(0.75, abs=1e-6)
+
+    # Below the weak floor: perfect clothing agreement cannot rescue it.
+    below = _match_full(
+        client, "run-wb7", _at_cosine(0.0625, ortho=3), appearance=_desc({0: 1.0})
+    )
+    assert below["nearMiss"] is None, "under the weak floor the face says nothing at all"
+
+    # Inside the weak band but a hair under the clothes bar: silent.
+    under_bar = _match_full(
+        client, "run-wb7", _at_cosine(0.1875, ortho=4), appearance=_desc({0: 0.74, 1: 0.26})
+    )
+    assert under_bar["nearMiss"] is None
+
+
+def test_weak_floor_zero_disables_only_the_clothing_band(client, monkeypatch):
+    """0 is the off switch for the weak band alone — the face band survives it.
+
+    This is the knob to reach for at a venue with uniformed staff, a dress
+    code or similar traditional dress, where torso agreement stops carrying
+    information about identity and the weak band would suggest the wrong
+    person all night.  Turning it off must not cost the face band.
+    """
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_WEAK_FLOOR", "0")
+    _match_full(client, "run-wb8", _e(0).tolist(), appearance=_desc({0: 1.0}))
+
+    weak = _match_full(
+        client, "run-wb8", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert weak["nearMiss"] is None, "weak floor 0 must silence the clothing band"
+
+    face = _match_full(
+        client, "run-wb8", _at_cosine(0.31, ortho=2), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert face["nearMiss"] is not None and face["nearMiss"]["basis"] == "face"
+    assert client.get("/health").json()["nearMissWeakFloor"] == 0.0
+
+
+def test_floor_zero_disables_the_weak_band_too(client, monkeypatch):
+    """The face floor is the master switch: 0 silences BOTH bands.
+
+    The weak band is defined as the region UNDER that floor, so with no floor
+    there is no region — one env var still turns the whole feature off.
+    """
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_FLOOR", "0")
+    _match_full(client, "run-wb9", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    out = _match_full(
+        client, "run-wb9", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
+    )
+    assert out["isNew"] is True and out["nearMiss"] is None
+
+
+def test_matched_verdict_never_carries_a_clothing_rider(client):
+    """A re-sighting in identical clothes is a MATCH, not a suggestion.
+
+    The rider is a mint-only object on both bases; a matched verdict already
+    resolved to one guest and has nothing to suggest.
+    """
+    outfit = _desc({0: 1.0})
+    _match_full(client, "run-wb10", _e(0).tolist(), appearance=outfit)
+    out = _match_full(client, "run-wb10", _at_cosine(0.75), appearance=outfit)
+    assert out["isNew"] is False
+    assert out["nearMiss"] is None
+
+
+def test_staff_hit_never_carries_a_clothing_rider(client):
+    """Staff identity is operator-attested; no clothing evidence is consulted."""
+    samples = [{"embedding": _e(7).tolist(), "quality": 80.0}]
+    res = client.post(
+        "/staff/enrol", json={"siteId": "site-wb", "staffId": "st-11", "samples": samples}
+    )
+    assert res.status_code == 200, res.text
+    out = client.post(
+        "/match",
+        json={
+            "runId": "run-wb11", "embedding": _e(7).tolist(), "quality": 85.0,
+            "siteId": "site-wb", "appearance": _desc({0: 1.0}),
+        },
+    ).json()
+    assert out["isStaff"] is True
+    assert out["nearMiss"] is None
+
+
+def test_health_reports_both_weak_band_knobs(client, monkeypatch):
+    """A disputed suggestion must be traceable to the exact bar that made it.
+
+    0.78 sits 0.033 above the measured impostor clothing reading of 0.747, so
+    "which bar was this run using" is a question that will be asked.
+    """
+    body = client.get("/health").json()
+    assert body["version"] == "0.9.0"
+    assert body["nearMissWeakFloor"] == pytest.approx(config.DEFAULT_NEARMISS_WEAK_FLOOR)
+    assert body["nearMissClothes"] == pytest.approx(config.DEFAULT_NEARMISS_CLOTHES)
+    assert pytest.approx(0.15) == config.DEFAULT_NEARMISS_WEAK_FLOOR
+    assert pytest.approx(0.78) == config.DEFAULT_NEARMISS_CLOTHES
+
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_WEAK_FLOOR", "")
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_CLOTHES", "")
+    assert config.nearmiss_weak_floor() == pytest.approx(0.15), "empty means unset"
+    assert config.nearmiss_clothes() == pytest.approx(0.78), "empty means unset"
+
+
 # ------------------------------------------------------- gallery overlap flag
 
 
@@ -382,3 +627,21 @@ def test_overlap_respects_an_operator_split(client):
     out = _match_full(client, "run-ov3", x)
     assert out["personKey"] == b["personKey"] and out["templateAdded"] is True
     assert out["overlap"] is None, "split pairs must never re-raise the banner"
+
+
+def test_band_floors_mean_what_they_say_at_the_boundary(client, monkeypatch):
+    """A knob set to a decimal an operator would type must fire AT that value.
+
+    Embeddings round-trip through float32, so a true cosine of 0.29 reads back
+    as 0.28999999165534973 and a hard `>=` dropped it out of the band — the
+    failure is silent (a missed suggestion, never a wrong one), which is how
+    it survived unexamined on the face floor. The weak band's safety margin is
+    0.033 wide, so the boundary has to be honest. The existing edge test uses
+    binary-exact values (0.25/0.75) and cannot catch this by construction.
+    """
+    monkeypatch.setenv("HECO_MATCH_NEARMISS_FLOOR", "0.29")
+    _match_full(client, "run-eps", _e(0).tolist())
+    out = _match_full(client, "run-eps", _at_cosine(0.29, ortho=1))
+    assert out["isNew"] is True
+    assert out["nearMiss"] is not None, "0.29 against a floor of 0.29 must flag"
+    assert out["nearMiss"]["basis"] == "face"

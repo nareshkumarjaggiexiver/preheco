@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .appearance import best_intersection
-from .store import VectorStore, close_store, open_store
+from .store import Neighbour, VectorStore, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -58,12 +58,15 @@ class MatchResult:
     # WRITES, not verdicts.
     appearance_vetoed: bool = False
     # Set ONLY on a mint whose best cosine against the pre-existing gallery
-    # landed inside the near-miss band [nearmiss_floor .. threshold):
+    # landed inside one of the TWO near-miss bands:
     # {"key": the near-missed identity, "cosine": that best score,
     #  "appearanceSim": torso intersection vs that identity's stored
-    #  descriptors, None when either side lacks one}.  Information for the
+    #  descriptors, None when either side lacks one,
+    #  "basis": "face" for the strong band [nearmiss_floor .. threshold),
+    #  "clothing" for the weak band [weak_floor .. nearmiss_floor) that also
+    #  required the torso descriptors to agree}.  Information for the
     #  operator, never behaviour — is_new stays True and nothing is merged
-    #  (see match() for the measured impostor pair that forbids it).
+    #  (see _near_miss() for the measured impostor pair that forbids it).
     near_miss: dict | None = None
     # Set when the template THIS CALL WROTE brought its identity within the
     # match threshold of a DIFFERENT identity — the gallery-overlap signal:
@@ -213,6 +216,107 @@ def _should_enrol(
     return True
 
 
+#: Tolerance on every band comparison below.  Embeddings and descriptors
+#: round-trip through float32 storage, so a value an operator AUTHORS as a
+#: boundary (0.29, 0.78) reads back a half-ULP under it — measured: a true
+#: cosine of 0.29 returns 0.28999999165534973 and fell out of the band.  It
+#: failed toward silence (a missed suggestion, never a wrong one), which is
+#: why it went unnoticed while the face floor had the same property — but the
+#: weak band's entire safety margin is 0.033 wide, so "the knob means what it
+#: says" has to be true at the boundary.  1e-6 is far below any tuning step an
+#: operator would make and far above float32's ~1e-7 error at these values.
+_BAND_EPS = 1e-6
+
+
+def _near_miss(
+    store: VectorStore,
+    hit: Neighbour | None,
+    appearance: list[float] | None,
+    nearmiss_floor: float,
+    nearmiss_weak_floor: float,
+    nearmiss_clothes: float,
+) -> dict | None:
+    """Should this mint carry a near-miss suggestion, and on WHOSE evidence?
+
+    Called on the MINT branch only, BEFORE the mint writes anything, so the
+    torso comparison runs against the near-missed identity's already-stored
+    descriptors and never against the sighting itself.  ``hit`` is the best of
+    the pre-existing gallery and on that branch always sits below the match
+    threshold, so each band only needs its floor.
+
+    TWO BANDS, one shape, and a ``basis`` field naming which one spoke:
+
+    ``basis="face"`` — cosine in ``[nearmiss_floor .. threshold)``, the
+    original v2 band, unchanged in behaviour and now merely labelled.  The
+    face got close enough on its own; clothing is reported but not required,
+    because at this range the face is the evidence.
+
+    ``basis="clothing"`` — cosine in ``[weak_floor .. nearmiss_floor)`` AND a
+    torso intersection that is present and ``>= nearmiss_clothes``.  THE
+    MEASUREMENT THAT FORCED THIS BAND, bench 6e1a5d (2026-08-06), ground truth
+    ONE person who walked out of frame, came back, and sat down: that person
+    produced six tracker ids and two surviving extra guests —
+
+        p00005: face 0.212 vs p00001, clothing 0.797
+        p00006: face 0.228 vs p00001, clothing 0.875
+
+    Both sat below the 0.29 face floor, so nothing was flagged, nobody was
+    asked, and the count was wrong by two.  Seated and turned-away re-entries
+    at this camera's angles land exactly there: the face signal is nearly
+    empty while the clothing signal is shouting.
+
+    NOW THE HONEST PART, because this band is the thinnest evidence in the
+    system.  The closest measured IMPOSTOR pair — two genuinely different men
+    — sat at face 0.377 with clothing 0.503, and another impostor pair reached
+    **clothing 0.747**.  The default bar of 0.78 clears that by 0.033.  That
+    is a hair, not a margin.  It is defensible for exactly one reason: a
+    near-miss is a SUGGESTION A HUMAN CONFIRMS, never a merge — ``is_new``
+    stays True, the count moves only on an operator's click.  Said plainly: at
+    a venue with uniformed staff, a dress code, or similar traditional dress,
+    this band is EXPECTED to produce wrong suggestions, and it is the first
+    knob to turn off (``HECO_MATCH_NEARMISS_WEAK_FLOOR=0``, which leaves the
+    face band exactly as it was).  Clothing agreement alone never proves
+    identity; here it only buys the operator a look.
+
+    ``appearance_sim`` is ``None`` when either side lacks a descriptor, and
+    absent is not zero — a descriptor-less mint therefore never enters the
+    weak band at all, rather than entering it on an assumed clash or an
+    assumed agreement.
+
+    Off switches: ``nearmiss_floor <= 0`` disables BOTH bands (the weak band
+    is defined as the region under that floor, so without a floor there is no
+    region), ``nearmiss_weak_floor <= 0`` disables only the weak one.  A
+    weak floor accidentally set at or above the face floor yields an empty
+    band rather than an inverted one, by construction of the comparison below.
+    """
+    if hit is None or nearmiss_floor <= 0:
+        return None
+    weak_on = nearmiss_weak_floor > 0
+    lowest = min(nearmiss_floor, nearmiss_weak_floor) if weak_on else nearmiss_floor
+    if hit.cosine < lowest - _BAND_EPS:
+        # Far outside both bands: skip the torso comparison entirely.  Most
+        # mints of a real event land here and this is the quiet path.
+        return None
+    appearance_sim = best_intersection(appearance, store.appearances_for(hit.key))
+    if hit.cosine >= nearmiss_floor - _BAND_EPS:
+        basis = "face"
+    elif (
+        weak_on
+        and hit.cosine >= nearmiss_weak_floor - _BAND_EPS
+        and appearance_sim is not None
+        and appearance_sim >= nearmiss_clothes - _BAND_EPS
+    ):
+        basis = "clothing"
+    else:
+        return None
+    return {
+        "key": hit.key,
+        "cosine": hit.cosine,
+        "appearanceSim": appearance_sim,
+        "basis": basis,
+    }
+
+
 def match(
     data_dir: Path,
     run_id: str,
@@ -227,6 +331,12 @@ def match(
     appearance: list[float] | None = None,
     appearance_clash: float = 0.0,
     nearmiss_floor: float = 0.0,
+    nearmiss_weak_floor: float = 0.0,
+    # 1.0 (not 0.0) is the safe default for a BAR rather than an off switch: a
+    # caller that turns the weak floor on without naming a clothes bar gets a
+    # band that essentially never fires, instead of one that fires on any
+    # clothing whatsoever.  The off switch is nearmiss_weak_floor=0.
+    nearmiss_clothes: float = 1.0,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -284,31 +394,36 @@ def match(
     a WRITE, never make or unmake a match.  ``appearance_clash <= 0`` is the
     off switch, and an absent descriptor on either side never vetoes.
 
-    THE NEAR-MISS FLAG (v2, 2026-08-06).  A mint whose best cosine against
-    the pre-existing gallery lands in ``[nearmiss_floor .. threshold)`` gets
-    ``near_miss = {key, cosine, appearanceSim}`` — the identity it almost
-    was, the score, and the torso intersection against THAT identity's stored
-    descriptors (None when either side lacks one; absent is not zero).
-    Measured tonight, and the reason this exists: the same person split at
-    face 0.3464 against the 0.363 threshold with clothing intersection 0.562
-    — new guest p00005 vs p00004, likely the same person — and the operator
-    found it BY EYE because the signal surfaced nowhere.  Now it rides the
-    response so the console can offer a one-click merge.
+    THE NEAR-MISS FLAG (v2, 2026-08-06), NOW TWO-SIGNAL.  A mint may carry
+    ``near_miss = {key, cosine, appearanceSim, basis}`` — the identity it
+    almost was, the score, the torso intersection against THAT identity's
+    stored descriptors (None when either side lacks one; absent is not zero),
+    and which signal spoke.  ``basis="face"`` is the original band
+    ``[nearmiss_floor .. threshold)``: measured at face 0.3464 with clothing
+    0.562, a split the operator found BY EYE because nothing surfaced it.
+    ``basis="clothing"`` is the weaker band ``[weak_floor ..
+    nearmiss_floor)``, which additionally requires the clothing to agree at
+    ``nearmiss_clothes`` — added because bench 6e1a5d measured one person
+    splitting at face 0.212/clothing 0.797 and face 0.228/clothing 0.875,
+    both under the face floor, both silently over-counted.  The full argument
+    and the honest 0.78-vs-0.747-impostor margin live in :func:`_near_miss`.
 
-    **THE VERDICT IS STILL A MINT.**  The flag is a suggestion to a human,
-    never an automatic merge, because the measurement runs both ways: an
-    IMPOSTOR pair on the same camera sits at face 0.377 with clothing
-    intersection 0.503 — two different men, near-threshold face AND agreeing
-    clothes.  Auto-merging on this evidence would fold real strangers into
-    one invoice line invisibly; the count must not move without the operator
-    clicking.  Out-of-band mints (best < floor, or an empty gallery) carry
-    ``near_miss = None``; matched verdicts and staff hits never carry it at
-    all.  ``nearmiss_floor <= 0`` is the off switch.
+    **THE VERDICT IS STILL A MINT, on either basis.**  The flag is a
+    suggestion to a human, never an automatic merge, because the measurement
+    runs both ways: an IMPOSTOR pair on the same camera sits at face 0.377
+    with clothing intersection 0.503, and another impostor pair reached
+    clothing 0.747.  Auto-merging on this evidence would fold real strangers
+    into one invoice line invisibly; the count must not move without the
+    operator clicking.  Out-of-band mints (below both floors, clothing under
+    the bar, or an empty gallery) carry ``near_miss = None``; matched
+    verdicts and staff hits never carry it at all.  ``nearmiss_floor <= 0``
+    switches off both bands; ``nearmiss_weak_floor <= 0`` switches off only
+    the clothing one.
 
     The defaults here are the pre-M1 behaviour (cap 1, no enrolment, no
-    appearance veto, no near-miss flag); the service passes the real values
-    from :mod:`app.config`, so a caller that only wants the old semantics
-    gets them by leaving the knobs alone.
+    appearance veto, no near-miss flag of either basis); the service passes
+    the real values from :mod:`app.config`, so a caller that only wants the
+    old semantics gets them by leaving the knobs alone.
     """
     sub_canon = quality is not None and quality < canon_px
     store = open_store(db_path(data_dir, run_id))
@@ -373,18 +488,10 @@ def match(
             )
         # NEAR-MISS: judged BEFORE this mint writes anything, against the
         # near-missed identity's already-stored descriptors — the same
-        # before-the-write discipline as appearance_sim above.  hit is the
-        # best of the PRE-EXISTING gallery and on this branch always sits
-        # below the threshold, so the band check only needs the floor.
-        near_miss = None
-        if hit is not None and 0 < nearmiss_floor <= hit.cosine:
-            near_miss = {
-                "key": hit.key,
-                "cosine": hit.cosine,
-                "appearanceSim": best_intersection(
-                    appearance, store.appearances_for(hit.key)
-                ),
-            }
+        # before-the-write discipline as appearance_sim above.
+        near_miss = _near_miss(
+            store, hit, appearance, nearmiss_floor, nearmiss_weak_floor, nearmiss_clothes
+        )
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
         )
@@ -393,9 +500,9 @@ def match(
         # rival to the founding view is bounded by that same best.  Overlap is
         # exclusively an ENROLMENT phenomenon — an identity GROWING a view
         # that lands inside someone else's accept region — which is also why
-        # the near-miss flag above (below threshold, clothing-gated) and the
-        # overlap flag (at/above threshold, unconditional) never both fire on
-        # one verdict.  Pinned by test, not assumed.
+        # the near-miss flag above (strictly BELOW threshold, on either basis)
+        # and the overlap flag (at/above threshold, unconditional) never both
+        # fire on one verdict.  Pinned by test, not assumed.
         best = hit.cosine if hit is not None else None
         return MatchResult(
             key, True, best, store.distinct_count(), sub_canon, 1, False,

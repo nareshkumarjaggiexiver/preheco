@@ -9,7 +9,7 @@ Endpoints:
     POST /match  {runId, embedding, quality?, siteId?, appearance?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
             templateN, templateAdded, appearanceSim, appearanceVetoed,
-            nearMiss: {key, cosine, appearanceSim} | null}
+            nearMiss: {key, cosine, appearanceSim, basis} | null}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -49,7 +49,7 @@ def _env_s(name: str, default: float) -> float:
         return default
     return float(raw)
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -243,6 +243,13 @@ def health() -> dict:
         # ...and the near-miss band's floor: a bench reading nearMissMints
         # must know which band produced them (0 = the flag was off).
         "nearMissFloor": config.nearmiss_floor(),
+        # ...and BOTH weak-band knobs, for the same audit reason and one more:
+        # the weak (clothing) band's default bar sits only 0.033 above the
+        # worst measured impostor clothing reading (0.747), so a run whose
+        # suggestions are being disputed must be able to say exactly which
+        # bar produced them.  weakFloor 0 = the clothing band was off.
+        "nearMissWeakFloor": config.nearmiss_weak_floor(),
+        "nearMissClothes": config.nearmiss_clothes(),
     }
 
 
@@ -312,6 +319,8 @@ def match(body: MatchRequest) -> dict:
             appearance=body.appearance,
             appearance_clash=config.appearance_clash(),
             nearmiss_floor=config.nearmiss_floor(),
+            nearmiss_weak_floor=config.nearmiss_weak_floor(),
+            nearmiss_clothes=config.nearmiss_clothes(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -331,7 +340,12 @@ def match(body: MatchRequest) -> dict:
         "appearanceVetoed": r.appearance_vetoed,
         # Only ever non-null on a MINT that near-missed an existing guest —
         # a one-click-merge suggestion for the operator, never behaviour
-        # (see gallery.match: impostors measured face 0.377 / clothes 0.503).
+        # (see gallery._near_miss: impostors measured face 0.377 / clothes
+        # 0.503, and a second impostor pair reached clothes 0.747).  Carries
+        # "basis": "face" for the [floor .. threshold) band, "clothing" for
+        # the weak band under it that required the torso descriptors to
+        # agree.  Consumers must read a MISSING/null basis as "face" — that
+        # is the old rider shape.
         "nearMiss": r.near_miss,
         # Non-null when the template this call wrote pulled its identity
         # within the match threshold of a DIFFERENT identity — two guests the

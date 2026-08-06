@@ -77,6 +77,38 @@ def test_env_tuning_applies_on_reset(client, monkeypatch):
     assert len(tracks) == 2
 
 
+def test_max_age_defaults_to_thirty_and_the_env_overrides_it(client, monkeypatch):
+    """HECO_TRACKER_MAX_AGE: default 30 (bench 6e1a5d), env wins, empty = unset.
+
+    30 frames is ~7.5 s at the bench's 3.97 fps, chosen because 15 (3.75 s)
+    let a SEATED person the detector kept losing shatter into tracks
+    6/7/8/12. The knob exists so that number can go back down without a
+    rebuild, and the empty case is the compose convention (``${VAR-}`` renders
+    as "", which env_int reads as unset — a bare int("") once took ingest
+    down).
+    """
+    from app.main import _new_tracker
+
+    assert _new_tracker().max_age == 30
+
+    monkeypatch.setenv("HECO_TRACKER_MAX_AGE", "9")
+    assert _new_tracker().max_age == 9
+    # ...and a run picks it up on /reset, which is where the env is re-read.
+    client.post("/reset", json={"runId": "r1"})
+    from app.main import _runs
+    assert _runs["r1"].max_age == 9
+
+    monkeypatch.setenv("HECO_TRACKER_MAX_AGE", "")
+    assert _new_tracker().max_age == 30, "empty means unset, not zero"
+
+    # The name this service shipped with still works (an operator who set it
+    # by hand must not be silently overridden), and the new name wins.
+    monkeypatch.setenv("TRACKER_MAX_AGE", "12")
+    assert _new_tracker().max_age == 12
+    monkeypatch.setenv("HECO_TRACKER_MAX_AGE", "40")
+    assert _new_tracker().max_age == 40
+
+
 def test_empty_boxes_ok(client):
     """A frame with no detections is valid and returns no tracks."""
     assert _track(client, "r1", []) == []

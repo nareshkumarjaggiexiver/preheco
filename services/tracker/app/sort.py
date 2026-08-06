@@ -104,16 +104,40 @@ class SortLite:
     """One run's tracker state: feed detections per frame, get live tracks.
 
     Parameters mirror classic SORT: ``max_age`` frames a track may coast
-    unmatched before being dropped, ``min_hits`` matches required before a
-    track is reported (suppresses one-frame ghosts; waived during the first
+    unmatched before being dropped (default 30 — see ``__init__`` for the
+    measured reason it is no longer 15), ``min_hits`` matches required before
+    a track is reported (suppresses one-frame ghosts; waived during the first
     ``min_hits`` frames of a run so counting starts immediately),
     ``iou_min`` the association gate, ``vel_smooth`` the velocity filter
     alpha (1.0 = trust only the newest delta).
     """
 
-    def __init__(self, max_age: int = 15, min_hits: int = 3,
+    def __init__(self, max_age: int = 30, min_hits: int = 3,
                  iou_min: float = 0.2, vel_smooth: float = 0.5) -> None:
-        """Configure thresholds; state starts empty."""
+        """Configure thresholds; state starts empty.
+
+        WHY ``max_age`` DEFAULTS TO 30 AND NOT THE ORIGINAL 15 (bench 6e1a5d,
+        2026-08-06, ground truth ONE person walking out of frame, back in,
+        then sitting down).  That one person produced SIX tracker ids — track
+        2 (53 frames), 5 (24), 6 (8), 7 (6), 8 (6), 12 (7).  The run ran at
+        3.97 fps, so 15 unmatched frames is **3.75 s** of coasting: leaving
+        the frame legitimately killed track 2, but while the subject was
+        SEATED the person detector lost them intermittently and every gap
+        longer than 3.75 s minted a fresh id — tracks 6/7/8/12 are that one
+        seated person, four times over.  30 frames is ~7.5 s at the same rate
+        and coasts those gaps.
+
+        THE HONEST CAVEAT: this treats a SYMPTOM.  The disease is YOLOX-nano
+        dropping seated bodies, and no amount of coasting fixes a detector
+        that cannot see the subject.  Worse, a longer coast WIDENS the window
+        in which a ghost track can latch onto a different person walking
+        through the dead track's predicted box — and a track that has changed
+        person is exactly the evidence the runner's heal and identity lock act
+        on, so a wrong coast can become a wrong MERGE, which under-counts
+        silently.  That is why the runner's clothing guard (the tracker-swap
+        detector) exists and why this number is an env knob
+        (``HECO_TRACKER_MAX_AGE``) with the old 15 one restart away.
+        """
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_min = iou_min
