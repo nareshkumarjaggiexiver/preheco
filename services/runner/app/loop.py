@@ -207,6 +207,12 @@ class RunLoop:
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
+        # TAP DUTY-CYCLE GUARD state (loop-thread only): when the previous tap
+        # round ENDED and what it measurably cost.  Cost 0.0 means "no round
+        # measured yet", which disarms the guard — it only ever reasons from a
+        # measurement, never a guess (see _maybe_tap).
+        self._tap_ended: float = 0.0
+        self._tap_cost_s: float = 0.0
         self._last_feedback: float = 0.0
         self._last_purge: float = 0.0
         # Why the frame loop stopped; decides how the run settles and
@@ -249,6 +255,16 @@ class RunLoop:
             # _maybe_heal).  Each one is a guest the delivered number would
             # otherwise have over-counted by exactly one.
             "healedSplits": 0,
+            # NEAR-MISS MINTS (CONTRACTS.md v2): fresh identities whose best
+            # face cosine landed just under the threshold against an existing
+            # guest (the match service's nearMiss field).  Measured tonight:
+            # the same person split at face 0.3464 vs a 0.363 threshold with
+            # clothing intersection 0.562 — the operator found it by eye
+            # because the signal surfaced nowhere.  Each one is a SUGGESTION
+            # for a one-click operator merge, never an automatic one: an
+            # IMPOSTOR pair measured 0.377 face with 0.503 clothing, so this
+            # flag must never move the count by itself.
+            "nearMissMints": 0,
             # TORSO-APPEARANCE VETOES (app/appearance.py; both ADVISORY-only
             # mechanisms — neither ever changes a match/count verdict).
             # healVetoedByAppearance: heal folds this loop refused because the
@@ -280,6 +296,13 @@ class RunLoop:
             "multiFaceFramesSkipped": 0,
             "plannerReportErrors": 0,
             "tapRoundsAbandoned": 0,
+            # Tap rounds the DUTY-CYCLE GUARD postponed (see _maybe_tap).  A
+            # separate counter from tapRoundsAbandoned on purpose: abandoned
+            # means a round STARTED and ran out of budget mid-way (some taps
+            # were lost); deferred means the round never started because the
+            # loop had not yet counted long enough to afford it — nothing was
+            # lost, the next interval retries with everything intact.
+            "tapRoundsDeferred": 0,
             # Whole-run gate accounting, one counter per reason a face was
             # discarded.  A gate that only says "N faces dropped" cannot be
             # audited: an operator who armed an IED floor and lost a third of a
@@ -346,14 +369,27 @@ class RunLoop:
         Collapsing the third into the first is how a five-second network blip
         at a wedding used to close the run as "ended" and delete the gallery,
         after which restarting re-counted every guest already through the gate.
+
+        INSTRUMENTATION: every returned frame observes ``frameWaitMs`` on the
+        ingest board — how long the loop stood IDLE here because the source
+        had no new frame yet (the 503 retries and stale-seq polls; 0.0 when
+        the first poll answered fresh).  Deliberately NOT the whole call
+        (``ingestMs`` already times that): the point is to split "the source
+        is slow" from "the loop is slow".  In the measured 0.4 fps death
+        spiral the frame period was ~2.5 s while this would have read ~0 —
+        ingest always had a newer frame ready — which points the diagnosis
+        at the loop's own untimed work (the tap round) instead of the camera.
         """
         deadline = time.monotonic() + self.s.source_stall_s
+        wait_start: float | None = None  # first moment the source made us wait
         while not self._stop.is_set() and time.monotonic() < deadline:
             r = self.client.get(f"{self.s.ingest_url}/frame")
             if r.status_code in (204, 404, 410):
                 self._end_reason = "source-ended"  # stub-style explicit end
                 return None
             if r.status_code == 503:  # no frame decoded yet — retry
+                if wait_start is None:
+                    wait_start = time.monotonic()
                 time.sleep(self.s.source_poll_s)
                 continue
             r.raise_for_status()
@@ -364,7 +400,11 @@ class RunLoop:
             seq = body.get("seq")
             if seq is None or seq != self._last_seq:
                 self._last_seq = seq
+                waited = 0.0 if wait_start is None else time.monotonic() - wait_start
+                self.board.observe("ingest", "frameWaitMs", waited * 1000.0)
                 return body
+            if wait_start is None:
+                wait_start = time.monotonic()
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
@@ -524,6 +564,13 @@ class RunLoop:
             # refusing.
             f"healVetoedByAppearance={st['healVetoedByAppearance']} "
             f"enrolVetoedByAppearance={st['enrolVetoedByAppearance']} "
+            # Mints flagged as probable splits of an existing guest (match's
+            # nearMiss wire, CONTRACTS.md v2).  Read beside `unique`: each is
+            # a suggested one-click operator merge that was NOT auto-applied
+            # (impostors measured face 0.377 / clothing 0.503, so the flag
+            # may never move the count itself).  A run ending with this > 0
+            # and no operator merges may be counting one guest twice.
+            f"nearMissMints={st['nearMissMints']} "
             f"excludedByZone={st['excludedByZone']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
@@ -545,6 +592,7 @@ class RunLoop:
             "healedSplits": st["healedSplits"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
+            "nearMissMints": st["nearMissMints"],
             "excludedByZone": st["excludedByZone"],
         }
         try:
@@ -811,6 +859,12 @@ class RunLoop:
                     # or either side descriptor-less) — visibility only, so
                     # the console can watch the advisory signal live.
                     "appearanceSim": m.get("appearanceSim"),
+                    # The match service's near-miss flag on a MINT: the fresh
+                    # key landed just under the threshold against an existing
+                    # guest ({key, cosine, appearanceSim} — CONTRACTS.md v2).
+                    # Carried into the tap verbatim so the console can offer
+                    # the operator the one-click merge; a SUGGESTION only.
+                    "nearMiss": m.get("nearMiss"),
                     "box": face.get("box"),
                 }
             )
@@ -829,6 +883,14 @@ class RunLoop:
                     st["subCanonMatches"] += 1
                 if m.get("isNew"):
                     st["unique"] += 1
+                    # The mint STANDS and unique has just moved up — the
+                    # near-miss flag beside it is information for a human,
+                    # never behaviour (the measured impostor pair at face
+                    # 0.377 / clothing 0.503 is why: clothing agreement
+                    # cannot tell a split guest from a stranger).  The count
+                    # moves back down only if the operator clicks merge.
+                    if m.get("nearMiss"):
+                        st["nearMissMints"] += 1
                 st["subCanonShare"] = (
                     st["subCanonMatches"] / st["matches"] if st["matches"] else 0.0
                 )
@@ -842,6 +904,18 @@ class RunLoop:
                 if m.get("appearanceVetoed"):
                     st["enrolVetoedByAppearance"] += 1
                 self._note_templates(m.get("personKey"), m.get("templateN"))
+            nm = m.get("nearMiss")
+            if m.get("isNew") and nm:
+                # The line the operator greps at midnight: which mint, against
+                # whom, and on what evidence — tonight's split (face 0.3464,
+                # clothes 0.562) was found BY EYE because this surfaced nowhere.
+                self.log.info(
+                    f"near-miss mint: {m.get('personKey')} minted at face "
+                    f"{_fmt(nm.get('cosine'))} vs {nm.get('key')} "
+                    f"(appearanceSim={_fmt(nm.get('appearanceSim'))}) — likely "
+                    "the same person; suggested to the operator, count "
+                    "unchanged unless they merge"
+                )
             # TRACK HEAL bookkeeping: only verdicts that can be pinned to a
             # track participate (no containing track = no heal for this one).
             track_id = self._track_for(face, tracks)
@@ -1304,19 +1378,67 @@ class RunLoop:
         frames only when the frame decodes (a stub/opaque frame simply skips the
         image upload).  Nothing here raises into the loop.
 
+        THE DUTY-CYCLE GUARD, and why the interval alone was a trap.  The
+        interval fires a round when >= ``tap_interval_s`` has passed — which
+        has two stable states, both measured on the T440 with 4K frames:
+        frames at ~0.43 s meant a round every ~5th frame (2.3 fps), but ONE
+        transient stall (a docker build on the box, both times it happened)
+        pushed a single frame past the ~2 s interval, after which EVERY frame
+        triggered a full ~1-1.5 s round and the loop locked at ~2.5 s/frame
+        — 0.4 fps forever, with identical stage timings in both states
+        (ingest 42 ms, persons 76, faces 58, embed 74, match 4).  The stages
+        were innocent; the untimed round was the entire gap, and nothing
+        could pull the loop back out.
+
+        So a round now fires only when BOTH hold: (a) the interval has
+        passed, AND (b) at least ``tap_duty_factor`` x the PREVIOUS round's
+        measured cost has elapsed since that round ENDED.  A 1 s round
+        forces >= 3 s of counting before the next (factor default 3, env
+        ``HECO_TAP_DUTY_FACTOR``), bounding the round at ~25% of loop time —
+        and the every-frame lock-in becomes impossible by construction,
+        because the trigger can never outrun the cost it just measured.  A
+        postponed round is counted in ``tapRoundsDeferred`` (NOT
+        ``tapRoundsAbandoned``: an abandoned round started and lost taps to
+        the budget; a deferred one never started and lost nothing) and the
+        interval clock restarts, so deferrals count ROUNDS the guard skipped,
+        not frames that flew past while it waited.
+
         A tap round is up to 5 payload POSTs plus 5 JPEG uploads, so bounding
         each call's timeout is not enough — a planner answering slowly but
         successfully would still cost ten timeouts per tick.  The whole round
         therefore shares ``tap_budget_s``: when it is spent the rest of the
         round is dropped (counted in ``tapRoundsAbandoned``) and the loop goes
         back to counting.  Debug frames are worth less than a guest.
+
+        Every round's wall cost is observed as ``tapRoundMs`` on the "count"
+        board (the loop-bookkeeping stage), so the next stall is diagnosable
+        from the console instead of from a bisection of the box's crontab.
         """
         if now - self._last_tap < self.s.tap_interval_s:
             return
+        if self._tap_cost_s > 0 and self.s.tap_duty_factor > 0:
+            quiet = self.s.tap_duty_factor * self._tap_cost_s
+            if now - self._tap_ended < quiet:
+                self._last_tap = now  # restart the interval: count rounds, not frames
+                self._bump("tapRoundsDeferred")
+                return
         self._last_tap = now
         last = self._last
         if last is None:
             return
+        started = time.monotonic()
+        try:
+            self._tap_round(last)
+        finally:
+            # Measured in wall time whatever happened inside — an abandoned
+            # round still spent what it spent, and the guard must reason from
+            # the true cost, not the happy path's.
+            self._tap_ended = time.monotonic()
+            self._tap_cost_s = self._tap_ended - started
+            self.board.observe("count", "tapRoundMs", self._tap_cost_s * 1000.0)
+
+    def _tap_round(self, last: dict) -> None:
+        """One tap round: the 5 structured payloads, then the 5 annotated JPEGs."""
         deadline = time.monotonic() + self.s.tap_budget_s
         st = self.status()
         payloads = taps.build_payloads(

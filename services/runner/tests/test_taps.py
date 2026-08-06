@@ -85,6 +85,32 @@ def test_match_payload_counters_and_staff_flag():
     assert m["matches"][1]["isStaff"] is True
 
 
+def test_match_payload_forwards_near_miss_rounded_and_null_otherwise():
+    """A mint's nearMiss rides the tap row (rounded); everyone else gets None.
+
+    The measured pair this carries: face 0.3464 vs the 0.363 threshold with
+    clothing intersection 0.562 — the operator's one-click-merge cue.  A
+    verdict without the flag must still carry the key as None, so the console
+    can rely on the field's presence.
+    """
+    verdicts = [
+        {"personKey": "p00005", "cosine": 0.34639, "isNew": True, "isStaff": False,
+         "nearMiss": {"key": "p00004", "cosine": 0.34639, "appearanceSim": 0.56201}},
+        {"personKey": "p00001", "cosine": 0.7, "isNew": False, "isStaff": False},
+        {"personKey": "p00006", "cosine": 0.2, "isNew": True, "isStaff": False,
+         "nearMiss": {"key": "p00002", "cosine": 0.31, "appearanceSim": None}},
+    ]
+    m = taps.match_payload(verdicts, unique=3, staff_crossings=0)
+    assert m["matches"][0]["nearMiss"] == {
+        "key": "p00004", "cosine": 0.3464, "appearanceSim": 0.562,
+    }
+    assert m["matches"][1]["nearMiss"] is None
+    # An absent appearanceSim stays None inside the flag — absent is not zero.
+    assert m["matches"][2]["nearMiss"] == {
+        "key": "p00002", "cosine": 0.31, "appearanceSim": None,
+    }
+
+
 def test_build_payloads_covers_the_five_stages():
     """One frame snapshot yields a payload per visual stage."""
     last = {

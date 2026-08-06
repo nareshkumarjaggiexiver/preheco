@@ -36,6 +36,37 @@ _FONT = cv2.FONT_HERSHEY_SIMPLEX
 #: Stages that carry a visual overlay (CONTRACTS.md v1); ingest is the raw frame.
 STAGES = ("ingest", "person-detect", "track", "face-detect", "match")
 
+#: Widest a tap frame may leave this module.  The debug console renders these
+#: as thumbnails-to-half-screen; 1280 px is already more than it displays.
+#: Encoding them at the camera's native size was pure cost, and a measured one:
+#: on the T440 a tap round annotates + JPEG-encodes FIVE 3840x2160 frames and
+#: uploads them, ~1-1.5 s per round — the entire gap between the stage
+#: timings (ingest 42 ms, persons 76, faces 58, embed 74, match 4) and the
+#: observed 0.4 fps death-spiral state (see loop._maybe_tap).  Downscaling to
+#: 1280 cuts the encoded pixels ~9x for a 4K source.  These tap frames are the
+#: runner's ONLY frame-upload path — there is no separate full-resolution
+#: keyframe path in this repo — so nothing loses evidence by this cap.
+TAP_MAX_WIDTH = 1280
+
+
+def downscale(img: np.ndarray, max_w: int = TAP_MAX_WIDTH) -> np.ndarray:
+    """Shrink a frame to at most ``max_w`` wide (aspect preserved); never grow.
+
+    Annotations are drawn at native resolution FIRST (so box coordinates need
+    no scaling) and the finished overlay is resized with ``INTER_AREA`` — the
+    correct interpolation for reduction, and the one that keeps 2 px box
+    strokes legible instead of aliasing them away.  A frame already at or
+    under the cap is returned untouched: upscaling a small source would only
+    blur it and cost encode time.
+    """
+    h, w = img.shape[:2]
+    if w <= max_w:
+        return img
+    scale = max_w / float(w)
+    return cv2.resize(
+        img, (max_w, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA
+    )
+
 
 def to_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
     """Encode a BGR image to raw JPEG bytes (for the multipart frame POST)."""
@@ -171,6 +202,11 @@ def render(stage: str, img: np.ndarray, last: dict, min_px: float, canon_px: flo
 
     ``ingest`` is the raw frame (re-encoded).  Unknown stages fall back to the
     raw frame so a new stage name never raises inside the best-effort loop.
+
+    Every stage — the raw ingest frame included — leaves here at most
+    :data:`TAP_MAX_WIDTH` px wide (see :func:`downscale`): the console shows
+    these small, and 4K tap frames were the measured bulk of the tap round's
+    ~1-1.5 s cost.
     """
     if stage == "person-detect":
         img = draw_persons(img, last.get("boxes", []))
@@ -181,4 +217,4 @@ def render(stage: str, img: np.ndarray, last: dict, min_px: float, canon_px: flo
         img = draw_faces(img, last.get("faces", []), min_px, canon_px)
     elif stage == "match":
         img = draw_matches(img, last.get("verdicts", []))
-    return to_jpeg(img)
+    return to_jpeg(downscale(img))
