@@ -212,6 +212,12 @@ class RunLoop:
         # _maybe_lock_fold).  Loop-thread only; read under _lock with the
         # locks it guards.
         self._frame_no: int = 0
+        # Identities that no longer exist: folded by a lock, a heal, an
+        # operator merge, or moved to the staff store.  Rides every match tap
+        # so the console can drop cards for keys the count has dropped — a
+        # key sampled once before it was folded would otherwise haunt the
+        # register forever (see _retire_key).  Guarded by _lock.
+        self._retired: list[dict] = []
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
@@ -1452,6 +1458,7 @@ class RunLoop:
                 self._dec_unique()
                 self._bump("healedSplits")
                 self._forget_mint(minted_key)
+                self._retire_key(minted_key, matched_key, "heal")
                 self.log.info(
                     f"healed split: track {track_id} minted {minted_key} "
                     f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
@@ -1718,6 +1725,7 @@ class RunLoop:
             self._dec_unique()
             self._bump("lockedTrackFolds")
             self._forget_mint(minted_key)
+            self._retire_key(minted_key, locked_key, "lock-fold")
             self.log.info(
                 f"locked track fold: track {track_id} had resolved to {locked_key} "
                 f"(cosine={_fmt(lock.get('cosine'))}) and then minted {minted_key} "
@@ -1883,12 +1891,14 @@ class RunLoop:
         st = self.status()
         with self._lock:
             mints = list(self._mints)
+            retired = list(self._retired)
         payloads = taps.build_payloads(
             last, self.s.quality_min_px, self.s.quality_canon_px,
             st["unique"], st["staffCrossings"],
             staff_face_frames=st["staffFaceFrames"],
             manual_additions=st["manualAdditions"],
             mints=mints,
+            retired=retired,
         )
         # ENFORCE the CONTRACTS.md 32 KB tap ceiling.  within_budget existed
         # from v1 but nothing ever CALLED it outside tests (found in the
@@ -1902,6 +1912,10 @@ class RunLoop:
             mp["mints"] = mp.get("mints", [])[-20:]
             if not taps.within_budget(mp):
                 mp["matches"] = mp.get("matches", [])[:10]
+            if not taps.within_budget(mp):
+                # Retirements shed LAST: they are the smallest list and the
+                # one that keeps the register from showing folded guests.
+                mp["retired"] = mp.get("retired", [])[-20:]
         for stage, payload in payloads.items():
             if time.monotonic() >= deadline:
                 self._bump("tapRoundsAbandoned")
@@ -2040,6 +2054,7 @@ class RunLoop:
                 if r.get("merged"):
                     self._dec_unique()
                     self._forget_mint(action.key_b)  # drop folds into keep
+                    self._retire_key(action.key_b, action.key_a, "operator-merge")
                     return True
                 return False
             if action.kind == "split":
@@ -2056,6 +2071,7 @@ class RunLoop:
                 if r.get("moved", 0) > 0:
                     self._dec_unique()
                     self._forget_mint(action.person_key)  # no longer a guest
+                    self._retire_key(action.person_key, None, "mark-staff")
                     return True
                 return False
             if action.kind == "count-missed":
@@ -2078,6 +2094,33 @@ class RunLoop:
         except Exception as e:  # noqa: BLE001 — match hiccup: retry on the next poll
             self.log.warning(f"could not apply a correction, will retry: {e}")
             return None
+
+    def _retire_key(self, person_key: str | None, into_key: str | None, reason: str) -> None:
+        """Record that an identity no longer exists, and why.
+
+        The mint-ledger purge (:meth:`_forget_mint`) stops the ledger
+        ADVERTISING a folded key, but a key that lived even for a second may
+        already have been captured in an earlier tap round's SAMPLED verdicts,
+        and the register builds from every round it has.  Measured within
+        minutes of the track lock shipping (run a7529b): the lock folded
+        p00002/3/4 on the spot, the ledger correctly held only p00001 and the
+        count correctly read 1 — and the register still showed 2, because one
+        historical round had sampled a p00002 sighting before the fold.
+
+        So the runner publishes its retirements the same way it publishes its
+        mints: a bounded list riding every match tap, naming the key, what it
+        was folded into and by which mechanism.  The console drops those cards;
+        the count and the register agree again in BOTH directions.
+        """
+        if not person_key:
+            return
+        with self._lock:
+            self._retired.append({
+                "personKey": person_key,
+                "intoKey": into_key,
+                "reason": reason,
+            })
+            del self._retired[:-500]  # bounded like the mint ledger
 
     def _forget_mint(self, person_key: str | None) -> None:
         """Remove a folded identity's row from the mint ledger.

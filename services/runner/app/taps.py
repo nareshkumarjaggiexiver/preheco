@@ -229,6 +229,7 @@ def match_payload(
     staff_face_frames: int = 0,
     manual_additions: int = 0,
     mints: list[dict] | None = None,
+    retired: list[dict] | None = None,
 ) -> dict:
     """Matcher verdicts (personKey + cosine + staff flag) with live counters.
 
@@ -291,6 +292,22 @@ def match_payload(
             }
             for m in (mints or [])[-MINT_LEDGER_CAP:]
         ],
+        # THE RETIREMENT LEDGER — the mint ledger's mirror.  A key that lived
+        # even for a second can already have been captured in an earlier tap
+        # round's sampled verdicts, and the register builds from every round
+        # it has: measured on run a7529b, the lock folded p00002 on the spot,
+        # the count correctly read 1, and the register still showed 2 from a
+        # single historical sighting.  Naming what was retired (and into what,
+        # by which mechanism) lets the console drop those cards, so the count
+        # and the register agree in BOTH directions.
+        "retired": [
+            {
+                "personKey": r.get("personKey"),
+                "intoKey": r.get("intoKey"),
+                "reason": r.get("reason"),
+            }
+            for r in (retired or [])[-MINT_LEDGER_CAP:]
+        ],
     }
 
 
@@ -303,6 +320,7 @@ def build_payloads(
     staff_face_frames: int = 0,
     manual_additions: int = 0,
     mints: list[dict] | None = None,
+    retired: list[dict] | None = None,
 ) -> dict[str, dict]:
     """Build the per-stage tap payloads from one frame's captured outputs.
 
@@ -317,7 +335,7 @@ def build_payloads(
         "face-detect": face_payload(last.get("faces", []), min_px, canon_px),
         "match": match_payload(
             last.get("verdicts", []), unique, staff_crossings,
-            staff_face_frames, manual_additions, mints=mints,
+            staff_face_frames, manual_additions, mints=mints, retired=retired,
         ),
     }
 

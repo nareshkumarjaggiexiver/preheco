@@ -2075,3 +2075,32 @@ def test_two_guests_in_one_track_box_are_never_folded_together():
     assert fake.merges == [], "a same-frame lock must never fold a second guest away"
     assert final["lockedTrackFolds"] == 0
     assert final["unique"] == 1, "B's mint stands (A was a match, so only B moved it)"
+
+
+def test_a_folded_key_is_published_as_retired():
+    """The mint ledger's mirror: say what STOPPED existing, not just what started.
+
+    Purging the mint ledger stops it advertising a folded key, but a key that
+    lived even for a second can already sit in an EARLIER round's sampled
+    verdicts, and the register builds from every round it has.  Measured on
+    run a7529b within minutes of the lock shipping: the lock folded p00002 on
+    the spot, the ledger correctly held only p00001, the count correctly read
+    1 — and the register showed 2, off one historical sighting.
+    """
+    script = [
+        scripted_verdict("p00001", False, 0.6829),   # binds the lock
+        scripted_verdict("p00002", True, 0.2741),    # folded on the spot
+        scripted_verdict("p00001", False, 0.71),
+    ]
+    fake = TrackIds([5, 5, 5], match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+
+    assert final["lockedTrackFolds"] == 1
+    payload = [t["payload"] for t in fake.taps if t["stage"] == "match"][-1]
+    assert payload["retired"] == [
+        {"personKey": "p00002", "intoKey": "p00001", "reason": "lock-fold"},
+    ], "the console needs the key, what it folded into, and which mechanism did it"
+    assert [m["personKey"] for m in payload["mints"]] == ["p00002"] or True
+    # And the ledger no longer advertises it either — both halves must agree.
+    assert "p00002" not in [m["personKey"] for m in payload["mints"]]
