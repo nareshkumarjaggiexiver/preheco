@@ -8,6 +8,7 @@ with the v1 surface: staff-aware /match, the merge/split/mark-staff and
 
 import base64
 import json
+import time
 
 import cv2
 import httpx
@@ -59,6 +60,7 @@ class V1Fake:
         self.taps: list[dict] = []
         self.stats: list[dict] = []  # every /stats flush body, in post order
         self.frames_posted: list[str] = []  # stage of each multipart frame POST
+        self.frame_bodies: list[bytes] = []  # raw multipart bodies (JPEG inside)
         self.feedback_polls = 0
         self.resolved: list[tuple[str, str]] = []  # (feedbackId, status)
         self.enrolled: dict | None = None
@@ -100,6 +102,7 @@ class V1Fake:
         if path.endswith("/frames"):
             # multipart: read the stage field out of the recorded call list
             self.frames_posted.append("frame")
+            self.frame_bodies.append(request.content)
             return httpx.Response(200, json={"ok": True})
         if path.endswith("/feedback") and request.method == "GET":
             self.feedback_polls += 1
@@ -1243,7 +1246,11 @@ def test_enrol_veto_is_counted_and_appearance_sim_reaches_the_tap():
     fake = V1Fake(n_frames=2, face_widths=(60.0,), match_script=script,
                   image_b64=real_jpeg_b64())
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
-    final = make_loop(fake, request, tap_interval_s=0.0).run()
+    # Duty guard off: this test reads frame 2's tap ROWS, and with the guard
+    # armed the second round is (correctly) deferred behind the first's cost.
+    final = make_loop(
+        fake, request, tap_interval_s=0.0, tap_duty_factor=0.0
+    ).run()
 
     assert final["unique"] == 1, "the veto must never change the count"
     assert final["enrolVetoedByAppearance"] == 1
@@ -1256,3 +1263,228 @@ def test_enrol_veto_is_counted_and_appearance_sim_reaches_the_tap():
         for row in t["payload"].get("matches", [])
     ]
     assert any(r.get("appearanceSim") == 0.31 for r in rows)
+
+
+# ------------------ the tap round pays for itself (P1, 2026-08-06 T440 bench)
+#
+# The tap round annotated and JPEG-encoded five FULL 3840x2160 frames and
+# uploaded them, ~1-1.5 s per round, and fired whenever >= tap_interval_s had
+# passed.  Two stable states measured: frames at ~0.43 s -> a round every ~5th
+# frame -> 2.3 fps; but one transient stall (a docker build, both times)
+# pushed a single frame past ~2 s, after which EVERY frame triggered a full
+# round -> ~2.5 s/frame, locked at 0.4 fps forever — with identical stage
+# timings in both states (ingest 42 ms, persons 76, faces 58, embed 74,
+# match 4).  The fixes: tap frames leave at <= 1280 px, the duty-cycle guard
+# makes the lock-in impossible by construction, and the round + the frame
+# wait are finally on the stats board.
+
+
+def wide_jpeg_b64(w: int = 2560, h: int = 1440) -> str:
+    """A decodable wide frame, standing in for the camera's native size."""
+    img = np.full((h, w, 3), (30, 60, 90), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def decode_multipart_jpeg(content: bytes) -> np.ndarray:
+    """The JPEG inside a multipart frame POST, decoded (SOI..EOI slice)."""
+    start = content.find(b"\xff\xd8")
+    end = content.rfind(b"\xff\xd9")
+    assert start != -1 and end != -1, "no JPEG in the multipart body"
+    img = cv2.imdecode(np.frombuffer(content[start : end + 2], np.uint8), cv2.IMREAD_COLOR)
+    assert img is not None
+    return img
+
+
+def test_posted_tap_frames_are_downscaled_end_to_end():
+    """Every JPEG the loop actually uploads is at most 1280 px wide.
+
+    Driven with a 2560x1440 source through the full loop, so the assertion
+    covers the real posting path — annotate.render's cap, not a unit shim.
+    These uploads are the runner's ONLY frame path (there is no separate
+    full-resolution keyframe path in this repo), so this IS the whole cost.
+    """
+    fake = V1Fake(n_frames=1, face_widths=(85.0,), image_b64=wide_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0).run()
+    assert final["state"] == "ended"
+    assert len(fake.frame_bodies) >= 5, "all five stages must still upload"
+    for content in fake.frame_bodies:
+        img = decode_multipart_jpeg(content)
+        assert img.shape[1] == 1280
+        assert img.shape[0] == 720, "aspect preserved (2560x1440 -> 1280x720)"
+
+
+def test_tap_duty_guard_defers_until_k_times_the_measured_cost():
+    """The guard's arithmetic, on a controlled clock: quiet = K x previous cost.
+
+    A remembered 1 s round with the default K=3 must hold the next round for
+    3 s from the previous round's END — the interval alone (0 here, i.e.
+    always elapsed) no longer suffices, which is precisely the property the
+    0.4 fps lock-in violated.
+    """
+    fake = V1Fake(n_frames=1, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    loop = make_loop(fake, request, tap_interval_s=0.0)  # K stays the default 3
+    loop.planner.create_run("ev-1")  # a run to post taps under
+    loop._remember("ZmFrZS1qcGVn", 1, 0, [], [], [], [])  # a snapshot to tap
+    now = time.monotonic()
+    loop._tap_cost_s = 1.0  # the previous round measurably cost one second
+    loop._tap_ended = now
+    loop._last_tap = now - 10.0  # the interval has long passed
+
+    loop._maybe_tap(now + 2.9)  # inside the 3 x 1.0 s quiet window
+    assert fake.taps == [], "the round must be deferred, not fired"
+    assert loop.status()["tapRoundsDeferred"] == 1
+
+    loop._maybe_tap(now + 3.05)  # the loop has now counted for >= K x cost
+    stages = {t["stage"] for t in fake.taps}
+    assert stages == {"ingest", "person-detect", "track", "face-detect", "match"}
+    assert loop.status()["tapRoundsDeferred"] == 1, "a served window defers nothing"
+
+
+def test_tap_duty_guard_breaks_the_every_frame_lock_in():
+    """THE SPIRAL REPLAY: interval elapsed on EVERY frame, guard still bounds it.
+
+    tap_interval_s=0 recreates the death-spiral trigger condition (every frame
+    qualifies); an absurd duty factor stands in for an expensive round.  One
+    round fires and is measured, then every later frame defers — the counting
+    is untouched.  Before the guard this exact configuration tapped on all
+    four frames, which is the 0.4 fps state in miniature.
+    """
+    fake = V1Fake(n_frames=4, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=1e9).run()
+    rounds = [t for t in fake.taps if t["stage"] == "ingest"]
+    assert len(rounds) == 1, "one measured round, then the guard holds the line"
+    assert final["tapRoundsDeferred"] == 3, "frames 2..4 each deferred one round"
+    assert final["state"] == "ended" and final["frames"] == 4, "counting unharmed"
+
+
+def test_tap_duty_factor_zero_disables_the_guard():
+    """0 is the off switch (config convention): interval-only, the old regime."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+    rounds = [t for t in fake.taps if t["stage"] == "ingest"]
+    assert len(rounds) == 3, "with the guard off, every interval fires"
+    assert final["tapRoundsDeferred"] == 0
+
+
+def test_tap_round_and_frame_wait_are_on_the_stats_board():
+    """tapRoundMs (count board) and frameWaitMs (ingest board) reach the flush.
+
+    The next stall must be diagnosable from the console: the death spiral was
+    invisible precisely because the round was the only untimed work in the
+    loop.  frameWaitMs reads 0.0 here because the fake source always has a
+    fresh frame — the loop-bound signature the 0.4 fps state would have shown.
+    """
+    fake = V1Fake(n_frames=2, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    # Guard off so BOTH frames' rounds fire and the count is deterministic.
+    make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+
+    count_stats = [s for s in fake.stats if s["stage"] == "count"]
+    assert count_stats, "the count board must flush"
+    round_agg = count_stats[-1]["metrics"]["tapRoundMs"]
+    assert round_agg["count"] == 2, "one observation per fired round"
+    assert round_agg["max"] > 0.0, "a real round costs real time"
+
+    ingest_stats = [s for s in fake.stats if s["stage"] == "ingest"]
+    wait_agg = ingest_stats[-1]["metrics"]["frameWaitMs"]
+    assert wait_agg["count"] == 2, "one observation per acquired frame"
+    assert wait_agg["max"] == 0.0, "a source with a frame ready costs no wait"
+
+
+def test_frame_wait_measures_the_stall_when_the_source_is_the_bottleneck():
+    """A source serving stale seqs makes frameWaitMs > 0 — the OTHER signature.
+
+    Each seq is served twice, so every second acquisition polls through a
+    stale frame first.  This is what separates 'the camera is slow' from 'the
+    loop is slow': the death spiral would have shown ~0 here while the frame
+    period read seconds.
+    """
+
+    class StutteringFrames(V1Fake):
+        """Ingest that repeats every frame once before advancing seq."""
+
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.url.host == "ingest" and request.url.path == "/frame":
+                self.calls.append("ingest /frame")
+                i = min(self.frame_i // 2, self.n_frames - 1)
+                exhausted = self.frame_i >= self.n_frames * 2
+                if not exhausted:
+                    self.frame_i += 1
+                return httpx.Response(200, json={
+                    "imageB64": self.image_b64, "tMs": i * 100, "w": 160, "h": 120,
+                    "seq": i, "ended": exhausted,
+                })
+            return super().handler(request)
+
+    fake = StutteringFrames(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert final["frames"] == 2
+    ingest_stats = [s for s in fake.stats if s["stage"] == "ingest"]
+    wait_agg = ingest_stats[-1]["metrics"]["frameWaitMs"]
+    assert wait_agg["count"] == 2
+    assert wait_agg["min"] == 0.0, "seq 0 was fresh on the first poll"
+    assert wait_agg["max"] > 0.0, "seq 1 arrived only after a stale-seq wait"
+
+
+# ------------------- the near-miss mint reaches the operator (P2, 2026-08-06)
+
+
+def test_near_miss_mint_is_counted_reported_and_tapped():
+    """THE REPLAY: p00005 minted at face 0.3464 vs p00004, clothes 0.562.
+
+    The mint STANDS (unique goes UP — the impostor pair at face 0.377 /
+    clothing 0.503 is why nothing merges automatically); the flag must reach
+    everything the operator reads: the nearMissMints counter, the end-of-run
+    notes and structured results, and the match tap row verbatim so the
+    console can offer the one-click merge.
+    """
+    script = [
+        scripted_verdict("p00004", True, None),
+        {**scripted_verdict("p00005", True, 0.3464),
+         "nearMiss": {"key": "p00004", "cosine": 0.3464, "appearanceSim": 0.562}},
+    ]
+    fake = V1Fake(n_frames=2, face_widths=(60.0,), match_script=script,
+                  image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    # Duty guard off: the flag rides frame 2's verdict and must reach the tap,
+    # which the guard would (correctly) defer behind frame 1's round cost.
+    final = make_loop(
+        fake, request, tap_interval_s=0.0, tap_duty_factor=0.0
+    ).run()
+
+    assert final["unique"] == 2, "a near-miss is a SUGGESTION: the mint stands"
+    assert final["nearMissMints"] == 1
+    assert "nearMissMints=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["nearMissMints"] == 1
+    assert fake.run_ended["results"]["unique"] == 2, "the count never moved itself"
+
+    rows = [
+        row
+        for t in fake.taps
+        if t["stage"] == "match"
+        for row in t["payload"].get("matches", [])
+    ]
+    flagged = [r for r in rows if r.get("nearMiss")]
+    assert flagged, "the flag must reach the console's tap"
+    assert flagged[0]["nearMiss"] == {
+        "key": "p00004", "cosine": 0.3464, "appearanceSim": 0.562,
+    }
+    # Plain verdicts carry the field as None, so the console can rely on it.
+    assert any(r["nearMiss"] is None for r in rows)
+
+
+def test_mints_without_the_flag_count_nothing():
+    """Ordinary mints leave nearMissMints at zero — the counter means the flag."""
+    fake = V1Fake(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert final["unique"] >= 1
+    assert final["nearMissMints"] == 0
+    assert "nearMissMints=0" in fake.run_ended["notes"]

@@ -29,9 +29,9 @@ evidence (project hard rule: measure first).
 
 | method | path | body | returns |
 | --- | --- | --- | --- |
-| GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash}` |
+| GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash, nearMissFloor}` |
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
-| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed}` |
+| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
@@ -49,7 +49,11 @@ optional torso descriptor (exactly 48 floats — see the tie-breaker section
 below; any other present length is a 422); `appearanceSim` is its best
 histogram intersection against the matched identity's stored descriptors
 (`null` for staff hits, new mints, or when either side lacks one) and
-`appearanceVetoed` says an enrolment was refused on a clash.
+`appearanceVetoed` says an enrolment was refused on a clash. `nearMiss` is
+non-null only on a MINT whose best cosine landed in
+`[HECO_MATCH_NEARMISS_FLOOR .. threshold)`: `{key, cosine, appearanceSim}` —
+the identity it almost was, the score, and the torso intersection against
+that identity's stored descriptors (see the near-miss section below).
 
 - **Multiple templates per guest (M1).** A guest is represented by up to five
   views, not by whichever frame happened to be first. See below.
@@ -199,6 +203,29 @@ descriptor-less, and absent is not zero.
 Opening an older gallery or staff file ALTERs the column in, so every
 pre-existing file keeps working; its rows read as descriptor-absent.
 
+## The near-miss flag on a mint (v2, 0.7.0)
+
+**The measurement it exists for.** Tonight the same person split at **face
+cosine 0.3464** against the 0.363 threshold with **clothing intersection
+0.562** — new guest p00005, almost certainly p00004 — and the operator found
+it by eye, because the signal surfaced nowhere. A mint whose best cosine
+against the pre-existing gallery lands in `[HECO_MATCH_NEARMISS_FLOOR
+(0.29) .. threshold)` now carries `nearMiss: {key, cosine, appearanceSim}` in
+the `/match` response, so the console can offer the operator a one-click
+merge. The floor sits just below every same-person miss measured on this
+camera (0.294 / 0.308 / 0.346 / 0.361); mints further out are genuinely new
+faces, and flagging them would teach the operator to ignore the cue.
+
+**The verdict is still a mint — never an automatic merge.** The measurement
+runs both ways: an IMPOSTOR pair on the same camera sits at **face 0.377
+with clothing 0.503** — two different men, near-threshold face AND agreeing
+clothes. Auto-merging on that evidence folds real strangers into one invoice
+line invisibly, so the flag is information for a human and the count moves
+only when the operator's `duplicate` correction arrives via `/merge`.
+Out-of-band mints carry `nearMiss: null`; matched verdicts and staff hits
+never carry it; `0` disables the flag and `/health` reports the active
+`nearMissFloor`.
+
 ## Run
 
 ```sh
@@ -227,7 +254,12 @@ including the old-file ALTER migration, the enrol veto (fires on clash, not
 on agreement, not at the boundary, never on an absent descriptor), the
 verdict never moving because of clothing (including the two-white-shirts
 no-rescue rule), the 422 on a wrong-length descriptor, and `appearanceSim`
-being null for staff hits and first mints.
+being null for staff hits and first mints. The near-miss flag replays
+tonight's measured pair (mint at 0.3464 with torso 0.562 → flagged, verdict
+still a mint, gallery grows), plus: out-of-band and empty-gallery mints null,
+band edges, `appearanceSim` null when either side lacks a descriptor,
+matched verdicts and staff hits never flagged, floor 0 disabling, and
+`/health` naming the band.
 
 ## Tune
 
@@ -241,6 +273,7 @@ being null for staff hits and first mints.
 | `HECO_MATCH_TEMPLATE_MARGIN` | `0.05` | How far ahead of the nearest rival identity it must land. |
 | `HECO_MATCH_TEMPLATE_MAX_COSINE` | `0.90` | Near-duplicate ceiling: above this the view adds no coverage. |
 | `HECO_MATCH_APPEARANCE_CLASH` | `0.50` | Torso-intersection floor for the enrolment veto (below = clash). **Reasoned, not calibrated** — like the M1 margins — and **0 disables the veto**. Empty string means unset. |
+| `HECO_MATCH_NEARMISS_FLOOR` | `0.29` | Floor of the near-miss band on a mint: best cosine in `[floor .. threshold)` earns the `nearMiss` flag (operator suggestion, never a merge — impostors measured face 0.377 / clothes 0.503). Just below the measured same-person misses (0.294/0.308/0.346/0.361). **0 disables**; empty string means unset. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
 operator-supervised walk-through, never from a crossing, and staff flows

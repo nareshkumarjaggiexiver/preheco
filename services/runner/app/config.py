@@ -77,6 +77,23 @@ class Settings:
     # answers slowly-but-successfully cannot cost the loop 10 x report_timeout.
     tap_budget_s: float = 3.0
 
+    # TAP DUTY-CYCLE GUARD (see loop._maybe_tap).  tap_interval_s alone has
+    # two stable states, both measured on the T440 with 4K frames: frames at
+    # ~0.43 s -> a ~1-1.5 s tap round every ~5th frame -> 2.3 fps; but ANY
+    # transient stall (a docker build on the box, both times) pushes one frame
+    # past the ~2 s interval, after which EVERY frame triggers a full round —
+    # ~2.5 s/frame, locked at 0.4 fps forever, with the stage timings
+    # identical in both states (ingest 42 ms, persons 76, faces 58, embed 74,
+    # match 4: the stages were innocent, the untimed round was the whole gap).
+    # The guard breaks the second state by construction: a round may fire only
+    # when this factor x the PREVIOUS round's measured cost has elapsed since
+    # that round ENDED, so a 1 s round forces >= 3 s of counting before the
+    # next — the round is bounded at ~1/(factor+1) of loop time (~25% at 3)
+    # and the every-frame lock-in is impossible whatever the interval says.
+    # 0 disables the guard (config semantics); deferred rounds are counted in
+    # the run status as tapRoundsDeferred.
+    tap_duty_factor: float = 3.0
+
     # A staff member seen again within this many seconds of their last sighting
     # is the SAME crossing, not a new one (see loop._pipeline_step).
     staff_cooldown_s: float = 5.0
@@ -174,6 +191,7 @@ def from_env() -> Settings:
         planner_timeout_s=env_float("HECO_PLANNER_TIMEOUT_S", s.planner_timeout_s),
         report_timeout_s=env_float("HECO_REPORT_TIMEOUT_S", s.report_timeout_s),
         tap_budget_s=env_float("HECO_TAP_BUDGET_S", s.tap_budget_s),
+        tap_duty_factor=env_float("HECO_TAP_DUTY_FACTOR", s.tap_duty_factor),
         staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
         heal_window_s=env_float("HECO_HEAL_WINDOW_S", s.heal_window_s),
         heal_min_cosine=env_float("HECO_HEAL_MIN_COSINE", s.heal_min_cosine),
