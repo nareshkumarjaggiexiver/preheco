@@ -679,6 +679,19 @@ Added to `GET runner /runs/:id`, to `results` on the closing
 (plus `zoneUnmeasured` in the status).
 
 
+### Amendment — the double-mint (2026-08-06 morning bench)
+
+A blurred crossing can mint TWICE in a second: the same woman's consecutive
+frames scored 0.29 against each other, so her track minted p00003 and then
+p00004 one second apart, settled on p00004 — and the heal, holding ONE
+remembered mint per track, had already forgotten p00003. The bookkeeping is
+now a per-track LIST (capped at 4): a comfortable match (>= 0.45) folds EVERY
+remembered singleton mint of that track except the matched key — including
+when the matched key is itself the track's own later mint. Blur at the source
+is treated separately (camera shutter floor raised 1/250 -> 1/500); the heal
+is what stops one bad second becoming a phantom guest when blur happens
+anyway.
+
 ## v2 addition — a gallery outlives its run (2026-08-06)
 
 A run's gallery used to be deleted the moment the run settled. The unique
