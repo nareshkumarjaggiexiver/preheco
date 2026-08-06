@@ -215,12 +215,20 @@ def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
     }
 
 
+#: Newest mint-ledger rows carried per tap round.  Mints are rare (one per
+#: guest, ever), so a window of 60 keeps each round comfortably inside the
+#: 32 KB ceiling while guaranteeing every mint rides MANY consecutive rounds —
+#: the planner scans all rounds, so one landing anywhere is enough.
+MINT_LEDGER_CAP = 60
+
+
 def match_payload(
     verdicts: list[dict],
     unique: int,
     staff_crossings: int,
     staff_face_frames: int = 0,
     manual_additions: int = 0,
+    mints: list[dict] | None = None,
 ) -> dict:
     """Matcher verdicts (personKey + cosine + staff flag) with live counters.
 
@@ -261,6 +269,28 @@ def match_payload(
         "manualAdditions": manual_additions,
         "matched": len(verdicts),
         "matches": rows,
+        # THE MINT LEDGER.  A mint is a count-changing event: the moment the
+        # tap-round sampling missed one, the guest register showed 1 guest
+        # against a headline of 5 with three CORRECT merge banners it could
+        # not render (2026-08-06, run cbdc6b: 69 rounds, 4 sampled verdicts,
+        # every one p00001 — all four mints fell between rounds).  Sightings
+        # may be sampled; mints may not.  Every mint verdict (riders and all)
+        # is appended to a bounded ledger in the loop and the newest
+        # MINT_LEDGER_CAP ride EVERY round, so the register is guaranteed a
+        # card — with first-seen time and any banner — for every guest the
+        # count contains.
+        "mints": [
+            {
+                "personKey": m.get("personKey"),
+                "tMs": m.get("tMs"),
+                "cosine": _r(m.get("cosine"), 4),
+                "appearanceSim": _r(m.get("appearanceSim"), 4),
+                "subCanon": bool(m.get("subCanon", False)),
+                "nearMiss": _near_miss(m),
+                "overlap": _overlap(m),
+            }
+            for m in (mints or [])[-MINT_LEDGER_CAP:]
+        ],
     }
 
 
@@ -272,6 +302,7 @@ def build_payloads(
     staff_crossings: int,
     staff_face_frames: int = 0,
     manual_additions: int = 0,
+    mints: list[dict] | None = None,
 ) -> dict[str, dict]:
     """Build the per-stage tap payloads from one frame's captured outputs.
 
@@ -286,7 +317,7 @@ def build_payloads(
         "face-detect": face_payload(last.get("faces", []), min_px, canon_px),
         "match": match_payload(
             last.get("verdicts", []), unique, staff_crossings,
-            staff_face_frames, manual_additions,
+            staff_face_frames, manual_additions, mints=mints,
         ),
     }
 

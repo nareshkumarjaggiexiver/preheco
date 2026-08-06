@@ -193,6 +193,14 @@ class RunLoop:
         # personKey -> how many templates that identity last reported holding.
         # Guarded by _lock, like _status, because the settle path reads it.
         self._template_n: dict[str, int] = {}
+        # THE MINT LEDGER: every count-changing verdict (isNew, non-staff),
+        # riders and all, appended here and carried on every match tap.  A
+        # sighting may be sampled away; a mint may not — the register showed
+        # 1 guest against a headline of 5 (with three correct merge banners
+        # it could not render) the first healthy-fps run after the tap duty
+        # guard, because all four mints fell between tap rounds.  Bounded;
+        # guarded by _lock.
+        self._mints: list[dict] = []
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
@@ -895,6 +903,16 @@ class RunLoop:
                     st["subCanonMatches"] += 1
                 if m.get("isNew"):
                     st["unique"] += 1
+                    self._mints.append({
+                        "personKey": m.get("personKey"),
+                        "tMs": t_ms,
+                        "cosine": m.get("cosine"),
+                        "appearanceSim": m.get("appearanceSim"),
+                        "subCanon": bool(m.get("subCanon", False)),
+                        "nearMiss": m.get("nearMiss"),
+                        "overlap": m.get("overlap"),
+                    })
+                    del self._mints[:-500]  # bound memory; taps window separately
                     # The mint STANDS and unique has just moved up — the
                     # near-miss flag beside it is information for a human,
                     # never behaviour (the measured impostor pair at face
@@ -1497,11 +1515,14 @@ class RunLoop:
         """One tap round: the 5 structured payloads, then the 5 annotated JPEGs."""
         deadline = time.monotonic() + self.s.tap_budget_s
         st = self.status()
+        with self._lock:
+            mints = list(self._mints)
         payloads = taps.build_payloads(
             last, self.s.quality_min_px, self.s.quality_canon_px,
             st["unique"], st["staffCrossings"],
             staff_face_frames=st["staffFaceFrames"],
             manual_additions=st["manualAdditions"],
+            mints=mints,
         )
         for stage, payload in payloads.items():
             if time.monotonic() >= deadline:

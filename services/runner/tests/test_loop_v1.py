@@ -1557,3 +1557,39 @@ def test_person_boxes_in_zones_are_marked_not_filtered():
     assert pd[-1]["inZone"] == 1, "and the display says which part is behind glass"
     flagged = [b for b in pd[-1]["boxes"] if b.get("inZone")]
     assert len(flagged) == 1 and flagged[0]["x"] == 36
+
+
+def test_the_mint_ledger_rides_every_match_tap():
+    """A mint is a count-changing event and must never be droppable by sampling.
+
+    Measured (2026-08-06, run cbdc6b): 69 tap rounds, 4 sampled verdicts —
+    all the same guest — while the run's four other mints fell between rounds,
+    so the register showed 1 guest against a headline of 5 and three CORRECT
+    merge banners had no card to render on.  Every match tap now carries the
+    newest mints (riders and all), so the register is guaranteed a card for
+    every guest the count contains, however sparse the sampling.
+    """
+    script = [
+        scripted_verdict("p00001", True, None),
+        {**scripted_verdict("p00002", True, 0.3204),
+         "appearanceSim": None,
+         "nearMiss": {"key": "p00001", "cosine": 0.3204, "appearanceSim": 0.8154}},
+        scripted_verdict("p00001", False, 0.70),
+    ]
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0,
+                      heal_window_s=0.0).run()
+
+    assert final["unique"] == 2
+    match_taps = [t["payload"] for t in fake.taps if t["stage"] == "match"]
+    assert match_taps, "match taps must post"
+    ledger = match_taps[-1].get("mints")
+    assert ledger is not None and len(ledger) == 2, "both mints ride the last round"
+    keys = [m["personKey"] for m in ledger]
+    assert keys == ["p00001", "p00002"], "ledger is append-order (mint order)"
+    assert all(isinstance(m.get("tMs"), int) for m in ledger), "mint time rides along"
+    flagged = ledger[1]
+    assert flagged["nearMiss"] == {"key": "p00001", "cosine": 0.3204, "appearanceSim": 0.8154}, (
+        "the rider must survive into the ledger — it is the banner's whole payload"
+    )
