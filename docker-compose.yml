@@ -114,6 +114,10 @@ services:
     ports: ["7106:7106"]
     volumes:
       - match-data:/srv/services/match/data   # per-run galleries survive restarts
+    environment:
+      # Galleries now OUTLIVE their runs (dispute evidence behind the invoice
+      # figure) and age out here instead of dying at settle. 24 h default.
+      HECO_GALLERY_RETENTION_S: ${HECO_GALLERY_RETENTION_S-}
 
   runner:
     <<: *heco-service

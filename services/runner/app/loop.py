@@ -505,15 +505,14 @@ class RunLoop:
             f"excludedByZone={st['excludedByZone']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
-        # A STALL IS NOT AN END. If the camera merely blinked, this run's
-        # embeddings are the only record of who has already come through the
-        # gate — deleting them means a restart counts every one of those guests
-        # a second time. So the gallery survives a stall, and the run settles
-        # as `failed` with the reason attached: a run that stopped because the
-        # camera vanished must not present itself as a complete count.
+        # A STALL IS NOT AN END. A run that stopped because the camera
+        # vanished must not present itself as a complete count, so it settles
+        # as `failed` with the reason attached.  (The gallery survives EVERY
+        # settle now, stall or not — see _release_run_state for why — so the
+        # stall case no longer needs special-casing to keep its embeddings.)
         stalled = self._end_reason == "source-stalled"
         notes = f"{notes} endReason={self._end_reason}"
-        self._release_run_state(keep_gallery=stalled)
+        self._release_run_state()
         status = "failed" if stalled else "ended"
         results = {
             "unique": st["unique"],
@@ -559,24 +558,31 @@ class RunLoop:
             "gateArmed": list(self.gate.armed),
         }
 
-    def _release_run_state(self, keep_gallery: bool = False) -> None:
+    def _release_run_state(self) -> None:
         """Give back every piece of per-run state this run created downstream.
 
-        ``keep_gallery`` preserves this run's face embeddings — used when the
-        source only STALLED, so that resuming does not re-count every guest
-        already through the gate. The match service's /gallery/sweep remains
-        the backstop that eventually reclaims it.
+        THE GALLERY IS NOT RELEASED HERE, DELIBERATELY.  It used to be —
+        settle called match /reset and the run's embeddings died with the run.
+        That destroyed the evidence behind an invoice figure at the exact
+        moment it became one: a venue disputing "5 unique guests" the next
+        morning could be shown nothing, and on the 2026-08-06 bench the same
+        deletion cost three diagnoses in one night — each time the question
+        "what did the gallery actually hold?" had to be answered from a file
+        that no longer existed.  A count whose evidence is destroyed at settle
+        is an assertion, not a record.
+
+        Retention did not disappear; it moved to the right owner.  The match
+        service now sweeps galleries older than HECO_GALLERY_RETENTION_S
+        (default 24 h) on a timer, so every gallery — settled, stalled or
+        crashed — ages out on the same clock, long after any dispute would be
+        raised and long before the embeddings could outlive their purpose.
 
         Nothing here can fail the run — it has already produced its number —
-        so each call is independently best-effort.  Three owners:
+        so each call is independently best-effort.  Two owners remain:
 
         * ingest's capture slot, so the next run can claim the camera;
         * the tracker's per-run SortLite, which otherwise stays resident until
-          the process restarts (one leak per run, forever);
-        * the gallery file, which holds this event's guests' face embeddings.
-          A per-run file that nobody deletes is a retention liability; the
-          match service's /gallery/sweep is only the backstop for runs that
-          die before reaching here.
+          the process restarts (one leak per run, forever).
         """
         planner_run_id = self.status().get("plannerRunId")
         with contextlib.suppress(Exception):
@@ -585,14 +591,11 @@ class RunLoop:
             # An enrolment now has a planner row (so the capture that creates a
             # biometric leaves a record) but it never created tracker state or
             # a gallery under that id, so there is nothing else of ours to hand
-            # back.  Releasing them anyway would be a pair of pointless calls
-            # against ids that were never opened.
+            # back.  Releasing it anyway would be a pointless call against an
+            # id that was never opened.
             return
         with contextlib.suppress(Exception):
             self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
-        if not keep_gallery:
-            with contextlib.suppress(Exception):
-                self._post(f"{self.s.match_url}/reset", {"runId": planner_run_id})
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
@@ -846,6 +849,20 @@ class RunLoop:
         filter guessing at geometry is worse than a filter reporting it could
         not run — and every face that passed untested is counted in
         ``zoneUnmeasured``, mirroring the ``gatedUnmeasured`` pattern.
+
+        Two ledgers, deliberately: besides the in-place tap stamp, every
+        excluded face is observed on the face-detect stats board as
+        ``faceZoneExcluded`` (value = box width px).  The tap flag is the
+        per-tick film strip — sampled, so a busy run drops rows — while this
+        aggregate's COUNT is the audited whole-run zone-excluded total, the
+        same film-strip vs audited-account split the planner's funnel draws
+        for every other number.  The width stats ride along free and show
+        WHAT size of face the polygons eat.  The first live verification
+        (2026-08-05) excluded 41 faces (excludedByZone=41) while unique
+        correctly stayed 1 — a total that must be readable from the funnel,
+        not only by curling the run status.  A run with no zones never
+        observes the metric, so its ABSENCE from old runs' stats means "no
+        zones were armed", not zero exclusions.
         """
         if not self.zones or not faces:
             return faces
@@ -876,6 +893,12 @@ class RunLoop:
             else:
                 f["excludedByZone"] = True
                 f["excludedZone"] = hit.get("label")
+                # The audited ledger (see docstring): one observation per
+                # excluded face, width in px, on the face-detect board the
+                # planner's whole-run funnel is built from.
+                self.board.observe(
+                    "face-detect", "faceZoneExcluded", float(box.get("w", 0.0))
+                )
                 excluded += 1
         if excluded:
             self._bump("excludedByZone", excluded)

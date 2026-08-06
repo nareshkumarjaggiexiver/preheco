@@ -77,11 +77,18 @@ says whether this sighting became one of them.
 - **Re-enrolment supersedes.** `/staff/enrol` replaces a member's prior samples
   with the new best-N, so `sampleCount` is exact rather than growing across
   walk-throughs.
-- **Gallery files have a lifecycle.** `/reset` deletes a run's gallery (the
-  runner calls it at start AND at end of run); `/gallery/sweep` deletes files
-  older than `maxAgeS` for runs that died without releasing. Each file holds
-  real guests' face embeddings, so this is a retention control. Staff stores
-  are never swept — they persist by design.
+- **Gallery files have a lifecycle — and it no longer ends at settle.** The
+  runner calls `/reset` once at run START (initialisation); it deliberately
+  does NOT delete at run end any more. The gallery is the evidence behind an
+  invoice figure, and deleting it at settle meant a venue disputing a count
+  the next morning could be shown nothing (and cost three diagnoses in one
+  night on the 2026-08-06 bench). Retention is now a **background sweep this
+  service runs itself**: on startup and then hourly, galleries older than
+  `HECO_GALLERY_RETENTION_S` (default 24 h) are deleted — settled, stalled
+  and crashed runs all on one clock. `/gallery/sweep` remains callable by
+  hand for an immediate pass. Each file holds real guests' face embeddings,
+  so the window is deliberately a day, not a season. Staff stores are never
+  swept — they persist by design, under consent, until erased.
 - **Open once, scan in memory.** Every store is opened once per process and
   its `(n, dim)` float32 matrix stays resident, updated write-through on each
   mutation (SQLite in WAL mode remains the durable record). A full match call

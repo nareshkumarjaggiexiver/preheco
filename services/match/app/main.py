@@ -26,6 +26,9 @@ Staff are checked FIRST (CONTRACTS.md v1): a staff hit is tagged
 carries it stays visible and tracked upstream.
 """
 
+import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -34,6 +37,17 @@ from pydantic import BaseModel, Field
 from . import config, gallery, staff
 from .store import close_all_stores
 
+
+def _env_s(name: str, default: float) -> float:
+    """Read a seconds knob; empty means unset (this service stays free of
+    heco_common on purpose, so this mirrors its env_float semantics locally —
+    compose renders ``${VAR-}`` as an empty string, and an empty string once
+    took the whole ingest service down by parsing as an error)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
 VERSION = "0.5.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
@@ -41,11 +55,53 @@ VERSION = "0.5.0"
 #: short enough that guests' embeddings do not outlive the event by a season.
 DEFAULT_SWEEP_MAX_AGE_S = 24 * 3600.0
 
+#: How often the background sweep runs.  An hour is frequent enough that a
+#: gallery never outlives its retention window by more than ~4%, and rare
+#: enough to be free.
+DEFAULT_SWEEP_INTERVAL_S = 3600.0
+
+
+def retention_s() -> float:
+    """How long a run's gallery outlives its run (env HECO_GALLERY_RETENTION_S).
+
+    Galleries used to be deleted the moment a run settled.  That destroyed the
+    evidence behind an invoice figure at the exact moment it became one — a
+    venue disputing a count the next morning could be shown nothing — so the
+    runner no longer deletes at settle, and THIS window is the retention
+    policy for every gallery: settled, stalled or crashed, all on one clock.
+    24 h covers the morning-after dispute; it is deliberately not a season,
+    because each file holds real guests' face embeddings.  Staff stores are
+    never swept — they persist by design, under consent, until erased.
+    """
+    return _env_s("HECO_GALLERY_RETENTION_S", DEFAULT_SWEEP_MAX_AGE_S)
+
+
+async def _sweep_forever() -> None:
+    """Age out old galleries on a timer; the retention control, automated.
+
+    /gallery/sweep existed but nothing called it — retention that requires a
+    human to remember a curl is not a policy.  One pass at startup (catching
+    files that aged while the service was down), then hourly.  Errors are
+    logged and the loop continues: a failed sweep must not take the matcher
+    down, and the next tick retries.
+    """
+    log = logging.getLogger("match")
+    while True:
+        try:
+            swept = gallery.sweep(config.data_dir(), retention_s())
+            if swept:
+                log.info("retention sweep removed %d gallery file(s): %s", len(swept), swept)
+        except Exception:  # noqa: BLE001 — the sweep must outlive one bad pass
+            log.exception("retention sweep failed; will retry next interval")
+        await asyncio.sleep(_env_s("HECO_GALLERY_SWEEP_INTERVAL_S", DEFAULT_SWEEP_INTERVAL_S))
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Release every cached store connection on shutdown."""
+    """Run the retention sweep for the process lifetime; release stores on exit."""
+    sweeper = asyncio.create_task(_sweep_forever())
     yield
+    sweeper.cancel()
     close_all_stores()
 
 

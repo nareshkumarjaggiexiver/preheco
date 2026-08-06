@@ -6,9 +6,12 @@ match, staff excluded from the guest gallery, and the merge/split/mark-staff
 corrections the runner applies from the feedback loop.
 """
 
+import os
+import time
+
 import numpy as np
 import pytest
-from app import config, main, staff
+from app import config, gallery, main, staff, store
 from fastapi.testclient import TestClient
 
 RNG = np.random.default_rng(11)
@@ -294,3 +297,48 @@ def test_gallery_sweep_deletes_orphaned_run_files_only(client, tmp_path):
     assert not old.exists()
     assert gallery.db_path(tmp_path, "new-run").exists(), "a live run must be untouched"
     assert staff.db_path(tmp_path, "site-keep").exists(), "staff stores persist by design"
+
+
+def test_the_retention_sweep_runs_itself(tmp_path, monkeypatch):
+    """The timed sweep is real code on the real clock, not an endpoint nobody calls.
+
+    Galleries now OUTLIVE their runs (the runner stopped deleting at settle —
+    the gallery is the evidence behind an invoice figure, and deleting it at
+    settle meant a disputed count could be shown nothing the next morning).
+    That is only safe because retention moved HERE: a background task started
+    by the service lifespan ages every gallery out after
+    HECO_GALLERY_RETENTION_S, settled and crashed runs alike.  This test pins
+    the moving parts an integration test can reach without waiting an hour:
+    the env knobs parse (empty string = unset, the compose ${VAR-} rendering),
+    the startup pass sweeps an already-stale file, and staff stores survive.
+    """
+    monkeypatch.setenv("HECO_MATCH_DATA_DIR", str(tmp_path))
+
+    # Env parsing: empty means unset, values parse, absent means default.
+    monkeypatch.setenv("HECO_GALLERY_RETENTION_S", "")
+    assert main.retention_s() == main.DEFAULT_SWEEP_MAX_AGE_S
+    monkeypatch.setenv("HECO_GALLERY_RETENTION_S", "7200")
+    assert main.retention_s() == 7200.0
+    monkeypatch.delenv("HECO_GALLERY_RETENTION_S")
+    assert main.retention_s() == main.DEFAULT_SWEEP_MAX_AGE_S
+
+    # A gallery already older than the retention window when the service
+    # starts, plus a staff store that must never be touched.
+    stale_gallery = gallery.db_path(tmp_path, "died-yesterday")
+    store.open_store(stale_gallery)
+    store.close_all_stores()
+    staff_store = staff.db_path(tmp_path, "site-keep")
+    store.open_store(staff_store)
+    store.close_all_stores()
+    long_ago = time.time() - main.DEFAULT_SWEEP_MAX_AGE_S - 60
+    os.utime(stale_gallery, (long_ago, long_ago))
+
+    # Entering the TestClient context runs the lifespan, which starts the
+    # sweeper; its first pass is immediate.  Poll briefly rather than sleep a
+    # fixed amount — the pass is fast but runs on the event loop's schedule.
+    with TestClient(main.app):
+        deadline = time.time() + 5.0
+        while stale_gallery.exists() and time.time() < deadline:
+            time.sleep(0.05)
+    assert not stale_gallery.exists(), "the startup pass must sweep a stale gallery"
+    assert staff_store.exists(), "staff stores persist by design"

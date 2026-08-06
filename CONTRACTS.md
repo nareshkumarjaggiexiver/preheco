@@ -677,3 +677,28 @@ Added to `GET runner /runs/:id`, to `results` on the closing
 `PUT /api/pipeline/runs/:id`, and to the end-of-run notes as
 `healedSplits=N excludedByZone=N`: **`healedSplits`**, **`excludedByZone`**
 (plus `zoneUnmeasured` in the status).
+
+
+## v2 addition — a gallery outlives its run (2026-08-06)
+
+A run's gallery used to be deleted the moment the run settled. The unique
+count is an invoice figure, and this destroyed the evidence behind it exactly
+when it became one: a venue disputing "5 unique guests" the next morning could
+be shown nothing, and on the 2026-08-06 bench the same deletion cost three
+diagnoses in one night — each needed rows that no longer existed.
+
+- **The runner no longer calls match `/reset` at settle.** The only reset is
+  the run's own start-up initialisation. Camera slot and tracker state are
+  still released at settle — those are leases; the gallery is a record.
+- **Retention moved to the match service, automated.** A background task
+  (started by the service lifespan) sweeps galleries older than
+  **`HECO_GALLERY_RETENTION_S`** (default 24 h) on startup and then hourly
+  (`HECO_GALLERY_SWEEP_INTERVAL_S`, default 3600). Settled, stalled and
+  crashed runs age out on one clock; the old special-casing of stalls
+  (keep-on-stall) is gone because keeping is now the rule.
+- **`POST /gallery/sweep` remains** for an immediate manual pass.
+- **Staff stores are never swept** — they persist by design, under consent,
+  until erased through the tombstone flow.
+- Retention stays a real control: 24 h covers the morning-after dispute and is
+  deliberately not longer, because every gallery file holds real guests' face
+  embeddings.

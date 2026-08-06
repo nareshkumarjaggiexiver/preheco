@@ -227,9 +227,10 @@ def test_orchestration_order():
     assert non_planner[3 : 3 + 7] == per_frame
     assert non_planner[10 : 10 + 7] == per_frame
     # Teardown: stalled-seq polls on ingest, then per-run state is handed back
-    # (camera, tracker, gallery), and only then is the planner PUT — which
-    # stays the LAST planner interaction of the run.
-    assert non_planner[-3:] == ["ingest /close", "tracker /release", "match /reset"]
+    # (camera and tracker — the gallery survives settle as dispute evidence),
+    # and only then is the planner PUT — which stays the LAST planner
+    # interaction of the run.
+    assert non_planner[-2:] == ["ingest /close", "tracker /release"]
     assert fake.calls[-1] == "planner /api/pipeline/runs/prun-1"
     assert fake.match_reset == {"runId": "prun-1"}
     assert fake.tracker_reset == {"runId": "prun-1"}
@@ -405,21 +406,28 @@ def test_planner_outage_during_flush_never_kills_the_count():
     assert fake.run_ended["status"] == "ended"
 
 
-def test_run_end_hands_back_camera_tracker_and_gallery():
-    """Per-run state has an owner and is released when the run ends.
+def test_run_end_hands_back_camera_and_tracker_but_keeps_the_gallery():
+    """Per-run state is released at settle — except the gallery, deliberately.
 
-    Regression: nothing was ever released.  Every run left its SortLite
-    resident in the tracker process and its ``gallery-<id>.db`` — full of real
-    guests' face embeddings — on disk forever, because gallery.reset only ever
-    deleted the file for the run's own freshly minted id.
+    The camera slot and the tracker's SortLite are leases: holding them blocks
+    the next run.  The gallery is EVIDENCE: it is the record behind the unique
+    count, and deleting it at settle destroyed the ability to audit a disputed
+    invoice figure the morning after (measured cost on the 2026-08-06 bench:
+    three diagnoses in one night needed rows that no longer existed).  So the
+    only /reset is the run's own start-up initialisation; retention moved to
+    the match service's timed sweep (HECO_GALLERY_RETENTION_S), where every
+    gallery ages out on the same clock regardless of how its run ended.
     """
     fake = FakePipeline(n_frames=2)
     final = make_loop(fake).run()
     assert final["state"] == "ended"
     assert fake.closed == {"owner": "run-local"}, "the camera must be handed back"
     assert fake.tracker_released == {"runId": "prun-1"}
-    # /reset is the gallery's delete: once at start, once to release at end.
-    assert len([c for c in fake.calls if c == "match /reset"]) == 2
+    resets = [c for c in fake.calls if c == "match /reset"]
+    assert len(resets) == 1, (
+        f"one reset (start-up init) and no teardown delete — the gallery is "
+        f"the evidence behind the count (saw {len(resets)})"
+    )
 
 
 def test_failed_run_also_releases_its_state():
@@ -598,18 +606,25 @@ def test_a_blinking_camera_does_not_end_the_run_or_destroy_the_gallery():
     assert any(c.endswith("/close") for c in fake.calls if c.startswith("ingest"))
 
 
-def test_a_finished_file_still_ends_cleanly_and_releases_everything():
-    """The other side of the same fork: a genuine end is still a clean end."""
+def test_a_finished_file_still_ends_cleanly_and_keeps_its_gallery():
+    """The other side of the same fork: a genuine end is still a clean end.
+
+    This test used to assert the OPPOSITE of what it does now — that a clean
+    end "reclaims the gallery" with a teardown reset.  That teardown was the
+    policy that destroyed the evidence behind the invoice figure at settle,
+    and it is gone: a clean end and a stall now leave the gallery alike, and
+    the match service's timed sweep is the one retention clock for both.
+    """
     fake = FakePipeline(n_frames=3)
     final = make_loop(fake).run()
 
     assert final["state"] == "ended"
     assert final["endReason"] == "source-ended"
     assert fake.run_ended["status"] == "ended"
-    # A completed run's gallery is transient and IS reclaimed: start-up reset
-    # plus the teardown reset that removes the file.
     resets = [c for c in fake.calls if c.startswith("match") and c.endswith("/reset")]
-    assert len(resets) == 2, f"a clean end reclaims the gallery (saw {len(resets)} resets)"
+    assert len(resets) == 1, (
+        f"start-up init only — settle must not delete the evidence (saw {len(resets)})"
+    )
 
 
 def test_the_final_count_is_reported_structurally_not_only_as_prose():
