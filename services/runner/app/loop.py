@@ -954,13 +954,16 @@ class RunLoop:
             # the matcher may refuse to ENROL a clashing sighting as a new
             # template, never change the verdict) and then serves as this
             # face's heal-veto evidence below.
+            # WHICH person box this face belongs to, resolved for every face
+            # (not only when a frame decoded): co-presence needs it to tell
+            # two guests apart from one guest and their reflection.
+            pbox = self._person_box_for(face, boxes)
+            pbox_id = id(pbox) if pbox is not None else None
             face_desc = None
-            if frame_img is not None:
-                pbox = self._person_box_for(face, boxes)
-                if pbox is not None:
-                    face_desc = appearance.torso_descriptor(
-                        frame_img, face["box"], pbox
-                    )
+            if frame_img is not None and pbox is not None:
+                face_desc = appearance.torso_descriptor(
+                    frame_img, face["box"], pbox
+                )
             body = {"runId": planner_run_id, "embedding": emb, "quality": w}
             if face_desc is not None:
                 body["appearance"] = face_desc
@@ -1008,22 +1011,29 @@ class RunLoop:
                     "box": face.get("box"),
                 }
             )
-            decided.append((face, m, face_desc))
+            decided.append((face, m, face_desc, pbox_id))
 
         # CO-PRESENCE, asserted between the passes: every distinct pair of
         # guests THIS FRAME held is two different people, certainly — and the
         # folds in pass two must not be able to contradict it.
-        self._assert_co_presence(planner_run_id, verdicts)
+        self._assert_co_presence(
+            planner_run_id,
+            [
+                (m.get("personKey"), pbox_id)
+                for _f, m, _d, pbox_id in decided
+                if m.get("personKey") and not m.get("isStaff")
+            ],
+        )
         # The keys this frame actually held, for the fold guard below: a fold
         # whose TARGET is visibly elsewhere in this same frame is folding two
         # co-present people together, whatever the tracker believes.
-        frame_keys = {
-            v.get("personKey")
-            for v in verdicts
-            if v.get("personKey") and not v.get("isStaff")
-        }
+        frame_bodies: dict[str, set] = {}
+        for _f, m, _d, pbox_id in decided:
+            k = m.get("personKey")
+            if k and not m.get("isStaff"):
+                frame_bodies.setdefault(k, set()).add(pbox_id)
 
-        for face, m, face_desc in decided:
+        for face, m, face_desc, _pbox_id in decided:
             if m.get("isStaff"):
                 # A staff hit never records a mint and never heals INTO staff:
                 # the staff store is operator-supervised evidence, and folding
@@ -1110,11 +1120,11 @@ class RunLoop:
                 # or clothing-clashed) is remembered for a later heal, because
                 # a key that has just been merged away is nothing to cure.
                 if not self._maybe_lock_fold(
-                    planner_run_id, track_id, m, face_desc, frame_keys
+                    planner_run_id, track_id, m, face_desc, frame_bodies
                 ):
                     self._record_mint(track_id, m, face_desc)
             else:
-                self._maybe_heal(planner_run_id, track_id, m, face_desc, frame_keys)
+                self._maybe_heal(planner_run_id, track_id, m, face_desc, frame_bodies)
                 self._note_lock(track_id, m, face_desc)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
@@ -1131,7 +1141,31 @@ class RunLoop:
     #: holds, and the count is the product.
     _COPRESENCE_CAP = 4000
 
-    def _assert_co_presence(self, planner_run_id: str, verdicts: list[dict]) -> None:
+    @staticmethod
+    def _different_bodies(bodies: dict, a: str | None, b: str | None) -> bool:
+        """Were these two identities seen on DIFFERENT bodies in one frame?
+
+        The one certain identity signal this system has, stated precisely.  Two
+        faces in TWO person boxes are two bodies, so two people — that is what
+        licenses a cannot_link and what forbids a fold.  Two faces in ONE box
+        are one body: a guest and the phone, mirror or photo they are holding
+        (measured on the 2026-08-06 bench, where a man's phone showed his own
+        face and the heal correctly folded it away).  Calling that pair "two
+        people" would both assert a false constraint and block a correct fold.
+
+        A face with no containing box pairs with everything: we cannot show it
+        shares a body, and asserting difference fails toward OVER-count, which
+        is the visible direction.  An identity absent from this frame is not
+        co-present with anything here.
+        """
+        ba, bb = bodies.get(a), bodies.get(b)
+        if not ba or not bb:
+            return False
+        if None in ba or None in bb:
+            return True
+        return ba.isdisjoint(bb)
+
+    def _assert_co_presence(self, planner_run_id: str, seen: list[tuple]) -> None:
         """Tell the gallery that everyone seen in ONE frame is a different person.
 
         THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
@@ -1203,15 +1237,26 @@ class RunLoop:
         """
         if self.s.copresence_split <= 0:
             return  # off: record nothing, send nothing
-        keys = sorted({
-            v["personKey"]
-            for v in verdicts
-            if v.get("personKey") and not v.get("isStaff")
-        })
+        # DIFFERENT PERSON BOXES, not merely different keys.  Two faces inside
+        # ONE person box are one body — a guest and the phone, mirror or photo
+        # they are holding — and calling those two people would block the heal
+        # that correctly folds the screen face (measured: the 2026-08-06 bench
+        # where a man's phone showed his own face, was minted, banner-flagged
+        # and then healed away without the operator lifting a finger).  Two
+        # faces in TWO boxes are two bodies, which is the certainty this whole
+        # mechanism rests on.  A face with no containing box pairs with
+        # everything: we cannot show it shares a body, and asserting difference
+        # fails toward over-count, which is the visible direction.
+        by_key: dict[str, set] = {}
+        for key, pbox_id in seen:
+            by_key.setdefault(key, set()).add(pbox_id)
+        keys = sorted(by_key)
         if len(keys) < 2:
             return  # one guest (or none) in frame: co-presence says nothing
         for i, a in enumerate(keys):
             for b in keys[i + 1:]:
+                if not self._different_bodies(by_key, a, b):
+                    continue  # one body wearing two faces: says nothing
                 pair = f"{a}|{b}"  # keys are sorted, so the pair is unordered
                 if pair in self._copresence_sent:
                     continue
@@ -1563,7 +1608,7 @@ class RunLoop:
         track_id: int,
         verdict: dict,
         face_desc: list[float] | None = None,
-        frame_keys: set | None = None,
+        frame_bodies: dict | None = None,
     ) -> None:
         """Fold a junk mint back when its own track disowns it (TRACK HEAL).
 
@@ -1660,7 +1705,7 @@ class RunLoop:
             doomed = [
                 e for e in live
                 if e["key"] and e["key"] != matched_key
-                and not (frame_keys and e["key"] in frame_keys)
+                and not self._different_bodies(frame_bodies or {}, e["key"], matched_key)
             ]
             kept = [e for e in live if not e["key"] or e["key"] == matched_key]
             if kept:
@@ -1852,7 +1897,7 @@ class RunLoop:
         track_id: int,
         verdict: dict,
         face_desc: list[float] | None = None,
-        frame_keys: set | None = None,
+        frame_bodies: dict | None = None,
     ) -> bool:
         """Fold a fresh mint into the identity its own track is locked to.
 
@@ -1926,17 +1971,18 @@ class RunLoop:
         with self._lock:
             self._prune_locks(now)
             lock = self._locks.get(track_id)
-            if lock is not None and frame_keys and lock["key"] in frame_keys:
-                lock = None  # co-present this frame: not the same person
-            # SAME-FRAME BINDING IS NOT EVIDENCE (see the docstring): a lock
-            # bound by an earlier face of THIS frame means two faces landed on
-            # one track box — two guests standing close, not one guest over
-            # time.  Refuse, and drop the binding: the box is ambiguous, so
-            # its claim about whose track this is cannot be trusted for the
-            # rest of the window either.
-            if lock is not None and lock.get("frame") == self._frame_no:
-                self._locks.pop(track_id, None)
-                lock = None
+            if lock is not None and self._different_bodies(
+                frame_bodies or {}, minted_key, lock["key"]
+            ):
+                lock = None  # a different body this frame: not the same person
+            # SUPERSEDED BY THE BODY RULE.  This used to refuse any lock bound
+            # during THIS frame, because two faces on one track box meant two
+            # guests standing close — and with no way to tell bodies apart,
+            # refusing was the only safe answer.  _different_bodies can now
+            # tell them apart properly: two PERSON boxes are two guests (still
+            # refused, below), one person box is one guest holding a phone or
+            # standing by a mirror (correctly folded, as the 2026-08-06 bench
+            # showed).  The blunt guard would have blocked that fold forever.
         if lock is None:
             return False
         locked_key = lock["key"]
