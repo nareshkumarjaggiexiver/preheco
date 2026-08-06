@@ -1644,3 +1644,30 @@ def test_v2_chromatic_vs_achromatic_clash_and_chromatic_stability():
     assert red_dim is not None and red_lit is not None and white is not None
     assert intersection(red_dim, red_lit) > 0.9, "same red cloth, dim vs lit"
     assert intersection(red_dim, white) < 0.05, "cloth with colour vs cloth without"
+
+
+def test_a_healed_mint_leaves_the_ledger_too():
+    """The register must stop showing a guest the count no longer contains.
+
+    Measured live (run 6e1a5d): three mints auto-healed within seconds, the
+    gallery correctly held 3 identities — and the register showed 6, because
+    the mint ledger still advertised the folded three: cards without frames,
+    one still wearing a "likely duplicate" chip.  A heal retires the key from
+    the gallery AND the ledger in the same breath.
+    """
+    script = [
+        scripted_verdict("p00001", True, None),
+        scripted_verdict("p00002", True, 0.3084),    # the junk re-entry mint
+        scripted_verdict("p00001", False, 0.69),     # same track disowns it -> heal
+    ]
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+
+    assert final["healedSplits"] == 1 and final["unique"] == 1
+    match_taps = [t["payload"] for t in fake.taps if t["stage"] == "match"]
+    ledger = match_taps[-1].get("mints", [])
+    keys = [m["personKey"] for m in ledger]
+    assert keys == ["p00001"], (
+        f"the folded mint must vanish from the ledger with the heal (saw {keys})"
+    )
