@@ -81,6 +81,16 @@ services:
       args: { SERVICE: tracker, PORT: "7103" }
     image: heco-tracker
     ports: ["7103:7103"]
+    environment:
+      # Frames a track may coast unmatched before it is dropped. Default 30
+      # (~7.5 s at the bench's 3.97 fps), raised from 15 (3.75 s) because on
+      # run 6e1a5d ONE person produced SIX tracker ids — 2, 5, 6, 7, 8, 12 —
+      # as the person detector kept losing them while SEATED and every gap
+      # past 3.75 s minted a fresh id. This treats a symptom: the disease is
+      # the detector, and a longer coast widens the window for a ghost track
+      # to latch onto a DIFFERENT person, which is why the runner's clothing
+      # guard and the lock's counters exist. Unset renders as "" = the default.
+      HECO_TRACKER_MAX_AGE: ${HECO_TRACKER_MAX_AGE-}
 
   faces:
     <<: *heco-service
@@ -124,6 +134,17 @@ services:
       # changed. Default 0.50 (reasoned, uncalibrated); 0 disables.
       HECO_MATCH_APPEARANCE_CLASH: ${HECO_MATCH_APPEARANCE_CLASH-}
       HECO_MATCH_NEARMISS_FLOOR: ${HECO_MATCH_NEARMISS_FLOOR-}
+      # The WEAK near-miss band (CONTRACTS.md v3): a mint whose face cosine
+      # lands in [WEAK_FLOOR, NEARMISS_FLOOR) is still suggested to the
+      # operator when the clothing agrees at >= NEARMISS_CLOTHES. Run 6e1a5d
+      # is why: two splits of ONE person sat at face 0.212 and 0.228 — under
+      # the 0.29 banner floor, so nothing fired — while their clothing read
+      # 0.797 and 0.875. Defaults 0.15 / 0.78, and 0.78 is deliberately ABOVE
+      # the 0.747 measured IMPOSTOR clothing reading. That margin is thin,
+      # which is exactly why this is a SUGGESTION and never a merge.
+      # WEAK_FLOOR=0 disables the weak band entirely.
+      HECO_MATCH_NEARMISS_WEAK_FLOOR: ${HECO_MATCH_NEARMISS_WEAK_FLOOR-}
+      HECO_MATCH_NEARMISS_CLOTHES: ${HECO_MATCH_NEARMISS_CLOTHES-}
 
   runner:
     <<: *heco-service
@@ -149,11 +170,26 @@ services:
       # "use the default"; HECO_HEAL_WINDOW_S=0 disables healing.
       HECO_HEAL_WINDOW_S: ${HECO_HEAL_WINDOW_S-}
       HECO_HEAL_MIN_COSINE: ${HECO_HEAL_MIN_COSINE-}
-      # Heal appearance veto (the tracker-swap detector): a heal fold whose
-      # mint-frame torso descriptor clashes (histogram intersection below this)
-      # with the healing frame's is refused. Default 0.50 (reasoned,
-      # uncalibrated); 0 disables the veto. Agreement never loosens the heal.
+      # TRACK IDENTITY LOCK: once a verdict on a track matches an existing
+      # identity at >= this cosine, a LATER mint on that same track is folded
+      # straight back into it (unique -1, lockedTrackFolds +1) instead of
+      # waiting for the heal's second comfortable match — which on run 6e1a5d
+      # never came, leaving p00005 (face 0.212) and p00006 (0.228) standing.
+      # Default 0.45, the heal's floor, above the 0.377 measured impostor
+      # ceiling. 0 disables the lock: a wrong merge under-counts SILENTLY, so
+      # every mechanism that makes track identity more authoritative ships
+      # with an off switch and its own counter.
+      HECO_TRACK_LOCK_MIN_COSINE: ${HECO_TRACK_LOCK_MIN_COSINE-}
+      # Clothing guard on BOTH folds (heal and lock), three bands, not a cliff:
+      # below CLASH (default 0.35) is a genuine disagreement and refuses the
+      # fold (healVetoedByAppearance); CLASH..UNSURE (default 0.55) proceeds
+      # but counts healUncertainAppearance; at/above UNSURE proceeds silently.
+      # The old single 0.50 floor vetoed a probably-correct fold at 0.4991 on
+      # run 6e1a5d. 0 in CLASH disables the refusal; absent descriptors never
+      # veto and never count. Agreement never loosens a cosine floor — a
+      # measured impostor pair reached clothing 0.747.
       HECO_HEAL_APPEARANCE_CLASH: ${HECO_HEAL_APPEARANCE_CLASH-}
+      HECO_HEAL_APPEARANCE_UNSURE: ${HECO_HEAL_APPEARANCE_UNSURE-}
       HECO_TAP_DUTY_FACTOR: ${HECO_TAP_DUTY_FACTOR-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}

@@ -17,6 +17,7 @@ import pytest
 from app.appearance import intersection, torso_descriptor
 from app.config import Settings
 from app.loop import RunLoop, httpx_file_transport, httpx_transport
+from heco_common.imaging import decode_jpeg_b64
 from heco_common.planner import PlannerClient
 
 
@@ -1063,6 +1064,25 @@ def solid_jpeg_b64(bgr, w=160, h=240) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+def split_image(left_bgr, right_bgr, split_x=40, w=160, h=240) -> np.ndarray:
+    """A two-colour frame: the torso crop (x 19..61) is half one, half the other.
+
+    This is the MID-RANGE clothing reading the three bands exist for — 0.4762
+    against the solid version of ``left_bgr``, which the old hard 0.50 floor
+    would have called a tracker swap and vetoed.
+    """
+    img = np.full((h, w, 3), left_bgr, dtype=np.uint8)
+    img[:, split_x:] = right_bgr
+    return img
+
+
+def split_jpeg_b64(left_bgr, right_bgr, split_x=40, w=160, h=240) -> str:
+    """The same, JPEG-encoded for the fake ingest to serve."""
+    ok, buf = cv2.imencode(".jpg", split_image(left_bgr, right_bgr, split_x, w, h))
+    assert ok
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
 def test_torso_descriptor_is_48_floats_l1_normalized():
     """The wire contract: 48 floats summing to 1 (v2 partition inside)."""
     d = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
@@ -1671,3 +1691,387 @@ def test_a_healed_mint_leaves_the_ledger_too():
     assert keys == ["p00001"], (
         f"the folded mint must vanish from the ledger with the heal (saw {keys})"
     )
+
+
+# ---------- the track identity LOCK + the clothing bands (bench 6e1a5d, 08-06)
+#
+# GROUND TRUTH: ONE person, walking out of frame, back in, then sitting down.
+# The tracker gave that one person SIX ids — track 2 (53 frames), 5 (24), 6
+# (8), 7 (6), 8 (6), 12 (7) — at 3.97 fps, where the old 15-frame max-age dies
+# after 3.75 s and every seated detector gap outlasted it.  Three of the mints
+# were auto-healed back into p00001.  TWO SURVIVED: p00005 (face 0.212 vs
+# p00001, clothing 0.797) and p00006 (0.228 / 0.875).  Both were minted by a
+# track that had ALREADY matched p00001 comfortably, and the heal could not
+# touch them because it waits for a LATER comfortable match on that track,
+# which never came; both also sat under the 0.29 near-miss floor, so not even
+# a banner fired.  The lock acts on the evidence already in hand.
+#
+# One more measurement bounds every test below: the closest measured IMPOSTOR
+# pair (two genuinely different men) sat at face 0.377 with clothing 0.503,
+# and another impostor pair reached clothing 0.747 — so clothing may refuse a
+# fold, never justify one.
+
+
+LOCK_SCRIPT = [
+    scripted_verdict("p00001", True, None),    # the guest's first sighting
+    scripted_verdict("p00001", False, 0.62),   # the track RESOLVES to p00001
+    scripted_verdict("p00009", True, 0.21),    # ...then mints anyway (p00005/6)
+]
+
+
+class TrackIds(V1Fake):
+    """V1Fake whose tracker reports a SCRIPTED track id per /track call.
+
+    V1Fake numbers tracks from the person-box index, so every frame is track
+    1 and a test can never show what bench 6e1a5d actually did: one person
+    carried across six ids.  This serves the ids in order (the last repeats
+    once exhausted), which is what makes "the lock is scoped to ONE track"
+    and distinctTracks testable at all.
+    """
+
+    def __init__(self, track_ids: list[int], **kw):
+        """Serve one frame per scripted track id."""
+        super().__init__(n_frames=len(track_ids), face_widths=(60.0,), **kw)
+        self.track_ids = list(track_ids)
+        self.track_calls = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Answer /track with the scripted id; everything else is V1Fake's."""
+        if request.url.host == "tracker" and request.url.path == "/track":
+            self.calls.append("tracker /track")
+            body = json.loads(request.content)
+            i = min(self.track_calls, len(self.track_ids) - 1)
+            self.track_calls += 1
+            return httpx.Response(200, json={
+                "tracks": [
+                    {"id": self.track_ids[i], "box": b, "ageFrames": 1, "hits": 1}
+                    for b in body["boxes"]
+                ]
+            })
+        return super().handler(request)
+
+
+def test_lock_folds_a_later_mint_without_waiting_for_a_second_match():
+    """THE REPLAY THE HEAL CANNOT DO: resolve at 0.62, mint later, fold NOW.
+
+    p00005 and p00006 survived bench 6e1a5d because the heal needs a LATER
+    comfortable match on the same track to fire and the seated subject never
+    supplied one.  Here the script simply STOPS after the mint — no further
+    verdict arrives — and the fold must still have happened, via /merge with
+    onlyIfSingleton (machine evidence gets the guard an operator's does not).
+    """
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00001", "drop": "p00009",
+        "onlyIfSingleton": True,
+    }]
+    assert final["unique"] == 1, "one person, one guest"
+    assert final["lockedTrackFolds"] == 1
+    assert final["healedSplits"] == 0, "the heal never fired — that is the point"
+    assert "lockedTrackFolds=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["lockedTrackFolds"] == 1
+    assert fake.run_ended["results"]["unique"] == 1
+
+
+def test_lock_disabled_by_zero_knob_leaves_the_split_standing():
+    """HECO_TRACK_LOCK_MIN_COSINE=0 is the off switch (config semantics).
+
+    Every mechanism that makes track identity more authoritative amplifies the
+    SILENT failure — a wrong merge under-counts and nobody ever sees it — so
+    each one must be switchable off in the field without a rebuild.  With the
+    lock off the run reproduces the bench exactly: the mint stands, unique 2.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, track_lock_min_cosine=0.0).run()
+
+    assert fake.merges == []
+    assert final["unique"] == 2
+    assert final["lockedTrackFolds"] == 0
+
+
+def test_lock_never_fires_across_different_track_ids():
+    """A lock binds ONE track: track 5's mint is not track 2's business.
+
+    The lock's entire claim is "THIS track was already this person moments
+    ago".  Two ids are two claims, and folding across them would merge two
+    people on the strength of nothing at all — precisely the silent under-count
+    this system fears most.
+    """
+    fake = TrackIds([2, 2, 5], match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [], "a mint on another track must never fold"
+    assert final["unique"] == 2
+    assert final["lockedTrackFolds"] == 0
+    assert final["distinctTracks"] == 2
+
+
+def test_lock_below_the_cosine_floor_never_binds_the_track():
+    """A 0.40 match is inside impostor range (0.377) and binds nothing.
+
+    The lock floor is the heal's floor for the heal's reason: the closest
+    measured impostor pair on this camera reached face 0.377, so evidence
+    below 0.45 cannot say whose track this is — and a lock set on it would
+    fold a stranger's mint into the wrong guest, silently.
+    """
+    script = list(LOCK_SCRIPT)
+    script[1] = scripted_verdict("p00001", False, 0.40)
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == []
+    assert final["unique"] == 2
+    assert final["lockedTrackFolds"] == 0
+
+
+def test_lock_fold_refused_by_the_gallery_counts_nothing():
+    """merged=false (no longer a singleton, or an operator split) counts NOTHING.
+
+    The match service holds evidence the loop does not — a second template
+    means the gallery independently re-sighted the mint, contradicting the
+    junk-mint theory — so the refusal is the system working, not an error.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(LOCK_SCRIPT))
+    fake.merge_ok = False
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert len(fake.merges) == 1, "attempted once, refused, not retried in a loop"
+    assert final["unique"] == 2, "the refused mint keeps its place in the count"
+    assert final["lockedTrackFolds"] == 0
+
+
+def test_lock_fold_vetoed_when_the_locked_and_minting_frames_clash():
+    """THE TRACKER-SWAP GUARD ON THE LOCK: right geometry, wrong shirt.
+
+    A longer tracker max-age (30 frames, ~7.5 s) widens the window in which a
+    ghost track can latch onto a DIFFERENT person, and the lock then makes
+    that track's identity authoritative — the two changes multiply each
+    other's risk.  So the lock carries the same clothing guard as the heal:
+    the frame that set the lock wears RED, the frame that mints wears BLUE
+    (intersection 0.0), and the fold is refused rather than erasing a real
+    guest.
+    """
+    red, blue = solid_jpeg_b64(RED_BGR), solid_jpeg_b64(BLUE_BGR)
+    fake = TorsoFrames(images=[red, red, blue], match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [], "a clashing fold must never reach /merge"
+    assert final["unique"] == 2, "the mint survives: it may be a real person"
+    assert final["lockedTrackFolds"] == 0
+    assert final["healVetoedByAppearance"] == 1
+    assert fake.run_ended["results"]["healVetoedByAppearance"] == 1
+
+
+def test_distinct_tracks_counts_every_id_a_run_ever_saw():
+    """THE BENCH NUMBER, finally on the record: 6 ids, 1 person.
+
+    Tracks 2/5/6/7/8/12 were one guest, and that was discoverable only by
+    querying the run's SQLite by hand.  distinctTracks rides the status, the
+    end-of-run notes and the structured results, so a 6-to-1 ratio against
+    `unique` is readable months later without a debugger.
+    """
+    ids = [2, 5, 6, 7, 8, 12]
+    script = [scripted_verdict(f"p{i:05d}", True, 0.2) for i in range(1, 7)]
+    fake = TrackIds(ids, match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["distinctTracks"] == 6
+    assert final["unique"] == 6, "six unhealed mints — the bench, reproduced"
+    assert "distinctTracks=6" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["distinctTracks"] == 6
+
+
+def test_distinct_tracks_counts_ids_not_sightings():
+    """One track seen on every frame is ONE distinct track, not one per frame."""
+    fake = TrackIds([4, 4, 4], match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert final["distinctTracks"] == 1
+
+
+# ----------------------------------------- the three clothing bands (finding C)
+#
+# The heal's clothing check was a CLIFF: intersection < 0.50 refused the fold.
+# On bench 6e1a5d it refused one at 0.4991 — nine ten-thousandths — on a fold
+# that was probably correct (track 2 had linked p00001 and p00005, and the
+# pipeline threw that evidence away).  The same run shows why no cliff can sit
+# there: the same man's surviving splits read 0.797 and 0.875 while two
+# genuinely DIFFERENT men reached 0.747 and another impostor pair 0.503.  So:
+# clash (< 0.35) refuses, uncertain ([0.35, 0.55)) PROCEEDS and is counted,
+# corroborated (>= 0.55) proceeds silently.
+
+
+def descriptor_pair(sim: float) -> tuple[list[float], list[float]]:
+    """Two 48-float descriptors whose histogram intersection is exactly ``sim``.
+
+    Shared mass ``sim`` in bin 0, the remainder parked in bins the other side
+    leaves empty — so the intersection is ``sim`` to the float, which is what
+    the 0.4991 boundary case needs (a JPEG cannot be aimed that precisely).
+    """
+    a = [0.0] * 48
+    b = [0.0] * 48
+    a[0] = b[0] = sim
+    a[1] = 1.0 - sim
+    b[2] = 1.0 - sim
+    return a, b
+
+
+def band_loop() -> RunLoop:
+    """A RunLoop built but never run, for exercising the band logic directly."""
+    return make_loop(V1Fake(n_frames=1), {"eventId": "ev-1", "source": {"path": "/x.mp4"}})
+
+
+def test_clothing_band_clash_refuses_the_fold():
+    """Below HECO_HEAL_APPEARANCE_CLASH (0.35) is a genuine disagreement."""
+    loop = band_loop()
+    a, b = descriptor_pair(0.30)
+    assert loop._appearance_refuses("heal", 2, "p00005", "p00001", a, b) is True
+    assert loop.status()["healVetoedByAppearance"] == 1
+    assert loop.status()["healUncertainAppearance"] == 0
+
+
+def test_the_measured_zero_point_four_nine_nine_one_now_proceeds_and_is_counted():
+    """THE 0.4991 CASE: the fold the old 0.50 cliff refused now goes through.
+
+    Track 2 had linked p00001 and p00005; the hard floor threw that evidence
+    away over nine ten-thousandths.  A mediocre clothing reading is not
+    evidence of a swap — it is a reading that separates nobody — so the fold
+    proceeds on its face evidence and the weak corroboration is RECORDED, so
+    an operator can see how often the system leaned on it.
+    """
+    loop = band_loop()
+    a, b = descriptor_pair(0.4991)
+    assert loop._appearance_refuses("heal", 2, "p00005", "p00001", a, b) is False
+    assert loop.status()["healUncertainAppearance"] == 1
+    assert loop.status()["healVetoedByAppearance"] == 0
+
+
+def test_clothing_band_corroborated_proceeds_silently():
+    """At/above HECO_HEAL_APPEARANCE_UNSURE (0.55) nothing is counted at all.
+
+    Agreement is not evidence FOR the fold either (an impostor pair measured
+    clothing 0.747): it simply fails to object, so there is nothing to report.
+    """
+    loop = band_loop()
+    a, b = descriptor_pair(0.90)
+    assert loop._appearance_refuses("heal", 2, "p00005", "p00001", a, b) is False
+    assert loop.status()["healUncertainAppearance"] == 0
+    assert loop.status()["healVetoedByAppearance"] == 0
+
+
+def test_an_absent_descriptor_neither_vetoes_nor_counts():
+    """Absent is not zero: an unseen torso must not read as a clash — or a doubt."""
+    loop = band_loop()
+    a, _ = descriptor_pair(0.30)
+    assert loop._appearance_refuses("heal", 2, "p00005", "p00001", a, None) is False
+    assert loop._appearance_refuses("heal", 2, "p00005", "p00001", None, a) is False
+    assert loop.status()["healVetoedByAppearance"] == 0
+    assert loop.status()["healUncertainAppearance"] == 0
+
+
+def test_the_uncertain_band_heals_end_to_end_where_the_old_cliff_refused():
+    """A real fold through the whole loop on a reading the 0.50 floor rejected.
+
+    The mint frame wears RED and the healing frame is half RED / half BLUE —
+    torso intersection 0.4762, measured, i.e. inside [0.35, 0.55) and BELOW
+    the old 0.50 cliff.  The heal must fold (unique back to 1) and count the
+    weak corroboration, not veto it.
+    """
+    red = solid_jpeg_b64(RED_BGR)
+    half = split_jpeg_b64(RED_BGR, BLUE_BGR)
+    # Measured on the JPEGs the loop actually decodes, not the raw arrays: the
+    # test must stand on the number the mechanism will see.
+    sim = intersection(
+        torso_descriptor(decode_jpeg_b64(red), FACE_BOX, PERSON_BOX),
+        torso_descriptor(decode_jpeg_b64(half), FACE_BOX, PERSON_BOX),
+    )
+    assert 0.35 <= sim < 0.50, f"the fixture must sit in the old cliff's shadow ({sim})"
+
+    fake = TorsoFrames(images=[red, red, half], match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["healedSplits"] == 1, "0.4762 must no longer veto a correct fold"
+    assert final["unique"] == 1
+    assert final["healVetoedByAppearance"] == 0
+    assert final["healUncertainAppearance"] == 1
+    assert "healUncertainAppearance=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["healUncertainAppearance"] == 1
+
+
+def test_a_clear_clash_still_refuses_end_to_end_with_the_lower_floor():
+    """0.35 is a LOWER floor, not an absent one: red vs blue (0.0) still vetoes.
+
+    Dropping the cliff must not disarm the tracker-swap detector — that guard
+    is the only thing standing between a longer tracker coast and a silent
+    under-count.
+    """
+    red, blue = solid_jpeg_b64(RED_BGR), solid_jpeg_b64(BLUE_BGR)
+    fake = TorsoFrames(images=[red, red, blue], match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == []
+    assert final["healedSplits"] == 0
+    assert final["healVetoedByAppearance"] == 1
+    assert final["healUncertainAppearance"] == 0
+
+
+def test_two_guests_in_one_track_box_are_never_folded_together():
+    """THE SILENT UNDER-COUNT the lock could have introduced, refused.
+
+    _track_for assigns a face to any track whose box CONTAINS its centre, so
+    two guests standing close enough share a track id. Process their faces in
+    order and the lock's claim inverts into a lie: guest A matches p00001 and
+    binds the lock, guest B is minted on the SAME frame, and a naive lock
+    folds B into A — a real, paying guest erased, with every other guard
+    passing (a fresh mint is trivially a singleton, cannot_link is empty, the
+    0.45 floor gated the binding to A, and only differing clothes could
+    object).
+
+    The lock's claim is about ONE track across TIME, so a fold requires a
+    strictly LATER frame than the binding, and an ambiguous frame drops the
+    binding outright.  Two faces, one track, one frame: no merge, both guests
+    stand.
+    """
+    class TwoFacesOneTrack(V1Fake):
+        def handler(self, request):
+            host, path = request.url.host, request.url.path
+            if host == "persons" and path == "/detect":
+                self.calls.append("persons /detect")
+                # ONE person box wide enough to contain both face centres.
+                return httpx.Response(200, json={"boxes": [
+                    {"x": 0, "y": 0, "w": 150, "h": 115, "conf": 0.9},
+                ]})
+            if host == "faces" and path == "/detect":
+                self.calls.append("faces /detect")
+                return httpx.Response(200, json={"faces": [
+                    {"box": {"x": 10, "y": 10, "w": 60, "h": 60},
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                    {"box": {"x": 80, "y": 10, "w": 60, "h": 60},
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                ]})
+            return super().handler(request)
+
+    script = [
+        scripted_verdict("p00001", False, 0.70),  # guest A: matches, binds the lock
+        scripted_verdict("p00050", True, 0.10),   # guest B: a genuinely new guest
+    ]
+    fake = TwoFacesOneTrack(n_frames=1, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [], "a same-frame lock must never fold a second guest away"
+    assert final["lockedTrackFolds"] == 0
+    assert final["unique"] == 1, "B's mint stands (A was a match, so only B moved it)"

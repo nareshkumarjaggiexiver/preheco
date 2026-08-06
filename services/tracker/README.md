@@ -69,7 +69,8 @@ id; per-run isolation; reset semantics; env tuning.
 
 | env | default | meaning |
 | --- | ------- | ------- |
-| `TRACKER_MAX_AGE` | `15` | Frames a track may coast unmatched before it is dropped. |
+| `HECO_TRACKER_MAX_AGE` | `30` | Frames a track may coast unmatched before it is dropped. **Was 15**; bench 6e1a5d (2026-08-06) counted SIX ids for ONE person (tracks 2/5/6/7/8/12) because at 3.97 fps 15 frames is 3.75 s and every seated-detector gap longer than that minted a new id. 30 ≈ 7.5 s. Treats a symptom — the disease is the person detector losing seated bodies — and a longer coast widens the window for a ghost track to latch onto a DIFFERENT person, which the runner's clothing guard exists to catch. |
+| `TRACKER_MAX_AGE` | (unset) | Deprecated spelling of the above, still read so an existing deployment's explicit value is not silently ignored. `HECO_TRACKER_MAX_AGE` wins when both are set. |
 | `TRACKER_MIN_HITS` | `3` | Matched frames before a track is reported (ghost suppression). |
 | `TRACKER_IOU_MIN` | `0.2` | Association gate: pairs below this IoU never match. |
 | `TRACKER_RUN_TTL_S` | `3600` | Forget a run's tracker after this many seconds without a `/track`. `0` disables eviction. |

@@ -865,7 +865,8 @@ merge suggestion**.
   Otherwise `nearMiss` is `null`. Matched verdicts and staff hits **never**
   carry it. The floor sits just below the measured same-person misses
   (0.294 / 0.308 / 0.346 / 0.361). `GET /health` reports `nearMissFloor`.
-  Match service **0.6.0 → 0.7.0**.
+  Match service **0.6.0 → 0.7.0**. *(Extended to two bands with a `basis`
+  field in 0.9.0 — see below.)*
 - **THE VERDICT IS STILL A MINT — never an automatic merge.** The measured
   reason: an IMPOSTOR pair on the same camera sits at **face 0.377 with
   clothing 0.503** — two different men, near-threshold face AND agreeing
@@ -879,6 +880,57 @@ merge suggestion**.
   (`nearMissMints=N`) and the structured `results`, and logs one INFO line
   per flag (both keys, both scores) so the night is greppable.
 
+### The near-miss band becomes TWO bands (match 0.8.0 → 0.9.0)
+
+The 0.29 floor above turned out to be blind to the splits that actually cost
+a count. **Bench run 6e1a5d (2026-08-06), ground truth ONE person** who walked
+out of frame, came back, and sat down: that one person produced **six tracker
+ids**. Three of the extra mints healed back into `p00001`; two survived as
+extra guests, and this is how they read against `p00001`:
+
+| survivor | face cosine | clothing intersection | banner before 0.9.0 |
+| --- | --- | --- | --- |
+| `p00005` | 0.212 | 0.797 | none — 0.212 is under the 0.29 floor |
+| `p00006` | 0.228 | 0.875 | none — 0.228 is under the 0.29 floor |
+
+The face signal could not see either split while the v2 clothing descriptor
+was reading 0.80–0.88. Seated and turned-away re-entries at this camera's
+angles land exactly there. So `nearMiss` now has two entry routes and names
+which one spoke.
+
+- **Rider shape gains `basis`.** `nearMiss: {key, cosine, appearanceSim,
+  basis}`, same object on both routes.
+  - `basis: "face"` — cosine in **[`HECO_MATCH_NEARMISS_FLOOR` ..
+    threshold)**. Unchanged behaviour, now labelled. Clothing is *reported*,
+    never required, at this range.
+  - `basis: "clothing"` — cosine in **[`HECO_MATCH_NEARMISS_WEAK_FLOOR` ..
+    `HECO_MATCH_NEARMISS_FLOOR`)** AND `appearanceSim` **is not null** AND
+    `appearanceSim >= HECO_MATCH_NEARMISS_CLOTHES`. Absent is not zero: a
+    sighting with no torso descriptor never enters this band at all.
+- **Consumers must treat a missing/null `basis` as `"face"`.** Rows written by
+  a pre-0.9.0 match service carry no `basis` key.
+- **New knobs**, both empty-string-unset like every knob in this service, both
+  reported by `GET /health` (`nearMissWeakFloor`, `nearMissClothes`):
+  - `HECO_MATCH_NEARMISS_WEAK_FLOOR` — default **0.15**; **0 disables the weak
+    band only** and leaves the face band exactly as it was.
+  - `HECO_MATCH_NEARMISS_CLOTHES` — default **0.78**.
+  - `HECO_MATCH_NEARMISS_FLOOR = 0` remains the master switch: the weak band
+    is defined as the region *under* that floor, so with no floor there is no
+    weak band either.
+- **THE HONEST MARGIN, because this is the thinnest evidence in the system.**
+  The closest measured impostor pair — two genuinely different men — sat at
+  face 0.377 with clothing 0.503, and **another impostor pair reached clothing
+  0.747**. The 0.78 bar clears the worst measured impostor by **0.033**. That
+  is a hair, not a margin. It is defensible for exactly one reason: a
+  near-miss is a **suggestion a human confirms, never a merge** — `isNew`
+  stays `true`, the count moves only on an operator click. Stated plainly: **at
+  a venue with uniformed staff, a dress code or similar traditional dress this
+  band is expected to produce wrong suggestions, and it is the first knob to
+  turn off** (`HECO_MATCH_NEARMISS_WEAK_FLOOR=0`). Clothing agreement alone
+  never proves identity; here it only buys the operator a look.
+- Everything else is unchanged: out-of-band mints carry `nearMiss: null`,
+  matched verdicts and staff hits never carry the rider on either basis, and
+  a mint can still never carry `overlap`.
 
 ## v2 addition — the gallery confesses its own overlaps (2026-08-06)
 
@@ -912,3 +964,43 @@ past a partition), but "persons 2" while one body stood inside a zone read
 as a bug to the operator. The person-detect tap now carries **`inZone`**
 (count + per-box flag) so the console can render "persons 2 · 1 in zone" —
 same facts, no ambiguity.
+
+
+## v3 — the runner trusts the tracker, within limits (2026-08-06)
+
+Bench 6e1a5d, ground truth ONE person who walked out of frame, returned, and
+sat down, produced **six tracker ids** (2/5/6/7/8/12). Three mints healed
+back; two survived — p00005 (face 0.212 vs p00001, clothing 0.797) and
+p00006 (0.228 / 0.875) — because the heal is a CURE that needs a second
+comfortable match to arrive, and on a subject the detector keeps losing it
+never does. Both also sat under the 0.29 near-miss floor, so no banner fired
+either. Three mechanisms answer that, each env-gated because each makes track
+identity more authoritative and therefore amplifies the SILENT failure (a
+wrong merge under-counts and nobody sees it) if the tracker swaps people.
+
+| knob | default | effect |
+| --- | --- | --- |
+| `HECO_TRACKER_MAX_AGE` | `30` | frames a track may coast unmatched (was hard-coded 15 = 3.75 s at the bench's 3.97 fps). Treats a symptom: the disease is YOLOX-nano dropping seated bodies. |
+| `HECO_TRACK_LOCK_MIN_COSINE` | `0.45` | a verdict matching at or above this BINDS its track to that identity; a later mint on the same track folds immediately. **0 disables.** |
+| `HECO_HEAL_APPEARANCE_CLASH` | `0.35` (was 0.50) | below this the torso CLASHES: the fold is refused. |
+| `HECO_HEAL_APPEARANCE_UNSURE` | `0.55` | between clash and this the fold PROCEEDS but is counted as weakly corroborated. |
+
+- **The lock is time-scoped, not frame-scoped.** Its claim is "this track was
+  following THIS person a moment ago". `_track_for` assigns a face to any
+  track whose box contains its centre, so two guests standing close share a
+  track id — and processing their faces in order would match the first, bind
+  the lock, then fold the SECOND: a real guest erased, with every other guard
+  passing. So a fold requires a **strictly later frame** than the binding,
+  and a frame that puts two faces on one track **drops that track's lock**.
+- **Clothing is a three-band validator, not a cliff.** The old 0.50 hard floor
+  vetoed a probably-correct fold at 0.4991. Clash (< 0.35) refuses and counts
+  `healVetoedByAppearance`; uncertain (0.35–0.55) proceeds and counts
+  `healUncertainAppearance`; above proceeds silently. Absent descriptors
+  veto nothing and count nothing.
+- **New run counters** (status, end-of-run notes, `results`; absent on older
+  runners, and absent is not zero): **`lockedTrackFolds`**,
+  **`distinctTracks`**, **`healUncertainAppearance`**.
+  `healVetoedByAppearance` now counts refusals from BOTH the heal and the
+  lock fold — it is a clothing-refusal counter, not a heal counter.
+- **`nearMissMints` counts both near-miss bands** (face and clothing basis);
+  the rider's `basis` field is what distinguishes them per suggestion.
