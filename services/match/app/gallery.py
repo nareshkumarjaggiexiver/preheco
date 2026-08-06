@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .appearance import best_intersection
 from .store import VectorStore, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -48,6 +49,14 @@ class MatchResult:
     sub_canon: bool  # this face was below the 80 px production canon
     template_n: int = 1  # templates this identity holds after the call
     template_added: bool = False  # this sighting was enrolled as an extra view
+    # Best torso-histogram intersection vs the matched identity's stored
+    # descriptors; None when either side lacks one (absent is not zero), and
+    # always None for a fresh mint — there was nothing stored to compare with.
+    appearance_sim: float | None = None
+    # An enrolment _should_enrol had approved was refused because the torso
+    # descriptor clashed.  Never set on the verdict path: appearance vetoes
+    # WRITES, not verdicts.
+    appearance_vetoed: bool = False
 
 
 def db_path(data_dir: Path, run_id: str) -> Path:
@@ -200,6 +209,8 @@ def match(
     template_confidence: float = 0.0,
     template_margin: float = 0.0,
     template_max_cosine: float = 1.0,
+    appearance: list[float] | None = None,
+    appearance_clash: float = 0.0,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -225,9 +236,42 @@ def match(
     rows share a key, the returned cosine IS that identity's best template
     score.  Verified, not assumed (``test_search_is_per_identity_best``).
 
-    The defaults here are the pre-M1 behaviour (cap 1, no enrolment); the
-    service passes the real values from :mod:`app.config`, so a caller that
-    only wants the old semantics gets them by leaving the knobs alone.
+    APPEARANCE IS ADVISORY (v1 tie-breaker, 2026-08-06).  ``appearance`` is
+    the sighting's torso descriptor (:mod:`app.appearance`).  Exactly three
+    things happen with it here, and nothing else:
+
+    1. It is STORED beside any template this call writes — the founding mint
+       and every enrolled extra — so later sightings have evidence to compare
+       against.
+    2. ``appearance_sim`` reports the best histogram intersection against the
+       matched identity's ALREADY-stored descriptors, for visibility (the
+       runner's taps and counters read it).  ``None`` when either side lacks
+       a descriptor — old galleries, no person box, tiny crops: absent is not
+       zero — and ``None`` for a fresh mint, which has nothing stored yet.
+    3. ENROLMENT VETO (anti-poison): a sighting :func:`_should_enrol` had
+       approved as an extra template is NOT kept when its descriptor clashes
+       (``appearance_sim < appearance_clash``) with everything the identity
+       has stored.  The one thing worse than missing a good template is
+       keeping a poisoned one: a template enrolled off a tracker swap or a
+       borderline impostor becomes a bridge that silently merges two paying
+       guests at every later crossing.
+
+    What appearance NEVER does is touch the verdict.  ``is_new``,
+    ``person_key`` and ``cosine`` are decided by the face alone, because the
+    measured evidence runs the other way: the closest impostor pair on this
+    camera — two DIFFERENT men at cosine 0.377, above the 0.363 threshold —
+    were BOTH IN LIGHT SHIRTS, so a torso "rescue" of near-threshold face
+    matches would have merged two real guests into one invoice line.  And the
+    same-person misses (0.294/0.308/0.361) wore the SAME clothes in every
+    frame, so at a wedding full of light shirts a rescue would chain
+    strangers together wholesale.  Advisory means: appearance may only refuse
+    a WRITE, never make or unmake a match.  ``appearance_clash <= 0`` is the
+    off switch, and an absent descriptor on either side never vetoes.
+
+    The defaults here are the pre-M1 behaviour (cap 1, no enrolment, no
+    appearance veto); the service passes the real values from
+    :mod:`app.config`, so a caller that only wants the old semantics gets
+    them by leaving the knobs alone.
     """
     sub_canon = quality is not None and quality < canon_px
     store = open_store(db_path(data_dir, run_id))
@@ -235,6 +279,10 @@ def match(
     with store.transaction():
         hit = store.search(embedding)
         if hit is not None and hit.cosine >= threshold:
+            # Similarity vs what is ALREADY stored, computed before this call
+            # writes anything — otherwise an enrolled sighting would be
+            # compared against itself and always report 1.0.
+            appearance_sim = best_intersection(appearance, store.appearances_for(hit.key))
             added = _should_enrol(
                 store,
                 hit.key,
@@ -247,8 +295,28 @@ def match(
                 template_margin,
                 template_max_cosine,
             )
+            vetoed = False
+            if (
+                added
+                and appearance_clash > 0
+                and appearance_sim is not None
+                and appearance_sim < appearance_clash
+            ):
+                # The face said "same person, comfortably"; the torso says the
+                # clothes agree with NONE of this identity's stored sightings.
+                # Within one event clothing is constant, so the sighting is
+                # suspect evidence (tracker swap, near-threshold impostor) and
+                # the identity must not grow towards it.  The VERDICT above is
+                # untouched — this refuses only the write.
+                added, vetoed = False, True
             if added:
-                store.add(hit.key, embedding, quality=quality, sub_canon=sub_canon)
+                store.add(
+                    hit.key,
+                    embedding,
+                    quality=quality,
+                    sub_canon=sub_canon,
+                    appearance=appearance,
+                )
                 # Redundancy, NOT quality — see _should_enrol clause 5 for the
                 # measurement that killed the quality rule here.
                 store.prune_redundant(hit.key, templates_per_person)
@@ -260,8 +328,12 @@ def match(
                 sub_canon,
                 store.count_for(hit.key),
                 added,
+                appearance_sim=appearance_sim,
+                appearance_vetoed=vetoed,
             )
-        key = store.add_auto(embedding, quality=quality, sub_canon=sub_canon, prefix="p")
+        key = store.add_auto(
+            embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
+        )
         best = hit.cosine if hit is not None else None
         return MatchResult(key, True, best, store.distinct_count(), sub_canon, 1, False)
 

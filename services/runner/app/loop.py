@@ -55,7 +55,7 @@ from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 
-from . import annotate, gate, taps
+from . import annotate, appearance, gate, taps
 from .config import Settings
 from .feedback import plan_action
 from .stats import SampleBuffer, StatsBoard
@@ -249,6 +249,18 @@ class RunLoop:
             # _maybe_heal).  Each one is a guest the delivered number would
             # otherwise have over-counted by exactly one.
             "healedSplits": 0,
+            # TORSO-APPEARANCE VETOES (app/appearance.py; both ADVISORY-only
+            # mechanisms — neither ever changes a match/count verdict).
+            # healVetoedByAppearance: heal folds this loop refused because the
+            # mint frame's torso descriptor clashed with the current frame's —
+            # each one is a suspected tracker swap that would have folded the
+            # WRONG person (the heal's documented residual risk, caught).
+            # enrolVetoedByAppearance: sightings the match service kept OUT of
+            # an identity's template stack because their appearance clashed
+            # with the identity's stored descriptors (anti-poison; read from
+            # each /match reply's appearanceVetoed flag).
+            "healVetoedByAppearance": 0,
+            "enrolVetoedByAppearance": 0,
             # EXCLUSION ZONES.  excludedByZone counts faces whose box centre
             # fell inside an operator-drawn no-count polygon — dropped before
             # the gate, so they are never embedded or matched, but kept
@@ -504,6 +516,14 @@ class RunLoop:
             # `unique` months later can see how much of the number the heal
             # and the operator's zones shaped (CONTRACTS.md heal + zones).
             f"healedSplits={st['healedSplits']} "
+            # The advisory appearance signal's two vetoes (app/appearance.py):
+            # heal folds refused as suspected tracker swaps, and sightings the
+            # matcher kept out of a template stack.  Reported beside
+            # healedSplits because they qualify it — a report reading the heal
+            # numbers months from now must see when the veto was doing the
+            # refusing.
+            f"healVetoedByAppearance={st['healVetoedByAppearance']} "
+            f"enrolVetoedByAppearance={st['enrolVetoedByAppearance']} "
             f"excludedByZone={st['excludedByZone']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
@@ -523,6 +543,8 @@ class RunLoop:
             "frames": frames,
             "matches": st["matches"],
             "healedSplits": st["healedSplits"],
+            "healVetoedByAppearance": st["healVetoedByAppearance"],
+            "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
             "excludedByZone": st["excludedByZone"],
         }
         try:
@@ -728,12 +750,38 @@ class RunLoop:
         for face in kept[: len(embeddings)]:
             board.observe("embed", "faceBoxWPx", float(face["box"]["w"]))
 
+        # TORSO APPEARANCE (app/appearance.py) — decoded ONCE per frame, only
+        # when a gate survivor could actually carry a descriptor (there must be
+        # a person box to crop within).  The stage payloads are base64 JPEG, so
+        # this is the loop's own decode; a stub/opaque frame or a frame with no
+        # person boxes simply produces no descriptors, and per the absent-is-
+        # not-zero convention nothing downstream may treat that as a clash.
+        frame_img = None
+        if boxes:
+            try:
+                frame_img = decode_jpeg_b64(image_b64)
+            except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
+                frame_img = None
+
         # match (one call per embedding; gallery keyed by the planner run id;
         # staff checked first when the run carries a siteId)
         verdicts: list[dict] = []
         for face, emb in zip(kept, embeddings, strict=False):
             w = float(face["box"]["w"])
+            # ONCE per face: the descriptor rides the /match body (advisory —
+            # the matcher may refuse to ENROL a clashing sighting as a new
+            # template, never change the verdict) and then serves as this
+            # face's heal-veto evidence below.
+            face_desc = None
+            if frame_img is not None:
+                pbox = self._person_box_for(face, boxes)
+                if pbox is not None:
+                    face_desc = appearance.torso_descriptor(
+                        frame_img, face["box"], pbox
+                    )
             body = {"runId": planner_run_id, "embedding": emb, "quality": w}
+            if face_desc is not None:
+                body["appearance"] = face_desc
             if site_id:
                 body["siteId"] = site_id
             m = self._timed(
@@ -758,6 +806,11 @@ class RunLoop:
                     # BEFORE anyone blames the threshold.  None on a staff hit.
                     "templateN": m.get("templateN"),
                     "templateAdded": bool(m.get("templateAdded", False)),
+                    # Best histogram intersection vs the matched identity's
+                    # stored torso descriptors (null for staff hits, new mints
+                    # or either side descriptor-less) — visibility only, so
+                    # the console can watch the advisory signal live.
+                    "appearanceSim": m.get("appearanceSim"),
                     "box": face.get("box"),
                 }
             )
@@ -781,6 +834,13 @@ class RunLoop:
                 )
                 if m.get("templateAdded"):
                     st["templatesEnrolled"] += 1
+                # The match service refused to keep this sighting as an extra
+                # template because its torso clashed with the identity's
+                # stored appearance (anti-poison).  The VERDICT is untouched —
+                # the guest still matched and still counts — this only tallies
+                # how often the enrolment veto engaged.
+                if m.get("appearanceVetoed"):
+                    st["enrolVetoedByAppearance"] += 1
                 self._note_templates(m.get("personKey"), m.get("templateN"))
             # TRACK HEAL bookkeeping: only verdicts that can be pinned to a
             # track participate (no containing track = no heal for this one).
@@ -788,9 +848,9 @@ class RunLoop:
             if track_id is None:
                 continue
             if m.get("isNew"):
-                self._record_mint(track_id, m)
+                self._record_mint(track_id, m, face_desc)
             else:
-                self._maybe_heal(planner_run_id, track_id, m)
+                self._maybe_heal(planner_run_id, track_id, m, face_desc)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
@@ -932,12 +992,43 @@ class RunLoop:
                 best_id, best_d = t.get("id"), d
         return best_id
 
+    @staticmethod
+    def _person_box_for(face: dict, boxes: list) -> dict | None:
+        """The person box a face belongs to: box centre inside the person box.
+
+        Same association rule as :meth:`_track_for` (centre containment, ties
+        to the nearest box centre) but over the RAW detector boxes, because the
+        torso crop needs the person's full extent this frame — a track box can
+        be a stale prediction, and a descriptor histogrammed off background
+        would manufacture exactly the clashes the veto must only see in real
+        tracker swaps.  None when no box contains the face (a face detected
+        outside every person box carries no torso to describe), and per the
+        absent-is-not-zero convention None disables the veto rather than
+        feeding it.
+        """
+        fb = face.get("box") or {}
+        cx = float(fb.get("x", 0.0)) + float(fb.get("w", 0.0)) / 2.0
+        cy = float(fb.get("y", 0.0)) + float(fb.get("h", 0.0)) / 2.0
+        best: dict | None = None
+        best_d = 0.0
+        for b in boxes:
+            bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+            bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
+            if not (bx <= cx <= bx + bw and by <= cy <= by + bh):
+                continue
+            d = (bx + bw / 2.0 - cx) ** 2 + (by + bh / 2.0 - cy) ** 2
+            if best is None or d < best_d:
+                best, best_d = b, d
+        return best
+
     #: At most this many un-healed mints remembered per track.  A real track
     #: double- or maybe triple-mints in a blurry crossing; dozens would mean
     #: the tracker is churning ids and the bookkeeping must not amplify it.
     _MINTS_PER_TRACK_CAP = 4
 
-    def _record_mint(self, track_id: int, verdict: dict) -> None:
+    def _record_mint(
+        self, track_id: int, verdict: dict, face_desc: list[float] | None = None
+    ) -> None:
         """Remember that this track just minted a new identity (heal evidence).
 
         A LIST per track, not a single slot.  The 2026-08-06 morning bench
@@ -949,6 +1040,12 @@ class RunLoop:
         mint" and p00003 — bookkeeping already gone — survived as a phantom
         guest.  Every un-healed mint of the track stays remembered for the
         window, so a later comfortable match can fold ALL the others.
+
+        ``face_desc`` is the mint frame's torso descriptor (or None when it
+        could not be measured — see app/appearance.py).  It is remembered so a
+        later heal can compare what the track's wearer LOOKED like at mint
+        time against the frame that wants to fold it: a clash there is the
+        fingerprint of a tracker swap, the heal's documented residual risk.
 
         Expired entries are pruned here — the only growth point — so the
         bookkeeping is bounded by the tracks active within one heal window.
@@ -966,11 +1063,18 @@ class RunLoop:
             entries.append({
                 "key": verdict.get("personKey"),
                 "cosine": verdict.get("cosine"),
+                "appearance": face_desc,
                 "at": now,
             })
             del entries[: -self._MINTS_PER_TRACK_CAP]
 
-    def _maybe_heal(self, planner_run_id: str, track_id: int, verdict: dict) -> None:
+    def _maybe_heal(
+        self,
+        planner_run_id: str,
+        track_id: int,
+        verdict: dict,
+        face_desc: list[float] | None = None,
+    ) -> None:
         """Fold a junk mint back when its own track disowns it (TRACK HEAL).
 
         The failure this kills, measured live: the bench (3 real people,
@@ -1011,16 +1115,34 @@ class RunLoop:
         * the 20 s window and staff exemption (staff verdicts never reach
           here — see the verdict loop).
 
-        KNOWN RESIDUAL RISK, documented rather than solved (CONTRACTS.md): a
+        KNOWN RESIDUAL RISK, now SHRUNK by the appearance veto (below): a
         tracker identity swap — two people crossing paths — can hand a track
         from person A to person B.  If A's mint is still a singleton inside
         the window and B matches at >= 0.45, the heal folds A into B: an
         under-count of one.  The guards above bound how often that can happen
         (singleton-only, 20 s, 0.45 floor, cannot_link respected); the hard
-        fix is track-quality gating and is out of scope tonight.  The reverse
+        fix is track-quality gating and remains out of scope.  The reverse
         ordering (track matches Y first, mints X later) is deliberately NOT
         healed — the mint came after the evidence, so the evidence says
         nothing about it.
+
+        THE APPEARANCE VETO (the tracker-swap detector, app/appearance.py):
+        clothing is constant within one event, so a track genuinely still on
+        its own person shows the same torso at mint time and at heal time —
+        while a swapped track shows person A's clothes on the mint frame and
+        person B's on the healing frame, a clash exactly when the fold would
+        be wrong.  A doomed entry whose remembered descriptor scores below
+        ``heal_appearance_clash`` (histogram intersection) against
+        ``face_desc`` is therefore refused: no /merge, ``unique`` untouched,
+        ``healVetoedByAppearance`` +1, and the bookkeeping dropped like a
+        merged=false refusal — after a swap every later verdict on this track
+        is about the OTHER person, so re-presenting the same wrong evidence
+        next verdict could only re-veto or, worse, squeak past the floor.
+        ADVISORY ONLY, and one-directional by design: absent descriptors
+        (either side) never veto — absent is not zero — and appearance
+        AGREEMENT never lowers the 0.45 cosine floor, because the measured
+        0.377 impostor pair was two DIFFERENT men both in light shirts:
+        agreeing torsos prove nothing, clashing torsos are the only signal.
         """
         if self.s.heal_window_s <= 0:
             return
@@ -1047,6 +1169,23 @@ class RunLoop:
                 self._minted.pop(track_id, None)
         for entry in doomed:
             minted_key = entry["key"]
+            # THE VETO: both sides must have been measured; a missing
+            # descriptor on either side is "could not see the torso", never
+            # "the torso differed".  Knob 0 disables (config semantics).
+            mint_desc = entry.get("appearance")
+            clash_floor = self.s.heal_appearance_clash
+            if clash_floor > 0 and mint_desc is not None and face_desc is not None:
+                sim = appearance.intersection(mint_desc, face_desc)
+                if sim < clash_floor:
+                    self._bump("healVetoedByAppearance")
+                    self.log.info(
+                        f"heal vetoed by appearance: track {track_id} minted "
+                        f"{minted_key} but its torso clashes with the frame "
+                        f"matching {matched_key} "
+                        f"(intersection={sim:.4f} < {clash_floor}) — suspected "
+                        f"tracker swap, mint kept, count unchanged"
+                    )
+                    continue
             try:
                 r = self._post(
                     f"{self.s.match_url}/merge",

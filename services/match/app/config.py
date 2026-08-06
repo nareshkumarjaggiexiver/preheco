@@ -77,6 +77,42 @@ DEFAULT_TEMPLATE_MARGIN = 0.05
 DEFAULT_TEMPLATE_MAX_COSINE = 0.90
 
 
+# ------------------------------------------- torso appearance tie-breaker (v1)
+#
+# Histogram-intersection floor BELOW which a sighting's torso descriptor is a
+# CLASH with the matched identity's stored descriptors, refusing the enrolment
+# of that sighting as a template (the anti-poison veto — app.gallery.match).
+# Appearance never touches the match verdict: the closest measured impostor
+# pair on this camera (cosine 0.377, above the 0.363 threshold) was two
+# DIFFERENT men BOTH IN LIGHT SHIRTS, so clothing must never rescue a face
+# match — it may only refuse a write.
+#
+# 0.50 is REASONED, NOT CALIBRATED — exactly like the M1 template margins.
+# The reasoning: two L1-normalised histograms of the SAME torso across
+# consecutive frames share most of their mass (intersection well above 0.5),
+# while a genuinely different outfit concentrates mass in other Hue×Saturation
+# bins (intersection well below).  The midpoint is the least-wrong uncalibrated
+# split; the first labelled torso pairs from a real event should move it.
+# 0 disables the veto entirely (the off switch, same convention as
+# TEMPLATES_PER_PERSON=1 for M1).
+DEFAULT_APPEARANCE_CLASH = 0.50
+
+
+def _env_f(name: str, default: float) -> float:
+    """Read a float knob where an EMPTY string means unset.
+
+    docker-compose renders ``${VAR-}`` as an empty string, and a bare
+    ``float("")`` once took the ingest service down at startup — so every
+    knob added since parses absent and empty the same way (the local pattern
+    ``main._env_s`` established; this service stays free of heco_common on
+    purpose).
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
+
 def threshold() -> float:
     """Return the active cosine threshold (env HECO_MATCH_THRESHOLD)."""
     return float(os.environ.get("HECO_MATCH_THRESHOLD", DEFAULT_THRESHOLD))
@@ -114,6 +150,18 @@ def template_max_cosine() -> float:
     Env HECO_MATCH_TEMPLATE_MAX_COSINE.
     """
     return float(os.environ.get("HECO_MATCH_TEMPLATE_MAX_COSINE", DEFAULT_TEMPLATE_MAX_COSINE))
+
+
+def appearance_clash() -> float:
+    """Torso-intersection floor for the enrolment veto (below = clash).
+
+    Env HECO_MATCH_APPEARANCE_CLASH; **0 disables the veto**.  The default
+    0.50 is reasoned, not calibrated — see DEFAULT_APPEARANCE_CLASH above —
+    and is deliberately env-tunable because the first labelled impostor/torso
+    pairs from a venue should be what moves it.  Empty string means unset
+    (the compose ``${VAR-}`` rendering), like every knob in this service.
+    """
+    return _env_f("HECO_MATCH_APPEARANCE_CLASH", DEFAULT_APPEARANCE_CLASH)
 
 
 def data_dir() -> Path:

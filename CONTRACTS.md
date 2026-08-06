@@ -24,7 +24,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest (v2 below) |
+| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker (v2 below) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -715,3 +715,93 @@ diagnoses in one night — each needed rows that no longer existed.
 - Retention stays a real control: 24 h covers the morning-after dispute and is
   deliberately not longer, because every gallery file holds real guests' face
   embeddings.
+
+## v2 addition — clothing is an ADVISORY tie-breaker, never evidence of identity (2026-08-06)
+
+Clothing is constant within one event, so a torso-appearance descriptor is
+real evidence about whether two sightings seconds apart are the same body.
+It is deliberately given NO voice in identity, because the bench measured why
+it must not have one: the closest impostor pair on this camera — two
+DIFFERENT men at cosine **0.377**, above the 0.363 face threshold — were
+**BOTH IN LIGHT SHIRTS**. Any mechanism that let a matching torso rescue a
+borderline face match would have merged those two paying guests into one
+invoice line, invisibly. Meanwhile the same-person misses (0.294 / 0.308 /
+0.361) wore the same clothes in every frame — at a wedding full of light
+shirts, a rescue chains strangers together wholesale. So appearance may only
+ever **VETO a write** the face pipeline was about to make; it never causes
+one.
+
+### The descriptor (computed by the RUNNER; the match service only stores and compares)
+
+- **48 floats**: an L1-normalised **12×4 Hue×Saturation histogram** of the
+  torso crop (OpenCV HSV: H 0–179 → 12 bins, S 0–255 → 4 bins). Pixels with
+  V < 40 or V > 240 are masked out (shadow / blowout).
+- **Torso crop**: within the person box, from the face box's bottom edge down
+  to `min(face bottom + 2.5 × face height, person box bottom)`; horizontally
+  the person box inset 15% each side.
+- **No descriptor** when the crop is under 24 px in either dimension, when
+  there is no containing person box, or when fewer than 100 unmasked pixels
+  remain. **Absent is not zero** — an absent descriptor disables every
+  appearance behaviour for that sighting (the `gatedUnmeasured` /
+  `zoneUnmeasured` convention applied to clothing).
+- **Similarity**: histogram intersection (sum of element-wise minimums; both
+  sides L1-normalised → range 0..1). Partial occlusion only removes mass, so
+  it can only lower the score — failing towards "no clash".
+
+### The three v1 uses — and the only three
+
+1. **HEAL VETO (runner).** A track-heal candidate whose remembered torso
+   descriptor CLASHES with the current frame's descriptor
+   (intersection < `HECO_HEAL_APPEARANCE_CLASH`) is refused — no `/merge` is
+   posted. This is a tracker-swap detector: it shrinks the heal's documented
+   residual risk (a track handed from person A to person B mid-window folding
+   A's mint into B, an under-count of one). An absent descriptor on either
+   side means the heal proceeds exactly as before.
+2. **ENROLMENT VETO (match).** A matched sighting that `_should_enrol` had
+   approved as an extra template is NOT kept when its descriptor clashes
+   (`appearanceSim < HECO_MATCH_APPEARANCE_CLASH`) with every descriptor the
+   identity has stored (anti-poison: a template enrolled off a tracker swap
+   or near-threshold impostor becomes a bridge that silently merges two
+   guests later). **The match verdict — isNew / personKey / cosine — is
+   never changed by appearance.**
+3. **VISIBILITY.** `/match` reports `appearanceSim`; the runner's match tap
+   carries it; the run status counts **`healVetoedByAppearance`** and
+   **`enrolVetoedByAppearance`**; the end-of-run notes include both.
+
+### Wire and storage
+
+- `POST /match` request gains optional **`appearance`**: exactly 48 floats
+  (any other present length is a readable 422 naming the contract).
+- The response gains **`appearanceSim`**: `float|null` — best intersection
+  against the matched identity's stored descriptors; `null` for staff hits,
+  new mints, or when either side lacks a descriptor — and
+  **`appearanceVetoed`**: `bool`.
+- The gallery's `vectors` table gains a nullable BLOB column **`appearance`**
+  (float32[48]), stored beside any template `/match` writes (founding mint
+  and enrolled extras). Opening an OLDER gallery/staff file ALTERs the
+  column in (SQLite `ADD COLUMN`), so every pre-existing file keeps working;
+  its rows read as descriptor-absent, never as zero histograms.
+- The descriptor is **never part of the cosine scan** — the resident scan
+  matrix stays face-only.
+- `GET {match}/health` reports `appearanceClash`.
+
+### Knobs (both UNCALIBRATED — reasoned like the M1 margins, env-tunable so the first labelled torso pairs move them)
+
+| env | default | meaning |
+| --- | --- | --- |
+| `HECO_HEAL_APPEARANCE_CLASH` (runner) | `0.50` | intersection below this = clash → the heal is refused; **0 disables** |
+| `HECO_MATCH_APPEARANCE_CLASH` (match) | `0.50` | intersection below this = clash → the enrolment is refused; **0 disables** |
+
+Empty string means unset for both (the compose `${VAR-}` rendering).
+
+### NEVER — the lines nobody may move without new impostor data
+
+- Never mint, merge, match or count on clothing alone.
+- Never let appearance RESCUE a face match (the 0.377 two-white-shirts pair
+  is exactly what a rescue merges) — appearance only refuses writes.
+- Never touch staff flows: staff identity is operator-attested, the staff
+  store gains no appearance rows (mark-staff deliberately leaves the
+  descriptor behind with the deleted gallery row), and staff verdicts carry
+  `appearanceSim: null`.
+- Never treat an absent descriptor as a zero histogram: absent means NO veto,
+  anywhere.
