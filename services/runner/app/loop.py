@@ -5,7 +5,11 @@ faces /detect (within the tracked boxes) -> exclusion zones (operator-drawn
 no-count polygons; see :meth:`RunLoop._apply_zones`) -> local quality gate ->
 embed /embed -> match /match per face -> unique count, with the TRACK HEAL
 (:meth:`RunLoop._maybe_heal`) folding back a mint the same track disowns
-moments later.  Every stage is timed; aggregates and
+moments later and the TRACK IDENTITY LOCK
+(:meth:`RunLoop._maybe_lock_fold`) folding one back the moment a track that
+has ALREADY resolved to an identity mints another — the case the heal cannot
+reach, because it waits for a second comfortable match that on bench 6e1a5d
+never arrived.  Every stage is timed; aggregates and
 sampled raw rows flush to the planner every ``flush_interval_s`` seconds.  On
 top of that (CONTRACTS.md v1): annotated debug frames + structured taps go up
 every ``tap_interval_s``, and operator feedback is polled every
@@ -201,6 +205,13 @@ class RunLoop:
         # guard, because all four mints fell between tap rounds.  Bounded;
         # guarded by _lock.
         self._mints: list[dict] = []
+        # Monotonic frame counter, used ONLY to tell "the same frame" from "a
+        # later frame" for the track lock.  Two faces on one track within one
+        # frame are two guests sharing a box, not one guest over time, and a
+        # lock bound by the first must never fold the second (see
+        # _maybe_lock_fold).  Loop-thread only; read under _lock with the
+        # locks it guards.
+        self._frame_no: int = 0
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
@@ -212,6 +223,22 @@ class RunLoop:
         # like _template_n; pruned on every mint and capped per track, so it
         # is bounded by the tracks active within one window, not the night.
         self._minted: dict[int, list[dict]] = {}
+        # TRACK IDENTITY LOCK bookkeeping: track_id -> {key, cosine, at,
+        # appearance}, the identity this track has ALREADY resolved to.  Set
+        # whenever a verdict on the track matches an existing identity at
+        # >= track_lock_min_cosine; a later mint on the same track is folded
+        # straight into it (see _maybe_lock_fold) instead of waiting for a
+        # second comfortable match that, on bench 6e1a5d, never came.  One
+        # entry per track, expiring on the same heal_window_s as _minted and
+        # pruned the same way — a lock from minutes ago is not evidence.
+        # Guarded by _lock.
+        self._locks: dict[int, dict] = {}
+        # Every track id this run has ever seen reported by the tracker.  ONE
+        # person produced SIX ids on bench 6e1a5d (2, 5, 6, 7, 8, 12) and that
+        # was invisible until someone queried SQLite by hand; the count of
+        # this set rides the status, the notes and the results so the shatter
+        # is readable beside `unique`.  Guarded by _lock.
+        self._track_ids: set = set()
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
@@ -263,6 +290,18 @@ class RunLoop:
             # _maybe_heal).  Each one is a guest the delivered number would
             # otherwise have over-counted by exactly one.
             "healedSplits": 0,
+            # TRACK IDENTITY LOCK: mints folded back IMMEDIATELY because the
+            # track that produced them had already resolved to an identity
+            # (see _maybe_lock_fold).  Separate from healedSplits because the
+            # evidence is different: a heal needs a SECOND comfortable match to
+            # arrive, and on bench 6e1a5d p00005/p00006 survived precisely
+            # because it never did.
+            "lockedTrackFolds": 0,
+            # How many DISTINCT track ids the tracker reported all run.  Read
+            # it beside `unique`: bench 6e1a5d put ONE person on SIX ids, which
+            # is the whole reason the lock and the longer tracker max-age
+            # exist, and it was discoverable only by opening SQLite by hand.
+            "distinctTracks": 0,
             # NEAR-MISS MINTS (CONTRACTS.md v2): fresh identities whose best
             # face cosine landed just under the threshold against an existing
             # guest (the match service's nearMiss field).  Measured tonight:
@@ -288,6 +327,15 @@ class RunLoop:
             # each /match reply's appearanceVetoed flag).
             "healVetoedByAppearance": 0,
             "enrolVetoedByAppearance": 0,
+            # Folds (heal or lock) that went ahead on a MEDIOCRE clothing
+            # reading — inside [heal_appearance_clash, heal_appearance_unsure).
+            # Not a veto and not an error: the fold happened, and this says how
+            # often the system acted on weak corroboration.  It exists because
+            # the old hard floor refused a probably-correct fold at
+            # intersection 0.4991 vs 0.50 (bench 6e1a5d) — nine ten-thousandths
+            # deciding a guest — and the honest answer to a reading that
+            # separates nobody is to proceed and SAY SO, not to guess.
+            "healUncertainAppearance": 0,
             # EXCLUSION ZONES.  excludedByZone counts faces whose box centre
             # fell inside an operator-drawn no-count polygon — dropped before
             # the gate, so they are never embedded or matched, but kept
@@ -567,6 +615,13 @@ class RunLoop:
             # `unique` months later can see how much of the number the heal
             # and the operator's zones shaped (CONTRACTS.md heal + zones).
             f"healedSplits={st['healedSplits']} "
+            # The lock's own ledger, kept apart from healedSplits because it
+            # acts on different evidence (the track had ALREADY resolved) and
+            # carries a different risk.  distinctTracks is the denominator that
+            # makes both readable: 6 tracks against 1 real guest (bench 6e1a5d)
+            # is the shatter these mechanisms are compensating for.
+            f"lockedTrackFolds={st['lockedTrackFolds']} "
+            f"distinctTracks={st['distinctTracks']} "
             # The advisory appearance signal's two vetoes (app/appearance.py):
             # heal folds refused as suspected tracker swaps, and sightings the
             # matcher kept out of a template stack.  Reported beside
@@ -574,6 +629,11 @@ class RunLoop:
             # numbers months from now must see when the veto was doing the
             # refusing.
             f"healVetoedByAppearance={st['healVetoedByAppearance']} "
+            # Folds that proceeded on a mediocre clothing reading.  Beside the
+            # veto on purpose: together they say what the clothing signal
+            # actually did — how often it refused, and how often it was too
+            # weak to mean anything and the fold went ahead regardless.
+            f"healUncertainAppearance={st['healUncertainAppearance']} "
             f"enrolVetoedByAppearance={st['enrolVetoedByAppearance']} "
             # Mints flagged as probable splits of an existing guest (match's
             # nearMiss wire, CONTRACTS.md v2).  Read beside `unique`: each is
@@ -602,7 +662,10 @@ class RunLoop:
             "frames": frames,
             "matches": st["matches"],
             "healedSplits": st["healedSplits"],
+            "lockedTrackFolds": st["lockedTrackFolds"],
+            "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
+            "healUncertainAppearance": st["healUncertainAppearance"],
             "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
             "nearMissMints": st["nearMissMints"],
             "galleryOverlaps": st["galleryOverlaps"],
@@ -684,6 +747,7 @@ class RunLoop:
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
+        self._frame_no += 1
         s, board, samples = self.s, self.board, self.samples
         image_b64 = frame["imageB64"]
         site_id = self.request.get("siteId")
@@ -712,6 +776,7 @@ class RunLoop:
         board.frame("track")
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
+        self._note_tracks(tracks)
 
         # Face-detect region = every RAW person box this frame, deduped against
         # the track boxes.
@@ -959,15 +1024,25 @@ class RunLoop:
                     "gallery can no longer tell these two apart; suggested to "
                     "the operator, count unchanged unless they merge"
                 )
-            # TRACK HEAL bookkeeping: only verdicts that can be pinned to a
-            # track participate (no containing track = no heal for this one).
+            # TRACK HEAL / TRACK LOCK bookkeeping: only verdicts that can be
+            # pinned to a track participate (no containing track = neither
+            # mechanism has any evidence about this one).  Staff verdicts never
+            # arrive here — they `continue` above — so a staff hit can neither
+            # set a lock nor be folded into one, exactly as it can never heal.
             track_id = self._track_for(face, tracks)
             if track_id is None:
                 continue
             if m.get("isNew"):
-                self._record_mint(track_id, m, face_desc)
+                # THE LOCK FIRST, then the heal's bookkeeping.  If this track
+                # has already resolved to an identity the fresh mint is folded
+                # back NOW; only a mint that survives that (no lock, refused,
+                # or clothing-clashed) is remembered for a later heal, because
+                # a key that has just been merged away is nothing to cure.
+                if not self._maybe_lock_fold(planner_run_id, track_id, m, face_desc):
+                    self._record_mint(track_id, m, face_desc)
             else:
                 self._maybe_heal(planner_run_id, track_id, m, face_desc)
+                self._note_lock(track_id, m, face_desc)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
@@ -1140,6 +1215,35 @@ class RunLoop:
                 best_id, best_d = t.get("id"), d
         return best_id
 
+    def _note_tracks(self, tracks: list) -> None:
+        """Remember every track id this frame reported, and publish the count.
+
+        WHY A RUN NEEDS THIS AT ALL.  On bench 6e1a5d (2026-08-06, ground
+        truth ONE person: out of frame, back in, then seated) the tracker
+        reported SIX ids for that one person — track 2 (53 frames), 5 (24), 6
+        (8), 7 (6), 8 (6) and 12 (7).  Leaving the frame killed track 2
+        legitimately; the rest are the person detector losing a SEATED subject
+        for longer than the tracker's max-age.  Nothing in the status, the
+        notes or the console said so: the shatter was found by opening the
+        run's SQLite file by hand.  Every mechanism in this loop that fights
+        splits (the heal, the lock, the longer max-age) is compensating for
+        this number, so the number itself has to be on the record — read
+        ``distinctTracks`` beside ``unique`` and a 6-to-1 ratio is visible
+        without a debugger.
+
+        A set of ints, one entry per track ever seen: at POC gate densities
+        that is tens to low thousands over a night, which is the same order as
+        the mint ledger and needs no windowing.
+        """
+        if not tracks:
+            return
+        with self._lock:
+            for t in tracks:
+                tid = t.get("id")
+                if tid is not None:
+                    self._track_ids.add(tid)
+            self._status["distinctTracks"] = len(self._track_ids)
+
     @staticmethod
     def _person_box_for(face: dict, boxes: list) -> dict | None:
         """The person box a face belongs to: box centre inside the person box.
@@ -1274,23 +1378,26 @@ class RunLoop:
         healed — the mint came after the evidence, so the evidence says
         nothing about it.
 
-        THE APPEARANCE VETO (the tracker-swap detector, app/appearance.py):
+        THE CLOTHING GUARD (the tracker-swap detector, app/appearance.py, now
+        three BANDS rather than one cliff — see :meth:`_appearance_refuses`):
         clothing is constant within one event, so a track genuinely still on
         its own person shows the same torso at mint time and at heal time —
         while a swapped track shows person A's clothes on the mint frame and
         person B's on the healing frame, a clash exactly when the fold would
-        be wrong.  A doomed entry whose remembered descriptor scores below
-        ``heal_appearance_clash`` (histogram intersection) against
-        ``face_desc`` is therefore refused: no /merge, ``unique`` untouched,
-        ``healVetoedByAppearance`` +1, and the bookkeeping dropped like a
-        merged=false refusal — after a swap every later verdict on this track
-        is about the OTHER person, so re-presenting the same wrong evidence
-        next verdict could only re-veto or, worse, squeak past the floor.
-        ADVISORY ONLY, and one-directional by design: absent descriptors
-        (either side) never veto — absent is not zero — and appearance
+        be wrong.  Only a CLEAR clash (below ``heal_appearance_clash``, now
+        0.35) refuses the fold; a mediocre reading proceeds and is counted in
+        ``healUncertainAppearance``, because a single hard floor at 0.50
+        VETOED a probably-correct fold at intersection 0.4991 on bench 6e1a5d
+        — nine ten-thousandths deciding a guest, on a reading that separates
+        nobody.  A refusal drops the bookkeeping like a merged=false refusal —
+        after a swap every later verdict on this track is about the OTHER
+        person, so re-presenting the same wrong evidence next verdict could
+        only re-veto or, worse, squeak past the floor.  ADVISORY ONLY, and
+        one-directional by design: absent descriptors (either side) veto
+        nothing and count nothing — absent is not zero — and appearance
         AGREEMENT never lowers the 0.45 cosine floor, because the measured
-        0.377 impostor pair was two DIFFERENT men both in light shirts:
-        agreeing torsos prove nothing, clashing torsos are the only signal.
+        impostor pairs reached clothing 0.503 and 0.747: agreeing torsos prove
+        nothing, clashing torsos are the only signal.
         """
         if self.s.heal_window_s <= 0:
             return
@@ -1317,23 +1424,13 @@ class RunLoop:
                 self._minted.pop(track_id, None)
         for entry in doomed:
             minted_key = entry["key"]
-            # THE VETO: both sides must have been measured; a missing
-            # descriptor on either side is "could not see the torso", never
-            # "the torso differed".  Knob 0 disables (config semantics).
-            mint_desc = entry.get("appearance")
-            clash_floor = self.s.heal_appearance_clash
-            if clash_floor > 0 and mint_desc is not None and face_desc is not None:
-                sim = appearance.intersection(mint_desc, face_desc)
-                if sim < clash_floor:
-                    self._bump("healVetoedByAppearance")
-                    self.log.info(
-                        f"heal vetoed by appearance: track {track_id} minted "
-                        f"{minted_key} but its torso clashes with the frame "
-                        f"matching {matched_key} "
-                        f"(intersection={sim:.4f} < {clash_floor}) — suspected "
-                        f"tracker swap, mint kept, count unchanged"
-                    )
-                    continue
+            # THE CLOTHING BANDS (see _appearance_refuses): only a CLEAR clash
+            # refuses; a mediocre reading proceeds and is counted.
+            if self._appearance_refuses(
+                "heal", track_id, minted_key, matched_key,
+                entry.get("appearance"), face_desc,
+            ):
+                continue
             try:
                 r = self._post(
                     f"{self.s.match_url}/merge",
@@ -1366,6 +1463,274 @@ class RunLoop:
                     f"a singleton or is split from {matched_key} — count unchanged, "
                     "which is the refusal doing its job"
                 )
+
+    def _appearance_refuses(
+        self,
+        kind: str,
+        track_id: int,
+        drop_key: str | None,
+        keep_key: str | None,
+        before_desc: list[float] | None,
+        now_desc: list[float] | None,
+    ) -> bool:
+        """Does the clothing evidence REFUSE this fold?  Three bands, one cliff gone.
+
+        Both folds in this loop — the heal (:meth:`_maybe_heal`) and the
+        identity lock (:meth:`_maybe_lock_fold`) — merge one key into another
+        on the strength of TRACK identity, and both carry the same residual
+        risk: a tracker swap handed the track from person A to person B, so
+        the fold would erase a real guest.  Clothing is constant within one
+        event, so ``before_desc`` (the torso at mint / at lock time) against
+        ``now_desc`` (the torso on the frame asking for the fold) is the one
+        cheap signal that sees a swap.
+
+        WHY THREE BANDS AND NOT A FLOOR.  The floor was 0.50 and on bench
+        6e1a5d it VETOED a fold at histogram intersection **0.4991** — nine
+        ten-thousandths — on a fold that was probably correct: track 2 had
+        linked p00001 and p00005, and the pipeline threw that evidence away.
+        The same run bounds what a mid-range reading can possibly mean: two
+        SURVIVING splits of the same man read 0.797 and 0.875, while two
+        genuinely DIFFERENT men reached 0.747 and another impostor pair 0.503.
+        A number that lands between the impostors and the genuine pairs
+        separates nobody, so:
+
+        * ``sim < heal_appearance_clash`` (0.35) — CLEAR CLASH.  Refuse, count
+          ``healVetoedByAppearance``, log it.  Only a genuine disagreement
+          blocks a fold.
+        * ``clash <= sim < heal_appearance_unsure`` (0.55) — UNCERTAIN.  The
+          fold PROCEEDS (a mediocre reading is not evidence of a swap; the
+          0.4991 case) and counts ``healUncertainAppearance``, so an operator
+          can see how often the system acted on weak corroboration.
+        * ``sim >= unsure`` — corroborated.  Proceeds silently.
+
+        ABSENT IS NOT ZERO: a missing descriptor on either side means "could
+        not see the torso", never "the torso differed" — it vetoes nothing and
+        counts nothing.  ``heal_appearance_clash`` 0 disables the refusal
+        entirely (config semantics), leaving the uncertain band to record what
+        the fold rode on.  And in no band does clothing AGREEMENT loosen a
+        cosine floor: the 0.747 impostor pair is the reason agreement can only
+        ever fail to object.
+        """
+        if before_desc is None or now_desc is None:
+            return False
+        sim = appearance.intersection(before_desc, now_desc)
+        clash_floor = self.s.heal_appearance_clash
+        if clash_floor > 0 and sim < clash_floor:
+            self._bump("healVetoedByAppearance")
+            self.log.info(
+                f"{kind} vetoed by appearance: track {track_id} carries "
+                f"{drop_key} but its torso clashes with the frame matching "
+                f"{keep_key} (intersection={sim:.4f} < {clash_floor}) — "
+                "suspected tracker swap, key kept, count unchanged"
+            )
+            return True
+        if sim < self.s.heal_appearance_unsure:
+            self._bump("healUncertainAppearance")
+            self.log.info(
+                f"{kind} proceeding on weak appearance: track {track_id} folding "
+                f"{drop_key} into {keep_key} at intersection={sim:.4f}, inside "
+                f"[{clash_floor}, {self.s.heal_appearance_unsure}) — a mediocre "
+                "clothing reading is not evidence of a swap (0.4991 refused a "
+                "correct fold once), so the face evidence stands and this is "
+                "recorded, not acted on"
+            )
+        return False
+
+    def _note_lock(
+        self, track_id: int, verdict: dict, face_desc: list[float] | None = None
+    ) -> None:
+        """Bind a track to the identity it just matched (TRACK IDENTITY LOCK).
+
+        The heal is a CURE and needs a second comfortable match to arrive
+        before it can act.  On bench 6e1a5d that second match never came for
+        two of the splits: p00005 (face 0.212 against p00001, clothing 0.797)
+        and p00006 (0.228 / 0.875) were minted by a track that had ALREADY
+        resolved to p00001, and both survived to the end of the run — under
+        the 0.29 near-miss floor, so not even a banner fired.  The lock is the
+        preventive half: once a track has matched an existing identity at
+        >= ``track_lock_min_cosine``, a later mint on that same track is folded
+        back immediately (:meth:`_maybe_lock_fold`).
+
+        0.45 is the same floor the heal uses, and above the 0.377 measured
+        impostor ceiling with margin: binding a track to an identity on weaker
+        evidence than that would let two different people share a lock.
+
+        ``face_desc`` — the torso on the frame that set the lock — is
+        remembered for the same reason ``_record_mint`` remembers one: it is
+        the "before" side of the clothing guard when a fold is later proposed,
+        and without it the lock's fold would have no swap detector at all.
+
+        One entry per track (the newest qualifying match wins: a fresher
+        binding is better evidence), expiring on ``heal_window_s`` and pruned
+        on the same schedule — a lock from minutes ago is not evidence about a
+        mint happening now.  Healing disabled (window 0) records nothing
+        rather than leak, exactly as ``_record_mint`` does.  Staff verdicts
+        never reach here: the caller skips them before any track bookkeeping.
+        """
+        if self.s.track_lock_min_cosine <= 0 or self.s.heal_window_s <= 0:
+            return  # lock (or healing) disabled: record nothing rather than leak
+        key = verdict.get("personKey")
+        cosine = verdict.get("cosine")
+        if not key or cosine is None:
+            return
+        if float(cosine) < self.s.track_lock_min_cosine:
+            return  # inside impostor range: proves nothing about whose track this is
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locks(now)
+            self._locks[track_id] = {
+                "key": key,
+                "cosine": float(cosine),
+                "at": now,
+                "appearance": face_desc,
+                # WHICH FRAME bound it.  A fold must come from a STRICTLY
+                # LATER frame — see _maybe_lock_fold's same-frame guard.
+                "frame": self._frame_no,
+            }
+
+    def _prune_locks(self, now: float) -> None:
+        """Drop locks older than the heal window.  Call with ``_lock`` held.
+
+        The same bound as the mint bookkeeping, for the same reason: the lock's
+        whole claim is "this track was THIS person moments ago", and a claim
+        from minutes ago is not evidence — it is just a stale assertion that
+        would let a mint be folded into someone the track may long since have
+        stopped following.
+        """
+        for tid in [t for t, e in self._locks.items() if now - e["at"] > self.s.heal_window_s]:
+            del self._locks[tid]
+
+    def _maybe_lock_fold(
+        self,
+        planner_run_id: str,
+        track_id: int,
+        verdict: dict,
+        face_desc: list[float] | None = None,
+    ) -> bool:
+        """Fold a fresh mint into the identity its own track is locked to.
+
+        Returns True only when the merge actually happened (the caller then
+        skips the heal bookkeeping — the key is gone, there is nothing left to
+        cure).
+
+        TWO GUESTS IN ONE BOX — the failure this refuses to have.  The lock's
+        claim is "this track was following THIS person a moment ago, so a new
+        face on it now is that person again".  That claim is about ONE track
+        across TIME.  Within a single frame it is false and dangerous:
+        :meth:`_track_for` assigns a face to any track whose box contains its
+        centre, so two guests standing close enough share a track id, and
+        processing their faces in order would match the first, bind the lock,
+        then fold the SECOND — a real guest erased, silently, with every other
+        guard passing (a fresh mint is trivially a singleton, cannot_link is
+        empty, the 0.45 floor gated the binding to the OTHER person, and only
+        a clothing clash could object).  So a fold requires a strictly later
+        frame than the one that bound the lock, and a frame that puts two
+        faces on one track drops that track's lock entirely (see the caller):
+        a box carrying two people is not evidence about either of them.
+
+        THE MEASUREMENT (bench 6e1a5d, ground truth ONE person).  Six tracker
+        ids for one guest; three mints were auto-healed back into p00001 and
+        TWO were not: p00005 (face 0.212 vs p00001, clothing 0.797) and p00006
+        (0.228 / 0.875).  Both were minted on a track that had already matched
+        p00001 comfortably, and both survived — the heal needs a LATER
+        comfortable match on the same track to fire, and on a subject the
+        detector keeps losing that match never arrives.  Both also sat below
+        the 0.29 near-miss floor, so no banner fired either.  The lock acts on
+        the evidence that was already in hand at mint time instead of waiting
+        for evidence that never comes.
+
+        The guards, each load-bearing and each borrowed deliberately from the
+        heal rather than invented:
+
+        * ``onlyIfSingleton`` — the match service refuses inside its own
+          transaction if the mint has already accumulated a second template
+          (the gallery independently re-sighted it, contradicting the "junk
+          mint" theory) or if an operator has split the pair.  ``merged=false``
+          counts NOTHING and is logged as the system working.
+        * the 0.45 lock floor (``_note_lock``) — above the 0.377 measured
+          impostor ceiling, so a lock can only ever ride evidence stronger
+          than any impostor pair we have seen.
+        * the heal window — a lock expires like mint bookkeeping does.
+        * the clothing bands (:meth:`_appearance_refuses`) — a clash refuses
+          the fold and counts ``healVetoedByAppearance``, and it also DROPS
+          the lock: a clash says this track is probably carrying a different
+          person now, and a lock about the wrong person is worse than no lock.
+
+        WHY IT IS ENV-GATED AND COUNTED SEPARATELY.  A wrong split over-counts
+        and somebody argues about the invoice; a wrong MERGE under-counts
+        silently and nobody ever sees it.  This mechanism makes track identity
+        more authoritative, which amplifies exactly that silent failure if the
+        tracker swaps people — so ``HECO_TRACK_LOCK_MIN_COSINE=0`` turns it
+        off completely and every fold it performs is counted in
+        ``lockedTrackFolds``, apart from ``healedSplits``, so a report months
+        later can say which mechanism moved the number.
+        """
+        if self.s.track_lock_min_cosine <= 0 or self.s.heal_window_s <= 0:
+            return False
+        minted_key = verdict.get("personKey")
+        if not minted_key:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locks(now)
+            lock = self._locks.get(track_id)
+            # SAME-FRAME BINDING IS NOT EVIDENCE (see the docstring): a lock
+            # bound by an earlier face of THIS frame means two faces landed on
+            # one track box — two guests standing close, not one guest over
+            # time.  Refuse, and drop the binding: the box is ambiguous, so
+            # its claim about whose track this is cannot be trusted for the
+            # rest of the window either.
+            if lock is not None and lock.get("frame") == self._frame_no:
+                self._locks.pop(track_id, None)
+                lock = None
+        if lock is None:
+            return False
+        locked_key = lock["key"]
+        if locked_key == minted_key:
+            return False  # nothing to fold: the gallery gave the mint the same key
+        if self._appearance_refuses(
+            "lock fold", track_id, minted_key, locked_key,
+            lock.get("appearance"), face_desc,
+        ):
+            # The torso says this track is not on the locked person any more,
+            # so the binding itself is suspect — drop it rather than let the
+            # next mint be folded into somebody the track has left behind.
+            with self._lock:
+                self._locks.pop(track_id, None)
+            return False
+        try:
+            r = self._post(
+                f"{self.s.match_url}/merge",
+                {
+                    "runId": planner_run_id,
+                    "keep": locked_key,
+                    "drop": minted_key,
+                    "onlyIfSingleton": True,
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — a fold must never stop the count
+            # Transient (match hiccup): the lock stays, and the mint falls
+            # through to the heal bookkeeping, so both mechanisms still have a
+            # shot at this key while the window lasts.
+            self.log.warning(f"lock fold failed, the heal may still cure it: {e}")
+            return False
+        if r.get("merged"):
+            self._dec_unique()
+            self._bump("lockedTrackFolds")
+            self._forget_mint(minted_key)
+            self.log.info(
+                f"locked track fold: track {track_id} had resolved to {locked_key} "
+                f"(cosine={_fmt(lock.get('cosine'))}) and then minted {minted_key} "
+                f"(cosine={_fmt(verdict.get('cosine'))}) — mint folded on the "
+                "spot, unique -1"
+            )
+            return True
+        self.log.info(
+            f"lock fold refused for track {track_id}: {minted_key} is no longer a "
+            f"singleton or is split from {locked_key} — count unchanged, which is "
+            "the refusal doing its job"
+        )
+        return False
 
     def _note_templates(self, person_key: object, template_n: object) -> None:
         """Track how many views each guest holds, and summarise it in the status.

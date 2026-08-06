@@ -123,20 +123,63 @@ class Settings:
     # evidence. A cross-identity match below this floor proves nothing and
     # heals nothing.
     heal_min_cosine: float = 0.45
-    # HEAL APPEARANCE VETO (see loop._maybe_heal and app/appearance.py). A heal
-    # candidate whose remembered torso descriptor scores BELOW this histogram
-    # intersection against the current frame's descriptor is refused — the
-    # clash is exactly the fingerprint of the heal's documented residual risk,
-    # a tracker identity swap handing the track from person A to person B
-    # mid-window. 0.50 is REASONED, NOT CALIBRATED (like the M1 margins were at
-    # first): identical L1-normalized histograms score 1.0, disjoint colour
-    # distributions 0.0, and one event's worth of same-person pairs has not yet
-    # been measured to place the floor empirically — calibrate it from real
-    # footage before trusting it near the boundary. 0 disables the veto.
-    # Appearance AGREEMENT never loosens anything (the 0.45 cosine floor
-    # stands): the measured 0.377 impostor pair was two DIFFERENT men both in
-    # light shirts, so agreeing torsos prove nothing about identity.
-    heal_appearance_clash: float = 0.50
+    # TRACK-SCOPED IDENTITY LOCK (see loop._note_lock / loop._maybe_lock_fold).
+    # The heal CURES a bad mint after the fact; the lock PREVENTS it. Once a
+    # verdict on a track has matched an existing identity at >= this cosine,
+    # that track is bound to that identity for the heal window, and a LATER
+    # mint on the SAME track is folded straight back into it — no need to wait
+    # for a second comfortable match to arrive, which on bench 6e1a5d is
+    # exactly what never came: p00005 (face 0.212 vs p00001) and p00006 (0.228)
+    # survived to the end of the run because the track that had already
+    # resolved to p00001 never matched again after minting them.
+    #
+    # 0.45 is the SAME floor the heal uses and for the same reason: the
+    # measured impostor ceiling on this camera is 0.377 (two genuinely
+    # different men), so the evidence that binds a track to an identity must
+    # sit clear of any impostor pair we have seen. 0 disables the lock
+    # entirely (config semantics), and it is disabled implicitly whenever
+    # healing is off, because the lock expires on the heal window.
+    #
+    # WHY IT HAS AN OFF SWITCH AT ALL: a wrong split over-counts and somebody
+    # argues about the invoice; a wrong MERGE under-counts silently and nobody
+    # ever sees it. The lock makes track identity more authoritative, which
+    # amplifies the silent failure if the tracker swaps people — so it is
+    # gated, counted (lockedTrackFolds) and guarded by the same clothing bands
+    # as the heal.
+    track_lock_min_cosine: float = 0.45
+    # HEAL APPEARANCE BANDS (see loop._appearance_refuses and app/appearance.py).
+    # A fold candidate's remembered torso descriptor is compared with the
+    # current frame's by histogram intersection, and the reading falls in one
+    # of three bands:
+    #
+    #   < heal_appearance_clash            CLEAR CLASH — the fold is refused
+    #                                      (healVetoedByAppearance), because
+    #                                      that is the fingerprint of a tracker
+    #                                      identity swap handing the track from
+    #                                      person A to person B mid-window;
+    #   clash .. heal_appearance_unsure    UNCERTAIN — the fold PROCEEDS and is
+    #                                      counted (healUncertainAppearance) so
+    #                                      an operator can see how often the
+    #                                      system acted on weak corroboration;
+    #   >= heal_appearance_unsure          corroborated — proceeds silently.
+    #
+    # WHY THE CLASH FLOOR DROPPED 0.50 -> 0.35. On bench 6e1a5d a fold was
+    # VETOED at intersection 0.4991 against the 0.50 floor — nine
+    # ten-thousandths, on a fold that was probably correct (track 2 had linked
+    # p00001 and p00005, and the pipeline threw that evidence away). A cliff at
+    # the exact centre of the distribution decides nothing well: the v2
+    # descriptor read two SURVIVING splits of the same man at 0.797 and 0.875,
+    # while a genuinely different pair of men reached 0.747 — mid-range
+    # readings simply do not separate people, so only a GENUINE disagreement
+    # may block, and everything between is recorded rather than acted on.
+    # 0 disables the clash veto (nothing is ever refused on clothing); absent
+    # descriptors on either side veto nothing and count nothing (absent is not
+    # zero). Both numbers are REASONED, NOT CALIBRATED — one event's worth of
+    # same-person pairs still has not been measured — and clothing agreement
+    # NEVER loosens the cosine floors, because that 0.747 impostor pair proves
+    # agreeing torsos say nothing about identity.
+    heal_appearance_clash: float = 0.35
+    heal_appearance_unsure: float = 0.55
 
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
@@ -195,8 +238,14 @@ def from_env() -> Settings:
         staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
         heal_window_s=env_float("HECO_HEAL_WINDOW_S", s.heal_window_s),
         heal_min_cosine=env_float("HECO_HEAL_MIN_COSINE", s.heal_min_cosine),
+        track_lock_min_cosine=env_float(
+            "HECO_TRACK_LOCK_MIN_COSINE", s.track_lock_min_cosine
+        ),
         heal_appearance_clash=env_float(
             "HECO_HEAL_APPEARANCE_CLASH", s.heal_appearance_clash
+        ),
+        heal_appearance_unsure=env_float(
+            "HECO_HEAL_APPEARANCE_UNSURE", s.heal_appearance_unsure
         ),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),

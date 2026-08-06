@@ -111,6 +111,39 @@ def test_ids_are_stable_and_monotonic():
     assert sorted(t.tid for t in out) == [1, 2, 3]
 
 
+def test_default_max_age_coasts_the_seated_gap_that_shattered_one_person():
+    """The default is 30 frames — ~7.5 s at the bench's 3.97 fps, not 3.75 s.
+
+    Bench 6e1a5d (2026-08-06, ONE person out of frame, back in, then seated)
+    produced SIX tracker ids: 2 (53 frames), 5 (24), 6 (8), 7 (6), 8 (6), 12
+    (7). At 3.97 fps the old 15-frame max-age died after 3.75 s unmatched, and
+    the seated subject's detector gaps were longer than that — so tracks
+    6/7/8/12 are the same person, four times. A 20-frame gap (~5 s, squarely
+    inside what killed those ids) must now re-associate to the SAME id.
+    """
+    seated = _box(100, 50)  # sitting still: the detector's gaps, not motion
+    assert SortLite().max_age == 30
+
+    trk = SortLite(min_hits=3)  # default max_age
+    for _ in range(8):
+        out = trk.step([seated])
+    tid = out[0].tid
+    for _ in range(20):  # ~5 s the detector cannot see the seated body
+        assert trk.step([]) == []
+    out = trk.step([seated])
+    assert [t.tid for t in out] == [tid], "a ~5 s seated gap must not mint a new id"
+
+    # ...and the same gap under the OLD 15-frame max-age is where the extra
+    # ids came from: the track is pruned mid-gap and the guest is minted anew.
+    old = SortLite(min_hits=1, max_age=15)  # min_hits=1: report the re-birth at once
+    for _ in range(8):
+        out = old.step([seated])
+    was = out[0].tid
+    for _ in range(20):
+        old.step([])
+    assert old.step([seated])[0].tid != was, "15 frames is what shattered track 6/7/8/12"
+
+
 def test_a_new_arrival_is_not_reported_until_confirmed():
     """The invariant behind runner finding D1.
 

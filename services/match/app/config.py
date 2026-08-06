@@ -113,6 +113,43 @@ DEFAULT_APPEARANCE_CLASH = 0.50
 DEFAULT_NEARMISS_FLOOR = 0.29
 
 
+# ------------------------------------- the WEAK (clothing) near-miss band (v2)
+#
+# The 0.29 floor above turned out to be BLIND to the splits that actually cost
+# us a count.  Bench run 6e1a5d (2026-08-06), ground truth ONE person walking
+# out of frame, back in, then sitting: that one person produced SIX tracker
+# ids, three of which the runner's heal folded back.  The two that SURVIVED as
+# extra guests read
+#
+#     p00005: face 0.212 vs p00001, clothing 0.797
+#     p00006: face 0.228 vs p00001, clothing 0.875
+#
+# Both sit BELOW 0.29, so no banner fired and the operator was never asked —
+# while the torso descriptor was shouting 0.80-0.88 at both of them.  Seated
+# and turned-away re-entries at this camera's angles land there: the face
+# signal has almost nothing to work with, the clothing signal has plenty.
+#
+# So a SECOND, weaker band exists: cosine in [WEAK_FLOOR .. FLOOR) earns a
+# near-miss ONLY when the clothing agrees at or above NEARMISS_CLOTHES.
+#
+# 0.15 is the weak floor: below it the face evidence is indistinguishable from
+# two strangers and the flag would rest on clothing alone.  0 disables the weak
+# band and leaves the face band exactly as it was.
+DEFAULT_NEARMISS_WEAK_FLOOR = 0.15
+
+# ...and the clothing bar that band requires.  BE HONEST ABOUT THIS NUMBER:
+# the closest measured IMPOSTOR pair on this camera — two genuinely different
+# men — reached clothing intersection 0.747, and another impostor pair sat at
+# 0.503 with face 0.377.  0.78 clears the worst measured impostor by 0.033.
+# That is a hair, not a margin, and it is the entire reason the weak band
+# produces a SUGGESTION a human confirms and never a merge: at a venue with
+# uniformed staff, a dress code, or similar traditional dress, this band is
+# EXPECTED to point at the wrong person, and it is the first knob to turn off
+# (set HECO_MATCH_NEARMISS_WEAK_FLOOR=0).  Clothing agreement alone never
+# proves identity; it only earns the operator a look.
+DEFAULT_NEARMISS_CLOTHES = 0.78
+
+
 def _env_f(name: str, default: float) -> float:
     """Read a float knob where an EMPTY string means unset.
 
@@ -171,12 +208,44 @@ def nearmiss_floor() -> float:
     """Cosine floor of the near-miss band on a mint (env HECO_MATCH_NEARMISS_FLOOR).
 
     A mint whose best cosine vs the existing gallery lands in
-    ``[floor .. threshold)`` carries a ``nearMiss`` flag — operator
-    information, never behaviour (see :func:`app.gallery.match`).  **0
-    disables the flag**; empty string means unset (the compose ``${VAR-}``
-    rendering), like every knob in this service.
+    ``[floor .. threshold)`` carries a ``nearMiss`` flag with basis ``"face"``
+    — operator information, never behaviour (see :func:`app.gallery.match`).
+    **0 disables the flag**, both bands: the weak clothing band below is a
+    band *under this floor*, so with no floor there is nothing to sit under.
+    Empty string means unset (the compose ``${VAR-}`` rendering), like every
+    knob in this service.
     """
     return _env_f("HECO_MATCH_NEARMISS_FLOOR", DEFAULT_NEARMISS_FLOOR)
+
+
+def nearmiss_weak_floor() -> float:
+    """Floor of the WEAK near-miss band (env HECO_MATCH_NEARMISS_WEAK_FLOOR).
+
+    A mint whose best cosine lands in ``[weak_floor .. nearmiss_floor)`` earns
+    a ``nearMiss`` with basis ``"clothing"`` — but only when the torso
+    descriptors agree at or above :func:`nearmiss_clothes`.  It exists because
+    bench 6e1a5d measured one person splitting at face 0.212 / clothing 0.797
+    and face 0.228 / clothing 0.875: both below the 0.29 face floor, both
+    unbannered, both real over-counts.
+
+    **0 disables the weak band** and leaves the face band untouched — the
+    first knob to turn off at a venue with uniforms or a dress code, where
+    clothing agreement stops carrying information.  Empty string means unset.
+    """
+    return _env_f("HECO_MATCH_NEARMISS_WEAK_FLOOR", DEFAULT_NEARMISS_WEAK_FLOOR)
+
+
+def nearmiss_clothes() -> float:
+    """Torso-intersection bar the weak band requires (env …_NEARMISS_CLOTHES).
+
+    0.78 sits **0.033 above the worst measured impostor clothing reading
+    (0.747, two genuinely different men)**.  That thin margin is the whole
+    reason the weak band is a suggestion for a human and never a merge — see
+    DEFAULT_NEARMISS_CLOTHES above and :func:`app.gallery._near_miss`.  Raise
+    it to make the band quieter; the honest off switch is
+    ``HECO_MATCH_NEARMISS_WEAK_FLOOR=0``.  Empty string means unset.
+    """
+    return _env_f("HECO_MATCH_NEARMISS_CLOTHES", DEFAULT_NEARMISS_CLOTHES)
 
 
 def appearance_clash() -> float:
