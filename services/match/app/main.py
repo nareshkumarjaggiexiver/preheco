@@ -6,9 +6,9 @@ surface the runner drives from the feedback loop.
 Endpoints:
     GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
-    POST /match  {runId, embedding, quality?, siteId?}
+    POST /match  {runId, embedding, quality?, siteId?, appearance?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
-            templateN, templateAdded}
+            templateN, templateAdded, appearanceSim, appearanceVetoed}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -32,7 +32,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import config, gallery, staff
 from .store import close_all_stores
@@ -48,7 +48,7 @@ def _env_s(name: str, default: float) -> float:
         return default
     return float(raw)
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -119,12 +119,35 @@ class MatchRequest(BaseModel):
 
     ``siteId`` opts a run into the staff whitelist: when present the staff
     store for that site is checked before the guest gallery.
+
+    ``appearance`` is the sighting's optional torso-appearance descriptor:
+    exactly 48 floats (the wire contract's L1-normalised 12×4 Hue×Saturation
+    histogram).  Omitted/null means the runner could not measure one (no
+    person box, tiny crop, old footage) — which disables every appearance
+    behaviour for this call rather than acting as a zero histogram.
     """
 
     runId: str
     embedding: list[float] = Field(min_length=8)
     quality: float | None = None  # face box width in px; <canon is tagged sub-canon
     siteId: str | None = None
+    appearance: list[float] | None = None
+
+    @field_validator("appearance")
+    @classmethod
+    def _appearance_is_48_floats(cls, v: list[float] | None) -> list[float] | None:
+        """Reject any present-but-wrong-length descriptor with a readable 422.
+
+        A truncated or padded histogram is a wire bug in the caller, and
+        silently comparing it would raise deep inside the store (or worse,
+        veto on garbage); the 422 names the contract instead.
+        """
+        if v is not None and len(v) != 48:
+            raise ValueError(
+                "appearance must be exactly 48 floats"
+                f" (12 hue x 4 saturation bins, L1-normalised); got {len(v)}"
+            )
+        return v
 
 
 class EnrolSample(BaseModel):
@@ -212,6 +235,10 @@ def health() -> dict:
         "templateConfidence": config.template_confidence(),
         "templateMargin": config.template_margin(),
         "templateMaxCosine": config.template_max_cosine(),
+        # ...and the appearance veto knob, for the same reason: an enrolment
+        # refused at clash 0.50 and one refused at 0.30 are different policies,
+        # and 0 here means the veto was off for the whole run.
+        "appearanceClash": config.appearance_clash(),
     }
 
 
@@ -256,6 +283,11 @@ def match(body: MatchRequest) -> dict:
                 # so a staff hit never enrols. templateN is not applicable.
                 "templateN": None,
                 "templateAdded": False,
+                # Staff flows carry no appearance handling at all: staff
+                # identity is operator-attested, never inferred from clothing,
+                # so there is nothing to compare and nothing to veto.
+                "appearanceSim": None,
+                "appearanceVetoed": False,
             }
 
     try:
@@ -270,6 +302,8 @@ def match(body: MatchRequest) -> dict:
             template_confidence=config.template_confidence(),
             template_margin=config.template_margin(),
             template_max_cosine=config.template_max_cosine(),
+            appearance=body.appearance,
+            appearance_clash=config.appearance_clash(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -285,6 +319,8 @@ def match(body: MatchRequest) -> dict:
         "staffId": None,
         "templateN": r.template_n,
         "templateAdded": r.template_added,
+        "appearanceSim": r.appearance_sim,
+        "appearanceVetoed": r.appearance_vetoed,
     }
 
 

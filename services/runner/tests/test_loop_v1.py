@@ -12,6 +12,8 @@ import json
 import cv2
 import httpx
 import numpy as np
+import pytest
+from app.appearance import intersection, torso_descriptor
 from app.config import Settings
 from app.loop import RunLoop, httpx_file_transport, httpx_transport
 from heco_common.planner import PlannerClient
@@ -65,6 +67,7 @@ class V1Fake:
         self.purges: list[dict] = []
         self.enrol_report: dict | None = None
         self.merges: list[dict] = []
+        self.match_bodies: list[dict] = []  # every /match request body, in order
         self.splits: list[dict] = []
         self.mark_staff: list[dict] = []
         self.manual_counts: list[dict] = []
@@ -172,6 +175,7 @@ class V1Fake:
                 200, json={"staffId": body["staffId"], "sampleCount": len(body["samples"])}
             )
         if path == "/match":
+            self.match_bodies.append(body)
             if self.match_script:
                 v = self.match_script.pop(0)
                 if v.get("isNew"):
@@ -1026,3 +1030,229 @@ def test_runs_rejects_malformed_zones_with_a_readable_422():
     not_a_pair = {"label": "z", "points": [[0.1], [0.9, 0.1], [0.5, 0.9]]}
     r = client.post("/runs", json={**base, "exclusionZones": [not_a_pair]})
     assert r.status_code == 422
+
+
+# ------------------------- torso appearance: descriptor + vetoes (v1 advisory)
+#
+# Clothing is constant within one event, so a torso H x S histogram is an
+# ADVISORY tie-breaker: it may VETO a heal fold (tracker-swap detector) or a
+# template enrolment (anti-poison), never mint/merge/match/count.  The measured
+# 0.377 impostor ceiling was two DIFFERENT men BOTH IN LIGHT SHIRTS — agreeing
+# torsos prove nothing, so agreement never loosens anything.  Geometry used
+# below: 160x240 frame, person box {10,20,60,200}, face {12,22,60,78} — the
+# torso crop is x 19..61, y 100..220 (42 x 120 px, comfortably measurable).
+
+PERSON_BOX = {"x": 10, "y": 20, "w": 60, "h": 200}
+FACE_BOX = {"x": 12, "y": 22, "w": 60, "h": 78}
+RED_BGR = (0, 0, 200)   # V=200: inside the 40..240 mask band, unlike pure red
+BLUE_BGR = (200, 0, 0)
+
+
+def solid_image(bgr, w=160, h=240) -> np.ndarray:
+    """A solid-colour BGR frame — one 'shirt' colour filling the torso crop."""
+    return np.full((h, w, 3), bgr, dtype=np.uint8)
+
+
+def solid_jpeg_b64(bgr, w=160, h=240) -> str:
+    """The same, JPEG-encoded for the fake ingest to serve."""
+    ok, buf = cv2.imencode(".jpg", solid_image(bgr, w, h))
+    assert ok
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def test_torso_descriptor_is_48_floats_l1_normalized():
+    """The wire contract: 12x4 H x S bins, flattened, summing to 1."""
+    d = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
+    assert d is not None
+    assert len(d) == 48
+    assert sum(d) == pytest.approx(1.0)
+
+
+def test_red_and_blue_torsos_clash_below_half():
+    """Different shirt colours must land clearly below the 0.50 clash floor."""
+    red = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
+    blue = torso_descriptor(solid_image(BLUE_BGR), FACE_BOX, PERSON_BOX)
+    assert red is not None and blue is not None
+    assert intersection(red, blue) < 0.5
+
+
+def test_identical_torsos_score_one():
+    """Histogram intersection of identical L1-normalized descriptors is 1.0."""
+    a = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
+    b = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
+    assert intersection(a, b) == pytest.approx(1.0)
+
+
+def test_tiny_torso_crop_yields_no_descriptor():
+    """A crop under 24 px in either dimension is unmeasurable — None, not zero.
+
+    Person box bottom at y=110 leaves only 10 px below the face's bottom edge
+    (y=100), so the vertical extent is under the 24 px floor.
+    """
+    short_person = {"x": 10, "y": 20, "w": 60, "h": 90}
+    assert torso_descriptor(solid_image(RED_BGR), FACE_BOX, short_person) is None
+
+
+def test_dark_frame_yields_no_descriptor():
+    """All pixels below V=40 are shadow-masked; fewer than 100 remain -> None.
+
+    Absent is NOT zero: a torso that could not be seen must never read as a
+    clash — dark frames are exactly where the blurred double-mint lived.
+    """
+    assert torso_descriptor(solid_image((10, 10, 10)), FACE_BOX, PERSON_BOX) is None
+
+
+def test_no_person_box_yields_no_descriptor():
+    """A face with no containing person box has no torso to describe."""
+    assert torso_descriptor(solid_image(RED_BGR), FACE_BOX, None) is None
+
+
+class TorsoFrames(V1Fake):
+    """Frames tall enough (160x240) to carry a measurable torso crop.
+
+    Serves one scripted JPEG per frame — so the mint frame and the healing
+    frame can wear DIFFERENT shirts — and a person box with 120 px of torso
+    below the fake's 60 px face (V1Fake's default 120-high frame leaves only
+    20 px, below the 24 px descriptor floor).
+    """
+
+    PERSON = {"x": 10, "y": 20, "w": 60, "h": 200, "conf": 0.9}
+
+    def __init__(self, images: list[str], **kw):
+        super().__init__(n_frames=len(images), face_widths=(60.0,), **kw)
+        self.images = images
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Serve the scripted per-frame JPEG and the torso-deep person box."""
+        host, path = request.url.host, request.url.path
+        if host == "ingest" and path == "/frame":
+            self.calls.append("ingest /frame")
+            i = min(self.frame_i, self.n_frames - 1)
+            exhausted = self.frame_i >= self.n_frames
+            if not exhausted:
+                self.frame_i += 1
+            return httpx.Response(200, json={
+                "imageB64": self.images[i], "tMs": i * 100, "w": 160, "h": 240,
+                "seq": i, "ended": exhausted,
+            })
+        if host == "persons" and path == "/detect":
+            self.calls.append("persons /detect")
+            return httpx.Response(200, json={"boxes": [dict(self.PERSON)]})
+        return super().handler(request)
+
+
+def test_loop_sends_appearance_on_match_when_computable():
+    """A decodable frame + a containing person box -> /match carries the 48."""
+    fake = TorsoFrames(images=[solid_jpeg_b64(RED_BGR)])
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+    assert fake.match_bodies, "the face must reach /match"
+    for body in fake.match_bodies:
+        desc = body.get("appearance")
+        assert desc is not None and len(desc) == 48
+        assert sum(desc) == pytest.approx(1.0)
+
+
+def test_loop_omits_appearance_when_the_frame_is_opaque():
+    """An undecodable (stub) frame sends NO appearance key — absent, not zero."""
+    fake = V1Fake(n_frames=1, face_widths=(85.0,))  # default opaque image_b64
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+    assert fake.match_bodies
+    assert all("appearance" not in b for b in fake.match_bodies)
+
+
+def test_loop_omits_appearance_when_the_torso_crop_is_too_small():
+    """Decodable frame, but V1Fake's 120-high geometry leaves a 20 px torso."""
+    fake = V1Fake(n_frames=1, face_widths=(60.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+    assert fake.match_bodies
+    assert all("appearance" not in b for b in fake.match_bodies)
+
+
+def test_heal_vetoed_when_the_mint_and_healing_frames_clash():
+    """THE TRACKER-SWAP REPLAY: the heal geometry is right but the shirt is not.
+
+    Tonight's script (mint at 0.3084, same track matches p00001 at 0.69), with
+    one change: the mint frame wears RED and the healing frame wears BLUE.
+    That colour flip is what a tracker swap looks like — the track was handed
+    from person A to person B mid-window, so folding the mint would erase a
+    REAL guest (the residual risk documented in _maybe_heal, now detected).
+    The fold must be refused: no /merge, unique unchanged, the veto counted
+    and reported.
+    """
+    red, blue = solid_jpeg_b64(RED_BGR), solid_jpeg_b64(BLUE_BGR)
+    fake = TorsoFrames(images=[red, red, blue], match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [], "a clashing fold must never reach /merge"
+    assert final["unique"] == 2, "the mint survives: it may be a real person"
+    assert final["healedSplits"] == 0
+    assert final["healVetoedByAppearance"] == 1
+    assert "healVetoedByAppearance=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["healVetoedByAppearance"] == 1
+
+
+def test_heal_proceeds_when_the_torsos_agree():
+    """Same replay, same shirt on every frame: the heal folds exactly as before.
+
+    Agreement is NOT evidence (the 0.377 impostor pair both wore light
+    shirts); it merely fails to veto, so the existing heal behaviour —
+    including the 0.45 cosine floor — runs untouched.
+    """
+    red = solid_jpeg_b64(RED_BGR)
+    fake = TorsoFrames(images=[red, red, red], match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00001", "drop": "p00002",
+        "onlyIfSingleton": True,
+    }]
+    assert final["unique"] == 1
+    assert final["healedSplits"] == 1
+    assert final["healVetoedByAppearance"] == 0
+
+
+def test_heal_veto_disabled_by_zero_knob():
+    """HECO_HEAL_APPEARANCE_CLASH=0 disables the veto (config semantics)."""
+    red, blue = solid_jpeg_b64(RED_BGR), solid_jpeg_b64(BLUE_BGR)
+    fake = TorsoFrames(images=[red, red, blue], match_script=list(TONIGHT_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, heal_appearance_clash=0.0).run()
+    assert final["healedSplits"] == 1, "with the veto off, the heal is v2 again"
+    assert final["healVetoedByAppearance"] == 0
+
+
+def test_enrol_veto_is_counted_and_appearance_sim_reaches_the_tap():
+    """The match side's anti-poison veto is visible: counter, notes, tap rows.
+
+    The runner does not decide this veto — it reads each /match reply's
+    appearanceVetoed flag (the matcher refused to keep a clashing sighting as
+    an extra template; the VERDICT itself is untouched) and reports it, and
+    forwards appearanceSim into the match tap so the console can watch the
+    advisory signal live.
+    """
+    script = [
+        scripted_verdict("p00001", True, None),
+        {**scripted_verdict("p00001", False, 0.55),
+         "appearanceVetoed": True, "appearanceSim": 0.31},
+    ]
+    fake = V1Fake(n_frames=2, face_widths=(60.0,), match_script=script,
+                  image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, tap_interval_s=0.0).run()
+
+    assert final["unique"] == 1, "the veto must never change the count"
+    assert final["enrolVetoedByAppearance"] == 1
+    assert "enrolVetoedByAppearance=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["enrolVetoedByAppearance"] == 1
+    rows = [
+        row
+        for t in fake.taps
+        if t["stage"] == "match"
+        for row in t["payload"].get("matches", [])
+    ]
+    assert any(r.get("appearanceSim") == 0.31 for r in rows)

@@ -106,6 +106,20 @@ class Settings:
     # evidence. A cross-identity match below this floor proves nothing and
     # heals nothing.
     heal_min_cosine: float = 0.45
+    # HEAL APPEARANCE VETO (see loop._maybe_heal and app/appearance.py). A heal
+    # candidate whose remembered torso descriptor scores BELOW this histogram
+    # intersection against the current frame's descriptor is refused — the
+    # clash is exactly the fingerprint of the heal's documented residual risk,
+    # a tracker identity swap handing the track from person A to person B
+    # mid-window. 0.50 is REASONED, NOT CALIBRATED (like the M1 margins were at
+    # first): identical L1-normalized histograms score 1.0, disjoint colour
+    # distributions 0.0, and one event's worth of same-person pairs has not yet
+    # been measured to place the floor empirically — calibrate it from real
+    # footage before trusting it near the boundary. 0 disables the veto.
+    # Appearance AGREEMENT never loosens anything (the 0.45 cosine floor
+    # stands): the measured 0.377 impostor pair was two DIFFERENT men both in
+    # light shirts, so agreeing torsos prove nothing about identity.
+    heal_appearance_clash: float = 0.50
 
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
@@ -163,6 +177,9 @@ def from_env() -> Settings:
         staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
         heal_window_s=env_float("HECO_HEAL_WINDOW_S", s.heal_window_s),
         heal_min_cosine=env_float("HECO_HEAL_MIN_COSINE", s.heal_min_cosine),
+        heal_appearance_clash=env_float(
+            "HECO_HEAL_APPEARANCE_CLASH", s.heal_appearance_clash
+        ),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
