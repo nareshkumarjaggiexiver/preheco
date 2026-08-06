@@ -13,13 +13,32 @@ torsos would have AGREED, so clothing agreement proves nothing about identity;
 only a CLASH carries information, and only against a decision face evidence
 was about to make anyway.
 
-WHY HUE x SATURATION AND NOT VALUE.  The descriptor is a 12x4 H x S histogram
-with the V channel used only as a mask.  Brightness is the axis illumination
-moves along — the same red kurta reads dark near the door and bright under the
-canopy lights, while its hue and saturation survive the walk across the frame.
-Pixels with V < 40 (shadow: hue is noise in the dark) or V > 240 (blowout:
-saturation collapses toward white) are masked out entirely rather than binned
-wrongly.
+THE v2 PARTITION: CHROMATIC BY HUE, ACHROMATIC BY BRIGHTNESS.  v1 was a pure
+12x4 Hue x Saturation histogram with V only as a mask, on the argument that
+brightness is the axis illumination moves along.  True for saturated cloth —
+and measurably WRONG for the clothes this camera actually sees: a light shirt
+is nearly desaturated, and the hue of a desaturated pixel is noise, so the
+same white shirt scattered across hue bins differently every frame.  Measured
+(2026-08-06, run cbdc6b): the same man's sightings read 0.88 / 0.48 / 0.77 /
+0.88 — a 0.40 spread on unchanged clothing.  v1's V-mask also DISCARDED
+V > 240, i.e. the brightest pixels of the very shirt it was trying to read.
+
+v2 keeps the same 48-float wire and splits it:
+
+* bins 0..35  — CHROMATIC pixels (S >= 40): 12 hue x 3 saturation.  Hue means
+  something here, and brightness still deliberately plays no part.
+* bins 36..38 — ACHROMATIC pixels (S < 40): 3 coarse brightness bins (dark /
+  mid / light cloth) over V 30..252, SOFT-assigned (each pixel splits its
+  mass between the two nearest bin centres) so the histogram is a continuous
+  function of brightness — auto-exposure drift moves a little mass, never all
+  of it.  White, grey and black cloth land here, described by the one
+  attribute a desaturated fabric reliably has.
+* bins 39..47 — reserved, always zero (the wire stays 48 and a future
+  partition change has headroom without another contract bump).
+
+Masks: V < 30 is shadow in both partitions (nothing reads reliably in the
+dark); V > 252 is specular blowout (a highlight, not cloth) — deliberately
+far above v1's 240 so bright shirts are finally IN the histogram.
 
 ABSENT IS NOT ZERO (codebase-wide convention, like ``gatedUnmeasured`` /
 ``zoneUnmeasured``): a sighting with no descriptor — no containing person box,
@@ -32,14 +51,28 @@ signal that measured "different".
 import cv2
 import numpy as np
 
-#: 12 hue bins (OpenCV HSV: H spans 0..179) x 4 saturation bins (S 0..255).
+#: Chromatic partition: 12 hue bins (OpenCV HSV: H 0..179) x 3 saturation
+#: bins over the SATURATED range (S 40..255) = bins 0..35.
 H_BINS = 12
-S_BINS = 4
+S_BINS = 3
+#: Below this saturation a pixel is ACHROMATIC — its hue is noise (the light-
+#: shirt failure v1 measured) — and it bins by brightness instead.
+S_ACHROMATIC = 40
+#: Achromatic partition: 3 coarse brightness bins (dark / mid / light cloth)
+#: over V 30..252 = bins 36..38, filled by SOFT (triangular) assignment — each
+#: pixel splits its mass between the two nearest bin centres.  Hard binning
+#: has a cliff: V=205 and V=218 (one shirt, auto-exposure drift) landed in
+#: adjacent bins with ZERO overlap.  Soft assignment makes the histogram a
+#: continuous function of brightness, so a small drift moves a little mass
+#: instead of all of it.
+V_BINS = 3
 
-#: V-channel mask bounds: below = shadow (hue is noise), above = blowout
-#: (saturation collapses).  Both families of pixel would land in wrong bins.
-V_MIN = 40
-V_MAX = 240
+#: V-channel mask bounds for BOTH partitions: below = shadow (nothing reads
+#: reliably in the dark), above = specular blowout (a highlight, not cloth).
+#: v1 masked at 240 and threw away the brightest pixels of every light shirt;
+#: 252 keeps them.
+V_MIN = 30
+V_MAX = 252
 
 #: The three None conditions (wire contract): a torso crop under this many
 #: pixels in either dimension carries too little cloth to histogram honestly…
@@ -69,12 +102,14 @@ def torso_descriptor(
     face itself and the background at the box edges.  The crop is additionally
     clamped to the image, because detector boxes legitimately overhang frames.
 
-    Returns the L1-normalized 12x4 Hue x Saturation histogram (H-major, 48
-    floats summing to 1) of the unmasked crop pixels, or **None** when any of
-    the contract's three conditions holds: no containing person box, a crop
-    under 24 px in either dimension, or fewer than 100 pixels surviving the
-    V-mask (V < 40 shadow / V > 240 blowout).  None means "could not measure",
-    and per the module convention it must never be treated as a clash.
+    Returns the L1-normalized 48-float v2 descriptor (chromatic 12x3 H x S in
+    bins 0..35, achromatic 6 V bins in 36..41, reserved zeros in 42..47 — see
+    the module docstring for why the partition exists), or **None** when any
+    of the contract's three conditions holds: no containing person box, a
+    crop under 24 px in either dimension, or fewer than 100 pixels surviving
+    the V-mask (V < 30 shadow / V > 252 blowout).  None means "could not
+    measure", and per the module convention it must never be treated as a
+    clash.
     """
     if person_box is None:
         return None
@@ -98,16 +133,34 @@ def torso_descriptor(
 
     crop = image_bgr[iy0:iy1, ix0:ix1]
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    v = hsv[:, :, 2]
-    mask = ((v >= V_MIN) & (v <= V_MAX)).astype(np.uint8)
-    if int(mask.sum()) < MIN_UNMASKED_PX:
+    h, sat, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    lit = (v >= V_MIN) & (v <= V_MAX)
+    if int(lit.sum()) < MIN_UNMASKED_PX:
         return None
 
-    hist = cv2.calcHist([hsv], [0, 1], mask, [H_BINS, S_BINS], [0, 180, 0, 256])
-    total = float(hist.sum())
-    if total <= 0.0:  # defensive: mask.sum() >= 100 makes this unreachable
+    chroma = lit & (sat >= S_ACHROMATIC)
+    achroma = lit & (sat < S_ACHROMATIC)
+
+    out = np.zeros(48, dtype=np.float64)
+    if chroma.any():
+        hist = cv2.calcHist(
+            [hsv], [0, 1], chroma.astype(np.uint8), [H_BINS, S_BINS],
+            [0, 180, S_ACHROMATIC, 256],
+        )
+        out[: H_BINS * S_BINS] = hist.flatten()
+    if achroma.any():
+        width = (V_MAX + 1 - V_MIN) / V_BINS
+        pos = (v[achroma].astype(np.float64) - V_MIN) / width - 0.5
+        lo = np.floor(pos).astype(int)
+        frac = pos - lo
+        base = H_BINS * S_BINS
+        for offset, weight in ((0, 1.0 - frac), (1, frac)):
+            idx = np.clip(lo + offset, 0, V_BINS - 1)
+            np.add.at(out, base + idx, weight)
+    total = float(out.sum())
+    if total <= 0.0:  # defensive: lit.sum() >= 100 makes this unreachable
         return None
-    return (hist / total).flatten().astype(float).tolist()
+    return (out / total).tolist()
 
 
 def intersection(a: list[float], b: list[float]) -> float:
