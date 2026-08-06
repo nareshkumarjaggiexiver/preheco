@@ -1488,3 +1488,72 @@ def test_mints_without_the_flag_count_nothing():
     assert final["unique"] >= 1
     assert final["nearMissMints"] == 0
     assert "nearMissMints=0" in fake.run_ended["notes"]
+
+
+def test_gallery_overlap_reaches_counter_notes_results_and_tap():
+    """The overlap flag rides a MATCHED verdict end to end, count untouched.
+
+    An enrolment grew p00002 into p00001's accept region (the pattern measured
+    at 0.544/0.452/0.376 across three benches, each pair one real person); the
+    match service flags it, the runner counts galleryOverlaps and forwards the
+    flag through the tap so the console can raise the standing merge banner.
+    """
+    script = [
+        scripted_verdict("p00001", True, None),
+        scripted_verdict("p00002", True, 0.30),
+        {**scripted_verdict("p00002", False, 0.60),
+         "templateAdded": True,
+         "overlap": {"key": "p00001", "cosine": 0.452, "appearanceSim": 0.805}},
+    ]
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    # heal_window_s=0: the fake serves ONE track, so the double-mint heal
+    # (correctly!) folded the scripted p00001 the first time this test ran —
+    # every layer polices the others.  Healing is off here because the wire
+    # under test is the overlap flag, not the heal.
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0,
+                      heal_window_s=0.0).run()
+
+    assert final["unique"] == 2, "information, never behaviour"
+    assert final["galleryOverlaps"] == 1
+    assert "galleryOverlaps=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["galleryOverlaps"] == 1
+    rows = [r for t in fake.taps if t["stage"] == "match"
+            for r in t["payload"].get("matches", []) if r.get("overlap")]
+    assert rows, "the tap must carry the flag for the console banner"
+    assert rows[-1]["overlap"] == {
+        "key": "p00001", "cosine": 0.452, "appearanceSim": 0.805,
+    }
+
+
+def test_person_boxes_in_zones_are_marked_not_filtered():
+    """'persons 2 · 1 in zone': the detector count explains itself.
+
+    The operator read "persons 2" while one body stood inside an excluded
+    zone and called it a bug (2026-08-06) — reasonably, because nothing said
+    the detector knew.  Bodies in zones stay DETECTED and TRACKED (deleting
+    them would cut track continuity for a guest walking past the partition
+    and re-mint them on the far side); only the tap display gains the split.
+    """
+    class TwoBodies(V1Fake):
+        def handler(self, request):
+            if request.url.host == "persons" and request.url.path == "/detect":
+                self.calls.append("persons /detect")
+                return httpx.Response(200, json={"boxes": [
+                    {"x": 10, "y": 20, "w": 40, "h": 90, "conf": 0.9},   # centre 0.19 — outside
+                    {"x": 36, "y": 20, "w": 10, "h": 90, "conf": 0.9},   # centre 0.256 — inside
+                ]})
+            return super().handler(request)
+
+    fake = TwoBodies(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"},
+               "exclusionZones": [FROSTED_ZONE]}
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+
+    assert final["state"] == "ended"
+    pd = [t["payload"] for t in fake.taps if t["stage"] == "person-detect"]
+    assert pd, "person-detect must tap"
+    assert pd[-1]["count"] == 2, "both bodies stay detected"
+    assert pd[-1]["inZone"] == 1, "and the display says which part is behind glass"
+    flagged = [b for b in pd[-1]["boxes"] if b.get("inZone")]
+    assert len(flagged) == 1 and flagged[0]["x"] == 36

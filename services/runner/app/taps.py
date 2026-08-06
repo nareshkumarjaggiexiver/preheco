@@ -37,6 +37,28 @@ def _near_miss(v: dict) -> dict | None:
         "appearanceSim": _r(nm.get("appearanceSim"), 4),
     }
 
+
+def _overlap(v: dict) -> dict | None:
+    """Compact a verdict's overlap for the tap row — same shape as nearMiss.
+
+    The match service flags an ENROLMENT whose just-written template landed at
+    or above the match threshold against a DIFFERENT identity: two guests the
+    gallery itself can no longer tell apart.  Measured emerging three times in
+    two days (cross-identity 0.544 / 0.452 / 0.376), each pair one real person
+    found by the operator reading cosine matrices by hand.  Unlike nearMiss it
+    fires regardless of clothing — at-or-above threshold is the gallery's own
+    standard of "same person" — and like nearMiss it is a suggestion, never a
+    merge.
+    """
+    ov = v.get("overlap")
+    if not ov:
+        return None
+    return {
+        "key": ov.get("key"),
+        "cosine": _r(ov.get("cosine"), 4),
+        "appearanceSim": _r(ov.get("appearanceSim"), 4),
+    }
+
 #: Max rows kept in any tap list — keeps payloads well under the 32 KB ceiling.
 ROW_CAP = 40
 
@@ -75,8 +97,26 @@ def ingest_payload(t_ms: int, seq: int | None = None) -> dict:
 
 
 def person_payload(boxes: list[dict]) -> dict:
-    """Person-detector output: exact count + a capped list of boxes."""
-    return {"count": len(boxes), "boxes": [_box(b) for b in boxes[:ROW_CAP]]}
+    """Person-detector output: exact count + a capped list of boxes.
+
+    ``inZone`` counts bodies whose centre sits inside an operator-drawn
+    exclusion zone.  They are still detected and still tracked — zones filter
+    FACES, not bodies, because a deleted body breaks track continuity for a
+    guest walking past a partition — but the count could not say so, and
+    "persons 2" with one person behind glass read as a bug to the operator
+    (2026-08-06).  The console renders "persons 2 · 1 in zone" instead.
+    """
+    rows = []
+    for b in boxes[:ROW_CAP]:
+        r = _box(b)
+        if b.get("inZone"):
+            r["inZone"] = True
+        rows.append(r)
+    return {
+        "count": len(boxes),
+        "inZone": sum(1 for b in boxes if b.get("inZone")),
+        "boxes": rows,
+    }
 
 
 def track_payload(tracks: list[dict]) -> dict:
@@ -210,6 +250,7 @@ def match_payload(
             # A mint that near-missed an existing guest ({key, cosine,
             # appearanceSim} or None) — the operator's one-click-merge cue.
             "nearMiss": _near_miss(v),
+            "overlap": _overlap(v),
         }
         for v in verdicts[:ROW_CAP]
     ]

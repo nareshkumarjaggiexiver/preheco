@@ -49,7 +49,7 @@ def _env_s(name: str, default: float) -> float:
         return default
     return float(raw)
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -294,6 +294,7 @@ def match(body: MatchRequest) -> dict:
                 "appearanceVetoed": False,
                 # ...and no near-miss flag either: a staff hit is not a mint.
                 "nearMiss": None,
+                "overlap": None,
             }
 
     try:
@@ -332,6 +333,12 @@ def match(body: MatchRequest) -> dict:
         # a one-click-merge suggestion for the operator, never behaviour
         # (see gallery.match: impostors measured face 0.377 / clothes 0.503).
         "nearMiss": r.near_miss,
+        # Non-null when the template this call wrote pulled its identity
+        # within the match threshold of a DIFFERENT identity — two guests the
+        # gallery itself can no longer tell apart (measured emerging at
+        # 0.544/0.452/0.376 across three benches, each pair one real person).
+        # Same rule as nearMiss: a suggestion, never a merge.
+        "overlap": r.overlap,
     }
 
 
