@@ -74,6 +74,7 @@ class V1Fake:
         self.run_ended: dict | None = None
         self.drop_resolve = 0  # PUT /api/feedback/:id to swallow (dropped reply)
         self.merge_ok = True  # False once the drop key no longer exists
+        self.merge_always_ok = False  # True: distinct drops all succeed (multi-heal)
         self.feedback_sticky = False  # re-serve open items until a PUT lands
 
     # -- helpers -----------------------------------------------------------
@@ -133,7 +134,9 @@ class V1Fake:
             return httpx.Response(200, json={"ok": True})
         if path == "/merge":
             self.merges.append(body)
-            merged, self.merge_ok = self.merge_ok, False  # a merge is one-shot
+            merged = self.merge_ok
+            if not self.merge_always_ok:
+                self.merge_ok = False  # a merge is one-shot (drop key is gone)
             return httpx.Response(
                 200, json={"merged": merged, "galleryN": max(0, self.guest_n - 1)}
             )
@@ -755,6 +758,60 @@ def test_track_heal_replays_tonight_and_folds_the_junk_mint():
     assert "healedSplits=1" in fake.run_ended["notes"]
     assert fake.run_ended["results"]["healedSplits"] == 1
     assert fake.run_ended["results"]["unique"] == 1
+
+
+def test_the_double_mint_is_healed_when_the_track_settles_on_its_second_key():
+    """THE 2026-08-06 MORNING REPLAY: two mints one second apart, both hers.
+
+    A blurred crossing (4 real people, counted 5): the same track minted
+    p00003 at cosine 0.17 and then p00004 at 0.29 — her consecutive frames
+    scored 0.29 against each other — and finally matched p00004 comfortably.
+    The single-slot bookkeeping this test killed forgot p00003 the moment
+    p00004 was recorded, so the phantom survived to the invoice.  Now every
+    remembered mint of the track EXCEPT the matched key is folded — including
+    when the matched key is itself the track's own later mint.
+    """
+    script = [
+        scripted_verdict("p00003", True, 0.17),   # her first frame, blurred
+        scripted_verdict("p00004", True, 0.29),   # one second later, v her own template
+        scripted_verdict("p00004", False, 0.83),  # the track settles on p00004
+    ]
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00004", "drop": "p00003",
+        "onlyIfSingleton": True,
+    }], "the earlier mint must fold into the key the track settled on"
+    assert final["unique"] == 1, "one woman, one guest — not two"
+    assert final["healedSplits"] == 1
+    assert fake.run_ended["results"]["healedSplits"] == 1
+
+
+def test_a_triple_mint_folds_every_phantom_on_one_comfortable_match():
+    """All remembered mints except the settled key fold — not just the newest.
+
+    Three blurry mints on one track, then one comfortable match to the third:
+    both earlier phantoms fold in the same pass, because each is disowned by
+    the same piece of evidence.  One extra guest healed per verdict would
+    leave the count wrong for a frame longer than it needs to be.
+    """
+    script = [
+        scripted_verdict("p00003", True, 0.17),
+        scripted_verdict("p00004", True, 0.29),
+        scripted_verdict("p00005", True, 0.31),
+        scripted_verdict("p00005", False, 0.83),
+    ]
+    fake = V1Fake(n_frames=4, face_widths=(60.0,), match_script=script)
+    fake.merge_always_ok = True  # two DISTINCT drop keys: both folds succeed
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert sorted(m["drop"] for m in fake.merges) == ["p00003", "p00004"]
+    assert all(m["keep"] == "p00005" and m["onlyIfSingleton"] for m in fake.merges)
+    assert final["unique"] == 1
+    assert final["healedSplits"] == 2
 
 
 def test_heal_refusal_changes_nothing_and_is_not_retried():

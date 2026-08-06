@@ -196,12 +196,14 @@ class RunLoop:
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
-        # TRACK-HEAL bookkeeping: track_id -> {key, cosine, at} recorded when a
-        # verdict on that track minted a NEW identity (isNew=true).  Guarded by
-        # _lock like _template_n.  Entries older than heal_window_s are pruned
-        # on every mint, so the dict is bounded by the tracks active within one
-        # window, not by the night's traffic.
-        self._minted: dict[int, dict] = {}
+        # TRACK-HEAL bookkeeping: track_id -> LIST of {key, cosine, at}, one
+        # per NEW identity (isNew=true) the track minted inside the heal
+        # window.  A list because a blurred crossing can mint twice in a
+        # second (see _record_mint), and the earlier mint is exactly the one
+        # a later comfortable match must be able to fold.  Guarded by _lock
+        # like _template_n; pruned on every mint and capped per track, so it
+        # is bounded by the tracks active within one window, not the night.
+        self._minted: dict[int, list[dict]] = {}
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
         self._last_tap: float = 0.0
@@ -930,8 +932,23 @@ class RunLoop:
                 best_id, best_d = t.get("id"), d
         return best_id
 
+    #: At most this many un-healed mints remembered per track.  A real track
+    #: double- or maybe triple-mints in a blurry crossing; dozens would mean
+    #: the tracker is churning ids and the bookkeeping must not amplify it.
+    _MINTS_PER_TRACK_CAP = 4
+
     def _record_mint(self, track_id: int, verdict: dict) -> None:
         """Remember that this track just minted a new identity (heal evidence).
+
+        A LIST per track, not a single slot.  The 2026-08-06 morning bench
+        (4 real people, counted 5) showed why: one woman's track minted
+        p00003 and then, ONE SECOND later and motion-blurred, minted p00004 —
+        her two frames scored 0.29 against each other.  With a single slot the
+        second mint overwrote the first, so when her track went on to match
+        p00004 comfortably the heal saw only "the track resolves to its own
+        mint" and p00003 — bookkeeping already gone — survived as a phantom
+        guest.  Every un-healed mint of the track stays remembered for the
+        window, so a later comfortable match can fold ALL the others.
 
         Expired entries are pruned here — the only growth point — so the
         bookkeeping is bounded by the tracks active within one heal window.
@@ -941,15 +958,17 @@ class RunLoop:
         now = time.monotonic()
         with self._lock:
             for tid in [
-                t for t, e in self._minted.items()
-                if now - e["at"] > self.s.heal_window_s
+                t for t, entries in self._minted.items()
+                if all(now - e["at"] > self.s.heal_window_s for e in entries)
             ]:
                 del self._minted[tid]
-            self._minted[track_id] = {
+            entries = self._minted.setdefault(track_id, [])
+            entries.append({
                 "key": verdict.get("personKey"),
                 "cosine": verdict.get("cosine"),
                 "at": now,
-            }
+            })
+            del entries[: -self._MINTS_PER_TRACK_CAP]
 
     def _maybe_heal(self, planner_run_id: str, track_id: int, verdict: dict) -> None:
         """Fold a junk mint back when its own track disowns it (TRACK HEAL).
@@ -964,6 +983,15 @@ class RunLoop:
         (cosine >= heal_min_cosine, within heal_window_s of the mint), the
         mint is folded into the matched identity via ``POST /merge`` with
         ``onlyIfSingleton: true`` and the unique count steps back down.
+
+        THE DOUBLE-MINT (2026-08-06 morning bench, 4 real people counted 5).
+        A blurred crossing minted p00003 and then p00004 ONE SECOND apart —
+        the same woman's consecutive frames scored 0.29 against each other.
+        Her track then matched p00004 comfortably, so "a different existing
+        identity" must include the track's OWN later mint: every remembered
+        mint of the track except the matched key is folded, not just one.
+        The blur was the disease (the shutter floor is the treatment); this
+        is the antibody that stops one bad second becoming a phantom guest.
 
         The guards, each load-bearing:
 
@@ -996,53 +1024,60 @@ class RunLoop:
         """
         if self.s.heal_window_s <= 0:
             return
-        with self._lock:
-            entry = self._minted.get(track_id)
-        if entry is None:
-            return
-        now = time.monotonic()
-        if now - entry["at"] > self.s.heal_window_s:
-            with self._lock:
-                self._minted.pop(track_id, None)
-            return
         matched_key = verdict.get("personKey")
-        minted_key = entry["key"]
-        if not matched_key or not minted_key or matched_key == minted_key:
-            return  # the track still resolves to its own mint — nothing to heal
         cosine = verdict.get("cosine")
+        if not matched_key:
+            return
         if cosine is None or float(cosine) < self.s.heal_min_cosine:
             return  # not comfortable enough to outrank the impostor ceiling
-        try:
-            r = self._post(
-                f"{self.s.match_url}/merge",
-                {
-                    "runId": planner_run_id,
-                    "keep": matched_key,
-                    "drop": minted_key,
-                    "onlyIfSingleton": True,
-                },
-            )
-        except Exception as e:  # noqa: BLE001 — a heal must never stop the count
-            # Transient (match hiccup): keep the bookkeeping; the next verdict
-            # on this track retries while the window lasts.
-            self.log.warning(f"heal attempt failed, will retry in-window: {e}")
-            return
+        now = time.monotonic()
         with self._lock:
-            self._minted.pop(track_id, None)
-        if r.get("merged"):
-            self._dec_unique()
-            self._bump("healedSplits")
-            self.log.info(
-                f"healed split: track {track_id} minted {minted_key} "
-                f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
-                f"(cosine={_fmt(cosine)}) — mint folded, unique -1"
-            )
-        else:
-            self.log.info(
-                f"heal refused for track {track_id}: {minted_key} is no longer "
-                f"a singleton or is split from {matched_key} — count unchanged, "
-                "which is the refusal doing its job"
-            )
+            entries = self._minted.get(track_id, [])
+            live = [e for e in entries if now - e["at"] <= self.s.heal_window_s]
+            # Every OTHER mint of this track is now disowned by the comfortable
+            # match — including when matched_key is itself one of the track's
+            # own mints, which is exactly the double-mint case: mint A, mint B
+            # one blurry second later, then match B strongly.  B is where the
+            # track settled; A is the phantom to fold.
+            doomed = [e for e in live if e["key"] and e["key"] != matched_key]
+            kept = [e for e in live if not e["key"] or e["key"] == matched_key]
+            if kept:
+                self._minted[track_id] = kept
+            else:
+                self._minted.pop(track_id, None)
+        for entry in doomed:
+            minted_key = entry["key"]
+            try:
+                r = self._post(
+                    f"{self.s.match_url}/merge",
+                    {
+                        "runId": planner_run_id,
+                        "keep": matched_key,
+                        "drop": minted_key,
+                        "onlyIfSingleton": True,
+                    },
+                )
+            except Exception as e:  # noqa: BLE001 — a heal must never stop the count
+                # Transient (match hiccup): put the bookkeeping back; the next
+                # verdict on this track retries while the window lasts.
+                self.log.warning(f"heal attempt failed, will retry in-window: {e}")
+                with self._lock:
+                    self._minted.setdefault(track_id, []).append(entry)
+                continue
+            if r.get("merged"):
+                self._dec_unique()
+                self._bump("healedSplits")
+                self.log.info(
+                    f"healed split: track {track_id} minted {minted_key} "
+                    f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
+                    f"(cosine={_fmt(cosine)}) — mint folded, unique -1"
+                )
+            else:
+                self.log.info(
+                    f"heal refused for track {track_id}: {minted_key} is no longer "
+                    f"a singleton or is split from {matched_key} — count unchanged, "
+                    "which is the refusal doing its job"
+                )
 
     def _note_templates(self, person_key: object, template_n: object) -> None:
         """Track how many views each guest holds, and summarise it in the status.
