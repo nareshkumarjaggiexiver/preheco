@@ -133,7 +133,7 @@ def torso_descriptor(
 
     crop = image_bgr[iy0:iy1, ix0:ix1]
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h, sat, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    sat, v = hsv[:, :, 1], hsv[:, :, 2]  # hue is read by calcHist directly
     lit = (v >= V_MIN) & (v <= V_MAX)
     if int(lit.sum()) < MIN_UNMASKED_PX:
         return None
