@@ -1354,6 +1354,7 @@ class RunLoop:
             if r.get("merged"):
                 self._dec_unique()
                 self._bump("healedSplits")
+                self._forget_mint(minted_key)
                 self.log.info(
                     f"healed split: track {track_id} minted {minted_key} "
                     f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
@@ -1673,6 +1674,7 @@ class RunLoop:
                 )
                 if r.get("merged"):
                     self._dec_unique()
+                    self._forget_mint(action.key_b)  # drop folds into keep
                     return True
                 return False
             if action.kind == "split":
@@ -1688,6 +1690,7 @@ class RunLoop:
                 r = self._post(f"{self.s.match_url}/mark-staff", body)
                 if r.get("moved", 0) > 0:
                     self._dec_unique()
+                    self._forget_mint(action.person_key)  # no longer a guest
                     return True
                 return False
             if action.kind == "count-missed":
@@ -1710,6 +1713,23 @@ class RunLoop:
         except Exception as e:  # noqa: BLE001 — match hiccup: retry on the next poll
             self.log.warning(f"could not apply a correction, will retry: {e}")
             return None
+
+    def _forget_mint(self, person_key: str | None) -> None:
+        """Remove a folded identity's row from the mint ledger.
+
+        The ledger exists so the register can show every guest the count
+        contains — and for exactly that reason it must STOP showing a guest
+        the count no longer contains.  Found live (2026-08-06, run 6e1a5d):
+        three mints were auto-healed within seconds, the gallery correctly
+        held 3 identities, and the register showed 6 — three cards without
+        frames, one still wearing a "likely duplicate" chip, all advertising
+        identities that had already been folded into their owner.  A heal, an
+        operator merge and a mark-staff all retire a key; the ledger follows.
+        """
+        if not person_key:
+            return
+        with self._lock:
+            self._mints = [m for m in self._mints if m.get("personKey") != person_key]
 
     def _dec_unique(self) -> None:
         """Drop the live unique count by one after a confirmed correction."""
