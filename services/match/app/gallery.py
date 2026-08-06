@@ -65,6 +65,13 @@ class MatchResult:
     #  operator, never behaviour — is_new stays True and nothing is merged
     #  (see match() for the measured impostor pair that forbids it).
     near_miss: dict | None = None
+    # Set when the template THIS CALL WROTE brought its identity within the
+    # match threshold of a DIFFERENT identity — the gallery-overlap signal:
+    # {"key": the overlapping rival, "cosine": the new template's similarity
+    #  to it, "appearanceSim": torso intersection vs the rival's stored
+    #  descriptors, None when either side lacks one}.  Same discipline as
+    # near_miss: information for the operator, never behaviour.
+    overlap: dict | None = None
 
 
 def db_path(data_dir: Path, run_id: str) -> Path:
@@ -339,6 +346,7 @@ def match(
                 # the identity must not grow towards it.  The VERDICT above is
                 # untouched — this refuses only the write.
                 added, vetoed = False, True
+            overlap = None
             if added:
                 store.add(
                     hit.key,
@@ -350,6 +358,7 @@ def match(
                 # Redundancy, NOT quality — see _should_enrol clause 5 for the
                 # measurement that killed the quality rule here.
                 store.prune_redundant(hit.key, templates_per_person)
+                overlap = _overlap_after_write(store, hit.key, embedding, appearance, threshold)
             return MatchResult(
                 hit.key,
                 False,
@@ -360,6 +369,7 @@ def match(
                 added,
                 appearance_sim=appearance_sim,
                 appearance_vetoed=vetoed,
+                overlap=overlap,
             )
         # NEAR-MISS: judged BEFORE this mint writes anything, against the
         # near-missed identity's already-stored descriptors — the same
@@ -378,11 +388,64 @@ def match(
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
         )
+        # A mint can NEVER create overlap, by construction: on this branch the
+        # best pre-write cosine sits below the threshold, and the nearest
+        # rival to the founding view is bounded by that same best.  Overlap is
+        # exclusively an ENROLMENT phenomenon — an identity GROWING a view
+        # that lands inside someone else's accept region — which is also why
+        # the near-miss flag above (below threshold, clothing-gated) and the
+        # overlap flag (at/above threshold, unconditional) never both fire on
+        # one verdict.  Pinned by test, not assumed.
         best = hit.cosine if hit is not None else None
         return MatchResult(
             key, True, best, store.distinct_count(), sub_canon, 1, False,
             near_miss=near_miss,
         )
+
+
+def _overlap_after_write(
+    store: VectorStore, key: str, embedding, appearance, threshold: float
+) -> dict | None:
+    """Did the template just written pull ``key`` into overlap with a rival?
+
+    THE PATTERN THIS SURFACES, measured three times in two days before it had
+    a name: a person splits into two identities (a seated face, a blurred
+    re-entry, a lens-edge view), and multi-template growth then WIDENS both
+    until their templates cross the match threshold — 0.544, 0.452 and 0.376
+    on consecutive benches, every pair later confirmed one person by the
+    operator.  At that point the gallery itself holds the evidence that two of
+    its identities are probably one guest, and nothing surfaced it; the
+    operator found each case by reading cosine matrices by hand.
+
+    So: after ANY template write (a mint's founding view or an enrolled
+    extra), ask the store for the nearest RIVAL identity to the new template.
+    At or above the match threshold, that rival would have MATCHED this very
+    sighting had the other identity not existed — the gallery's own standard
+    of "same person", which is why this fires regardless of clothing (unlike
+    the near-miss banner, which sits below the threshold and needs the
+    clothes to agree before it speaks).  The torso intersection rides along
+    for the operator's judgement.
+
+    An operator's cannot-link split silences the pair for good: they have
+    already looked at these two and said "different people", and a banner
+    that keeps arguing with them is noise.  Overlap created by merge()
+    re-pointing rows is deliberately not detected here — a merge is itself an
+    operator act, and its survivor is pruned back through prune_redundant.
+
+    Information only, never behaviour: nothing is merged, the count does not
+    move.  The runner forwards it; the planner turns it into a one-click
+    suggestion.
+    """
+    rival = store.runner_up(embedding, key)
+    if rival is None or rival.cosine < threshold:
+        return None
+    if store.cannot_link(key, rival.key):
+        return None
+    return {
+        "key": rival.key,
+        "cosine": rival.cosine,
+        "appearanceSim": best_intersection(appearance, store.appearances_for(rival.key)),
+    }
 
 
 def add_manual(data_dir: Path, run_id: str, note: str | None = None) -> tuple[str, int]:

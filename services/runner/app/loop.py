@@ -265,6 +265,9 @@ class RunLoop:
             # IMPOSTOR pair measured 0.377 face with 0.503 clothing, so this
             # flag must never move the count by itself.
             "nearMissMints": 0,
+            # Enrolments that grew one identity into another past the match
+            # threshold — each is a standing "probably one person" candidate.
+            "galleryOverlaps": 0,
             # TORSO-APPEARANCE VETOES (app/appearance.py; both ADVISORY-only
             # mechanisms — neither ever changes a match/count verdict).
             # healVetoedByAppearance: heal folds this loop refused because the
@@ -571,6 +574,7 @@ class RunLoop:
             # may never move the count itself).  A run ending with this > 0
             # and no operator merges may be counting one guest twice.
             f"nearMissMints={st['nearMissMints']} "
+            f"galleryOverlaps={st['galleryOverlaps']} "
             f"excludedByZone={st['excludedByZone']} "
             f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
@@ -593,6 +597,7 @@ class RunLoop:
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
             "nearMissMints": st["nearMissMints"],
+            "galleryOverlaps": st["galleryOverlaps"],
             "excludedByZone": st["excludedByZone"],
         }
         try:
@@ -753,6 +758,7 @@ class RunLoop:
         # excludedByZone) so the taps and the annotated frame can show the
         # operator exactly what their polygon is eating.
         countable = self._apply_zones(faces, frame)
+        self._mark_person_zones(boxes, frame)
 
         # QUALITY GATE (local) — the pipeline's only irreversible discard.
         # Width floor 56 px as always; the IED / frontality / sharpness floors
@@ -865,6 +871,12 @@ class RunLoop:
                     # Carried into the tap verbatim so the console can offer
                     # the operator the one-click merge; a SUGGESTION only.
                     "nearMiss": m.get("nearMiss"),
+                    # The overlap flag on an ENROLMENT: the template just
+                    # written landed at/above the threshold against a DIFFERENT
+                    # guest — the gallery has grown two identities into each
+                    # other (measured 0.544/0.452/0.376, each pair one person).
+                    # Same contract as nearMiss: a suggestion, never a merge.
+                    "overlap": m.get("overlap"),
                     "box": face.get("box"),
                 }
             )
@@ -903,6 +915,10 @@ class RunLoop:
                 # how often the enrolment veto engaged.
                 if m.get("appearanceVetoed"):
                     st["enrolVetoedByAppearance"] += 1
+                # Two identities the gallery can no longer tell apart — each
+                # event is a standing merge candidate for the operator.
+                if m.get("overlap"):
+                    st["galleryOverlaps"] += 1
                 self._note_templates(m.get("personKey"), m.get("templateN"))
             nm = m.get("nearMiss")
             if m.get("isNew") and nm:
@@ -915,6 +931,15 @@ class RunLoop:
                     f"(appearanceSim={_fmt(nm.get('appearanceSim'))}) — likely "
                     "the same person; suggested to the operator, count "
                     "unchanged unless they merge"
+                )
+            ov = m.get("overlap")
+            if ov:
+                self.log.info(
+                    f"gallery overlap: {m.get('personKey')} grew a template at "
+                    f"face {_fmt(ov.get('cosine'))} vs {ov.get('key')} "
+                    f"(appearanceSim={_fmt(ov.get('appearanceSim'))}) — the "
+                    "gallery can no longer tell these two apart; suggested to "
+                    "the operator, count unchanged unless they merge"
                 )
             # TRACK HEAL bookkeeping: only verdicts that can be pinned to a
             # track participate (no containing track = no heal for this one).
@@ -1039,6 +1064,37 @@ class RunLoop:
         if excluded:
             self._bump("excludedByZone", excluded)
         return countable
+
+    def _mark_person_zones(self, boxes: list, frame: dict) -> None:
+        """Stamp person boxes whose centre sits inside an operator zone.
+
+        DISPLAY ONLY — nothing is filtered.  Person boxes inside zones stay
+        detected and stay TRACKED on purpose: deleting them would cut track
+        continuity for a guest walking past a partition, and a broken track
+        re-mints its person on the far side (the split class every heal and
+        banner in this system exists to fight).  What the operator asked for
+        (2026-08-06 bench) is narrower and right: the console said
+        "persons 2" while one of the two stood inside an excluded zone, and
+        the number LOOKED wrong because nothing said the detector knew.  So
+        the tap now says "persons 2 · 1 in zone" — same facts, no ambiguity.
+
+        Same centre rule and same honesty as _apply_zones: no dims, no marks.
+        """
+        if not self.zones or not boxes:
+            return
+        w = frame.get("w")
+        h = frame.get("h")
+        if not w or not h:
+            return
+        w, h = float(w), float(h)
+        for b in boxes:
+            cx = float(b.get("x", 0.0)) + float(b.get("w", 0.0)) / 2.0
+            cy = float(b.get("y", 0.0)) + float(b.get("h", 0.0)) / 2.0
+            if any(
+                point_in_polygon(cx, cy, [[p[0] * w, p[1] * h] for p in z["points"]])
+                for z in self.zones
+            ):
+                b["inZone"] = True
 
     @staticmethod
     def _track_for(face: dict, tracks: list) -> int | None:

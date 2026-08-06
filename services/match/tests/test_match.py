@@ -307,3 +307,78 @@ def test_near_miss_floor_zero_disables_and_health_reports_it(client, monkeypatch
 
     monkeypatch.setenv("HECO_MATCH_NEARMISS_FLOOR", "")
     assert config.nearmiss_floor() == pytest.approx(0.29), "empty means unset"
+
+
+# ------------------------------------------------------- gallery overlap flag
+
+
+def test_enrolment_that_creates_overlap_is_flagged(client):
+    """THE PATTERN, measured three times before it had a name: a split pair's
+    identities GROW into each other via multi-template enrolment until their
+    templates cross the match threshold (0.544 / 0.452 / 0.376 on consecutive
+    benches, every pair one real person by the operator's own eyes) — and the
+    gallery held that evidence with nothing surfacing it.
+
+    Deliberate geometry.  A founded at e0; B minted at 0.30 vs A (safely below
+    the 0.363 threshold).  Then a sighting X with cos(X,A)=0.45 and
+    cos(X,B)=0.60 arrives: it matches B (argmax), clears every enrolment gate
+    (0.413 <= 0.60 < 0.90; margin over rival A = 0.15 >= 0.05) — and the
+    template just written sits 0.45 vs A, above the threshold.  B now holds a
+    view the gallery could not tell from A, and the write comes back flagged.
+    """
+    a = _match_full(client, "run-ov", _e(0).tolist(), appearance=_desc({0: 1.0}))
+    b = _match_full(client, "run-ov", _at_cosine(0.30), appearance=_desc({1: 1.0}))
+    assert b["isNew"] is True and b["overlap"] is None, "0.30 apart: two people, no flag"
+
+    # X's clothes must agree with B's (its own identity) or the appearance
+    # veto refuses the very write this test needs — the first draft of this
+    # test dressed X in the RIVAL's clothes and the anti-poison veto blocked
+    # the enrolment, which is the layering working exactly as designed.
+    x = _unit(0.45 * _e(0) + 0.487 * _e(1) + math.sqrt(1 - 0.45**2 - 0.487**2) * _e(2))
+    out = _match_full(client, "run-ov", x, appearance=_desc({0: 0.2, 1: 0.8}))
+    assert out["personKey"] == b["personKey"] and out["isNew"] is False
+    assert out["templateAdded"] is True, "the write is what creates the overlap"
+    ov = out["overlap"]
+    assert ov is not None, "an above-threshold rival to the new template must flag"
+    assert ov["key"] == a["personKey"]
+    assert ov["cosine"] == pytest.approx(0.45, abs=1e-5)
+    assert ov["appearanceSim"] == pytest.approx(0.2, abs=1e-5), (
+        "torso vs the RIVAL's stored descriptor"
+    )
+    assert out["galleryN"] == 2, "information, never behaviour: the count is untouched"
+
+
+def test_a_mint_never_carries_overlap(client):
+    """Overlap is an enrolment phenomenon, impossible on a mint by construction.
+
+    On the mint branch the best pre-write cosine is below the threshold, and
+    the nearest rival to the founding view is bounded by that same best — so
+    the flag cannot fire, and the code no longer even asks.  Pinned here so a
+    refactor that reorders the write and the search gets caught: a mint in the
+    near-miss band must carry nearMiss and never overlap.
+    """
+    _match_full(client, "run-ov2", _e(0).tolist())
+    out = _match_full(client, "run-ov2", _at_cosine(0.30, ortho=2))
+    assert out["isNew"] is True
+    assert out["nearMiss"] is not None, "0.30 is inside the near-miss band"
+    assert out["overlap"] is None
+
+
+def test_overlap_respects_an_operator_split(client):
+    """cannot_link silences the overlap flag for good: the operator has ruled.
+
+    Two identities held apart by a split are EXPECTED to sit close; a banner
+    that keeps arguing with the operator's explicit decision is noise, and
+    noise trains operators to ignore banners.  Identical geometry to the
+    flagged test above — the ONLY difference is the split — so this pair
+    proves the suppression rather than a quirk of the vectors.
+    """
+    a = _match_full(client, "run-ov3", _e(0).tolist())
+    b = _match_full(client, "run-ov3", _at_cosine(0.30))
+    assert b["isNew"] is True
+    r = client.post("/split", json={"runId": "run-ov3", "a": a["personKey"], "b": b["personKey"]})
+    assert r.status_code == 200
+    x = _unit(0.45 * _e(0) + 0.487 * _e(1) + math.sqrt(1 - 0.45**2 - 0.487**2) * _e(2))
+    out = _match_full(client, "run-ov3", x)
+    assert out["personKey"] == b["personKey"] and out["templateAdded"] is True
+    assert out["overlap"] is None, "split pairs must never re-raise the banner"

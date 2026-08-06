@@ -878,3 +878,37 @@ merge suggestion**.
   **`nearMissMints`** in the run status, the end-of-run notes
   (`nearMissMints=N`) and the structured `results`, and logs one INFO line
   per flag (both keys, both scores) so the night is greppable.
+
+
+## v2 addition — the gallery confesses its own overlaps (2026-08-06)
+
+Multi-template growth can carry two identities INTO each other: a guest
+splits early (a seated face, a blurred re-entry, a lens-edge view) and
+enrolment then widens both halves until their stored views cross the match
+threshold. Measured three times in two days — cross-identity 0.544, 0.452
+and 0.376 — every pair one real person, found by the operator reading
+cosine matrices by hand.
+
+- On any ENROLMENT whose just-written template lands at-or-above the match
+  threshold against a different identity, `/match` returns
+  **`overlap`: {key, cosine, appearanceSim}** (same rider shape as
+  `nearMiss`). A MINT can never carry it, by construction: on the mint
+  branch the nearest rival is bounded by a best that sits below the
+  threshold — pinned by test.
+- Unlike `nearMiss` it fires regardless of clothing (at-or-above threshold
+  is the gallery's own standard of "same person"); the clothing figure rides
+  along as evidence for the operator either way.
+- An operator's cannot-link split silences the pair at the source, forever.
+- The runner forwards the rider through the match tap, counts
+  **`galleryOverlaps`** (status, notes, results), and logs one INFO line per
+  event. The planner raises a standing amber merge banner on the NEWER
+  guest of the pair (keys are monotonic, so newer folds into older),
+  wording the clothing agreement or clash honestly. A suggestion, never a
+  merge: the count moves only on the operator's click.
+
+Also in this change, display honesty for person boxes: zones filter FACES,
+never bodies (a deleted body breaks track continuity for a guest walking
+past a partition), but "persons 2" while one body stood inside a zone read
+as a bug to the operator. The person-detect tap now carries **`inZone`**
+(count + per-box flag) so the console can render "persons 2 · 1 in zone" —
+same facts, no ambiguity.
