@@ -51,11 +51,17 @@ Storage
                   photographs"; it is NOT used on the enrolment path any more,
                   because quality is face width and face width is distance —
                   see :meth:`prune_redundant` for the measurement.
-* ``cannot_link`` operator "these are two different people" constraints
-                  (from a *false-match* correction), stored order-independent.
+* ``cannot_link`` "these are two different people" constraints, stored
+                  order-independent.  Written by an operator's *false-match*
+                  correction and by the runner asserting CO-PRESENCE (two faces
+                  at different positions in one frame are two people).
                   :meth:`merge` refuses to fold a constrained pair — that is
                   how "raise the pair's internal distance, no auto-merge later"
-                  is realised in a brute-force store.
+                  is realised in a brute-force store — and the policy layer
+                  reads the same rows to withhold both operator-facing
+                  "probably a duplicate" banners (:func:`app.gallery.
+                  _overlap_after_write` and :func:`app.gallery._near_miss`).
+                  It is deliberately the ONE record of "known different".
 * ``manual``      operator-attested people who were counted but never matched
                   (a *missed* correction).  They own no vector on purpose —
                   there is no face to store — so they can never be matched
@@ -696,7 +702,14 @@ class VectorStore:
     # ------------------------------------- operator corrections (pure ops)
 
     def cannot_link(self, a: str, b: str) -> bool:
-        """True if the pair carries a do-not-merge constraint."""
+        """True if the pair carries a do-not-merge constraint.
+
+        Three callers now, all of them treating the row as "known different":
+        :meth:`merge` (refuse the fold), and the two banner paths in
+        :mod:`app.gallery` that withhold a duplicate suggestion for a pair
+        somebody has already settled.  One indexed primary-key lookup, so it is
+        cheap enough to sit on the mint path.
+        """
         lo, hi = _pair(a, b)
         row = self.conn.execute(
             "SELECT 1 FROM cannot_link WHERE a = ? AND b = ?", (lo, hi)
@@ -704,11 +717,18 @@ class VectorStore:
         return row is not None
 
     def split(self, a: str, b: str) -> None:
-        """Record a *false-match* correction: a and b are different people.
+        """Record that a and b are different people (*false-match* / co-presence).
 
         Realises "raise the pair's internal distance (no auto-merge later)" as
-        a persistent cannot-link constraint that :meth:`merge` honours.  Both
-        keys keep every template they had, so the distinct count is unchanged.
+        a persistent cannot-link constraint that :meth:`merge` honours and that
+        both duplicate-suggestion banners consult.  Both keys keep every
+        template they had, so the distinct count is unchanged.
+
+        Keys are NOT required to exist.  A constraint is a statement about a
+        pair of identifiers, not about stored rows: :meth:`merge` already
+        refuses an unknown key on its own terms, and :meth:`remove` clears a
+        retired key's rows.  Refusing to record the assertion would mean losing
+        it, and losing it is how two people get folded into one.
         """
         if a == b:
             raise ValueError("cannot split a key from itself")

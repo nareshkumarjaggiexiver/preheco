@@ -2104,3 +2104,249 @@ def test_a_folded_key_is_published_as_retired():
     assert [m["personKey"] for m in payload["mints"]] == ["p00002"] or True
     # And the ledger no longer advertises it either — both halves must agree.
     assert "p00002" not in [m["personKey"] for m in payload["mints"]]
+
+
+# ------------------------------ co-presence (run 05b3b7, 2026-08-06)
+#
+# Ground truth THREE people, counted THREE — the COUNT was right and the NOISE
+# was wrong.  Two "likely duplicate" banners were raised between people who are
+# demonstrably different: p00002 carried "Minted 0.316 from p00001 — clothing
+# agreement 0.94" and p00007 (the operator) carried "Minted 0.360 from p00002 —
+# clothing agreement 0.57".  p00001 and p00002 walked in through the main door
+# TOGETHER; p00007 and p00002 stood in the alley TOGETHER.  Both false
+# suggestions sat INSIDE the ordinary near-miss band (0.316 / 0.360 against the
+# 0.363 threshold) and clothing agreement did not save them.
+#
+# No threshold fixes it: the impostor pair measured 0.377 while same-person
+# misses measured 0.294 / 0.308 / 0.361, so the distributions overlap.  But the
+# run's own tap ledger held a single round matching p00002 and p00007 in the
+# SAME FRAME — two faces at different positions in one frame are two different
+# people, which is about as certain as machine evidence gets.  These tests
+# replay that frame.  The fake serves one face per entry in `face_widths`, all
+# inside the one person/track box, so a multi-width fake IS a multi-person
+# frame.
+
+CO_PRESENT_SCRIPT = [
+    scripted_verdict("p00007", True, 0.360),   # the operator, in the alley
+    scripted_verdict("p00002", True, 0.316),   # the guest standing beside him
+]
+
+
+def test_two_identities_in_one_frame_assert_one_sorted_cannot_link():
+    """THE REPLAY: p00002 and p00007 in one frame -> exactly one /split.
+
+    The pair is asserted through the door that already exists — the same
+    ``POST /split`` an operator's false-match correction uses — so the gallery
+    records cannot_link, which BOTH suppresses the wrong "likely duplicate"
+    banner and makes /merge refuse the pair for the rest of the run.  The keys
+    ride sorted, because (a, b) and (b, a) are one assertion and the ledger
+    must not hold two.  Note the script's arrival order is p00007 THEN p00002:
+    the wire order must not decide the pair's order.
+    """
+    fake = V1Fake(
+        n_frames=1, face_widths=(60.0, 85.0), match_script=list(CO_PRESENT_SCRIPT)
+    )
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.splits == [
+        {"runId": "prun-1", "a": "p00002", "b": "p00007"},
+    ], "one unordered pair, sorted, asserted once"
+    assert final["coPresenceSplits"] == 1
+    assert final["unique"] == 2, "co-presence never moves the count itself"
+    assert fake.merges == [], "an assertion is not a fold"
+
+
+def test_co_presence_counter_reaches_the_notes_and_the_results():
+    """The tally is on the permanent record, beside the fold counters.
+
+    A report read months later has to be able to say how much CERTAIN evidence
+    the run had that no threshold could see — the run that motivated this one
+    held p00002 and p00007 in a frame and did nothing with it, and that was
+    discoverable only by reading the tap ledger by hand.
+    """
+    fake = V1Fake(
+        n_frames=1, face_widths=(60.0, 85.0), match_script=list(CO_PRESENT_SCRIPT)
+    )
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+
+    assert "coPresenceSplits=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["coPresenceSplits"] == 1
+
+
+def test_the_same_co_present_pair_is_never_asserted_twice():
+    """Two people standing together for a whole run cost ONE /split, not one per frame.
+
+    The assertion is permanent in the gallery, so re-sending it every frame
+    would spend the frame loop's budget on a fact the gallery already holds —
+    and the count is the product.  The later verdicts sit below the 0.45 heal
+    and lock floors so nothing else fires and the split ledger is the only
+    thing under test.
+    """
+    script = list(CO_PRESENT_SCRIPT) + [
+        scripted_verdict("p00007", False, 0.30),
+        scripted_verdict("p00002", False, 0.31),
+        scripted_verdict("p00007", False, 0.32),
+        scripted_verdict("p00002", False, 0.33),
+    ]
+    fake = V1Fake(n_frames=3, face_widths=(60.0, 85.0), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["frames"] == 3, "all three frames really did hold both people"
+    assert fake.splits == [{"runId": "prun-1", "a": "p00002", "b": "p00007"}]
+    assert final["coPresenceSplits"] == 1
+
+
+def test_three_identities_in_one_frame_assert_all_three_pairs():
+    """Co-presence is pairwise: three people in a frame are three assertions.
+
+    Everyone in the frame is different from everyone else in it, so a group
+    arriving together protects every pair among them at once — the alley on
+    run 05b3b7 held two, the main door held two more.
+    """
+    script = [
+        scripted_verdict("p00007", True, 0.360),
+        scripted_verdict("p00002", True, 0.316),
+        scripted_verdict("p00009", True, 0.28),
+    ]
+    fake = V1Fake(n_frames=1, face_widths=(60.0, 70.0, 85.0), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.splits == [
+        {"runId": "prun-1", "a": "p00002", "b": "p00007"},
+        {"runId": "prun-1", "a": "p00002", "b": "p00009"},
+        {"runId": "prun-1", "a": "p00007", "b": "p00009"},
+    ]
+    assert final["coPresenceSplits"] == 3
+
+
+def test_a_staff_verdict_beside_a_guest_asserts_nothing():
+    """Staff are not guest identities and live in a different key space.
+
+    A staff hit is a crossing, not a gallery person: asserting cannot_link
+    between a staff id and a guest key would write a constraint about two
+    stores that never meet.  One guest in frame is no pair at all.
+    """
+    script = [
+        scripted_verdict("st-1", False, 0.7, staff=True),
+        scripted_verdict("p00002", True, 0.316),
+    ]
+    fake = V1Fake(n_frames=1, face_widths=(60.0, 85.0), match_script=script)
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["staffFaceFrames"] == 1, "the staff hit really was served"
+    assert fake.splits == []
+    assert final["coPresenceSplits"] == 0
+
+
+def test_one_identity_alone_in_a_frame_asserts_nothing():
+    """A single face in a frame says nothing about anybody: no pair, no POST."""
+    fake = V1Fake(
+        n_frames=1, face_widths=(60.0,),
+        match_script=[scripted_verdict("p00002", True, 0.316)],
+    )
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["matches"] == 1
+    assert fake.splits == []
+    assert final["coPresenceSplits"] == 0
+
+
+def test_the_co_presence_knob_at_zero_records_nothing_and_sends_nothing():
+    """HECO_COPRESENCE_SPLIT=0 is the off switch (config semantics).
+
+    The mechanism has a documented cost — a hand-held PHONE showing its
+    owner's face puts one person in the frame twice and will be asserted as
+    two, blocking a fold that was right — so it must be switchable off in the
+    field without a rebuild, exactly like the track lock's floor.
+    """
+    fake = V1Fake(
+        n_frames=1, face_widths=(60.0, 85.0), match_script=list(CO_PRESENT_SCRIPT)
+    )
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, copresence_split=0).run()
+
+    assert fake.splits == []
+    assert final["coPresenceSplits"] == 0
+    assert "coPresenceSplits=0" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["coPresenceSplits"] == 0
+
+
+def test_co_presence_is_asserted_before_any_fold_can_contradict_it():
+    """The frame two guests first share must not be the frame one is erased on.
+
+    A single-pass verdict loop asserted co-presence at the END of the frame,
+    after the lock and heal had already run — so on the very frame that PROVED
+    two people were distinct, a fold could still merge them.  Two passes now:
+    every face is matched first, co-presence is asserted, and only then may a
+    fold read it.  A fold whose TARGET was matched by another face of the same
+    frame is refused, whatever the tracker believes about the box.
+    """
+    class TwoFacesOneTrack(V1Fake):
+        def handler(self, request):
+            host, path = request.url.host, request.url.path
+            if host == "persons" and path == "/detect":
+                self.calls.append("persons /detect")
+                return httpx.Response(200, json={"boxes": [
+                    {"x": 0, "y": 0, "w": 150, "h": 115, "conf": 0.9},
+                ]})
+            if host == "faces" and path == "/detect":
+                self.calls.append("faces /detect")
+                return httpx.Response(200, json={"faces": [
+                    {"box": {"x": 10, "y": 10, "w": 60, "h": 60},
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                    {"box": {"x": 80, "y": 10, "w": 60, "h": 60},
+                     "landmarks": [[1, 1]] * 5, "conf": 0.9, "widthPx": 60.0,
+                     "iedPx": 30.0, "frontality": 0.9, "sharpness": 400.0},
+                ]})
+            return super().handler(request)
+
+    # Frame 1 binds the lock to p00001.  Frame 2 processes the MINT FIRST and
+    # the p00001 face second — deliberately, so the lock is still the one bound
+    # on frame 1 and the same-frame guard cannot fire.  Only knowing the whole
+    # frame's identities BEFORE folding (the two-pass split) can refuse this;
+    # a single pass would not yet have seen the p00001 face.
+    script = [
+        scripted_verdict("p00001", False, 0.70),
+        scripted_verdict("p00001", False, 0.70),
+        scripted_verdict("p00050", True, 0.10),
+        scripted_verdict("p00001", False, 0.70),
+    ]
+    fake = TwoFacesOneTrack(n_frames=2, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    merges = [m for m in fake.merges if m.get("drop") == "p00050"]
+    assert merges == [], "co-presence must beat the lock: p00001 is visibly elsewhere"
+    assert final["lockedTrackFolds"] == 0
+    # And the pair WAS asserted as distinct, from the same frame.
+    assert any(sorted([s["a"], s["b"]]) == ["p00001", "p00050"] for s in fake.splits)
+
+
+def test_co_present_pairs_are_published_for_the_console():
+    """cannot_link cannot unsay a suggestion made before the pair was proven.
+
+    A near-miss rider is judged at MINT time; on run 05b3b7 p00007's mint
+    raised a "likely duplicate" banner against p00002, and only later did the
+    two appear in one frame.  The constraint stops future merges but the
+    banner had already been attached to that guest's card, so the console
+    needs the pair list to suppress it retroactively.
+    """
+    script = [
+        scripted_verdict("p00001", False, 0.70),
+        scripted_verdict("p00002", False, 0.70),
+    ]
+    fake = V1Fake(n_frames=1, face_widths=(60.0, 61.0), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=0.0).run()
+
+    payload = [t["payload"] for t in fake.taps if t["stage"] == "match"][-1]
+    assert payload["coPresent"] == [["p00001", "p00002"]], (
+        "the console suppresses banners for pairs proven distinct"
+    )

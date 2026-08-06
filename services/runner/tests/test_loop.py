@@ -47,6 +47,10 @@ class FakePipeline:
         self.embed_face_counts: list[int] = []
         self.match_qualities: list[float] = []
         self.match_reset: dict | None = None
+        # Every co-presence cannot_link the loop asserted, in order: two guests
+        # matched in ONE frame are two different people (see
+        # RunLoop._assert_co_presence).
+        self.splits: list[dict] = []
         self.tracker_reset: dict | None = None
         self.tracker_released: dict | None = None
         self.opened: dict | None = None
@@ -153,6 +157,9 @@ class FakePipeline:
             if path == "/reset":
                 self.match_reset = body
                 return httpx.Response(200, json={"ok": True})
+            if path == "/split":
+                self.splits.append(body)
+                return httpx.Response(200, json={"ok": True, "galleryN": 0})
             if path == "/match":
                 self.match_calls += 1
                 self.match_qualities.append(body["quality"])
@@ -214,7 +221,10 @@ def test_orchestration_order():
     assert non_planner[0] == "match /reset"
     assert non_planner[1] == "tracker /reset"
     assert non_planner[2] == "ingest /open"
-    # Per-frame order (2 kept faces -> 2 match calls per frame).
+    # Per-frame order (2 kept faces -> 2 match calls per frame), and the
+    # CO-PRESENCE assertion last: it can only be made once every verdict of the
+    # frame is known, and the two guests this frame held are certainly two
+    # different people.
     per_frame = [
         "ingest /frame",
         "persons /detect",
@@ -223,9 +233,17 @@ def test_orchestration_order():
         "embed /embed",
         "match /match",
         "match /match",
+        "match /split",
     ]
-    assert non_planner[3 : 3 + 7] == per_frame
-    assert non_planner[10 : 10 + 7] == per_frame
+    n = len(per_frame)
+    assert non_planner[3 : 3 + n] == per_frame
+    assert non_planner[3 + n : 3 + 2 * n] == per_frame
+    # Each frame minted a fresh pair here, so each frame asserts once — and
+    # the keys ride sorted, because (a, b) and (b, a) are one assertion.
+    assert fake.splits == [
+        {"runId": "prun-1", "a": "p00001", "b": "p00002"},
+        {"runId": "prun-1", "a": "p00003", "b": "p00004"},
+    ]
     # Teardown: stalled-seq polls on ingest, then per-run state is handed back
     # (camera and tracker — the gallery survives settle as dispute evidence),
     # and only then is the planner PUT — which stays the LAST planner

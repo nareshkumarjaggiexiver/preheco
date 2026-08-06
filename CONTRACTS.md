@@ -24,7 +24,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below) |
+| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -1004,3 +1004,77 @@ wrong merge under-counts and nobody sees it) if the tracker swaps people.
   lock fold — it is a clothing-refusal counter, not a heal counter.
 - **`nearMissMints` counts both near-miss bands** (face and clothing basis);
   the rider's `basis` field is what distinguishes them per suggestion.
+
+## v3 addition — co-presence is machine-asserted cannot-link (runner + match, 2026-08-06)
+
+**The complaint was NOISE, not the count.** Run 05b3b7, ground truth THREE
+people, counted THREE — correct — while raising two "likely duplicate" merge
+suggestions between people who are demonstrably different:
+
+| banner | face cosine | clothing agreement | reality |
+| --- | --- | --- | --- |
+| `p00002` "minted from `p00001`" | 0.316 | 0.94 | walked in the main door **together** |
+| `p00007` "minted from `p00002`" | 0.360 | 0.57 | stood in the alley **together** |
+
+The tap ledger proves the second outright: **one tap round matched `p00002`
+and `p00007` in the SAME FRAME**. Two faces at different positions in one
+frame are two different people — about as certain as machine evidence gets —
+and the pipeline held that fact and did nothing with it.
+
+**No threshold tuning fixes this.** Both riders sat at 0.316 / 0.360 against
+the 0.363 threshold, i.e. *inside* the ordinary face near-miss band, and
+clothing (0.94, 0.57) did not save them. The measured same-person misses on
+this camera are 0.294 / 0.308 / 0.361 and the closest measured impostor pair
+is 0.377: the genuine and impostor face distributions overlap exactly there.
+This is not the weak/clothing band misbehaving — genuinely different people
+land in the face band at this camera. **Co-presence is an INDEPENDENT signal
+and the only certain one available.**
+
+- **Runner → `POST /split`.** For every frame, the distinct **non-staff**
+  personKeys among that frame's verdicts are collected; every unordered pair
+  in that set is co-present and is posted to `{match}/split {runId, a, b}`
+  **once** (already-sent pairs are remembered and never re-sent; the pair
+  memory is bounded per run and logs one warning when it fills, after which no
+  further pairs are asserted — pairs already recorded keep their constraint).
+  Counted as **`coPresenceSplits`** in the run status, the end-of-run notes
+  and the structured `results` (absent on older runners; absent is not zero).
+- **`HECO_COPRESENCE_SPLIT`** (`env_int`, default **1**, empty-means-unset)
+  is the off switch: `0` disables the assertion entirely. It is the ONLY knob
+  for this feature — see the suppression note below.
+- **Match: a pair under `cannot_link` no longer earns a near-miss rider**, on
+  either basis. Match service **0.9.0 → 0.10.0**; no field changed shape,
+  some riders simply stop being emitted. A near-miss rider is a QUESTION put
+  to the operator; the constraint is the ANSWER already on file — from their
+  own `false-match` correction, or now from the runner asserting co-presence.
+  Re-asking a settled question is the noise that trains operators to ignore
+  banners.
+- **`cannot_link` now governs THREE things**, and the count is not one of
+  them: `/merge` refuses the pair, the gallery-**overlap** banner is withheld,
+  and the **near-miss** rider is withheld. The constraint is deliberately
+  becoming the gallery's single record of "known different" — one fact,
+  asserted by a human or by the machine, honoured everywhere.
+- **The verdict never moves.** `personKey`, `isNew`, `cosine` and `galleryN`
+  are identical with and without the constraint (pinned by test): cannot-link
+  changes what is SUGGESTED about someone, never who they are.
+- **No knob on the suppression itself.** A banner that contradicts a recorded
+  fact has no defensible reading, so the suppression is inherent to
+  `cannot_link`; the off switch lives at the source (`HECO_COPRESENCE_SPLIT`).
+  An operator's own `/split` clicks are unaffected by it, as they should be.
+- **The planner needs no change** — a rider that is never emitted renders no
+  banner. Its existing standing merge-suggestion UI is untouched.
+
+**What this buys beyond silence.** `cannot_link` also makes `/merge` refuse,
+so a track heal or a track-lock fold can no longer fold two **co-present**
+people together — the SILENT under-count (a real paying guest erased) that
+every guard in this system exists to prevent. Noise reduction and accuracy
+protection are the same change.
+
+**THE KNOWN COST, documented rather than hidden.** A person holding a **phone
+showing their own face** — or a mirror, or a printed photo — puts one real
+person's face in the frame twice, and co-presence will assert they are two
+different people. That blocks a fold which was CORRECT: it blocked exactly
+such a phone-face heal on the 2026-08-06 bench. The trade is deliberate and
+follows the asymmetry this project runs on: a blocked fold **over**-counts,
+which is visible and an operator can merge; a wrong fold **under**-counts
+silently and nobody ever sees it. Fixed mirrors and screens are handled by
+exclusion zones; a hand-held phone is not, and that is the residual.

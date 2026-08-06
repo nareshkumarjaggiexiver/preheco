@@ -34,7 +34,7 @@ evidence (project hard rule: measure first).
 | POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss: {key, cosine, appearanceSim, basis} \| null}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
-| POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
+| POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
 | POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
@@ -55,7 +55,9 @@ non-null only on a MINT that landed in one of the two near-miss bands:
 the torso intersection against that identity's stored descriptors, and which
 signal spoke (`"face"` for `[HECO_MATCH_NEARMISS_FLOOR .. threshold)`,
 `"clothing"` for the weak band under it). A missing/null `basis` is the
-pre-0.9.0 shape and means `"face"`. See the near-miss section below.
+pre-0.9.0 shape and means `"face"`, and since 0.10.0 a pair under a
+cannot-link constraint carries **no rider on either basis** — the question has
+already been answered. See the near-miss section below.
 
 - **Multiple templates per guest (M1).** A guest is represented by up to five
   views, not by whichever frame happened to be first. See below.
@@ -66,7 +68,11 @@ pre-0.9.0 shape and means `"face"`. See the near-miss section below.
 - **Corrections** back the runner's feedback loop. `/merge` folds `drop` into
   `keep` (count −1) unless a `/split` cannot-link constraint refuses it;
   `/split` records that constraint ("raise the pair's internal distance, no
-  auto-merge later"); `/mark-staff` lifts a guest out of the gallery (count −1)
+  auto-merge later") — from the operator's *false-match* click **or from the
+  runner asserting co-presence**, and it now governs three things, none of
+  them the count (see [Co-presence →
+  cannot-link](#co-presence--cannot-link-v3-0100));
+  `/mark-staff` lifts a guest out of the gallery (count −1)
   and re-homes their templates in the staff store (under `staffId`, or a fresh
   `anon#####` key). `/mark-staff` **refuses without a siteId**: the templates
   are the only record of who that person is, so removing them with nowhere to
@@ -225,8 +231,10 @@ clothes. Auto-merging on that evidence folds real strangers into one invoice
 line invisibly, so the flag is information for a human and the count moves
 only when the operator's `duplicate` correction arrives via `/merge`.
 Out-of-band mints carry `nearMiss: null`; matched verdicts and staff hits
-never carry it; `0` disables the flag and `/health` reports the active
-`nearMissFloor`.
+never carry it; a pair already under a cannot-link constraint never carries it
+either (0.10.0 — see [Co-presence →
+cannot-link](#co-presence--cannot-link-v3-0100)); `0` disables the flag and
+`/health` reports the active `nearMissFloor`.
 
 ### The weak (clothing) band — 0.9.0
 
@@ -269,6 +277,72 @@ which silences the clothing band and leaves the face band exactly as it was.
 weak band is defined as the region *under* that floor. `/health` reports
 `nearMissWeakFloor` and `nearMissClothes` so a disputed suggestion can always
 be traced to the bar that made it.
+
+## Co-presence → cannot-link (v3, 0.10.0)
+
+**The complaint was noise, not the count.** Run 05b3b7 (2026-08-06), ground
+truth THREE people, counted THREE — correct — and it raised two "likely
+duplicate" merge suggestions between people who are demonstrably different:
+
+| banner | face cosine | clothing agreement | reality |
+| --- | --- | --- | --- |
+| `p00002` "minted from `p00001`" | 0.316 | 0.94 | walked in the main door **together** |
+| `p00007` "minted from `p00002`" | 0.360 | 0.57 | stood in the alley **together** |
+
+The tap ledger proves the second outright: one tap round matched **`p00002`
+and `p00007` in the same frame**. Two faces at different positions in one
+frame are two different people — about as certain as machine evidence gets —
+and the pipeline had that fact and did nothing with it.
+
+**No threshold move fixes this.** Both riders sat at 0.316 / 0.360 against the
+0.363 threshold: *inside* the ordinary face near-miss band, with the measured
+same-person misses on this camera at 0.294 / 0.308 / 0.361 and the closest
+measured impostor pair at 0.377. The genuine and impostor distributions
+overlap right there, and clothing did not separate them either (0.94 on a
+false rider, 0.57 on another). This is not the weak band misbehaving —
+genuinely different people simply land in the face band at this camera.
+Co-presence is an **independent** signal and the only certain one available.
+
+**The design is deliberately small: the primitive already existed.** The
+runner posts every co-present pair to `POST /split`, once per unordered pair,
+and `cannot_link` — the operator's own "these are different people" record —
+does the rest. It now governs **three** things:
+
+1. `/merge` refuses the pair (already true).
+2. The gallery-**overlap** banner is withheld (already true).
+3. The **near-miss** rider is withheld — new here, on both bases.
+
+So the constraint has become the gallery's single record of "known different",
+which is exactly what it should be: one fact, asserted by a human or by the
+machine, honoured everywhere.
+
+**What this buys beyond silence.** Because `/merge` also refuses, a track heal
+or a track-lock fold can no longer fold two co-present people together — the
+SILENT under-count (a real paying guest erased) that every guard in this
+system exists to prevent. Noise reduction and accuracy protection are the same
+change.
+
+**A rider is a question; the constraint is the answer already on file.**
+Re-asking a settled question is what trains an operator to click banners away,
+so the suppression has **no knob of its own** — a banner that contradicts a
+recorded fact has no defensible reading. The off switch belongs at the source:
+`HECO_COPRESENCE_SPLIT=0` in the **runner** stops co-presence being asserted
+at all (an operator's own `/split` clicks are unaffected, as they should be).
+
+**The suppression changes the SUGGESTION and nothing else.** `personKey`,
+`isNew`, `cosine` and `galleryN` are identical with and without the
+constraint — pinned by test — because cannot-link must never change who
+somebody is, only what is suggested about them.
+
+**The known cost, stated not hidden.** A person holding a **phone showing
+their own face** — or a mirror, or a printed photo — puts one real person's
+face in the frame twice, and co-presence will assert they are two different
+people. That blocks a fold which would have been correct (it blocked exactly
+such a phone-face heal on the 2026-08-06 bench). The trade is deliberate and
+follows this project's standing asymmetry: a blocked fold **over**-counts,
+which is visible and an operator can merge; a wrong fold **under**-counts
+silently and nobody ever sees it. Fixed mirrors and screens are handled by
+exclusion zones; a hand-held phone is not, and that is the residual.
 
 ## Run
 

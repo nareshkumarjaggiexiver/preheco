@@ -190,6 +190,23 @@ services:
       # measured impostor pair reached clothing 0.747.
       HECO_HEAL_APPEARANCE_CLASH: ${HECO_HEAL_APPEARANCE_CLASH-}
       HECO_HEAL_APPEARANCE_UNSURE: ${HECO_HEAL_APPEARANCE_UNSURE-}
+      # CO-PRESENCE SPLITS (1 = on, the default; 0 = off entirely). Every
+      # unordered pair of distinct non-staff identities matched in ONE frame is
+      # asserted to the gallery as a cannot_link via POST /split. Run 05b3b7
+      # (ground truth THREE people, counted THREE — the count was right, the
+      # NOISE was wrong) raised two false "likely duplicate" banners: 0.316
+      # from p00001 with clothing 0.94, and 0.360 from p00002 with clothing
+      # 0.57, both against the 0.363 threshold. No threshold fixes that — the
+      # impostor pair measured 0.377 while same-person misses measured
+      # 0.294/0.308/0.361, so the distributions overlap — while that same run's
+      # tap ledger held p00002 and p00007 matched in the SAME FRAME, which
+      # settles it outright. cannot_link both silences the banner and makes
+      # /merge refuse, so no heal or lock fold can erase one of two co-present
+      # guests. KNOWN COST: a hand-held PHONE showing its owner's face puts one
+      # person in the frame twice and will be asserted as two — a blocked fold
+      # OVER-counts, which is visible and mergeable, where a wrong fold
+      # UNDER-counts silently. Fixed mirrors/screens are exclusion-zone work.
+      HECO_COPRESENCE_SPLIT: ${HECO_COPRESENCE_SPLIT-}
       HECO_TAP_DUTY_FACTOR: ${HECO_TAP_DUTY_FACTOR-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}

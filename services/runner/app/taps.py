@@ -230,6 +230,7 @@ def match_payload(
     manual_additions: int = 0,
     mints: list[dict] | None = None,
     retired: list[dict] | None = None,
+    co_present: list[list[str]] | None = None,
 ) -> dict:
     """Matcher verdicts (personKey + cosine + staff flag) with live counters.
 
@@ -308,6 +309,14 @@ def match_payload(
             }
             for r in (retired or [])[-MINT_LEDGER_CAP:]
         ],
+        # PAIRS PROVEN DISTINCT by sharing a frame.  A near-miss rider is
+        # judged at MINT time, when the pair has often never been seen
+        # together yet, so the constraint alone cannot unsay a suggestion it
+        # already made — measured on run 05b3b7, where p00002 and p00007 were
+        # matched in one frame AFTER p00007's mint had already raised a
+        # "likely duplicate" banner against p00002.  The console suppresses
+        # suggestions for these pairs retroactively.
+        "coPresent": [list(p) for p in (co_present or [])[-MINT_LEDGER_CAP:]],
     }
 
 
@@ -321,6 +330,7 @@ def build_payloads(
     manual_additions: int = 0,
     mints: list[dict] | None = None,
     retired: list[dict] | None = None,
+    co_present: list[list[str]] | None = None,
 ) -> dict[str, dict]:
     """Build the per-stage tap payloads from one frame's captured outputs.
 
@@ -336,6 +346,7 @@ def build_payloads(
         "match": match_payload(
             last.get("verdicts", []), unique, staff_crossings,
             staff_face_frames, manual_additions, mints=mints, retired=retired,
+            co_present=co_present,
         ),
     }
 
