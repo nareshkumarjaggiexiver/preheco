@@ -118,6 +118,11 @@ services:
       # Galleries now OUTLIVE their runs (dispute evidence behind the invoice
       # figure) and age out here instead of dying at settle. 24 h default.
       HECO_GALLERY_RETENTION_S: ${HECO_GALLERY_RETENTION_S-}
+      # Enrolment appearance veto (advisory anti-poison): a sighting whose
+      # torso descriptor scores below this intersection against the identity's
+      # stored appearance is not kept as an extra template. Verdicts are never
+      # changed. Default 0.50 (reasoned, uncalibrated); 0 disables.
+      HECO_MATCH_APPEARANCE_CLASH: ${HECO_MATCH_APPEARANCE_CLASH-}
 
   runner:
     <<: *heco-service
@@ -143,6 +148,11 @@ services:
       # "use the default"; HECO_HEAL_WINDOW_S=0 disables healing.
       HECO_HEAL_WINDOW_S: ${HECO_HEAL_WINDOW_S-}
       HECO_HEAL_MIN_COSINE: ${HECO_HEAL_MIN_COSINE-}
+      # Heal appearance veto (the tracker-swap detector): a heal fold whose
+      # mint-frame torso descriptor clashes (histogram intersection below this)
+      # with the healing frame's is refused. Default 0.50 (reasoned,
+      # uncalibrated); 0 disables the veto. Agreement never loosens the heal.
+      HECO_HEAL_APPEARANCE_CLASH: ${HECO_HEAL_APPEARANCE_CLASH-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

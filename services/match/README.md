@@ -29,9 +29,9 @@ evidence (project hard rule: measure first).
 
 | method | path | body | returns |
 | --- | --- | --- | --- |
-| GET | `/health` | — | `{ok, model, version, threshold, canonPx}` |
+| GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash}` |
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
-| POST | `/match` | `{runId, embedding, quality?, siteId?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded}` |
+| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction |
@@ -44,7 +44,12 @@ evidence (project hard rule: measure first).
 against the pre-existing gallery (`null` on the very first face of a run).
 `galleryN` is the distinct-guest count after the call. `templateN` is how many
 views the matched identity now holds (`null` for a staff hit); `templateAdded`
-says whether this sighting became one of them.
+says whether this sighting became one of them. `appearance` is the sighting's
+optional torso descriptor (exactly 48 floats — see the tie-breaker section
+below; any other present length is a 422); `appearanceSim` is its best
+histogram intersection against the matched identity's stored descriptors
+(`null` for staff hits, new mints, or when either side lacks one) and
+`appearanceVetoed` says an enrolment was refused on a clash.
 
 - **Multiple templates per guest (M1).** A guest is represented by up to five
   views, not by whichever frame happened to be first. See below.
@@ -156,6 +161,44 @@ the scan grew with the row count, everything else stayed flat. `count_for` was
 moved onto the `idx_vectors_key` index because the verdict now reports
 `templateN` on every call and the old key-list scan cost 27 µs at that size.
 
+## Torso appearance — the advisory tie-breaker (v1)
+
+**What it is.** The runner can attach a torso-appearance descriptor to a
+`/match` call: 48 floats, an L1-normalised 12×4 Hue×Saturation histogram of
+the torso crop (OpenCV HSV; V < 40 / V > 240 masked out as shadow/blowout).
+Clothing is constant within one event, so the descriptor is real evidence
+about whether two sightings seconds apart are the same body. Similarity is
+histogram intersection (0..1). This service computes nothing from pixels —
+by the time a descriptor arrives it is 48 numbers on the wire (`app/appearance.py`).
+
+**What it does here — exactly one thing.** The ENROLMENT VETO (anti-poison):
+a matched sighting that `_should_enrol` had approved as an extra template is
+**not** kept when its descriptor clashes (`appearanceSim <
+HECO_MATCH_APPEARANCE_CLASH`) with every descriptor the identity has stored.
+A poisoned template — one enrolled off a tracker swap or a near-threshold
+impostor — becomes a bridge that silently merges two paying guests at every
+later crossing, which is the invisible failure mode. Descriptors are stored
+beside any template the call writes (founding mint and enrolled extras) so
+later sightings have something to compare against.
+
+**What it never does.** The match verdict — `isNew` / `personKey` / `cosine`
+— is decided by the face alone. The measured reason: the closest impostor
+pair on this camera, two DIFFERENT men at cosine **0.377** (above the 0.363
+threshold), were **both in light shirts**. A torso "rescue" of borderline
+face matches would have merged those two real guests — and since the
+same-person misses (0.294/0.308/0.361) wear the same clothes in every frame,
+a rescue would chain light-shirted strangers together wholesale. Appearance
+only refuses writes. Staff flows carry no appearance handling anywhere
+(staff identity is operator-attested; `mark-staff` deliberately leaves the
+descriptor behind), and an **absent descriptor never vetoes** — old
+galleries, faces without a person box and sub-24 px crops all arrive
+descriptor-less, and absent is not zero.
+
+**Storage and migration.** The `vectors` table gains a nullable
+`appearance` BLOB (float32[48]), never part of the resident cosine scan.
+Opening an older gallery or staff file ALTERs the column in, so every
+pre-existing file keeps working; its rows read as descriptor-absent.
+
 ## Run
 
 ```sh
@@ -178,7 +221,13 @@ geometry (Cholesky of the measured Gram matrix, so the cosines are the
 measurement rather than an approximation of it), plus the `/merge
 onlyIfSingleton` guard: a singleton mint folds, a re-sighted key refuses with
 its templates untouched, the flag-less operator flow is unchanged, and a
-cannot-link split still wins.
+cannot-link split still wins. `tests/test_appearance.py` covers the torso
+tie-breaker: the pure intersection arithmetic, the storage round-trip
+including the old-file ALTER migration, the enrol veto (fires on clash, not
+on agreement, not at the boundary, never on an absent descriptor), the
+verdict never moving because of clothing (including the two-white-shirts
+no-rescue rule), the 422 on a wrong-length descriptor, and `appearanceSim`
+being null for staff hits and first mints.
 
 ## Tune
 
@@ -191,9 +240,11 @@ cannot-link split still wins.
 | `HECO_MATCH_TEMPLATE_CONFIDENCE` | `0.05` | How far above the threshold a match must land to be kept as a template. |
 | `HECO_MATCH_TEMPLATE_MARGIN` | `0.05` | How far ahead of the nearest rival identity it must land. |
 | `HECO_MATCH_TEMPLATE_MAX_COSINE` | `0.90` | Near-duplicate ceiling: above this the view adds no coverage. |
+| `HECO_MATCH_APPEARANCE_CLASH` | `0.50` | Torso-intersection floor for the enrolment veto (below = clash). **Reasoned, not calibrated** — like the M1 margins — and **0 disables the veto**. Empty string means unset. |
 
-Staff enrolment is unaffected by all four: staff templates come only from the
-operator-supervised walk-through, never from a crossing.
+Staff enrolment is unaffected by all five: staff templates come only from the
+operator-supervised walk-through, never from a crossing, and staff flows
+carry no appearance handling at all.
 
 ## Known POC limits
 
@@ -205,7 +256,9 @@ operator-supervised walk-through, never from a crossing.
   the real number needs impostor pairs from the venue.
 - **The gates' defaults are reasoned, not measured.** 0.05 / 0.05 / 0.90 come
   from the geometry above, not from a labelled bench set; they are env-tunable
-  precisely because the first impostor data should move them.
+  precisely because the first impostor data should move them. The appearance
+  clash floor (0.50) is in the same category: the first labelled torso pairs
+  from a real event should move it.
 - Brute-force scan, not an index (see sqlite-vec above).
 - Threshold is fixed per run; gallery-size-aware thresholding is a product
   requirement, not a POC one.

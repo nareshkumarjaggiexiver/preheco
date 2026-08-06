@@ -182,6 +182,10 @@ def match_payload(
             # shows an operator whether multi-template is actually engaging.
             "templateN": v.get("templateN"),
             "templateAdded": bool(v.get("templateAdded", False)),
+            # Advisory torso-appearance similarity vs the matched identity's
+            # stored descriptors (4 dp, None for staff/new/descriptor-less —
+            # absent is not zero).  Visibility only: it never moves a verdict.
+            "appearanceSim": _r(v.get("appearanceSim"), 4),
         }
         for v in verdicts[:ROW_CAP]
     ]

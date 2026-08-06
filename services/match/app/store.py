@@ -81,6 +81,10 @@ from pathlib import Path
 import numpy as np
 
 #: SQLite schema for one store file.  ``IF NOT EXISTS`` makes open idempotent.
+#: ``appearance`` (2026-08-06) is the optional torso-appearance descriptor
+#: captured WITH the face template (float32[48] BLOB, NULL when the runner
+#: could not measure one) — last in the column list so a freshly created table
+#: matches the column order ALTER produces on an older file (see __init__).
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vectors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +93,8 @@ CREATE TABLE IF NOT EXISTS vectors (
     dim        INTEGER NOT NULL,
     quality    REAL,
     sub_canon  INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    appearance BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_vectors_key ON vectors(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
@@ -180,6 +185,16 @@ class VectorStore:
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(_SCHEMA)
+        # Migrate OLDER files in place (2026-08-06): ``CREATE TABLE IF NOT
+        # EXISTS`` never touches an existing table, so a gallery or staff store
+        # created before the torso-appearance column existed opens without it.
+        # ADD COLUMN is the entire migration — the new column defaults to NULL,
+        # and NULL is precisely what "no descriptor" means everywhere in the
+        # tie-breaker (absent is not zero, the codebase-wide convention), so a
+        # pre-existing file keeps working and no veto can ever fire on its rows.
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(vectors)")}
+        if "appearance" not in cols:
+            self.conn.execute("ALTER TABLE vectors ADD COLUMN appearance BLOB")
         # In-memory index, loaded lazily and kept write-through afterwards.
         # None means "not loaded / invalidated" — the next read reloads it.
         self._keys: list[str] | None = None
@@ -411,6 +426,31 @@ class VectorStore:
         ).fetchall()
         return [np.frombuffer(v, dtype=np.float32).reshape(d) for v, d in rows]
 
+    def appearances_for(self, key: str) -> list[np.ndarray]:
+        """Every stored torso-appearance descriptor for one key (NULLs skipped).
+
+        The read half of the advisory tie-breaker: :func:`app.gallery.match`
+        compares an incoming sighting's descriptor against THESE to compute
+        ``appearanceSim`` and to decide the enrolment veto.  NULL rows —
+        templates enrolled before the column existed, or sightings whose torso
+        the runner could not measure (no person box, crop under 24 px, fewer
+        than 100 unmasked pixels) — are skipped rather than decoded as zeros,
+        because a zero histogram would score intersection 0.0 against
+        everything and read as a maximal CLASH: absent is not zero, and
+        under-counting is this pipeline's dominant failure mode.
+
+        Answered from SQLite through ``idx_vectors_key``, not from the
+        resident index, which deliberately does not hold appearance at all —
+        the scan matrix is the face-only cosine machine and stays that way
+        (see :meth:`add` for the two-white-shirts measurement behind that).
+        """
+        rows = self.conn.execute(
+            "SELECT appearance FROM vectors WHERE key = ? AND appearance IS NOT NULL"
+            " ORDER BY id ASC",
+            (key,),
+        ).fetchall()
+        return [np.frombuffer(r[0], dtype=np.float32) for r in rows]
+
     def count_for(self, key: str) -> int:
         """How many templates a single key owns.
 
@@ -467,14 +507,29 @@ class VectorStore:
         embedding: list[float] | np.ndarray,
         quality: float | None = None,
         sub_canon: bool = False,
+        appearance: list[float] | np.ndarray | None = None,
     ) -> None:
-        """Store one template under an explicit key (used for staff ids)."""
+        """Store one template under an explicit key (used for staff ids).
+
+        ``appearance`` is the sighting's optional torso-appearance descriptor
+        (the wire contract's 48-float L1-normalised Hue×Saturation histogram),
+        stored as a float32 BLOB beside the face vector — beside, not inside:
+        it never joins the resident scan matrix, because the cosine scan
+        answers WHO and clothing must have no voice in that answer (the
+        closest measured impostor pair on this camera, cosine 0.377, was two
+        DIFFERENT men BOTH IN LIGHT SHIRTS — an appearance term in the scan
+        would pull exactly such pairs together and merge two real guests).
+        ``None`` stores NULL, which every reader treats as "not measured",
+        never as a zero histogram.  Staff enrolment always passes ``None``:
+        the staff store deliberately has no appearance handling.
+        """
         v = as_unit(embedding)
+        blob = None if appearance is None else np.asarray(appearance, dtype=np.float32).tobytes()
         self._index()  # load BEFORE the insert, or the load would see it twice
         cur = self.conn.execute(
-            "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (key, v.tobytes(), v.size, quality, int(sub_canon), _now()),
+            "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at, appearance)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (key, v.tobytes(), v.size, quality, int(sub_canon), _now(), blob),
         )
         self._append_row(key, v, int(cur.lastrowid))
 
@@ -484,10 +539,11 @@ class VectorStore:
         quality: float | None = None,
         sub_canon: bool = False,
         prefix: str = "p",
+        appearance: list[float] | np.ndarray | None = None,
     ) -> str:
         """Mint a fresh monotonic key, store the template under it, return it."""
         key = self.mint_key(prefix)
-        self.add(key, embedding, quality, sub_canon)
+        self.add(key, embedding, quality, sub_canon, appearance)
         return key
 
     def add_manual(self, note: str | None = None, prefix: str = "m") -> str:
@@ -701,6 +757,13 @@ class VectorStore:
         Used by *mark-staff*: the guest person is lifted out of this gallery
         (distinct count −1) and its returned templates are re-added to the site
         staff store under a staff id.  Returns an empty list for an unknown key.
+
+        Appearance descriptors are DELIBERATELY not in the returned tuples:
+        the only caller re-homes these rows into the staff store, and staff
+        flows carry no appearance handling anywhere (staff identity is
+        operator-attested, never inferred from clothing), so the descriptor
+        dies with the gallery row instead of leaking into a persistent
+        per-site file.
         """
         self._index()  # load BEFORE the delete, so the index still has the rows
         rows = self.conn.execute(

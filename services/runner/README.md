@@ -8,8 +8,8 @@ quality gate → embed → match → unique count` — timing every stage. Aggre
 (count/min/mean/max) and sampled raw rows are POSTed to the site-planner every
 2 s; the run releases its downstream state (camera, tracker, gallery) and ends
 with a `PUT … {status: ended, notes}` carrying the unique count, frame count,
-staff crossings, staff face-frames, manual additions, healed splits,
-zone-excluded faces and sub-canon share.
+staff crossings, staff face-frames, manual additions, healed splits, the two
+appearance-veto tallies, zone-excluded faces and sub-canon share.
 
 **The count is the product; reporting is secondary.** No planner call made from
 the frame loop can fail a run or stall it for long: errors are swallowed AND
@@ -65,6 +65,54 @@ a threshold cannot see (CONTRACTS.md "the track heal and exclusion zones"):
   frame with no dimensions to scale the polygons by excludes nothing and
   counts `zoneUnmeasured` instead (the `gatedUnmeasured` honesty pattern).
 
+## Torso appearance: an advisory veto, never a verdict
+
+Clothing is constant within one event, so the loop computes a cheap
+**torso-appearance descriptor** for every gate-surviving face and uses it in
+exactly two places — both refusals of actions face evidence had already
+justified. It never mints, merges, matches or counts: the measured 0.377
+impostor ceiling on this camera was two DIFFERENT men **both in light
+shirts**, so torso *agreement* proves nothing about identity; only a *clash*
+carries information.
+
+- **The descriptor** (`app/appearance.py`, wire contract fixed): 48 floats —
+  an L1-normalized 12×4 Hue×Saturation histogram (OpenCV HSV: H 0–179 → 12
+  bins, S 0–255 → 4 bins) of the torso crop, with V < 40 (shadow) and V > 240
+  (blowout) pixels masked out. Hue/saturation and not value because brightness
+  is the axis illumination moves along as a guest walks the frame. The crop:
+  within the containing person box (same centre-containment association as
+  the track lookup), from the face box's bottom edge down to
+  `min(face bottom + 2.5 × face height, person box bottom)`, horizontally the
+  person box inset 15% each side. **No descriptor** (None, never zero) when
+  the crop is under 24 px in either dimension, there is no containing person
+  box, fewer than 100 unmasked pixels remain, or the frame does not decode —
+  and an absent descriptor never vetoes anything, the codebase-wide
+  absent-is-not-zero convention (`gatedUnmeasured` / `zoneUnmeasured`).
+- **Heal veto — the tracker-swap detector.** The heal's documented residual
+  risk is a tracker identity swap: two people cross paths, the track is handed
+  from person A to person B, B matches at ≥ 0.45 inside the window, and A's
+  singleton mint is folded into B — an under-count of one. A swapped track
+  shows A's clothes on the mint frame and B's on the healing frame, so before
+  each `/merge` the loop compares the mint frame's remembered descriptor with
+  the current frame's: histogram intersection below
+  `HECO_HEAL_APPEARANCE_CLASH` (default **0.50** — reasoned, uncalibrated;
+  `0` disables) refuses the fold — no merge, `unique` untouched,
+  `healVetoedByAppearance` +1, an info log with both keys and the similarity.
+  This SHRINKS the residual risk; it does not eliminate it (same-colour
+  swaps are invisible to it — that is what track-quality gating remains for).
+  Appearance agreement never lowers the 0.45 cosine floor: v1 never loosens
+  anything.
+- **Enrolment veto (match-side, reported here).** The descriptor rides every
+  `/match` body as `appearance`; the matcher may refuse to keep a clashing
+  sighting as an *additional template* (anti-poison,
+  `HECO_MATCH_APPEARANCE_CLASH`, same default) — the verdict itself is never
+  changed. The runner reads each reply's `appearanceVetoed` into
+  `enrolVetoedByAppearance` and forwards `appearanceSim` (best intersection
+  vs the matched identity's stored descriptors; null for staff hits, new
+  mints, or a descriptor-less side) into the match tap, so the console can
+  watch the advisory signal live. Both counters land in the run status, the
+  end-of-run notes and the structured results, beside `healedSplits`.
+
 ## v1: staff, taps, feedback, enrol
 
 - **Staff whitelist.** A run carrying a `siteId` sends it on every `/match`, so
@@ -119,7 +167,7 @@ a threshold cannot see (CONTRACTS.md "the track heal and exclusion zones"):
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version}` |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, healVetoedByAppearance, enrolVetoedByAppearance, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, sampleCount, state, error) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -155,8 +203,13 @@ The track heal replays tonight's measured bench (mint at 0.3084, same track at
 0.69 → folded; plus refusal, window, cosine-floor and staff-skip cases) and
 the exclusion zones run end to end (a zoned face never reaches `/match` but
 stays visible in the tap; a dims-less frame counts `zoneUnmeasured`; malformed
-zones 422 at `POST /runs`). The pure helpers (`taps`, `annotate`, `feedback`)
-are unit-tested directly.
+zones 422 at `POST /runs`). The torso-appearance tests cover the descriptor
+contract on synthetic frames (red vs blue clash < 0.5, identical → 1.0, tiny
+crop / dark frame / no person box → None), the `/match` `appearance` field
+being sent only when computable, the heal veto replay (clashing frames refuse
+the fold; agreeing frames heal exactly as before; knob 0 disables), and the
+match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
+`feedback`) are unit-tested directly.
 
 ## Tune
 
@@ -180,6 +233,7 @@ are unit-tested directly.
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |
 | `HECO_HEAL_WINDOW_S` | `20.0` | How long after a mint the same track's later match may fold it; `0` disables healing |
 | `HECO_HEAL_MIN_COSINE` | `0.45` | Heal evidence floor — above the 0.377 measured impostor ceiling with margin (tonight's heal evidence was 0.69); a cross-key match below it heals nothing |
+| `HECO_HEAL_APPEARANCE_CLASH` | `0.50` | Heal appearance veto: a fold whose mint-frame torso descriptor scores below this (histogram intersection) against the healing frame's is refused as a suspected tracker swap. Reasoned, uncalibrated; **0 = veto off**; absent descriptors never veto |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |
