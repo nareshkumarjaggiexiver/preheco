@@ -62,6 +62,15 @@ class ExclusionZone(BaseModel):
 
     label: str
     points: list[list[float]] = Field(min_length=3)
+    #: 'faces' (default): the zone excludes FACES from counting while bodies
+    #: stay detected and tracked — the safe mode for partitions and mirrors a
+    #: real guest can walk in front of. 'detections': the zone also drops
+    #: PERSON boxes before the tracker, so no track ever forms — for surfaces
+    #: that GENERATE garbage tracks (a wall TV playing faces, a poster) and
+    #: that no real person can stand inside. A real guest crossing a
+    #: detections zone has their track cut and may be double-counted; the
+    #: planner's zone editor says so where the mode is chosen.
+    mode: Literal["faces", "detections"] = "faces"
 
     @model_validator(mode="after")
     def _points_are_normalized_pairs(self) -> "ExclusionZone":
