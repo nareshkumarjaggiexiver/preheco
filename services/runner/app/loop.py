@@ -421,6 +421,8 @@ class RunLoop:
             # the frame carried no dimensions to scale the polygons by.
             "excludedByZone": 0,
             "zoneUnmeasured": 0,
+            "personsZoned": 0,
+            "personsZoneUnmeasured": 0,
             "feedbackApplied": 0,
             "feedbackRejected": 0,
             "manualAdditions": 0,
@@ -867,13 +869,20 @@ class RunLoop:
             board.observe("person-detect", "personBoxHPx", float(b["h"]))
             samples.add("person-detect", t_ms, {"personBoxHPx": float(b["h"])})
 
+        # DETECTIONS-MODE ZONES — before the tracker, so a garbage source (a
+        # wall TV playing faces, a poster) never forms a track at all. The
+        # dropped boxes STAY in `boxes` stamped excludedByZone, so the taps
+        # and the annotated frame show the operator what the zone is eating;
+        # only the tracker and the face search stop seeing them.
+        trackable = self._apply_detection_zones(boxes, frame)
+
         # track (stateful per run — the tracker keys its state on runId)
         tracked = self._timed(
             "track",
             "trackMs",
             lambda: self._post(
                 f"{s.tracker_url}/track",
-                {"runId": planner_run_id, "tMs": t_ms, "boxes": boxes},
+                {"runId": planner_run_id, "tMs": t_ms, "boxes": trackable},
             ),
         )
         board.frame("track")
@@ -900,7 +909,7 @@ class RunLoop:
         # this frame, which is real recall. Boxes-first ordering means a fresh
         # detection always wins the dedupe over a stale prediction.
         within = dedupe_boxes(
-            list(boxes) + [t["box"] for t in tracks], iou_thr=0.6
+            list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
         )
         faces_out = self._timed(
             "face-detect",
@@ -1793,6 +1802,62 @@ class RunLoop:
             self._bump("excludedByZone", excluded)
         return countable
 
+    def _apply_detection_zones(self, boxes: list, frame: dict) -> list:
+        """Drop person boxes whose centre sits inside a DETECTIONS-mode zone.
+
+        The narrow, opt-in sibling of _apply_zones: a detections zone marks a
+        surface that GENERATES phantom people (a wall TV, a poster) — nothing
+        real can be inside it, so the right moment to act is BEFORE the
+        tracker, where the phantom would otherwise mint a track, churn ids
+        and burn face-detect/embed work every frame. Faces-mode zones never
+        come through here: deleting a real guest's body breaks track
+        continuity, which is why 'faces' stays the default and the editor
+        warns before this mode is chosen.
+
+        Same honesty as _apply_zones: dropped boxes STAY in the caller's list
+        stamped excludedByZone/excludedZone (taps + annotated frame show what
+        the polygon ate), each is observed on the person-detect board, and a
+        frame with no dimensions filters NOTHING — personsZoneUnmeasured
+        counts what passed untested, because a filter guessing at geometry is
+        worse than a filter reporting it could not run.
+        """
+        dz = [z for z in self.zones if z.get("mode") == "detections"]
+        if not dz or not boxes:
+            return boxes
+        w = frame.get("w")
+        h = frame.get("h")
+        if not w or not h:
+            self._bump("personsZoneUnmeasured", len(boxes))
+            return boxes
+        w, h = float(w), float(h)
+        trackable: list = []
+        dropped = 0
+        for b in boxes:
+            cx = float(b.get("x", 0.0)) + float(b.get("w", 0.0)) / 2.0
+            cy = float(b.get("y", 0.0)) + float(b.get("h", 0.0)) / 2.0
+            hit = next(
+                (
+                    z
+                    for z in dz
+                    if point_in_polygon(
+                        cx, cy, [[p[0] * w, p[1] * h] for p in z["points"]]
+                    )
+                ),
+                None,
+            )
+            if hit is None:
+                trackable.append(b)
+            else:
+                b["excludedByZone"] = True
+                b["excludedZone"] = hit.get("label")
+                self.board.observe(
+                    "person-detect", "personZoneExcluded", float(b.get("h", 0.0))
+                )
+                dropped += 1
+        if dropped:
+            self._bump("personsZoned", dropped)
+        return trackable
+
     def _mark_person_zones(self, boxes: list, frame: dict) -> None:
         """Stamp person boxes whose centre sits inside an operator zone.
 
@@ -1816,6 +1881,8 @@ class RunLoop:
             return
         w, h = float(w), float(h)
         for b in boxes:
+            if b.get("excludedByZone"):
+                continue # already stamped by the detections filter — one fact, one flag
             cx = float(b.get("x", 0.0)) + float(b.get("w", 0.0)) / 2.0
             cy = float(b.get("y", 0.0)) + float(b.get("h", 0.0)) / 2.0
             if any(
