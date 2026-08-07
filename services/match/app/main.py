@@ -8,7 +8,7 @@ Endpoints:
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?, appearance?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
-            templateN, templateAdded, appearanceSim, appearanceVetoed,
+            templateN, templateAdded, appearanceSim, appearanceVetoed, templateId,
             nearMiss: {key, cosine, appearanceSim, basis} | null}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
@@ -53,7 +53,7 @@ def _env_s(name: str, default: float) -> float:
 #: rider — the constraint is now the gallery's single record of "known
 #: different" and governs merge refusal, the overlap banner and this one.  No
 #: field changed shape; some riders simply stop being emitted.
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -137,6 +137,11 @@ class MatchRequest(BaseModel):
     quality: float | None = None  # face box width in px; <canon is tagged sub-canon
     siteId: str | None = None
     appearance: list[float] | None = None
+    # Identities the CALLER has proven this face is not.  The runner sends it
+    # when two different bodies in one frame both resolved to the same key —
+    # one body cannot be in two places, so the weaker sighting is re-asked
+    # with that key off the table.  Empty/absent changes nothing.
+    excludeKeys: list[str] | None = None
 
     @field_validator("appearance")
     @classmethod
@@ -195,6 +200,13 @@ class SplitRequest(BaseModel):
     runId: str
     a: str
     b: str
+
+
+class ForgetTemplateRequest(BaseModel):
+    """Body of POST /template/forget — retract one wrongly-enrolled template."""
+
+    runId: str
+    templateId: int
 
 
 class MarkStaffRequest(BaseModel):
@@ -303,6 +315,7 @@ def match(body: MatchRequest) -> dict:
                 # so there is nothing to compare and nothing to veto.
                 "appearanceSim": None,
                 "appearanceVetoed": False,
+                "templateId": None,
                 # ...and no near-miss flag either: a staff hit is not a mint.
                 "nearMiss": None,
                 "overlap": None,
@@ -325,6 +338,7 @@ def match(body: MatchRequest) -> dict:
             nearmiss_floor=config.nearmiss_floor(),
             nearmiss_weak_floor=config.nearmiss_weak_floor(),
             nearmiss_clothes=config.nearmiss_clothes(),
+            exclude_keys=set(body.excludeKeys or ()),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -342,6 +356,10 @@ def match(body: MatchRequest) -> dict:
         "templateAdded": r.template_added,
         "appearanceSim": r.appearance_sim,
         "appearanceVetoed": r.appearance_vetoed,
+        # Rowid of the template this call enrolled, or null when it wrote
+        # nothing / minted.  Only use: hand it back to POST /template/forget
+        # if the caller later PROVES the enrolment was wrong.
+        "templateId": r.template_id,
         # Only ever non-null on a MINT that near-missed an existing guest —
         # a one-click-merge suggestion for the operator, never behaviour
         # (see gallery._near_miss: impostors measured face 0.377 / clothes
@@ -443,6 +461,35 @@ def split(body: SplitRequest) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "galleryN": n}
+
+
+@app.post("/template/forget")
+def forget_template(body: ForgetTemplateRequest) -> dict:
+    """Retract ONE enrolled template the caller has proven wrong.
+
+    The runner's same-frame guard is the caller: when two different bodies in
+    one frame both resolve to the same key, the loser's sighting was already
+    enrolled into that key by the /match call that discovered it, and the
+    template must come back out or it keeps capturing that person in every
+    later frame where they stand alone.
+
+    ``forgotten: false`` is a NORMAL outcome, not a failure: the row may
+    already have been evicted by the post-enrolment redundancy prune, or it
+    may be its key's last template, which is refused so no identity is left
+    existing-but-unmatchable.  ``galleryN`` is unchanged either way — this
+    removes a VIEW of somebody, never somebody.
+    """
+    try:
+        forgotten = gallery.forget_template(
+            config.data_dir(), body.runId, body.templateId
+        )
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {
+        "ok": True,
+        "forgotten": forgotten,
+        "galleryN": gallery.count(config.data_dir(), body.runId),
+    }
 
 
 @app.post("/mark-staff")

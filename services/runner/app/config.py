@@ -181,6 +181,46 @@ class Settings:
     heal_appearance_clash: float = 0.35
     heal_appearance_unsure: float = 0.55
 
+    # SAME-FRAME SAME-KEY GUARD (see loop._split_same_key).  The clothing floor
+    # under which two faces in ONE frame, sitting in two DIFFERENT person
+    # boxes, that both resolved to the SAME identity are ruled two people and
+    # the weaker one is re-resolved with that identity off the table.  0
+    # disables the guard entirely.
+    #
+    # WHY IT EXISTS (run fa8fc3, 2026-08-07, ground truth TWO men, counted
+    # ONE).  Frame kf-577 holds them side by side, both boxed, both labelled
+    # p00001, matched at face 0.6874 and 0.6733 — not borderline, no near-miss
+    # band, nothing for an operator to notice.  By the end p00001 held five
+    # templates whose internal cosines ran 0.2223..0.5232, impostor-level
+    # against each other: one identity had grown to contain both men.  Every
+    # existing mechanism was structurally blind to it.  Co-presence asserts
+    # that two KEYS in a frame are different people and there was only ever
+    # one key.  The enrolment veto refuses WRITES, never verdicts, and it is
+    # charitable by construction (BEST intersection over the identity's stored
+    # views), so once one of the second man's sightings was in, every later
+    # one agreed with it and nothing clashed again.  The near-miss banners
+    # fire on MINTS and no second mint ever happened.
+    #
+    # THE EVIDENCE THE GUARD USES IS NOT THE FACE.  Two bodies at different
+    # positions in one frame cannot be one guest, whatever the cosine says —
+    # the same certainty co-presence already runs on, applied one step
+    # earlier, to the case where the matcher collapsed the pair before a
+    # second key existed to constrain.
+    #
+    # CLOTHING IS REQUIRED AS CORROBORATION, and that is the whole reason for
+    # a floor rather than a bare box test.  A person and their reflection in a
+    # hall mirror, or a face on a hand-held phone screen, ALSO occupy two
+    # person boxes — and would be split into two guests by box geometry alone,
+    # turning this fix into an over-count.  Those pairs wear the SAME clothes
+    # and read high; fa8fc3's two men read 0.130..0.294 across the divide,
+    # against 0.624..0.817 within each man.  0.35 is the same CLEAR-CLASH floor
+    # heal_appearance_clash uses, for the same reason: mid-range clothing
+    # readings do not separate people, so only a genuine disagreement may act.
+    # Descriptor absent on either side = no split (absent is not zero); this
+    # errs towards the under-count, which is why the guard is a floor and not
+    # the whole answer.
+    same_frame_clash: float = 0.35
+
     # CO-PRESENCE SPLITS (see loop._assert_co_presence).  1 = on, 0 = off.
     #
     # THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
@@ -286,6 +326,7 @@ def from_env() -> Settings:
         heal_appearance_unsure=env_float(
             "HECO_HEAL_APPEARANCE_UNSURE", s.heal_appearance_unsure
         ),
+        same_frame_clash=env_float("HECO_SAME_FRAME_CLASH", s.same_frame_clash),
         copresence_split=env_int("HECO_COPRESENCE_SPLIT", s.copresence_split),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),

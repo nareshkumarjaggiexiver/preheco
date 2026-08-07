@@ -2494,3 +2494,341 @@ def test_a_forced_round_still_obeys_the_duty_guard():
     assert final["tapRoundsDeferred"] > 0, (
         "a mint may jump the interval queue; it may not outrun the cost guard"
     )
+
+
+# ------------------------- the same-frame same-key guard (run fa8fc3)
+#
+# THE MEASUREMENT.  Run fa8fc3, 2026-08-07, ground truth TWO men, reported ONE.
+# Frame kf-577 (t=32957ms, persons 3, matched 2) holds both of them boxed side
+# by side and BOTH labelled p00001 — matched at face 0.6874 and 0.6733, so far
+# above the 0.363 threshold that no near-miss band and no banner ever fired.
+# The gallery ended with five templates under that one key whose internal
+# cosines ran 0.2223..0.5232 — impostor-level against each other.  One identity
+# had grown to contain two people, and the run said "1 unique guest".
+#
+# EVERY EXISTING MECHANISM WAS STRUCTURALLY BLIND.  Co-presence constrains two
+# KEYS and there was only ever one.  The enrolment veto refuses WRITES, never
+# verdicts, and it is charitable by construction (BEST intersection over the
+# identity's stored views), so once one of the second man's sightings was in,
+# every later one agreed with it and nothing clashed again — the run scored
+# enrolVetoedByAppearance 0 while the clothing evidence sat right there:
+# {id7,id10,id14} agreeing 0.624..0.817, {id13,id16} agreeing 0.668, and
+# 0.130..0.294 ACROSS the divide.  The near-miss banners fire on MINTS and a
+# second mint never happened.
+#
+# The guard uses the one fact none of them had: two bodies at different
+# positions in one frame cannot be one guest.
+
+# Geometry: 320x300 frame, two person boxes far apart, each tall enough for a
+# measurable torso (crop 62 x 170 px, well over the 24 px floor).
+MEN_BOXES = [
+    {"x": 20, "y": 10, "w": 90, "h": 250, "conf": 0.9},
+    {"x": 160, "y": 10, "w": 90, "h": 250, "conf": 0.9},
+]
+MEN_FACES = [
+    {"box": {"x": 35, "y": 20, "w": 60, "h": 70}, "landmarks": [[1, 1]] * 5,
+     "conf": 0.9, "widthPx": 60.0, "iedPx": 30.0, "frontality": 0.9,
+     "sharpness": 400.0},
+    {"box": {"x": 175, "y": 20, "w": 60, "h": 70}, "landmarks": [[1, 1]] * 5,
+     "conf": 0.9, "widthPx": 60.0, "iedPx": 30.0, "frontality": 0.9,
+     "sharpness": 400.0},
+]
+
+# kf-577 itself: the second man matched the first man's key, comfortably.
+FA8FC3_SCRIPT = [
+    scripted_verdict("p00001", True, None),      # the man in the dark green polo
+    scripted_verdict("p00001", False, 0.6733),   # the man in the cream shirt
+    scripted_verdict("p00002", True, 0.2100),    # ...re-resolved with p00001 barred
+]
+
+
+class TwoMen(V1Fake):
+    """Two SEPARATE person boxes, one face in each, over a two-colour frame.
+
+    The left half of the frame is one shirt colour and the right half another,
+    so the two torso crops land in different colour clusters — the clothing
+    evidence fa8fc3 had and never acted on.  ``one_body`` collapses both faces
+    into a SINGLE person box instead, which is the phone-screen/mirror case the
+    guard must refuse to split.
+    """
+
+    def __init__(self, left_bgr=RED_BGR, right_bgr=BLUE_BGR, one_body=False,
+                 short_bodies=False, **kw):
+        kw.setdefault(
+            "image_b64", split_jpeg_b64(left_bgr, right_bgr, split_x=130, w=320, h=300)
+        )
+        super().__init__(**kw)
+        self.one_body = one_body
+        self.short_bodies = short_bodies
+        self.forgets: list[dict] = []
+
+    def handler(self, request):
+        """Serve the two men's boxes and faces over the two-colour frame."""
+        host, path = request.url.host, request.url.path
+        if host == "persons" and path == "/detect":
+            self.calls.append("persons /detect")
+            if self.one_body:
+                # One box spanning both faces: a man and the phone he is
+                # holding, or a man and his reflection in the same mirror.
+                return httpx.Response(
+                    200, json={"boxes": [{"x": 20, "y": 10, "w": 230, "h": 250,
+                                          "conf": 0.9}]}
+                )
+            boxes = [dict(b) for b in MEN_BOXES]
+            if self.short_bodies:
+                # Torso crop 20 px tall — under the 24 px floor, so NO
+                # descriptor is measurable for either man.
+                for b in boxes:
+                    b["h"] = 100
+            return httpx.Response(200, json={"boxes": boxes})
+        if host == "faces" and path == "/detect":
+            self.calls.append("faces /detect")
+            return httpx.Response(200, json={"faces": [dict(f) for f in MEN_FACES]})
+        return super().handler(request)
+
+    def _match(self, path, body):
+        if path == "/template/forget":
+            self.forgets.append(body)
+            return httpx.Response(200, json={"ok": True, "forgotten": True,
+                                             "galleryN": self.guest_n})
+        return super()._match(path, body)
+
+
+def test_the_two_men_of_kf577_are_measurably_different_cloth():
+    """The fixture really does carry the evidence — checked before it is relied on.
+
+    A geometry slip that made either descriptor None would let every "no split"
+    test below pass for the wrong reason, so the clash is asserted directly.
+    """
+    img = split_image(RED_BGR, BLUE_BGR, split_x=130, w=320, h=300)
+    left = torso_descriptor(img, MEN_FACES[0]["box"], MEN_BOXES[0])
+    right = torso_descriptor(img, MEN_FACES[1]["box"], MEN_BOXES[1])
+    assert left is not None and right is not None, "both torsos are measurable"
+    assert intersection(left, right) < 0.35, "and they clearly clash"
+    assert intersection(left, left) == pytest.approx(1.0)
+
+
+def test_two_bodies_in_one_frame_cannot_be_one_guest():
+    """THE REPLAY: both men land on p00001 — the second is taken back off it.
+
+    This is the only mechanism in the loop that catches a silent UNDER-count.
+    Everything else here either suggests something to an operator or refuses a
+    fold; without this, fa8fc3's second man simply never existed.
+    """
+    fake = TwoMen(n_frames=1, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 1
+    assert final["unique"] == 2, "two men in the frame, two guests in the count"
+
+    # The re-ask went out with p00001 barred — not a blind mint.
+    reask = [b for b in fake.match_bodies if b.get("excludeKeys")]
+    assert len(reask) == 1
+    assert reask[0]["excludeKeys"] == ["p00001"]
+
+    # And now that there ARE two keys, co-presence can do its job on them.
+    assert fake.splits == [{"runId": "prun-1", "a": "p00001", "b": "p00002"}]
+    assert final["coPresenceSplits"] == 1
+
+
+def test_the_split_retracts_the_template_it_proved_wrong():
+    """The poisoned view comes back OUT, or the merge simply returns next frame.
+
+    A template of man B living under man A goes on capturing man B in every
+    later frame where he stands ALONE — where no second body exists to
+    disprove it a second time.  That is precisely how one key came to hold
+    five mutually-impostor templates.
+    """
+    poisoning = list(FA8FC3_SCRIPT)
+    poisoning[1] = {**poisoning[1], "templateAdded": True, "templateId": 13}
+    fake = TwoMen(n_frames=1, match_script=poisoning)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 1
+    assert fake.forgets == [{"runId": "prun-1", "templateId": 13}]
+
+
+def test_two_faces_in_ONE_body_are_never_split():
+    """A man and the phone showing his own face are one guest, not two.
+
+    The guard's evidence is BODIES.  One person box holding two faces is the
+    documented phone/mirror case, and splitting it would turn this fix into
+    the over-count it was built to avoid.
+    """
+    fake = TwoMen(n_frames=1, one_body=True, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 0
+    assert [b for b in fake.match_bodies if b.get("excludeKeys")] == []
+    assert fake.forgets == []
+
+
+def test_two_bodies_in_the_SAME_clothes_are_never_split():
+    """A man and his reflection in a hall mirror occupy two boxes too.
+
+    Two boxes alone would split them and over-count; the clothing corroboration
+    is what tells that pair apart from two men, because a reflection wears
+    exactly what it is reflecting.
+    """
+    fake = TwoMen(
+        n_frames=1, left_bgr=RED_BGR, right_bgr=RED_BGR,
+        match_script=list(FA8FC3_SCRIPT),
+    )
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 0
+    assert [b for b in fake.match_bodies if b.get("excludeKeys")] == []
+
+
+def test_an_unmeasurable_torso_never_splits_anyone():
+    """Absent is not zero — a torso nobody could measure is not a clash.
+
+    This deliberately errs towards the under-count the guard exists to fix,
+    and it is the right way round: a missing descriptor is no evidence, and
+    acting on no evidence would split guests at random.
+    """
+    fake = TwoMen(n_frames=1, short_bodies=True, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 0
+    assert [b for b in fake.match_bodies if b.get("excludeKeys")] == []
+
+
+def test_the_guard_has_an_off_switch():
+    """HECO_SAME_FRAME_CLASH=0 restores the pre-guard behaviour exactly."""
+    fake = TwoMen(n_frames=1, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, same_frame_clash=0.0).run()
+
+    assert final["sameFrameSplits"] == 0
+    assert final["unique"] == 1, "the fa8fc3 under-count, reproduced on demand"
+
+
+def test_the_split_counter_reaches_the_notes_and_the_results():
+    """A run's permanent record has to say how many merges the frames disproved."""
+    fake = TwoMen(n_frames=1, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+
+    assert "sameFrameSplits=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["sameFrameSplits"] == 1
+
+
+def test_the_split_rides_the_tap_with_its_evidence():
+    """The console can show the operator WHY this face is not wearing that key."""
+    fake = TwoMen(n_frames=1, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+
+    split = [
+        v
+        for tap in fake.taps
+        if tap.get("stage") == "match"
+        for v in tap["payload"].get("matches", [])
+        if v.get("sameFrameSplit")
+    ]
+    assert len(split) == 1
+    ev = split[0]["sameFrameSplit"]
+    assert ev["from"] == "p00001"
+    assert ev["cosine"] == 0.6733, "the confident match the frame overruled"
+    assert ev["clothes"] < 0.35
+    assert split[0]["personKey"] == "p00002"
+
+
+# The phone case with teeth.  Two faces in ONE person box usually produce
+# near-identical torso descriptors — the crop's x range comes from the BOX, so
+# the clothing rule alone happens to refuse the split and the body check looks
+# redundant.  It is not.  A man holding a phone at waist height puts the second
+# face far enough down the box that its torso crop lands on his legs rather
+# than his shirt, and those genuinely clash.  Then the ONLY thing standing
+# between this pipeline and an invented guest is "same body".
+
+MAN_WITH_PHONE_BOX = {"x": 20, "y": 10, "w": 90, "h": 380, "conf": 0.9}
+MAN_WITH_PHONE_FACES = [
+    # his own face, up at head height
+    {"box": {"x": 35, "y": 20, "w": 60, "h": 70}, "landmarks": [[1, 1]] * 5,
+     "conf": 0.9, "widthPx": 60.0, "iedPx": 30.0, "frontality": 0.9,
+     "sharpness": 400.0},
+    # the same face again, on the screen he is holding at his waist
+    {"box": {"x": 35, "y": 200, "w": 60, "h": 70}, "landmarks": [[1, 1]] * 5,
+     "conf": 0.9, "widthPx": 60.0, "iedPx": 30.0, "frontality": 0.9,
+     "sharpness": 400.0},
+]
+
+
+def banded_image(top_bgr, bottom_bgr, split_y=268, w=320, h=400) -> np.ndarray:
+    """Shirt above, trousers below — one body whose two crops disagree."""
+    img = np.full((h, w, 3), top_bgr, dtype=np.uint8)
+    img[split_y:, :] = bottom_bgr
+    return img
+
+
+def banded_jpeg_b64(top_bgr, bottom_bgr, split_y=268, w=320, h=400) -> str:
+    """The same, JPEG-encoded for the fake ingest to serve."""
+    ok, buf = cv2.imencode(".jpg", banded_image(top_bgr, bottom_bgr, split_y, w, h))
+    assert ok
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+class ManWithPhone(V1Fake):
+    """ONE person box, two faces at different heights, shirt/trousers banding."""
+
+    def __init__(self, **kw):
+        kw.setdefault("image_b64", banded_jpeg_b64(RED_BGR, BLUE_BGR))
+        super().__init__(**kw)
+        self.forgets: list[dict] = []
+
+    def handler(self, request):
+        """Serve one person box holding both faces, over a banded frame."""
+        host, path = request.url.host, request.url.path
+        if host == "persons" and path == "/detect":
+            self.calls.append("persons /detect")
+            return httpx.Response(200, json={"boxes": [dict(MAN_WITH_PHONE_BOX)]})
+        if host == "faces" and path == "/detect":
+            self.calls.append("faces /detect")
+            return httpx.Response(
+                200, json={"faces": [dict(f) for f in MAN_WITH_PHONE_FACES]}
+            )
+        return super().handler(request)
+
+    def _match(self, path, body):
+        if path == "/template/forget":
+            self.forgets.append(body)
+            return httpx.Response(200, json={"ok": True, "forgotten": True,
+                                             "galleryN": self.guest_n})
+        return super()._match(path, body)
+
+
+def test_the_phone_at_waist_height_really_does_clash_on_clothing():
+    """The fixture has teeth — shirt and trousers disagree below the floor.
+
+    Asserted directly, because if these two crops happened to AGREE the test
+    below would pass without the body check ever being consulted.
+    """
+    img = banded_image(RED_BGR, BLUE_BGR)
+    face = torso_descriptor(img, MAN_WITH_PHONE_FACES[0]["box"], MAN_WITH_PHONE_BOX)
+    phone = torso_descriptor(img, MAN_WITH_PHONE_FACES[1]["box"], MAN_WITH_PHONE_BOX)
+    assert face is not None and phone is not None
+    assert intersection(face, phone) < 0.35, "clothing alone would allow the split"
+
+
+def test_one_body_is_one_guest_even_when_its_two_crops_clash():
+    """SAME BODY ends it. No split, no re-ask, no invented guest.
+
+    This is the guard's own over-count risk, closed: the frame says two faces,
+    the clothing says two shirts, and the person box says one man — and the
+    person box is the only one of the three that is about people.
+    """
+    fake = ManWithPhone(n_frames=1, match_script=list(FA8FC3_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 0
+    assert final["unique"] == 1, "one man and his phone are one guest"
+    assert [b for b in fake.match_bodies if b.get("excludeKeys")] == []
+    assert fake.forgets == []

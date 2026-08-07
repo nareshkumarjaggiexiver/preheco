@@ -57,6 +57,12 @@ class MatchResult:
     # descriptor clashed.  Never set on the verdict path: appearance vetoes
     # WRITES, not verdicts.
     appearance_vetoed: bool = False
+    # Rowid of the template this call ENROLLED (None when nothing was written,
+    # and None on a mint — a mint's unit of retraction is the whole key, which
+    # the runner already handles).  Handed back so a caller who later proves
+    # the enrolment wrong can retract exactly that row via POST /template/forget
+    # instead of guessing; the runner's same-frame guard is the only caller.
+    template_id: int | None = None
     # Set ONLY on a mint whose best cosine against the pre-existing gallery
     # landed inside one of the TWO near-miss bands:
     # {"key": the near-missed identity, "cosine": that best score,
@@ -395,6 +401,11 @@ def match(
     # band that essentially never fires, instead of one that fires on any
     # clothing whatsoever.  The off switch is nearmiss_weak_floor=0.
     nearmiss_clothes: float = 1.0,
+    # Identities this probe has been PROVEN not to be — the runner's same-frame
+    # guard, never a heuristic.  Excluded from the scan so the probe resolves
+    # against the rest of the gallery (an existing guest if one fits, a fresh
+    # mint otherwise) instead of re-landing on the key it cannot belong to.
+    exclude_keys: set[str] | None = None,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -499,7 +510,7 @@ def match(
     store = open_store(db_path(data_dir, run_id))
 
     with store.transaction():
-        hit = store.search(embedding)
+        hit = store.search(embedding, exclude=exclude_keys)
         if hit is not None and hit.cosine >= threshold:
             # Similarity vs what is ALREADY stored, computed before this call
             # writes anything — otherwise an enrolled sighting would be
@@ -532,8 +543,9 @@ def match(
                 # untouched — this refuses only the write.
                 added, vetoed = False, True
             overlap = None
+            template_id = None
             if added:
-                store.add(
+                template_id = store.add(
                     hit.key,
                     embedding,
                     quality=quality,
@@ -554,6 +566,7 @@ def match(
                 added,
                 appearance_sim=appearance_sim,
                 appearance_vetoed=vetoed,
+                template_id=template_id,
                 overlap=overlap,
             )
         key = store.add_auto(
@@ -700,6 +713,28 @@ def merge(
         if merged and templates_per_person > 1:
             store.prune_redundant(keep, templates_per_person)
         return merged, store.distinct_count()
+
+
+def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:
+    """Retract one enrolled template by rowid; True if it was actually removed.
+
+    Exists for a caller that can only DISPROVE a write after making it: the
+    runner matches every face in a frame before it can see that two different
+    bodies landed on the same key, by which point the loser has already been
+    enrolled into an identity it cannot belong to.  Without this the split
+    fixes only the frame in hand — the poisoned template stays in the gallery
+    and goes on capturing that person in every later frame where they appear
+    ALONE and no same-frame evidence exists.  Run fa8fc3 is the worked example:
+    five templates under one key, internally 0.22..0.52 (impostor-level),
+    holding two different men.
+
+    False — not an error — when the row is already gone (``prune_redundant``
+    fires immediately after every enrolment and may have evicted it) or when
+    it is its key's last template (see :meth:`VectorStore.forget_template`).
+    """
+    store = open_store(db_path(data_dir, run_id))
+    with store.transaction():
+        return store.forget_template(template_id)
 
 
 def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
