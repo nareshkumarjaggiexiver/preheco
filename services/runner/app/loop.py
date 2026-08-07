@@ -264,6 +264,11 @@ class RunLoop:
         # (x, y) and (y, x) are one entry and a pair is never re-sent.
         # Loop-thread only, like _frame_no and _last — every read and write
         # happens inside _pipeline_step.  Capped (_COPRESENCE_CAP).
+        #: personKey -> width (px) of the best face card the planner has taken,
+        #: and the crops waiting for the next tap round. Two dicts, not one: a
+        #: card is only "the best so far" once it has actually landed.
+        self._face_cards: dict[str, float] = {}
+        self._face_pending: dict[str, tuple[bytes, float]] = {}
         self._copresence_sent: set[str] = set()
         # Whether the cap has already been reported; the warning is worth
         # saying once and worthless once per frame.
@@ -348,6 +353,12 @@ class RunLoop:
             # did not exist.  A run with a non-zero value here counted people
             # the matcher alone would have merged away.
             "sameFrameSplits": 0,
+            # FACE CARDS: how many per-guest face crops the planner took. A
+            # register card is what lets an operator tell WHO an identity is
+            # without reading a label off a crowded frame, so a run where this
+            # sits at 0 while guests exist means the register is showing
+            # pictures nobody can use (undecodable frames, or no face box).
+            "faceCardsPosted": 0,
             # How many DISTINCT track ids the tracker reported all run.  Read
             # it beside `unique`: bench 6e1a5d put ONE person on SIX ids, which
             # is the whole reason the lock and the longer tracker max-age
@@ -732,6 +743,7 @@ class RunLoop:
             "lockedTrackFolds": st["lockedTrackFolds"],
             "coPresenceSplits": st["coPresenceSplits"],
             "sameFrameSplits": st["sameFrameSplits"],
+            "faceCardsPosted": st["faceCardsPosted"],
             "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "healUncertainAppearance": st["healUncertainAppearance"],
@@ -952,8 +964,11 @@ class RunLoop:
         # this is the loop's own decode; a stub/opaque frame or a frame with no
         # person boxes simply produces no descriptors, and per the absent-is-
         # not-zero convention nothing downstream may treat that as a clash.
+        # Decoded for the torso descriptor (which needs a person box) AND for
+        # face cards (which need only a face), so the condition is either —
+        # a guest whose body the detector missed still deserves a picture.
         frame_img = None
-        if boxes:
+        if boxes or kept:
             try:
                 frame_img = decode_jpeg_b64(image_b64)
             except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
@@ -1144,6 +1159,12 @@ class RunLoop:
             # mechanism has any evidence about this one).  Staff verdicts never
             # arrive here — they `continue` above — so a staff hit can neither
             # set a lock nor be folded into one, exactly as it can never heal.
+            # THE GUEST'S OWN PICTURE. Cropped here (pure CPU, ~1 ms) and
+            # uploaded inside the next tap round, never from this loop: frame
+            # uploads on the hot path are what produced the 0.4 fps death
+            # spiral, and a thumbnail must never cost a guest.
+            self._maybe_face_card(frame_img, face, m)
+
             track_id = self._track_for(face, tracks)
             if track_id is None:
                 continue
@@ -1198,6 +1219,84 @@ class RunLoop:
         if None in ba or None in bb:
             return True
         return ba.isdisjoint(bb)
+
+    def _maybe_face_card(self, frame_img, face: dict, m: dict) -> None:
+        """Keep this guest's best face so far, cropped, for the register.
+
+        WHY (operator, 2026-08-07): the register showed whole annotated frames,
+        and in a busy doorway every frame holds three people — "it is hard to
+        find who it is". A card answers that: one guest's face, alone.
+
+        BEST, not first. A mint is often the WORST look at somebody — the
+        frame that created p00003 was a face of 29 px eye-distance with a phone
+        across it, while the same run matched other guests at 44-60 px — so a
+        card taken at mint and never revisited would show the register exactly
+        the picture that made the identity hard to judge in the first place. A
+        later face is taken only when it is clearly better, by a margin
+        (``face_card_improve``), which bounds the number of cards per guest to
+        a handful whatever the run does: each replacement must beat the last by
+        that factor, so the count is logarithmic in how much the face grows.
+
+        Cropping happens HERE and uploading does not. Encoding a 192 px JPEG is
+        about a millisecond; posting it is a network round trip, and network
+        round trips inside the frame loop are what caused the 0.4 fps death
+        spiral the tap duty guard exists to prevent. The card waits in
+        ``_face_pending`` for the next tap round, which already has a deadline
+        and a budget for exactly this kind of work.
+
+        Staff get no card: they are held out of the guest count and their
+        likeness is operator-attested elsewhere; carding them here would put a
+        face nobody consented to in a register they do not appear in.
+        """
+        if frame_img is None or m.get("isStaff"):
+            return
+        key = m.get("personKey")
+        box = face.get("box")
+        if not key or not box:
+            return
+        # No separate zero-width guard: face_crop refuses a box with no area
+        # (tested there), and a branch here that no test could distinguish from
+        # its absence is exactly the dead defence this codebase keeps catching.
+        width = float(box.get("w") or 0.0)
+        best = max(self._face_cards.get(key, 0.0), self._face_pending.get(key, (None, 0.0))[1])
+        if best and width < best * self.s.face_card_improve:
+            return
+        try:
+            crop = annotate.face_crop(frame_img, box)
+            if crop is None:
+                return
+            jpeg = annotate.to_jpeg(crop, quality=82)
+        except Exception:  # noqa: BLE001 — a thumbnail must never kill a run
+            return
+        self._face_pending[key] = (jpeg, width)
+
+    def _flush_face_cards(self, deadline: float) -> None:
+        """Upload the face cards waiting from recent frames, inside the round.
+
+        Ordered BEST FIRST so a round that runs out of budget has spent it on
+        the clearest pictures rather than on whichever guest happened to be
+        seen last. A card that misses its round stays pending and rides the
+        next one; only a card superseded by a better crop is ever dropped, and
+        that is not a loss.
+        """
+        if not self._face_pending:
+            return
+        with self._lock:
+            pending = sorted(
+                self._face_pending.items(), key=lambda kv: kv[1][1], reverse=True
+            )
+        for key, (jpeg, width) in pending:
+            if time.monotonic() >= deadline:
+                return
+            if not self.planner.post_face_card(key, jpeg):
+                continue
+            with self._lock:
+                # Only clear what we actually sent: a better crop may have
+                # arrived for this key while the upload was in flight.
+                if self._face_pending.get(key, (None, None))[1] == width:
+                    self._face_pending.pop(key, None)
+                self._face_cards[key] = max(self._face_cards.get(key, 0.0), width)
+            self._bump("faceCardsPosted")
 
     def _split_same_key(
         self,
@@ -2478,6 +2577,11 @@ class RunLoop:
             except Exception:  # noqa: BLE001 — one bad overlay must not stop the rest
                 continue
             self.planner.post_frame(stage, jpeg)
+
+        # The guests' own pictures, last: the stage frames are what the live
+        # console is watching right now, and a card can always ride the next
+        # round. Bounded by the same deadline as everything else here.
+        self._flush_face_cards(deadline)
 
     # ------------------------------------------------------ operator feedback
 
