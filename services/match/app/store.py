@@ -357,13 +357,26 @@ class VectorStore:
 
     # ------------------------------------------------------------- reads
 
-    def search(self, embedding: list[float] | np.ndarray) -> Neighbour | None:
+    def search(
+        self, embedding: list[float] | np.ndarray, exclude: set[str] | None = None
+    ) -> Neighbour | None:
         """Return the nearest stored template by cosine, or None if empty.
 
         Rows are unit vectors, so the dot product is the cosine and the whole
         scan is one ``(n, dim) @ (dim,)`` multiply against the resident matrix
         — no SQLite round trip, no BLOB rebuild.  The best row's key is
         returned even when several templates share it (multi-template person).
+
+        ``exclude`` removes whole identities from the scan before the argmax,
+        for the one caller that has already PROVEN the probe cannot be them:
+        the runner's same-frame guard, which re-asks about a face that matched
+        a key another body in the same frame was simultaneously wearing (see
+        ``RunLoop._split_same_key``).  Masking rather than re-querying keeps
+        this on the same single multiply, and returning the runner-up KEY —
+        not merely "no" — matters: the second man may legitimately be an
+        already-known guest, and forcing a blind mint would split him instead.
+        None when every remaining row is excluded, which the caller reads as
+        "nobody else is close" and mints.
         """
         self._index()
         if not self._n:
@@ -372,6 +385,15 @@ class VectorStore:
         if q.size != self._dim:
             raise ValueError(f"embedding dim {q.size} != store dim {self._dim}")
         sims = self._buf[: self._n] @ q
+        if exclude:
+            live = np.fromiter(
+                (k not in exclude for k in self._keys[: self._n]),
+                dtype=bool,
+                count=self._n,
+            )
+            if not live.any():
+                return None
+            sims = np.where(live, sims, -np.inf)
         i = int(np.argmax(sims))
         return Neighbour(key=self._keys[i], cosine=float(sims[i]))
 
@@ -514,8 +536,13 @@ class VectorStore:
         quality: float | None = None,
         sub_canon: bool = False,
         appearance: list[float] | np.ndarray | None = None,
-    ) -> None:
-        """Store one template under an explicit key (used for staff ids).
+    ) -> int:
+        """Store one template under an explicit key; returns its rowid.
+
+        The rowid is returned so a caller who later PROVES the write was wrong
+        can retract exactly it (:meth:`forget_template`) rather than guessing
+        at "the most recent row" — the runner's same-frame guard is that
+        caller.  Callers with nothing to retract simply ignore it.
 
         ``appearance`` is the sighting's optional torso-appearance descriptor
         (the wire contract's 48-float L1-normalised Hue×Saturation histogram),
@@ -537,7 +564,9 @@ class VectorStore:
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (key, v.tobytes(), v.size, quality, int(sub_canon), _now(), blob),
         )
-        self._append_row(key, v, int(cur.lastrowid))
+        row_id = int(cur.lastrowid)
+        self._append_row(key, v, row_id)
+        return row_id
 
     def add_auto(
         self,
@@ -698,6 +727,42 @@ class VectorStore:
         self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in doomed])
         self._drop_ids(doomed)
         return len(doomed)
+
+    def forget_template(self, row_id: int) -> bool:
+        """Retract ONE enrolled template by rowid; True if it was removed.
+
+        The undo half of :meth:`add`, for the caller that discovers a write was
+        wrong only AFTER making it: the runner matches every face in a frame
+        before it can see that two different bodies landed on one key, and by
+        then the loser's sighting has already been enrolled into the identity
+        it does not belong to.  Leaving it there is not cosmetic — a poisoned
+        template goes on pulling that person into the wrong identity in every
+        LATER frame, including the frames where they stand alone and no
+        same-frame evidence exists to catch it again.  That is precisely how
+        run fa8fc3 counted two men as one.
+
+        REFUSES to remove a key's LAST template, returning False.  A key with
+        no vectors would still hold its slot in the distinct count while being
+        unmatchable forever — a guest who exists but can never be recognised
+        again.  Retiring a whole identity is :meth:`remove`'s job, not this
+        one's.  Also False when the row is already gone, which is ordinary:
+        ``prune_redundant`` runs immediately after every enrolment and may
+        have evicted this very row before anyone asked to forget it.
+        """
+        row = self.conn.execute(
+            "SELECT key FROM vectors WHERE id = ?", (row_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        held = self.conn.execute(
+            "SELECT count(*) FROM vectors WHERE key = ?", (row[0],)
+        ).fetchone()[0]
+        if held <= 1:
+            return False
+        self._index()  # load BEFORE the delete, so the index still has the row
+        self.conn.execute("DELETE FROM vectors WHERE id = ?", (row_id,))
+        self._drop_ids({row_id})
+        return True
 
     # ------------------------------------- operator corrections (pure ops)
 
