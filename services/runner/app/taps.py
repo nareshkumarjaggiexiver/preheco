@@ -222,6 +222,27 @@ def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:
 MINT_LEDGER_CAP = 60
 
 
+def _same_frame_split(v: dict) -> dict | None:
+    """Compact a verdict's same-frame split for the tap row.
+
+    Unlike nearMiss and overlap — which SUGGEST — this one records something
+    that already happened: the matcher gave this face an identity that another
+    body in the same frame was simultaneously wearing, and the frame overruled
+    it.  ``{"from": the key it was taken off, "cosine": the confident match
+    that was overruled, "clothes": the torso intersection that corroborated
+    it}``.  The console shows it beside the guest so an operator can see the
+    machine disagreeing with itself and why; the count already reflects it.
+    """
+    sp = v.get("sameFrameSplit")
+    if not sp:
+        return None
+    return {
+        "from": sp.get("from"),
+        "cosine": _r(sp.get("cosine"), 4),
+        "clothes": _r(sp.get("clothes"), 4),
+    }
+
+
 def match_payload(
     verdicts: list[dict],
     unique: int,
@@ -261,6 +282,10 @@ def match_payload(
             # appearanceSim} or None) — the operator's one-click-merge cue.
             "nearMiss": _near_miss(v),
             "overlap": _overlap(v),
+            # This face was taken OFF the key the matcher gave it, because a
+            # different body in this same frame had it too (None on every
+            # ordinary verdict).  Not a suggestion — it already happened.
+            "sameFrameSplit": _same_frame_split(v),
         }
         for v in verdicts[:ROW_CAP]
     ]

@@ -542,7 +542,7 @@ def test_health_reports_both_weak_band_knobs(client, monkeypatch):
     "which bar was this run using" is a question that will be asked.
     """
     body = client.get("/health").json()
-    assert body["version"] == "0.10.0"
+    assert body["version"] == "0.11.0"
     assert body["nearMissWeakFloor"] == pytest.approx(config.DEFAULT_NEARMISS_WEAK_FLOOR)
     assert body["nearMissClothes"] == pytest.approx(config.DEFAULT_NEARMISS_CLOTHES)
     assert pytest.approx(0.15) == config.DEFAULT_NEARMISS_WEAK_FLOOR
@@ -781,3 +781,175 @@ def test_band_floors_mean_what_they_say_at_the_boundary(client, monkeypatch):
     assert out["isNew"] is True
     assert out["nearMiss"] is not None, "0.29 against a floor of 0.29 must flag"
     assert out["nearMiss"]["basis"] == "face"
+
+
+# ------------------------- same-frame guard: excludeKeys + template retraction
+#
+# Run fa8fc3 (2026-08-07, ground truth TWO men, counted ONE) drove both of
+# these.  Frame kf-577 held the two of them side by side, both matched to
+# p00001 at face 0.6874 and 0.6733; by the end that one key held five
+# templates whose internal cosines ran 0.2223..0.5232 — impostor-level against
+# each other, one identity containing two people.  The matcher could not have
+# seen it: /match is asked about ONE embedding at a time and never sees the
+# frame.  The runner can, so it needs two things the service did not offer —
+# a way to re-ask with the proven-wrong identity off the table, and a way to
+# take back the template that identity was just given.
+
+
+def test_exclude_keys_resolves_against_the_rest_of_the_gallery(client):
+    """A barred key is skipped and the RUNNER-UP is returned, not a blind mint.
+
+    This is the whole reason exclusion beats "force a mint": the second body
+    in the frame is often a guest already in the gallery, and minting them
+    blindly would split a returning guest every time two people share a frame.
+    """
+    alice, bob = person_centroid(), person_centroid()
+    a = client.post("/match", json={"runId": "r", "embedding": sighting(alice)}).json()
+    b = client.post("/match", json={"runId": "r", "embedding": sighting(bob)}).json()
+    assert a["isNew"] and b["isNew"] and a["personKey"] != b["personKey"]
+
+    again = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(alice)}
+    ).json()
+    assert again["personKey"] == a["personKey"], "unbarred, alice is alice"
+
+    barred = client.post(
+        "/match",
+        json={
+            "runId": "r",
+            "embedding": sighting(alice),
+            "excludeKeys": [a["personKey"]],
+        },
+    ).json()
+    assert barred["personKey"] != a["personKey"], "the barred key is off the table"
+
+
+def test_exclude_keys_mints_when_nobody_else_is_close(client):
+    """Bar the only identity in the gallery and the sighting has to mint."""
+    alice = person_centroid()
+    a = client.post("/match", json={"runId": "r", "embedding": sighting(alice)}).json()
+
+    barred = client.post(
+        "/match",
+        json={
+            "runId": "r",
+            "embedding": sighting(alice),
+            "excludeKeys": [a["personKey"]],
+        },
+    ).json()
+    assert barred["isNew"] is True
+    assert barred["personKey"] != a["personKey"]
+    assert barred["galleryN"] == 2, "the second man is now a guest in his own right"
+
+
+def test_exclude_keys_absent_or_empty_changes_nothing(client):
+    """The field is opt-in: no excludeKeys and an empty list both match normally."""
+    alice = person_centroid()
+    a = client.post("/match", json={"runId": "r", "embedding": sighting(alice)}).json()
+    for payload in ({}, {"excludeKeys": []}, {"excludeKeys": None}):
+        got = client.post(
+            "/match", json={"runId": "r", "embedding": sighting(alice), **payload}
+        ).json()
+        assert got["personKey"] == a["personKey"], payload
+
+
+def view_at(centroid: np.ndarray, target_cosine: float) -> list[float]:
+    """A sighting at an EXACT cosine from the identity — a genuinely new view.
+
+    ``sighting()`` lands around 0.99, which the redundancy bar
+    (``template_max_cosine`` 0.90) rejects on purpose: a view identical to one
+    already stored teaches the gallery nothing.  Enrolment tests therefore need
+    a view that is comfortably the same person and comfortably not a duplicate.
+    """
+    c = centroid / np.linalg.norm(centroid)
+    r = RNG.normal(size=128)
+    r = r - r.dot(c) * c
+    r = r / np.linalg.norm(r)
+    return _unit(target_cosine * c + math.sqrt(1.0 - target_cosine**2) * r)
+
+
+def test_match_reply_carries_the_rowid_of_the_template_it_enrolled(client, monkeypatch):
+    """templateId names the exact row, so a retraction cannot hit the wrong one."""
+    monkeypatch.setenv("HECO_MATCH_TEMPLATES_PER_PERSON", "5")
+    alice = person_centroid()
+    first = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(alice), "quality": 90.0}
+    ).json()
+    assert first["isNew"] is True
+    assert first["templateId"] is None, "a mint is retracted as a whole key, not a row"
+
+    second = client.post(
+        "/match",
+        json={"runId": "r", "embedding": view_at(alice, 0.75), "quality": 90.0},
+    ).json()
+    assert second["isNew"] is False
+    assert second["templateAdded"] is True
+    assert isinstance(second["templateId"], int)
+
+    third = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(alice), "quality": 90.0}
+    ).json()
+    assert third["templateAdded"] is False, "0.99 is a duplicate view, not a new one"
+    assert third["templateId"] is None, "nothing written, nothing to retract"
+
+
+def test_forget_template_removes_exactly_that_view_and_not_the_guest(client, monkeypatch):
+    """The retraction takes back a VIEW of somebody, never somebody.
+
+    Without this the same-frame split fixes only the frame in hand: man B's
+    template stays under man A and goes on capturing him in every later frame
+    where he stands ALONE and there is no second body to disprove it.  That is
+    exactly how fa8fc3 held two men under one key.
+    """
+    monkeypatch.setenv("HECO_MATCH_TEMPLATES_PER_PERSON", "5")
+    alice = person_centroid()
+    client.post("/match", json={"runId": "r", "embedding": sighting(alice), "quality": 90.0})
+    enrolled = client.post(
+        "/match", json={"runId": "r", "embedding": view_at(alice, 0.75), "quality": 90.0}
+    ).json()
+    assert enrolled["templateAdded"] is True
+    assert enrolled["templateN"] == 2
+
+    got = client.post(
+        "/template/forget", json={"runId": "r", "templateId": enrolled["templateId"]}
+    ).json()
+    assert got["forgotten"] is True
+    assert got["galleryN"] == 1, "the guest still exists — one fewer view of them"
+
+    back = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(alice), "quality": 90.0}
+    ).json()
+    assert back["personKey"] == enrolled["personKey"], "still recognisable"
+    assert back["templateN"] == 1, "the retracted view is really gone"
+
+
+def test_forget_template_refuses_a_keys_last_template(client):
+    """A key with no vectors would exist in the count and be unmatchable forever."""
+    from app import store as store_mod
+
+    alice = person_centroid()
+    minted = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(alice)}
+    ).json()
+    assert minted["isNew"] is True
+
+    with store_mod.VectorStore(
+        main.gallery.db_path(main.config.data_dir(), "r")
+    ) as s:
+        row_id = s.conn.execute("SELECT id FROM vectors").fetchone()[0]
+
+    got = client.post(
+        "/template/forget", json={"runId": "r", "templateId": row_id}
+    ).json()
+    assert got["forgotten"] is False, "refused — this is the guest's only view"
+    assert got["galleryN"] == 1
+    after = client.post("/match", json={"runId": "r", "embedding": sighting(alice)}).json()
+    assert after["personKey"] == minted["personKey"], "still recognisable"
+
+
+def test_forget_template_on_an_absent_row_is_a_normal_false(client):
+    """The redundancy prune may already have evicted the row — not an error."""
+    alice = person_centroid()
+    client.post("/match", json={"runId": "r", "embedding": sighting(alice)})
+    got = client.post("/template/forget", json={"runId": "r", "templateId": 999999}).json()
+    assert got == {"ok": True, "forgotten": False, "galleryN": 1}

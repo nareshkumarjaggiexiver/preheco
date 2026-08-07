@@ -338,6 +338,16 @@ class RunLoop:
             # makes /merge refuse, so a fold can never erase one of two
             # co-present guests.
             "coPresenceSplits": 0,
+            # SAME-FRAME SPLITS: sightings taken OFF an identity because a
+            # different body in the SAME frame was wearing it too (see
+            # :meth:`_split_same_key`).  This is the only counter in the run
+            # that reports a silent UNDER-count being caught — every other
+            # mechanism here either suggests something to an operator or
+            # refuses a fold.  Run fa8fc3 would have scored 1 and reported two
+            # guests; it scored nothing and reported one, because the guard
+            # did not exist.  A run with a non-zero value here counted people
+            # the matcher alone would have merged away.
+            "sameFrameSplits": 0,
             # How many DISTINCT track ids the tracker reported all run.  Read
             # it beside `unique`: bench 6e1a5d put ONE person on SIX ids, which
             # is the whole reason the lock and the longer tracker max-age
@@ -675,6 +685,9 @@ class RunLoop:
             # or lock fold erasing one of the two, which is the silent
             # under-count this loop fears most.
             f"coPresenceSplits={st['coPresenceSplits']} "
+            # Silent under-counts caught: bodies the matcher had merged into
+            # one identity and the frame itself disproved.
+            f"sameFrameSplits={st['sameFrameSplits']} "
             f"distinctTracks={st['distinctTracks']} "
             # The advisory appearance signal's two vetoes (app/appearance.py):
             # heal folds refused as suspected tracker swaps, and sightings the
@@ -718,6 +731,7 @@ class RunLoop:
             "healedSplits": st["healedSplits"],
             "lockedTrackFolds": st["lockedTrackFolds"],
             "coPresenceSplits": st["coPresenceSplits"],
+            "sameFrameSplits": st["sameFrameSplits"],
             "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "healUncertainAppearance": st["healUncertainAppearance"],
@@ -1021,6 +1035,15 @@ class RunLoop:
             )
             decided.append((face, m, face_desc, pbox_id))
 
+        # SAME-FRAME SAME-KEY GUARD, run first of all: co-presence can only
+        # constrain two DIFFERENT keys, so a frame in which two bodies were
+        # both given ONE key has to be corrected before co-presence looks at
+        # it — otherwise there is no pair to assert and the merge stands
+        # (run fa8fc3: two men, one key, silently counted as one).
+        decided = self._split_same_key(
+            planner_run_id, site_id, decided, embeddings, verdicts
+        )
+
         # CO-PRESENCE, asserted between the passes: every distinct pair of
         # guests THIS FRAME held is two different people, certainly — and the
         # folds in pass two must not be able to contradict it.
@@ -1175,6 +1198,198 @@ class RunLoop:
         if None in ba or None in bb:
             return True
         return ba.isdisjoint(bb)
+
+    def _split_same_key(
+        self,
+        planner_run_id: str,
+        site_id: str | None,
+        decided: list[tuple],
+        embeddings: list,
+        verdicts: list[dict],
+    ) -> list[tuple]:
+        """Undo a merge the matcher made because it only ever sees one face.
+
+        ONE BODY CANNOT BE IN TWO PLACES.  When two faces in a single frame sit
+        in two DIFFERENT person boxes and both come back as the same identity,
+        the matcher is provably wrong about one of them — and it could not have
+        known, because /match is asked about one embedding at a time and has no
+        view of the frame.  This is the same certainty co-presence runs on,
+        applied one step earlier: co-presence constrains two KEYS, and here the
+        matcher collapsed the pair before a second key ever existed.
+
+        Run fa8fc3 is the case (see ``config.same_frame_clash`` for the full
+        measurement): two men side by side in kf-577, both labelled p00001 at
+        face 0.6874 and 0.6733 — far above any near-miss band, so nothing was
+        flagged to anyone and the run reported one guest.
+
+        WHAT IT DOES.  The strongest sighting keeps the identity; each other
+        one is re-asked with that key EXCLUDED, so it resolves against the rest
+        of the gallery — landing on an already-known guest when one fits, and
+        minting only when nobody does.  Forcing a blind mint instead would
+        split a returning guest every time two people happened to share a frame.
+
+        AND IT RETRACTS THE POISONED WRITE.  The losing sighting was already
+        enrolled into the wrong identity by the very /match call that revealed
+        the conflict, and leaving it there would defeat the whole fix: a
+        template of man B living under man A goes on capturing man B in every
+        LATER frame, including all the frames where he stands alone and no
+        same-frame evidence exists to catch it twice.  ``templateId`` from that
+        reply is handed to POST /template/forget; a false answer is ordinary
+        (the redundancy prune may already have evicted the row).
+
+        TWO GUARDS AGAINST TURNING AN UNDER-COUNT INTO AN OVER-COUNT.  Both
+        faces must sit in person boxes that are genuinely different objects —
+        a face with no containing box proves nothing and is left alone — and
+        their torso descriptors must CLASH below ``same_frame_clash``.  The
+        clothing test is what separates two men from a man and his reflection
+        in a hall mirror, or from a face on a phone screen he is holding:
+        those also occupy two boxes, but they wear the same clothes.  Missing
+        descriptor on either side means no split, absent is not zero.
+
+        ``embeddings`` is index-parallel to ``decided`` (both come from the
+        same zip in the caller) and is needed to re-ask about a face: the
+        vector is not carried in the reply.
+
+        Returns ``decided`` rebuilt with the corrected replies, and rewrites
+        the matching entries of ``verdicts`` in place, so pass two, the tap
+        payload, the mint ledger and the stats all read the split — not the
+        merge that was briefly true between the two passes.
+        """
+        floor = self.s.same_frame_clash
+        if floor <= 0 or len(decided) < 2:
+            return decided
+
+        by_key: dict[str, list[int]] = {}
+        for i, (_face, m, _desc, _pbox) in enumerate(decided):
+            key = m.get("personKey")
+            if key and not m.get("isStaff"):
+                by_key.setdefault(key, []).append(i)
+
+        out = list(decided)
+        for key, idxs in by_key.items():
+            if len(idxs) < 2:
+                continue
+            # WHO KEEPS THE IDENTITY.  A MINT keeps it outright: that sighting
+            # is the one that brought the key into existence this frame, and
+            # taking it away would leave the key held only by the sighting
+            # being disputed.  A mint's cosine is also not comparable with a
+            # match's — it measures distance to OTHER identities, not to the
+            # key it was given — so ranking the two together is a category
+            # error (it hands fa8fc3's key to the wrong man, and the count
+            # stays at one).  Among ordinary matches, highest cosine wins:
+            # the sighting the gallery agrees with most.
+            idxs.sort(
+                key=lambda i: (
+                    not decided[i][1].get("isNew"),
+                    -(decided[i][1].get("cosine") or -1.0),
+                )
+            )
+            keeper_box, keeper_desc = decided[idxs[0]][3], decided[idxs[0]][2]
+            for i in idxs[1:]:
+                face, m, desc, pbox_id = decided[i]
+                if keeper_box is None or pbox_id is None or pbox_id == keeper_box:
+                    continue  # not provably two bodies
+                if keeper_desc is None or desc is None:
+                    continue  # absent is not zero
+                sim = appearance.intersection(keeper_desc, desc)
+                if sim >= floor:
+                    continue  # same cloth: a reflection or a screen, not a guest
+                fixed = self._resolve_excluding(
+                    planner_run_id, site_id, face, m, embeddings[i], desc, key
+                )
+                if fixed is None:
+                    continue
+                out[i] = (face, fixed, desc, pbox_id)
+                verdicts[i].update(
+                    {
+                        "personKey": fixed.get("personKey"),
+                        "cosine": fixed.get("cosine"),
+                        "isNew": fixed.get("isNew"),
+                        "isStaff": bool(fixed.get("isStaff", False)),
+                        "subCanon": bool(fixed.get("subCanon", False)),
+                        "templateN": fixed.get("templateN"),
+                        "templateAdded": bool(fixed.get("templateAdded", False)),
+                        "appearanceSim": fixed.get("appearanceSim"),
+                        "nearMiss": fixed.get("nearMiss"),
+                        "overlap": fixed.get("overlap"),
+                        # Why this face is not wearing the key the matcher
+                        # first gave it — carried into the tap so the console
+                        # can show the operator the split and its evidence.
+                        "sameFrameSplit": {
+                            "from": key,
+                            "clothes": sim,
+                            "cosine": m.get("cosine"),
+                        },
+                    }
+                )
+                with self._lock:
+                    self._status["sameFrameSplits"] += 1
+                self.log.info(
+                    f"same-frame split: a second body in this frame also "
+                    f"matched {key} (face {_fmt(m.get('cosine'))}) but their "
+                    f"clothing intersects only {sim:.3f} (<{floor}) — one body "
+                    f"cannot be in two places, so it was re-resolved as "
+                    f"{fixed.get('personKey')} "
+                    f"({'new' if fixed.get('isNew') else 'existing'}, face "
+                    f"{_fmt(fixed.get('cosine'))})"
+                )
+        return out
+
+    def _resolve_excluding(
+        self,
+        planner_run_id: str,
+        site_id: str | None,
+        face: dict,
+        m: dict,
+        embedding: list,
+        desc: list | None,
+        key: str,
+    ) -> dict | None:
+        """Retract the wrong enrolment, then re-ask /match with ``key`` barred.
+
+        Order matters: the retraction goes first so the re-search cannot see
+        the very template it is about to be told to ignore anyway, and so a
+        failure to re-match still leaves the gallery cleaner than it was.
+        None on any transport failure — the caller then keeps the matcher's
+        original answer, which merely means this frame did not manage to fix
+        the merge and a later frame may.
+        """
+        template_id = m.get("templateId")
+        if template_id is not None:
+            try:
+                self._post(
+                    f"{self.s.match_url}/template/forget",
+                    {"runId": planner_run_id, "templateId": int(template_id)},
+                )
+            except StageError as e:
+                # Not fatal: the split is still worth making. Say so, because a
+                # surviving poisoned template is exactly what re-merges these
+                # two in a later frame.
+                self.log.warning(
+                    f"could not retract template {template_id} from {key} "
+                    f"after a same-frame split: {e} — the wrong view stays in "
+                    "the gallery and may recapture this guest"
+                )
+        body = {
+            "runId": planner_run_id,
+            "embedding": embedding,
+            "quality": float(face["box"]["w"]),
+            "excludeKeys": [key],
+        }
+        if desc is not None:
+            body["appearance"] = desc
+        if site_id:
+            body["siteId"] = site_id
+        try:
+            return self._timed(
+                "match", "matchMs", lambda b=body: self._post(f"{self.s.match_url}/match", b)
+            )
+        except StageError as e:
+            self.log.warning(
+                f"same-frame re-resolve against everyone but {key} failed: {e} "
+                "— keeping the matcher's original answer for this frame"
+            )
+            return None
 
     def _assert_co_presence(self, planner_run_id: str, seen: list[tuple]) -> None:
         """Tell the gallery that everyone seen in ONE frame is a different person.

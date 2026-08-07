@@ -24,7 +24,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
+| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, templateId, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -1078,3 +1078,97 @@ follows the asymmetry this project runs on: a blocked fold **over**-counts,
 which is visible and an operator can merge; a wrong fold **under**-counts
 silently and nobody ever sees it. Fixed mirrors and screens are handled by
 exclusion zones; a hand-held phone is not, and that is the residual.
+
+## v3 addition — one body cannot be in two places (runner + match, 2026-08-07)
+
+**THE MEASUREMENT.** Run `fa8fc3`, 2026-08-07, ground truth **two men**,
+reported **one**. Keyframe `kf-577` (t=32957 ms, `persons: 3, matched: 2`)
+holds them side by side, both boxed, and both labelled **`p00001`** — matched
+at face **0.6874** and **0.6733**. Not borderline: no near-miss band, no
+banner, nothing for an operator to notice. By the end of the run that single
+key held five templates whose internal cosines ran **0.2223 .. 0.5232** —
+mutually impostor-level. One identity had grown to contain two people, and the
+run reported one guest.
+
+**Every existing mechanism was structurally blind to it.**
+
+- **Co-presence** constrains two *keys*, and there was only ever one key. The
+  matcher collapsed the pair one step before the constraint could exist.
+- **The enrolment veto** refuses WRITES, never verdicts, and is charitable by
+  construction (BEST intersection over the identity's stored views). Once one
+  of the second man's sightings was inside, every later one agreed with *it*
+  and nothing clashed again. The run scored `enrolVetoedByAppearance: 0`.
+- **The near-miss and overlap banners** fire on MINTS, and a second mint never
+  happened.
+
+The clothing evidence to separate them was present the whole time and unused:
+the surviving templates cluster {id7, id10, id14} agreeing **0.624 .. 0.817**
+and {id13, id16} agreeing **0.668**, with **0.130 .. 0.294** *across* the
+divide — two men, cleanly separated, by a signal no mechanism was positioned
+to act on.
+
+**THE ASSERTION.** Two faces in ONE frame occupying two DIFFERENT person boxes
+cannot be the same guest, whatever the cosine says. This is the same certainty
+co-presence already runs on, applied one step earlier — to the case where the
+matcher merged the pair before a second key existed to constrain.
+
+- **Runner → `_split_same_key`**, run between the two verdict passes and
+  BEFORE co-presence (co-presence needs two keys; this is what produces them).
+  Verdicts are grouped by `personKey`; for any key held by more than one
+  non-staff verdict, one sighting keeps it and each other must be *disproved*
+  to lose it.
+- **Who keeps the identity.** A **mint** keeps it outright — that sighting
+  brought the key into existence this frame, and its cosine is not comparable
+  with a match's (it measures distance to OTHER identities). Among ordinary
+  matches, highest cosine keeps it.
+- **TWO conditions, both required, before anyone is split.** The two faces sit
+  in person boxes that are genuinely different objects (a face with no
+  containing box proves nothing and is left alone), AND their torso
+  descriptors intersect **below `HECO_SAME_FRAME_CLASH`** (`env_float`,
+  default **0.35** — the same CLEAR-CLASH floor `heal_appearance_clash` uses;
+  `0` disables the guard). Descriptor missing on either side ⇒ no split:
+  absent is not zero, and this deliberately errs towards the under-count.
+- **`POST /match` request gains optional `excludeKeys`**: `list[str] | None`,
+  identities the caller has PROVEN this face is not. They are masked out of
+  the scan before the argmax. The loser is re-asked with the disputed key
+  barred, so it resolves against the **rest of the gallery** — landing on an
+  already-known guest when one fits, minting only when nobody does. Forcing a
+  blind mint instead would split a returning guest every time two people
+  happened to share a frame.
+- **`POST /match` reply gains `templateId`**: `int | null`, the rowid of the
+  template this call enrolled (null when nothing was written, and null on a
+  mint — a mint's unit of retraction is the whole key).
+- **`POST /template/forget {runId, templateId}` → `{ok, forgotten, galleryN}`**
+  retracts exactly that row. **`forgotten: false` is a NORMAL outcome**, not a
+  failure: the post-enrolment redundancy prune may already have evicted it, or
+  it may be its key's last template, which is refused so no identity is left
+  existing-but-unmatchable. `galleryN` is unchanged either way — this removes
+  a VIEW of somebody, never somebody.
+- **Why the retraction is not optional.** The losing sighting was already
+  enrolled into the wrong identity by the very `/match` call that revealed the
+  conflict. Leaving it there defeats the whole guard: a template of man B
+  living under man A goes on capturing man B in every LATER frame — including
+  every frame where he stands ALONE and no second body exists to disprove it a
+  second time. That is precisely how one key came to hold five mutually
+  impostor-level templates.
+- **`sameFrameSplits`** joins the run status, the end-of-run notes and the
+  structured `results` (absent on older runners; absent is not zero). It is
+  **the only counter in the run that reports a silent UNDER-count being
+  caught** — every other mechanism here either suggests something to an
+  operator or refuses a fold. A non-zero value means the run counted people
+  the matcher alone would have merged away.
+- **Tap rows gain `sameFrameSplit`**: `{from, cosine, clothes} | null`. Unlike
+  `nearMiss` and `overlap`, which SUGGEST, this records something that already
+  happened — the key the face was taken off, the confident match the frame
+  overruled, and the torso intersection that corroborated it.
+
+**THE OVER-COUNT RISK, closed by the body test.** A person and their
+reflection in a hall mirror, or a face on a hand-held phone screen, also put
+two faces in one frame — and clothing alone would sometimes split them: a
+phone held at *waist height* gives the second face a torso crop over the
+holder's trousers rather than his shirt, which genuinely clashes. The person
+box is the arbiter, and it is the only one of the three signals that is about
+people. Pinned by test: one box, two faces, clashing crops ⇒ **no split**.
+
+**Match service 0.10.0 → 0.11.0** (new request field, new reply field, new
+endpoint; all additive). The runner's verdicts are unchanged in shape.
