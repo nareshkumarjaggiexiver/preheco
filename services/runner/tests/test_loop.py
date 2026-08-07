@@ -758,3 +758,48 @@ def test_the_reason_a_face_was_gated_reaches_the_console():
     assert faces["gatedBy"] == {"ied": 1, "width": 1}
     assert [row["gate"] for row in faces["faces"]] == ["ied", "width"]
     assert faces["faces"][0]["iedPx"] == 20.0, "the evidence travels with the verdict"
+
+
+def test_forensic_mode_uploads_every_processed_frame_with_its_identity():
+    """Forensic bench mode: one raw-frame upload per PROCESSED frame, carrying
+    seq/tMs so the planner's copy joins the decision ledger row exactly. Off
+    by default — a normal run uploads no per-frame pictures."""
+    fake = FakePipeline(n_frames=3)
+    loop = make_loop(fake)
+    loop.request["forensic"] = True
+    uploads = []
+
+    def record(url, data, fn, body, ct):
+        uploads.append(data)
+        return (201, "")
+
+    loop.planner.file_transport = record
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert final["forensicFramesPosted"] == 3
+    assert len([u for u in uploads if u.get("forensic") == "1"]) == 3
+    first = next(u for u in uploads if u.get("forensic") == "1")
+    assert first["stage"] == "ingest"
+    assert "seq" in first and "tMs" in first
+    # The fake's frames are opaque stubs, so no native dims — and absent must
+    # mean absent, never a guessed field.
+    assert "width" not in first
+    assert fake.run_created["config"]["forensic"] is True
+
+
+def test_normal_runs_upload_no_per_frame_pictures():
+    """The per-frame picture trade is opt-in; an ordinary run must not pay it."""
+    fake = FakePipeline(n_frames=2)
+    loop = make_loop(fake)
+    uploads = []
+
+    def record(url, data, fn, body, ct):
+        uploads.append(data)
+        return (201, "")
+
+    loop.planner.file_transport = record
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert "forensicFramesPosted" not in final
+    assert [u for u in uploads if u.get("forensic") == "1"] == []
+    assert fake.run_created["config"]["forensic"] is False

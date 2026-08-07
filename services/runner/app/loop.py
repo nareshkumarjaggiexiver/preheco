@@ -51,6 +51,7 @@ real guests' face embeddings, so leaving it behind is a retention liability,
 not just disk).  See :meth:`RunLoop._release_run_state`.
 """
 
+import base64
 import contextlib
 import threading
 import time
@@ -278,6 +279,11 @@ class RunLoop:
         self._copresence_capped: bool = False
         # Snapshot of the frame just processed, for debug taps (loop-thread only).
         self._last: dict | None = None
+        # Native frame dimensions, read ONCE from the first frame's JPEG header
+        # (the camera's resolution does not change mid-run) — they ride the
+        # ingest tap and the forensic uploads so the console can scale ledger
+        # box coordinates onto the downscaled pictures it shows.
+        self._native_dims: tuple[int, int] | None = None
         self._last_tap: float = 0.0
         # TAP DUTY-CYCLE GUARD state (loop-thread only): when the previous tap
         # round ENDED and what it measurably cost.  Cost 0.0 means "no round
@@ -621,6 +627,7 @@ class RunLoop:
                 config={
                     "source": req["source"],
                     "mode": "count",
+                    "forensic": bool(req.get("forensic", False)),
                     "siteId": req.get("siteId"),
                     **self._gate_config(),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
@@ -2443,10 +2450,19 @@ class RunLoop:
         visible boundary would leave the operator unable to check their own
         drawing.
         """
+        if self._native_dims is None:
+            with contextlib.suppress(Exception):
+                # A prefix is plenty: SOF sits in the first KBs of a camera
+                # JPEG, and the slice length stays a multiple of 4 so the
+                # base64 decode of a partial body is legal.
+                self._native_dims = taps.jpeg_dims(base64.b64decode(image_b64[:98304]))
+        dims = self._native_dims
         self._last = {
             "image_b64": image_b64,
             "seq": seq,
             "t_ms": t_ms,
+            "w": dims[0] if dims else None,
+            "h": dims[1] if dims else None,
             "boxes": boxes,
             "tracks": tracks,
             "faces": faces,
@@ -2454,6 +2470,45 @@ class RunLoop:
             "zones": self.zones,
         }
         self._record_frame()
+        self._maybe_forensic_frame()
+
+    def _maybe_forensic_frame(self) -> None:
+        """Forensic bench mode: upload THIS frame's raw picture, every frame.
+
+        The decision ledger already records every processed frame's reasoning
+        (~1 KB); this is its missing other half — the pixels — kept only when
+        the run was STARTED forensic, because an always-on copy of every frame
+        is a storage and retention decision, not a default. One best-effort
+        multipart POST per frame on the short report timeout: measured on the
+        bench LAN this is tens of milliseconds against a 300-1200 ms frame,
+        and the operator opted into exactly that trade at the toggle. seq and
+        tMs ride along so the planner's copy joins the decision ledger row
+        exactly; width/height are the NATIVE dimensions the overlay scaling
+        needs. Failures are counted, never raised — a dropped picture is a
+        thinner record, not a broken run.
+        """
+        if not self.request.get("forensic"):
+            return
+        last = self._last
+        if not last:
+            return
+        try:
+            raw = base64.b64decode(last["image_b64"])
+        except Exception:  # noqa: BLE001 — an opaque stub frame has no picture to keep
+            self._bump("forensicFramesDropped")
+            return
+        ok = self.planner.post_frame(
+            "ingest",
+            raw,
+            extra={
+                "forensic": 1,
+                "seq": last.get("seq"),
+                "tMs": last.get("t_ms"),
+                "width": last.get("w"),
+                "height": last.get("h"),
+            },
+        )
+        self._bump("forensicFramesPosted" if ok else "forensicFramesDropped")
 
     def _record_frame(self) -> None:
         """Append THIS frame's decisions to the ledger the engineer reads.

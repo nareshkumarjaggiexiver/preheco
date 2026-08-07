@@ -97,6 +97,11 @@ class RunRequest(BaseModel):
     siteId: str | None = None
     staffId: str | None = None
     exclusionZones: list[ExclusionZone] | None = None
+    #: Engineering-station bench mode: post the RAW frame for EVERY processed
+    #: frame (not just the sampled tap rounds), so the console can scrub the
+    #: run frame by frame. Costs one LAN upload per frame — a deliberate,
+    #: opt-in trade documented at the toggle.
+    forensic: bool = False
 
     @model_validator(mode="after")
     def _enrol_needs_site_and_staff(self) -> "RunRequest":
