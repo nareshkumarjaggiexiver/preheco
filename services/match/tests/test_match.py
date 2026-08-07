@@ -953,3 +953,183 @@ def test_forget_template_on_an_absent_row_is_a_normal_false(client):
     client.post("/match", json={"runId": "r", "embedding": sighting(alice)})
     got = client.post("/template/forget", json={"runId": "r", "templateId": 999999}).json()
     assert got == {"ok": True, "forgotten": False, "galleryN": 1}
+
+
+# ------------------------- the duplicate review list (run 0f5c6d)
+#
+# THE MEASUREMENT.  Run 0f5c6d, 2026-08-07, ground truth THREE people,
+# reported FOUR.  One man — at the back of the room by the glass door, phone
+# to his ear — was minted twice: p00002 and p00003 scored 0.2117 against each
+# other, a same-person miss far below the 0.363 threshold.  Nothing could act
+# on it automatically, because nothing separated it from a real new arrival:
+# the duplicate pair agreed on CLOTHING at 0.587 while two genuinely different
+# men in the same run agreed at 0.538.  Five hundredths.  A threshold in that
+# gap is a coin toss wearing a number, and getting it wrong merges a paying
+# guest — the failure nobody ever sees.
+#
+# So this feature decides nothing.  It hands a human a short ranked list.
+
+
+def review(client, run="r", **kw):
+    """Ask one run's gallery which identity pairs a human should look at."""
+    return client.post("/review/duplicates", json={"runId": run, **kw}).json()
+
+
+def band_pair(client, run, base, appearance_a=None, appearance_b=None, cosine=0.22):
+    """Two keys of one run whose mutual face score sits inside the review band.
+
+    ``excludeKeys`` is what makes the second one a separate key at all — the
+    same door the runner's same-frame guard uses — so a test can build the
+    exact geometry run 0f5c6d produced without needing two real faces.
+    """
+    body = {"runId": run, "embedding": sighting(base), "quality": 90.0}
+    if appearance_a is not None:
+        body["appearance"] = appearance_a
+    ka = client.post("/match", json=body).json()["personKey"]
+    body = {
+        "runId": run, "embedding": view_at(base, cosine), "quality": 90.0,
+        "excludeKeys": [ka],
+    }
+    if appearance_b is not None:
+        body["appearance"] = appearance_b
+    kb = client.post("/match", json=body).json()["personKey"]
+    return ka, kb
+
+
+def hist(**bins):
+    """An L1-normalised 48-bin descriptor with named mass — intersections by
+    construction, so a test states the reading it means to test."""
+    d = [0.0] * 48
+    for i, m in bins.items():
+        d[int(i[1:])] = m
+    assert abs(sum(d) - 1.0) < 1e-9, "a descriptor is L1-normalised"
+    return d
+
+
+def test_review_asks_only_about_pairs_the_gallery_has_not_settled(client):
+    """A cannot_link pair never appears — that question is already answered.
+
+    The constraint is written by co-presence (two faces at different positions
+    in one frame) or by the operator's own false-match click. Re-asking a
+    settled question is exactly the noise that teaches operators to ignore
+    banners, and in the motivating run this alone removed both pairs involving
+    p00001 — the only guest anyone was ever certain about.
+    """
+    ka, kb = band_pair(client, "r", person_centroid())
+
+    before = review(client)
+    assert [frozenset((p["a"], p["b"])) for p in before["pairs"]] == [frozenset((ka, kb))]
+
+    client.post("/split", json={"runId": "r", "a": ka, "b": kb})
+
+    after = review(client)
+    assert after["pairs"] == [], "settled, so no longer asked"
+    assert after["considered"] == before["considered"], "still examined, just not asked"
+
+
+def test_review_ignores_pairs_outside_the_band(client):
+    """At/above threshold the gallery already calls them one person; far below,
+    they are not similar in any measurable sense. Neither needs a human."""
+    a = person_centroid()
+    ka = client.post("/match", json={"runId": "r", "embedding": sighting(a)}).json()["personKey"]
+    twin = client.post(
+        "/match", json={"runId": "r", "embedding": sighting(a), "excludeKeys": [ka]}
+    ).json()["personKey"]
+    assert twin != ka
+    assert review(client)["pairs"] == [], "0.99 is not a question, it is an answer"
+
+    client.post("/match", json={"runId": "r2", "embedding": sighting(person_centroid())})
+    client.post("/match", json={"runId": "r2", "embedding": sighting(person_centroid())})
+    assert review(client, run="r2")["pairs"] == [], "orthogonal strangers are not a question"
+
+
+def test_clothing_ranks_the_queue_and_never_removes_anyone(client):
+    """THE 0.587/0.538 RULE, pinned with the measured numbers.
+
+    In run 0f5c6d the DUPLICATE pair agreed on clothing at 0.587 and two
+    genuinely DIFFERENT men agreed at 0.538. Both readings are reproduced
+    here. The stronger agreement must LEAD the queue, and the weaker must
+    still BE in it: any clothing bar between those two numbers would have put
+    the real duplicate and an unrelated pair on opposite sides of a coin toss,
+    and the losing side of that toss is a merged guest nobody ever sees.
+    """
+    dup_a = hist(b0=0.587, b1=0.413)
+    dup_b = hist(b0=0.587, b2=0.413)          # intersects dup_a at 0.587
+    oth_a = hist(b3=0.538, b4=0.462)
+    oth_b = hist(b3=0.538, b5=0.462)          # intersects oth_a at 0.538, dup_* at 0
+
+    dup = band_pair(client, "r", person_centroid(), dup_a, dup_b)
+    oth = band_pair(client, "r", person_centroid(), oth_a, oth_b)
+
+    got = review(client)
+    ranked = [(frozenset((p["a"], p["b"])), p["clothes"]) for p in got["pairs"]]
+    assert ranked[0][0] == frozenset(dup)
+    assert ranked[0][1] == pytest.approx(0.587, abs=1e-3)
+    assert frozenset(oth) in [r[0] for r in ranked], "the weaker pair is still asked about"
+    assert dict(ranked)[frozenset(oth)] == pytest.approx(0.538, abs=1e-3)
+
+
+def test_an_unmeasured_torso_still_gets_reviewed(client):
+    """Absent is not zero — a guest nobody could measure must not fall off the
+    list silently. It ranks behind measured pairs, it does not vanish."""
+    base = person_centroid()
+    k1 = client.post(
+        "/match",
+        json={"runId": "r", "embedding": sighting(base), "quality": 90.0,
+              "appearance": [1.0 / 48] * 48},
+    ).json()["personKey"]
+    k2 = client.post(
+        "/match",
+        json={"runId": "r", "embedding": view_at(base, 0.22), "quality": 90.0,
+              "excludeKeys": [k1]},
+    ).json()["personKey"]
+    got = review(client)
+    assert len(got["pairs"]) == 1
+    p = got["pairs"][0]
+    assert {p["a"], p["b"]} == {k1, k2}
+    assert p["clothes"] is None, "one side had no descriptor: not measured, not 0.0"
+
+
+def test_review_states_what_it_dropped(client):
+    """A truncated queue that looks complete is how a real duplicate goes unread."""
+    base = person_centroid()
+    keys = []
+    for t in (0.20, 0.21, 0.22, 0.23):
+        e = sighting(base) if not keys else view_at(base, t)
+        keys.append(client.post(
+            "/match", json={"runId": "r", "embedding": e, "excludeKeys": keys}
+        ).json()["personKey"])
+    full = review(client)
+    capped = review(client, limit=1)
+    assert capped["returned"] == 1
+    assert capped["dropped"] == len(full["pairs"]) - 1
+    assert capped["considered"] == full["considered"], "the cap bounds the ANSWER, not the work"
+
+
+def test_review_writes_nothing(client):
+    """Read-only: it asks a question, it does not act on one."""
+    a = person_centroid()
+    client.post("/match", json={"runId": "r", "embedding": sighting(a), "quality": 90.0})
+    client.post("/match", json={"runId": "r", "embedding": view_at(a, 0.22), "quality": 90.0})
+    before = client.post("/match", json={"runId": "r", "embedding": sighting(a)}).json()
+    review(client)
+    review(client)
+    after = client.post("/match", json={"runId": "r", "embedding": sighting(a)}).json()
+    assert after["galleryN"] == before["galleryN"]
+    assert after["personKey"] == before["personKey"]
+
+
+def test_review_on_an_empty_or_unknown_run_is_an_empty_queue(client):
+    """No gallery, no question — not a 500."""
+    got = review(client, run="never-ran")
+    assert got == {
+        "runId": "never-ran", "threshold": config.DEFAULT_THRESHOLD,
+        "pairs": [], "considered": 0, "returned": 0, "dropped": 0,
+    }
+
+
+def test_review_rejects_an_unsafe_run_id(client):
+    """Same 422 as every other run-scoped call — a runId is part of a filename."""
+    assert client.post(
+        "/review/duplicates", json={"runId": "../../etc/passwd"}
+    ).status_code == 422

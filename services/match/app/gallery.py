@@ -23,13 +23,16 @@ guests' face embeddings, so an orphaned one is a retention liability, not just
 disk.  :func:`sweep` is the backstop for runs that died without releasing.
 """
 
+import itertools
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from .appearance import best_intersection
-from .store import Neighbour, VectorStore, close_store, open_store
+from .store import Neighbour, VectorStore, as_unit, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -713,6 +716,84 @@ def merge(
         if merged and templates_per_person > 1:
             store.prune_redundant(keep, templates_per_person)
         return merged, store.distinct_count()
+
+
+def review_duplicates(
+    data_dir: Path,
+    run_id: str,
+    threshold: float,
+    floor: float,
+    limit: int = 50,
+) -> dict:
+    """Identity pairs a human should look at, ranked. Never a verdict.
+
+    THE CASE THIS EXISTS FOR (run 0f5c6d, 2026-08-07, ground truth THREE
+    people, reported FOUR).  One man — at the back of the room, phone to his
+    ear — was minted twice: p00002 and p00003 scored **0.2117** against each
+    other, a same-person miss so far below the 0.363 threshold that no
+    automatic mechanism could act on it.  And nothing else could separate him
+    either: his duplicate pair agreed on clothing at **0.587** while two
+    genuinely DIFFERENT men in that same run agreed at **0.538**.  Five
+    hundredths apart.  There is no threshold in that gap, and inventing one
+    would trade this over-count for a merged guest, which is the failure
+    nobody ever notices.
+
+    So this does not decide.  It ASKS, and it asks about as few pairs as the
+    evidence allows:
+
+    * **A recorded `cannot_link` disqualifies a pair outright.** That is the
+      gallery's record of "known different" — written by co-presence (two
+      faces at different positions in one frame) or by the operator's own
+      false-match click.  Re-asking a settled question is the noise that
+      trains operators to ignore banners.  In the motivating run this alone
+      removed both pairs involving p00001.
+    * **The face score must sit in ``[floor, threshold)``.** At or above the
+      threshold the gallery already calls them one person and no review is
+      needed; below the floor they are not similar in any measurable sense.
+    * **Clothing RANKS, it never filters.** Given 0.587-against-0.538 above,
+      a clothing bar here would be a coin toss wearing a number.  It orders
+      the queue so the likeliest pair is read first, and pairs whose torsos
+      were never measurable still appear — ranked last among themselves by
+      face score — because absent is not zero and an unmeasured guest must
+      not fall silently off a review list.
+
+    Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d}``.
+    ``dropped`` is stated rather than swallowed: a truncated queue that looks
+    complete is how a real duplicate goes unreviewed.
+    """
+    store = open_store(db_path(data_dir, run_id))
+    with store.reading():
+        keys = store.keys()
+        vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
+        apps = {k: store.appearances_for(k) for k in keys}
+        candidates, considered = [], 0
+        for a, b in itertools.combinations(keys, 2):
+            considered += 1
+            if store.cannot_link(a, b):
+                continue
+            if not vecs[a] or not vecs[b]:
+                continue
+            cosine = max(float(x @ y) for x in vecs[a] for y in vecs[b])
+            if cosine < floor or cosine >= threshold:
+                continue
+            pairs = [(p, q) for p in apps[a] for q in apps[b]]
+            clothes = (
+                max(float(np.minimum(p, q).sum()) for p, q in pairs) if pairs else None
+            )
+            candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes})
+
+    # Measured clothing first, best agreement leading; unmeasured pairs keep
+    # their place in the queue behind them, ordered by face score.
+    candidates.sort(
+        key=lambda c: (c["clothes"] is None, -(c["clothes"] or 0.0), -c["cosine"])
+    )
+    kept = candidates[: max(0, limit)]
+    return {
+        "pairs": kept,
+        "considered": considered,
+        "returned": len(kept),
+        "dropped": len(candidates) - len(kept),
+    }
 
 
 def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:

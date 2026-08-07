@@ -1172,3 +1172,73 @@ people. Pinned by test: one box, two faces, clashing crops ⇒ **no split**.
 
 **Match service 0.10.0 → 0.11.0** (new request field, new reply field, new
 endpoint; all additive). The runner's verdicts are unchanged in shape.
+
+## v3 addition — the queue that asks instead of guessing (match + planner, 2026-08-07)
+
+**THE MEASUREMENT.** Run `0f5c6d`, 2026-08-07, ground truth **three** people,
+reported **four**. One man — at the back of the room by the glass door, phone
+to his ear — was minted twice. His two identities scored **0.2117** against
+each other: a same-person miss far below the 0.363 threshold, nothing
+borderline about it, and no banner raised anywhere.
+
+**AND NOTHING COULD HAVE DECIDED IT AUTOMATICALLY.** That duplicate pair
+agreed on **clothing at 0.587**. Two genuinely different men in the same run —
+one in a white shirt, one in red — agreed at **0.538**. Five hundredths apart.
+Any clothing bar drawn between those readings is a coin toss wearing a number,
+and the losing side of that toss folds a paying guest away silently. The
+near-miss weak band already covered this case and correctly declined to fire:
+it requires 0.78 clothing agreement, and lowering that bar to catch 0.587
+would also flag unrelated people.
+
+**Nor was capture quality a usable lever.** Every verdict in that run, read by
+eye distance: the two men near the camera gave **41–60 px** and were matched at
+0.66–0.72 all run; both identities minted from good faces (44.3, 51.7 px) were
+correct; both minted from poor faces (32.4, 29 px) were problems. But the
+32.4 px mint was a **real person**, so a mint-quality bar high enough to stop
+the duplicate also erases a guest — the project's standing asymmetry forbids
+it. The root cause is the camera's reach, not a threshold.
+
+**So the pipeline stops guessing and asks.**
+
+- **`POST /review/duplicates {runId, limit?}`** → `{runId, threshold, pairs[],
+  considered, returned, dropped}`. Read-only: no write, no merge, `galleryN`
+  untouched. Each pair is `{a, b, cosine, clothes}`.
+- **Three rules, and only one of them is a threshold.**
+  1. A recorded **`cannot_link` disqualifies a pair outright** — co-presence,
+     or the operator's own *false-match* click. That question already has an
+     answer, and re-asking settled questions is what trains operators to
+     ignore banners. On `0f5c6d` this alone removed both pairs involving
+     `p00001`, the only guest anyone was certain about.
+  2. The face score must sit in **`[nearmiss_weak_floor .. threshold)`**. At or
+     above the threshold the gallery already calls them one person; below the
+     floor they are not similar in any measurable sense.
+  3. **Clothing RANKS the queue and never filters it.** Given 0.587-against-
+     0.538, a clothing bar here would decide by coin toss. Pairs whose torsos
+     were never measurable still appear, ranked last among themselves — absent
+     is not zero, and an unmeasured guest must not fall silently off a review
+     list.
+- **`dropped` is stated, never swallowed.** A truncated queue that looks
+  complete is how a real duplicate goes unreviewed. `considered` reports how
+  many pairs were examined, so the cap bounds the ANSWER, not the work.
+- **Planner: `GET /api/pipeline/runs/:id/duplicates`** proxies it and **never
+  throws on an unreachable box**: `{reached, pairs, considered, dropped,
+  error, address}`. **`pairs: null` (not `[]`) when it could not ask** — an
+  empty queue drawn over a dead pipeline box tells an operator their run is
+  clean when nothing was ever checked, which is the same class of lie as a
+  silent under-count. Refuses a deleted run with 404, like every run-scoped
+  read.
+- **The console renders it under the guest register**, and its merge is the
+  **same** `duplicate` correction the merge banner and the corrections strip
+  file — `buildFeedbackPayload` shapes it, `sendFeedback` posts it. A queue
+  merge and a hand-raised one are one operation, not two that resemble each
+  other. **The earlier key keeps the identity**; it carries the guest's
+  first-seen time, keyframe and accumulated views, and the later key is by
+  definition the accident.
+- **The count never moves on its own.** Nothing in this feature merges, mints
+  or retires anybody. It produces a list.
+
+**Verified against the real gallery**: 6 pairs existed, 4 were eliminated (two
+by `cannot_link`, two below the floor), **2 were asked about, and the real
+duplicate ranked first**.
+
+**Match service 0.11.0** (new endpoint only; no field changed shape).
