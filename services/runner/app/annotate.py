@@ -206,9 +206,14 @@ def _rect(img: np.ndarray, box: dict, colour, label: str | None = None) -> None:
 
 
 def draw_persons(img: np.ndarray, boxes: list[dict]) -> np.ndarray:
-    """Green person boxes with detector confidence."""
+    """Green person boxes with detector confidence; a body a detections-mode
+    zone dropped before the tracker is magenta and says so — the zone colour,
+    matching the excluded faces, so one colour means one thing everywhere."""
     out = img.copy()
     for b in boxes:
+        if b.get("excludedByZone"):
+            _rect(out, b, _MAGENTA, "zone")
+            continue
         conf = b.get("conf")
         _rect(out, b, _GREEN, f"{conf:.2f}" if conf is not None else None)
     return out

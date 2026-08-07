@@ -47,6 +47,7 @@ class FakePipeline:
         self.embed_face_counts: list[int] = []
         self.match_qualities: list[float] = []
         self.match_reset: dict | None = None
+        self.tracked_boxes: list = []  # what the tracker was HANDED, per frame
         # Every co-presence cannot_link the loop asserted, in order: two guests
         # matched in ONE frame are two different people (see
         # RunLoop._assert_co_presence).
@@ -128,6 +129,7 @@ class FakePipeline:
             if path == "/track":
                 if "runId" not in body or not isinstance(body.get("tMs"), int):
                     return httpx.Response(422, json={"detail": "runId/tMs required"})
+                self.tracked_boxes.append(body.get("boxes", []))
                 tracks = [
                     {"id": n + 1, "box": b, "ageFrames": self.frame_i, "hits": 1}
                     for n, b in enumerate(body["boxes"])
@@ -135,7 +137,10 @@ class FakePipeline:
                 return httpx.Response(200, json={"tracks": tracks})
 
         if host == "faces" and path == "/detect":
-            assert body.get("within"), "faces must be searched within tracked boxes"
+            # `within` may be EMPTY: a frame whose every body was zoned (or
+            # missed) still searches the whole frame — that is the v1 recall
+            # rule test_loop_v1 pins. The key must simply be present.
+            assert "within" in body, "faces call must carry its search regions"
             faces = [
                 {
                     "box": {"x": 12, "y": 22, "w": w, "h": w * 1.3},
@@ -803,3 +808,52 @@ def test_normal_runs_upload_no_per_frame_pictures():
     assert "forensicFramesPosted" not in final
     assert [u for u in uploads if u.get("forensic") == "1"] == []
     assert fake.run_created["config"]["forensic"] is False
+
+
+def _zone(mode, label="tv"):
+    """A polygon covering the fake detector's box centre (30,~70 of 320x240)."""
+    return {
+        "label": label, "mode": mode,
+        "points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]],
+    }
+
+
+def test_detections_zone_kills_the_garbage_track_before_it_forms():
+    """A detections-mode zone drops the person box BEFORE the tracker — no
+    track forms, no face is searched there — while the box stays visible,
+    stamped, in the taps' own list. The whole point of the mode: a wall TV
+    must stop minting tracks, not merely stop being counted."""
+    fake = FakePipeline(n_frames=2)
+    loop = make_loop(fake)
+    loop.zones = [_zone("detections")]
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert final["personsZoned"] == 2, "one dropped body per frame, counted"
+    assert fake.tracked_boxes == [[], []], "the tracker never saw the zoned body"
+    # Visible, never hidden: the loop's own snapshot keeps the stamped box.
+    assert loop._last["boxes"][0]["excludedByZone"] is True
+    assert loop._last["boxes"][0]["excludedZone"] == "tv"
+
+
+def test_faces_zone_still_lets_the_body_track():
+    """The default mode is untouched by the new filter: a faces zone excludes
+    faces from counting but the body still reaches the tracker — deleting it
+    would cut track continuity for a guest walking past a partition."""
+    fake = FakePipeline(n_frames=1)
+    loop = make_loop(fake)
+    loop.zones = [_zone("faces", label="partition")]
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert "personsZoned" not in {k: v for k, v in final.items() if v}
+    assert len(fake.tracked_boxes[0]) == 1, "the body tracked through the zone"
+
+
+def test_detections_zone_with_no_frame_dims_filters_nothing_and_says_so():
+    """A filter that cannot scale its polygons must not guess: no dims, no
+    drop, and personsZoneUnmeasured counts what passed untested."""
+    fake = FakePipeline(n_frames=1)
+    loop = make_loop(fake)
+    loop.zones = [_zone("detections")]
+    out = loop._apply_detection_zones([{"x": 1, "y": 1, "w": 2, "h": 2}], {})
+    assert len(out) == 1, "nothing filtered without geometry"
+    assert loop.status()["personsZoneUnmeasured"] == 1

@@ -152,6 +152,12 @@ def person_payload(boxes: list[dict]) -> dict:
         r = _box(b)
         if b.get("inZone"):
             r["inZone"] = True
+        if b.get("excludedByZone"):
+            # A detections-mode zone dropped this body before the tracker —
+            # shown, never hidden, exactly like the excluded faces.
+            r["excludedByZone"] = True
+            if b.get("excludedZone") is not None:
+                r["excludedZone"] = b.get("excludedZone")
         rows.append(r)
     return {
         "count": len(boxes),
