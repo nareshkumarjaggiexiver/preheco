@@ -61,6 +61,13 @@ class V1Fake:
         self.taps: list[dict] = []
         self.stats: list[dict] = []  # every /stats flush body, in post order
         self.frames_posted: list[str] = []  # stage of each multipart frame POST
+        # THE FRAME LEDGER: every record the runner filed, and how many POSTs
+        # it took. The second number is the point — a POST per frame at 4 fps
+        # is the death spiral, so the batching is asserted, not assumed.
+        self.frame_records: list[dict] = []
+        self.frame_record_posts = 0
+        self.frame_records_status = 201
+        self.frame_records_fail_first = 0  # reject this many POSTs, then accept
         self.frame_bodies: list[bytes] = []  # raw multipart bodies (JPEG inside)
         self.feedback_polls = 0
         self.resolved: list[tuple[str, str]] = []  # (feedbackId, status)
@@ -97,6 +104,15 @@ class V1Fake:
             return httpx.Response(200, json={"ok": True})
         if path.endswith("/samples"):
             return httpx.Response(200, json={"ok": True})
+        if path.endswith("/frame-records"):
+            self.frame_record_posts += 1
+            if self.frame_records_fail_first > 0:
+                self.frame_records_fail_first -= 1
+                return httpx.Response(503, json={"error": "planner restarting"})
+            if self.frame_records_status >= 400:
+                return httpx.Response(self.frame_records_status, json={"error": "nope"})
+            self.frame_records.extend(body.get("records", []))
+            return httpx.Response(201, json={"stored": len(body.get("records", []))})
         if path.endswith("/taps"):
             self.taps.append(body)
             return httpx.Response(200, json={"ok": True})
@@ -272,8 +288,11 @@ def make_loop(fake: V1Fake, request: dict, **settings_kw) -> RunLoop:
         tracker_url="http://tracker:7103", faces_url="http://faces:7104",
         embed_url="http://embed:7105", match_url="http://match:7106",
         planner_url="http://planner:8787",
-        flush_interval_s=0.0, source_poll_s=0.001, source_stall_s=0.05,
-        **settings_kw,
+        # Harness defaults, overridable: flushing every frame lets a test read
+        # its stats immediately, but a test ABOUT batching has to be able to
+        # ask for the production cadence instead.
+        **{"flush_interval_s": 0.0, "source_poll_s": 0.001, "source_stall_s": 0.05,
+           **settings_kw},
     )
     client = httpx.Client(transport=httpx.MockTransport(fake.handler))
     planner = PlannerClient(
@@ -3016,3 +3035,135 @@ def test_maybe_face_card_refuses_staff_a_box_less_face_and_a_dead_frame():
 
     loop._maybe_face_card(None, face, {"personKey": "p00003"})
     assert "p00003" not in loop._face_pending
+
+
+# ------------------------- the frame ledger (the forensics foundation)
+#
+# THE GAP IT CLOSES.  Tap rounds are sampled at tap_interval_s, and on the
+# measured bench that is 12% of frames (run 0f5c6d: 41 rounds over 356 frames;
+# d48e2e: 9%).  The other ~88% were fully processed — detected, tracked, gated,
+# embedded, matched — and every decision was then discarded, so "why was frame
+# 217 rejected?" had no answer for 8 frames in 9.  Anything built on that would
+# be a confident-looking interpolation of one frame in nine.
+
+
+def test_EVERY_processed_frame_is_on_the_ledger_not_one_in_nine():
+    """The whole point: coverage is 100%, not the tap round's 12%.
+
+    Including the frames where NOTHING happened — a frame that produced no
+    face and no verdict is precisely the frame an engineer is asking about,
+    and it is the one the sampled taps were least likely to catch.
+    """
+    fake = V1Fake(n_frames=9, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert len(fake.frame_records) == final["frames"] == 9
+    assert [r["seq"] for r in fake.frame_records] == list(range(9)), "in order, no gaps"
+    assert final["frameRecordsPosted"] == 9
+    assert final["frameRecordsDropped"] == 0
+
+
+def test_a_frame_where_nothing_survived_the_gate_is_still_recorded():
+    """A rejected frame is evidence, not an absence.
+
+    The old behaviour returned early and remembered nothing, so the very
+    frames a "why did nobody get counted" investigation needs were the ones
+    with no record at all.
+    """
+    fake = V1Fake(n_frames=3, face_widths=(40.0,))  # 40 px: under the 56 px floor
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["matches"] == 0, "the fixture really gated everything"
+    assert len(fake.frame_records) == 3
+    rec = fake.frame_records[0]
+    assert rec["faces"]["count"] == 1 and rec["faces"]["kept"] == 0
+    assert rec["verdicts"] == []
+
+
+def test_the_ledger_is_BATCHED_never_a_post_per_frame():
+    """A network round trip per frame at 4 fps is the 0.4 fps death spiral.
+
+    The ledger rides the stats flush, so a run of many frames costs a handful
+    of POSTs — the same discipline the tap duty guard enforces for frames.
+    """
+    # make_loop's harness default is flush_interval_s=0 (flush every frame, so
+    # the other tests see their stats immediately); production is 2.0 s, which
+    # at 4 fps is ~8 records per POST. The batching is a property of the real
+    # interval, so the real interval is what is tested.
+    fake = V1Fake(n_frames=12, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request, flush_interval_s=30.0).run()
+
+    assert len(fake.frame_records) == 12, "every frame still lands"
+    assert fake.frame_record_posts == 1, (
+        f"{fake.frame_record_posts} POSTs for 12 frames — a POST per frame at "
+        "4 fps is four network round trips a second inside the frame loop"
+    )
+
+
+def test_a_records_stage_decisions_and_the_events_that_moved_the_count():
+    """Per-stage detail in the SAME shapes the taps publish, plus the frame's
+    own count-changing decisions — the thing counters and log lines could never
+    answer: which FRAME did it."""
+    fake = V1Fake(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+
+    rec = fake.frame_records[0]
+    assert set(rec) == {"seq", "tMs", "persons", "tracks", "faces", "verdicts", "ms", "events"}
+    assert rec["persons"]["count"] >= 1
+    assert rec["verdicts"][0]["personKey"].startswith("p")
+    assert rec["ms"]["match"] >= 0, "every stage's wall cost for THIS frame"
+    assert any(e.startswith("mint ") for e in rec["events"]), "the mint is pinned to its frame"
+
+
+def test_a_failed_flush_re_queues_the_batch_in_order_and_says_it_lost_nothing():
+    """Order is the ledger's whole value; a retry that re-orders is worse than
+    one that waits."""
+    # A planner restart mid-run: the first two flushes are refused, the rest
+    # land. Every frame must still arrive, IN ORDER — a ledger with frame 3
+    # after frame 5 is worse than one missing them, because it reads as the
+    # pipeline having processed them out of order.
+    fake = V1Fake(n_frames=6, face_widths=(85.0,))
+    fake.frame_records_fail_first = 2
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.frame_record_posts > 2, "it really retried"
+    assert [r["seq"] for r in fake.frame_records] == list(range(6)), (
+        "every refused frame came back, in order"
+    )
+    assert final["frameRecordsPosted"] == 6
+    # And nothing is reported LOST: they were in hand the whole time, and
+    # calling a retry a loss sends an engineer hunting a gap that is not there.
+    assert final["frameRecordsDropped"] == 0
+
+
+def test_a_ledger_the_planner_never_takes_is_reported_lost_not_hidden():
+    """When the planner is down for the whole run, the records really are gone.
+
+    That is a different claim from a retry, and the run has to make it: a gap
+    in the ledger and a frame where nothing happened look identical to a reader.
+    """
+    fake = V1Fake(n_frames=6, face_widths=(85.0,))
+    fake.frame_records_status = 500
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.frame_records == [], "nothing landed"
+    assert fake.frame_record_posts > 0, "but it really tried"
+    assert final["frameRecordsPosted"] == 0
+
+
+def test_the_ledger_counters_reach_the_permanent_record():
+    """A gap in the ledger and a frame where nothing happened look identical to
+    a reader, so the loss has to be a number on the run, not an inference."""
+    fake = V1Fake(n_frames=4, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request).run()
+
+    results = fake.run_ended["results"]
+    assert results["frameRecordsPosted"] == 4
+    assert results["frameRecordsDropped"] == 0
