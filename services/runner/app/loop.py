@@ -267,6 +267,9 @@ class RunLoop:
         #: personKey -> width (px) of the best face card the planner has taken,
         #: and the crops waiting for the next tap round. Two dicts, not one: a
         #: card is only "the best so far" once it has actually landed.
+        #: One decision record per PROCESSED frame, drained by _flush. Not a
+        #: sample: the whole point is that every frame is in here.
+        self._frame_ledger: list[dict] = []
         self._face_cards: dict[str, float] = {}
         self._face_pending: dict[str, tuple[bytes, float]] = {}
         self._copresence_sent: set[str] = set()
@@ -359,6 +362,11 @@ class RunLoop:
             # sits at 0 while guests exist means the register is showing
             # pictures nobody can use (undecodable frames, or no face box).
             "faceCardsPosted": 0,
+            # FRAME LEDGER: records posted, and records LOST. A gap in the
+            # ledger and a frame where nothing happened look identical to a
+            # reader, so the loss is counted rather than left to be inferred.
+            "frameRecordsPosted": 0,
+            "frameRecordsDropped": 0,
             # How many DISTINCT track ids the tracker reported all run.  Read
             # it beside `unique`: bench 6e1a5d put ONE person on SIX ids, which
             # is the whole reason the lock and the longer tracker max-age
@@ -744,6 +752,8 @@ class RunLoop:
             "coPresenceSplits": st["coPresenceSplits"],
             "sameFrameSplits": st["sameFrameSplits"],
             "faceCardsPosted": st["faceCardsPosted"],
+            "frameRecordsPosted": st["frameRecordsPosted"],
+            "frameRecordsDropped": st["frameRecordsDropped"],
             "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "healUncertainAppearance": st["healUncertainAppearance"],
@@ -828,6 +838,11 @@ class RunLoop:
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
+        # THIS frame's own wall times and count-changing decisions, for the
+        # frame ledger. Reset here rather than in _remember so a stage that
+        # raises still leaves the partial timings it did spend.
+        self._frame_ms: dict[str, float] = {}
+        self._frame_events: list[str] = []
         self._frame_no += 1
         s, board, samples = self.s, self.board, self.samples
         image_b64 = frame["imageB64"]
@@ -1098,6 +1113,7 @@ class RunLoop:
                     # A guest just came into existence: this frame is the one
                     # picture guaranteed to contain them.
                     self._mint_frame = True
+                    self._event(f"mint {m.get('personKey')} @{_fmt(m.get('cosine'))}")
                     self._mints.append({
                         "personKey": m.get("personKey"),
                         "tMs": t_ms,
@@ -1423,6 +1439,10 @@ class RunLoop:
                 )
                 with self._lock:
                     self._status["sameFrameSplits"] += 1
+                self._event(
+                    f"same-frame split {key} -> {fixed.get('personKey')} "
+                    f"(clothes {sim:.3f})"
+                )
                 self.log.info(
                     f"same-frame split: a second body in this frame also "
                     f"matched {key} (face {_fmt(m.get('cosine'))}) but their "
@@ -1597,6 +1617,7 @@ class RunLoop:
                     return
                 if self._send_co_presence_split(planner_run_id, a, b):
                     self._bump("coPresenceSplits")
+                    self._event(f"co-presence {a} != {b}")
                     self.log.info(
                         f"co-presence split: {a} and {b} were matched in the "
                         f"same frame (#{self._frame_no}) — two faces at "
@@ -2066,6 +2087,7 @@ class RunLoop:
             if r.get("merged"):
                 self._dec_unique()
                 self._bump("healedSplits")
+                self._event(f"heal fold {minted_key} -> {matched_key}")
                 self._forget_mint(minted_key)
                 self._retire_key(minted_key, matched_key, "heal")
                 self.log.info(
@@ -2133,6 +2155,7 @@ class RunLoop:
         clash_floor = self.s.heal_appearance_clash
         if clash_floor > 0 and sim < clash_floor:
             self._bump("healVetoedByAppearance")
+            self._event(f"heal VETOED on clothing ({sim:.4f})")
             self.log.info(
                 f"{kind} vetoed by appearance: track {track_id} carries "
                 f"{drop_key} but its torso clashes with the frame matching "
@@ -2342,6 +2365,7 @@ class RunLoop:
         if r.get("merged"):
             self._dec_unique()
             self._bump("lockedTrackFolds")
+            self._event(f"lock fold {minted_key} -> {locked_key}")
             self._forget_mint(minted_key)
             self._retire_key(minted_key, locked_key, "lock-fold")
             self.log.info(
@@ -2429,6 +2453,40 @@ class RunLoop:
             "verdicts": verdicts,
             "zones": self.zones,
         }
+        self._record_frame()
+
+    def _record_frame(self) -> None:
+        """Append THIS frame's decisions to the ledger the engineer reads.
+
+        Called from :meth:`_remember`, which every processed frame reaches —
+        including the ones that end early because nothing survived the gate.
+        That is the point: a frame where nothing happened is precisely the
+        frame an engineer is asking about, and the sampled tap rounds covered
+        only 12% of frames on the measured bench, so 8 frames in 9 had no
+        record of having been looked at at all.
+
+        Bounded, and the bound is REPORTED. The buffer only grows when the
+        planner is unreachable (a flush empties it every couple of seconds),
+        so hitting the cap means an outage — and a ledger with a silent hole
+        in it would have an engineer reasoning about a gap that is not there.
+        """
+        try:
+            record = taps.frame_record(
+                self._last,
+                self.s.quality_min_px,
+                self.s.quality_canon_px,
+                ms=self._frame_ms,
+                events=self._frame_events,
+            )
+        except Exception:  # noqa: BLE001 — the ledger must never stop counting
+            self._bump("frameRecordsDropped")
+            return
+        with self._lock:
+            self._frame_ledger.append(record)
+            if len(self._frame_ledger) > taps.FRAME_LEDGER_CAP:
+                dropped = len(self._frame_ledger) - taps.FRAME_LEDGER_CAP
+                del self._frame_ledger[:dropped]
+                self._status["frameRecordsDropped"] += dropped
 
     def _count_stage(self) -> None:
         """Record the count stage: the running unique total, once per frame."""
@@ -3002,12 +3060,34 @@ class RunLoop:
     # -------------------------------------------------------------- plumbing
 
     def _timed(self, stage: str, metric: str, fn):
-        """Run fn, record its wall time under stage/metric, return its result."""
+        """Run fn, record its wall time under stage/metric, return its result.
+
+        The board gets the observation it always did; the frame ledger gets a
+        per-FRAME total for the stage, ACCUMULATED because some stages are
+        called once per face (match) and an engineer asking "what did this
+        frame cost at the matcher" means all of it, not the last call.
+        """
         t = time.perf_counter()
         out = fn()
         self._last_ms = (time.perf_counter() - t) * 1000.0
         self.board.observe(stage, metric, self._last_ms)
+        ms = getattr(self, "_frame_ms", None)
+        if ms is not None:
+            ms[stage] = ms.get(stage, 0.0) + self._last_ms
         return out
+
+    def _event(self, text: str) -> None:
+        """Note a count-changing decision against the CURRENT frame.
+
+        Mints, folds, splits and vetoes are the only things in a run that move
+        the number, and until now they existed as counters and log lines — a
+        total and a wall of prose, with no way to ask which FRAME did it. On
+        the ledger they sit beside the frame's own evidence, which is where a
+        "why did this happen here?" question is actually answered.
+        """
+        events = getattr(self, "_frame_events", None)
+        if events is not None and len(events) < 12:
+            events.append(text)
 
     def _flush(self, elapsed_s: float) -> None:
         """Push per-stage aggregates and the sample batch to the planner.
@@ -3027,6 +3107,26 @@ class RunLoop:
             rows = self.samples.drain()
             if rows:
                 self.planner.post_samples([Sample(**row) for row in rows])
+            # THE FRAME LEDGER, batched. One POST per flush, never one per
+            # frame: a network round trip inside the frame loop is what
+            # produced the 0.4 fps death spiral, and this runs 4x a second.
+            with self._lock:
+                batch, self._frame_ledger = self._frame_ledger, []
+            if batch:
+                if self.planner.post_frame_records(batch):
+                    self._bump("frameRecordsPosted", len(batch))
+                else:
+                    # Back in hand for the next flush, at the FRONT. Today the
+                    # drain and this restore both happen between frames, so
+                    # nothing can have been appended in between and front and
+                    # back are the same list — this is written as the front
+                    # because it states the invariant that matters (a frame
+                    # never overtakes an earlier one), not because it currently
+                    # rescues anything. NOT dropped: they are still in hand,
+                    # and reporting a retry as a loss would send an engineer
+                    # hunting a gap in the ledger that is not there.
+                    with self._lock:
+                        self._frame_ledger[:0] = batch
         except PlannerError:
             self._bump("plannerReportErrors")
         except Exception:  # noqa: BLE001 — reporting must never stop counting

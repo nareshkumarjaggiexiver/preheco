@@ -1321,3 +1321,76 @@ still. **Face cards** answer it directly: one guest's face, alone.
 - Cards live under the run's frames directory, so the deletion preview's
   recursive footprint already counts them and the purge already removes them.
   No new retention path.
+
+## v3 addition — the frame ledger (runner + planner, 2026-08-07)
+
+**THE GAP.** Tap rounds are sampled at `tap_interval_s`. On the measured bench
+that is **12% of frames** (run 0f5c6d: 41 rounds over 356 frames; d48e2e: 9%).
+The other ~88% were fully processed — detected, tracked, gated, embedded,
+matched — and **every decision was then discarded**. "Why was frame 217
+rejected?" therefore had no answer for 8 frames in 9, and any deep-dive view
+built on that would be a confident-looking interpolation of one frame in nine.
+
+**THE SPLIT THAT MAKES IT AFFORDABLE.** A frame's REASONING and a frame's
+PIXELS have completely different costs, measured on the real record shapes:
+
+| | per frame | 4-hour event @ 4 fps |
+|---|---|---|
+| decision record | 339 B empty … 1863 B busy, **657 B weighted** | **38 MB** |
+| frame image | 97 KB | 5,456 MB |
+
+143× apart. So the reasoning is kept for **every** frame, always, and the
+imagery is not (it is armed by the engineer for a bounded window).
+
+- **`taps.frame_record(last, min_px, canon_px, ms=, events=)`** builds it from
+  the SAME per-stage builders the tap round uses — an engineer reading a frame
+  and an operator reading a tap must be looking at one dialect, not two that
+  drift. `verdict_rows` was factored out of `match_payload` for exactly that.
+  What is deliberately LEFT OUT is everything run-wide: the unique count and
+  the mint/retirement/co-presence ledgers belong to a round, not a frame, and
+  repeating them 57,600 times would be most of the file.
+- **`ms`** is the frame's per-stage wall time, ACCUMULATED — `match` is called
+  once per face, and "what did this frame cost at the matcher" means all of it.
+  **`events`** are the frame's count-changing decisions (mint, heal fold, lock
+  fold, same-frame split, clothing veto, co-presence): until now those existed
+  only as run totals and log prose, with no way to ask which FRAME did it.
+- **Written from `_remember`**, which every processed frame reaches *including*
+  the ones that end early because nothing survived the gate. That is the point:
+  a frame where nothing happened is precisely the frame an engineer is asking
+  about, and the sampled rounds were least likely to catch it.
+- **BATCHED, never a POST per frame.** The ledger rides the stats flush
+  (`flush_interval_s`, 2 s → ~8 records per POST at 4 fps). Four network round
+  trips a second inside the frame loop is the shape that produced the 0.4 fps
+  death spiral. The client chunks at 500 records per request; a batch that
+  fails is re-queued **whole and in front**, so frames never overtake each
+  other, and is NOT counted as dropped — a retry reported as a loss sends an
+  engineer hunting a gap that is not there.
+- **`frameRecordsPosted` / `frameRecordsDropped`** join the run status, notes
+  and results. A gap in the ledger and a frame where nothing happened look
+  identical to a reader, so the loss is a number, not an inference.
+- **`POST /api/pipeline/runs/:id/frame-records {records: [...]}`** →
+  `{stored}`. Max 1000 per POST. **UPSERT on (run_id, seq)**: a re-queued batch
+  may contain frames the planner already holds, and overwriting the same truth
+  is right where a duplicate row would put a phantom frame on the timeline. A
+  record with neither `seq` nor `tMs` is **refused**, not defaulted to 0 —
+  every such frame would stack on one point of the spine and read as a stall
+  that never happened; `tMs` stands in for `seq` when a source numbers nothing.
+- **`GET /api/pipeline/runs/:id/frames-ledger`** → the SPINE: every frame of
+  the run with its counters, outcome, track ids, total ms and events, but
+  **without** `payload_json`. Not paged, deliberately — an engineer zooming
+  into 40 frames must see where that window sits in the whole run, and a paged
+  overview would lie. Dropping the payloads is what makes that affordable
+  (~57k rows of counters, against ~80 MB with them). Carries `processed` (what
+  the run actually ran) and `dropped` as the honest denominators; a run from
+  before the ledger reports `recorded: 0, processed: null` — absent is not zero.
+- **`GET …/frames-ledger/window?from=&to=&limit=`** → FULL records for a seq
+  range, capped at 500 and **stating `truncated`**: a window that silently
+  stopped at the cap would read as the pipeline stopping there. Bounds are in
+  `seq` because that is the spine's own axis — a brushed selection is the
+  query, with no translation to get wrong.
+- **`outcome`** is one coarse label per frame for colouring the spine, ordered
+  by what an engineer hunts: `mint` › `matched` › `embedded` › `zoned` ›
+  `gated` › `face-only` › `no-face` › `empty`. A spine with six colours is
+  read; one with sixty is decoration.
+- Schema **v14 → v15** (`run_frames`, cascade-deleted with the run, so the
+  existing soft-delete and purge windows already govern it).

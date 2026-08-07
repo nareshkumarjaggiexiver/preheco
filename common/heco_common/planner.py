@@ -281,6 +281,43 @@ class PlannerClient:
             return False
         return status < 400
 
+    #: Frame records per POST. A flush at 4 fps carries ~8, so this only binds
+    #: after an outage — and a 4000-record backlog in ONE body would be ~5.6 MB
+    #: against the planner's JSON limit, which would fail the whole batch
+    #: instead of the part that did not fit.
+    FRAME_RECORD_CHUNK = 500
+
+    def post_frame_records(self, records: list[dict]) -> bool:
+        """Best-effort batch POST of per-frame decision records.
+
+        THE LEDGER'S ONE RULE IS BATCHING. This is called from the stats flush,
+        not from the frame loop: at 4 fps a POST per frame is 4 network round
+        trips a second inside the loop, which is exactly the shape that
+        produced the 0.4 fps death spiral the tap duty guard exists to prevent.
+
+        Returns True only when EVERY chunk landed. A partial success returns
+        False and the caller re-queues the whole batch, which can duplicate
+        records the planner already holds — the planner therefore upserts on
+        (run, seq), so a replayed frame overwrites itself rather than appearing
+        twice. Losing order or inventing frames would both be worse than
+        writing the same truth again.
+        """
+        if not records:
+            return True
+        try:
+            run_id = self._require_run()
+        except Exception:  # noqa: BLE001 — no run open: nothing to file against
+            return False
+        ok = True
+        for i in range(0, len(records), self.FRAME_RECORD_CHUNK):
+            chunk = records[i : i + self.FRAME_RECORD_CHUNK]
+            sent, _ = self._send_once(
+                "POST", f"/api/pipeline/runs/{run_id}/frame-records",
+                {"records": chunk},
+            )
+            ok = ok and sent
+        return ok
+
     def post_face_card(self, person_key: str, jpeg: bytes) -> bool:
         """Best-effort multipart POST of ONE guest's face card.
 

@@ -243,27 +243,16 @@ def _same_frame_split(v: dict) -> dict | None:
     }
 
 
-def match_payload(
-    verdicts: list[dict],
-    unique: int,
-    staff_crossings: int,
-    staff_face_frames: int = 0,
-    manual_additions: int = 0,
-    mints: list[dict] | None = None,
-    retired: list[dict] | None = None,
-    co_present: list[list[str]] | None = None,
-) -> dict:
-    """Matcher verdicts (personKey + cosine + staff flag) with live counters.
+def verdict_rows(verdicts: list[dict]) -> list[dict]:
+    """One frame's match verdicts, as the console reads them.
 
-    Both staff numbers are reported because they answer different questions
-    and only one of them is about people: ``staffCrossings`` counts passes (a
-    waiter through the gate ten times is ten), ``staffFaceFrames`` counts
-    matched face-frames and moves with the frame rate — useful for debugging
-    recall, meaningless in a report.  ``manualAdditions`` is how much of
-    ``unique`` an operator attested by hand rather than the pipeline detecting
-    it; a console that shows the total must be able to show that split.
+    Factored out of :func:`match_payload` because the per-frame decision ledger
+    (``frame_record``) needs the SAME rows without the run-wide counters and
+    ledgers that only make sense once per tap round.  One builder, one shape:
+    an engineer reading a frame record and an operator reading a tap are
+    looking at the same fields, and cannot drift into two dialects.
     """
-    rows = [
+    return [
         {
             "personKey": v.get("personKey"),
             "cosine": _r(v.get("cosine"), 4),
@@ -289,6 +278,29 @@ def match_payload(
         }
         for v in verdicts[:ROW_CAP]
     ]
+
+
+def match_payload(
+    verdicts: list[dict],
+    unique: int,
+    staff_crossings: int,
+    staff_face_frames: int = 0,
+    manual_additions: int = 0,
+    mints: list[dict] | None = None,
+    retired: list[dict] | None = None,
+    co_present: list[list[str]] | None = None,
+) -> dict:
+    """Matcher verdicts (personKey + cosine + staff flag) with live counters.
+
+    Both staff numbers are reported because they answer different questions
+    and only one of them is about people: ``staffCrossings`` counts passes (a
+    waiter through the gate ten times is ten), ``staffFaceFrames`` counts
+    matched face-frames and moves with the frame rate — useful for debugging
+    recall, meaningless in a report.  ``manualAdditions`` is how much of
+    ``unique`` an operator attested by hand rather than the pipeline detecting
+    it; a console that shows the total must be able to show that split.
+    """
+    rows = verdict_rows(verdicts)
     return {
         "unique": unique,
         "staffCrossings": staff_crossings,
@@ -373,6 +385,58 @@ def build_payloads(
             staff_face_frames, manual_additions, mints=mints, retired=retired,
             co_present=co_present,
         ),
+    }
+
+
+#: How many frame records the runner batches before a flush drops the oldest.
+#: At 4 fps and a 2 s flush that is ~8 per batch, so this is only ever reached
+#: when the planner is unreachable — it bounds MEMORY during an outage, and the
+#: drop is counted rather than silent.
+FRAME_LEDGER_CAP = 4000
+
+
+def frame_record(
+    last: dict,
+    min_px: float,
+    canon_px: float,
+    ms: dict | None = None,
+    events: list[str] | None = None,
+) -> dict:
+    """EVERY frame's decisions, compactly — the pipeline engineer's evidence.
+
+    THE GAP THIS CLOSES.  Tap rounds are sampled at ``tap_interval_s``, and on
+    the measured bench that is **12% of frames** (run 0f5c6d: 41 rounds over
+    356 frames; run d48e2e: 9%).  The other ~88% are fully processed — detected,
+    tracked, gated, embedded, matched — and every decision is then discarded.
+    So "why was frame 217 rejected?" has had no answer for 8 frames in 9, which
+    makes deep debugging guesswork dressed up as analysis.
+
+    A record is ~1 KB, so a 4-hour event costs about 58 MB of decisions against
+    5.6 GB if the PIXELS were kept too — which is exactly why the two are
+    separated: the reasoning is cheap enough to keep always, the imagery is not
+    (see the armed capture window).
+
+    Deliberately the SAME per-stage shapes the tap round publishes, reusing the
+    same builders — an engineer reading a frame and an operator reading a tap
+    must be looking at one dialect, not two that drift.  What is left OUT is
+    everything run-wide: the unique count, the mint/retirement ledgers and the
+    co-presence pairs belong to a round, not to a frame, and repeating them
+    57,600 times would be most of the file.
+
+    ``ms`` is this frame's per-stage wall time and ``events`` the loop's own
+    count-changing decisions on it (a mint, a fold, a split, a veto) — the two
+    things the stage payloads cannot carry because they are about the frame
+    rather than about what was in it.
+    """
+    return {
+        "seq": last.get("seq"),
+        "tMs": last.get("t_ms", 0),
+        "persons": person_payload(last.get("boxes", [])),
+        "tracks": track_payload(last.get("tracks", [])),
+        "faces": face_payload(last.get("faces", []), min_px, canon_px),
+        "verdicts": verdict_rows(last.get("verdicts", [])),
+        "ms": {k: _r(v, 1) for k, v in (ms or {}).items()},
+        "events": list(events or []),
     }
 
 
