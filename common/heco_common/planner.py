@@ -281,6 +281,33 @@ class PlannerClient:
             return False
         return status < 400
 
+    def post_face_card(self, person_key: str, jpeg: bytes) -> bool:
+        """Best-effort multipart POST of ONE guest's face card.
+
+        A card is that guest's face cut out of the frame, so the register can
+        show WHO an identity is rather than which crowded doorway they were
+        standing in (operator, 2026-08-07: "sometimes all images of that guest
+        come with other people ... it is hard to find who it is").
+
+        Same contract as :meth:`post_frame` — one attempt, failures swallowed,
+        no retry. A missing card costs a thumbnail; a loop held up by an upload
+        costs frames, and frames are how guests are counted.
+        """
+        if self.file_transport is None:
+            return False
+        try:
+            # _require_run() is INSIDE the try, unlike post_frame's. This is
+            # called from the tap round, whose caller has no except clause, so
+            # an exception here would end the run — and a run must never die
+            # over a thumbnail. "No run open" is simply "no card".
+            url = f"{self.base_url}/api/pipeline/runs/{self._require_run()}/faces"
+            status, _ = self.file_transport(
+                url, {"personKey": person_key}, f"{person_key}.jpg", jpeg, "image/jpeg"
+            )
+        except Exception:  # noqa: BLE001 — best-effort, never propagate
+            return False
+        return status < 400
+
     # ---------------------------------------- operator feedback (v1)
 
     def poll_feedback(self, since: str | None = None) -> list[dict]:

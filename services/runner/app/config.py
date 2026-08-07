@@ -221,6 +221,25 @@ class Settings:
     # the whole answer.
     same_frame_clash: float = 0.35
 
+    # FACE CARDS (see loop._maybe_face_card).  How much wider a face must be,
+    # as a multiple of the best card already taken, before it replaces it.
+    #
+    # A card is the guest register's picture of one guest — their face cut out
+    # of the frame — and it exists because whole frames could not answer "which
+    # of these three people is p00003?".  The FIRST look at somebody is often
+    # the worst: run 0f5c6d minted p00003 from a face of 29 px eye-distance
+    # with a phone across it while matching other guests all evening at 44-60,
+    # so a card fixed at mint would hand the register exactly the picture that
+    # made the identity ambiguous.
+    #
+    # 1.25 is a compromise between that and cost.  Every replacement must beat
+    # the last by this factor, so the number of cards per guest is logarithmic
+    # in how much their face grows as they approach the camera — a guest going
+    # from 40 px to 200 px costs five uploads, not five hundred.  Lower means
+    # sharper cards and more uploads inside the tap round's budget; 1.0 would
+    # re-upload on every marginally wider face and is the setting to avoid.
+    face_card_improve: float = 1.25
+
     # CO-PRESENCE SPLITS (see loop._assert_co_presence).  1 = on, 0 = off.
     #
     # THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
@@ -327,6 +346,7 @@ def from_env() -> Settings:
             "HECO_HEAL_APPEARANCE_UNSURE", s.heal_appearance_unsure
         ),
         same_frame_clash=env_float("HECO_SAME_FRAME_CLASH", s.same_frame_clash),
+        face_card_improve=env_float("HECO_FACE_CARD_IMPROVE", s.face_card_improve),
         copresence_split=env_int("HECO_COPRESENCE_SPLIT", s.copresence_split),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),

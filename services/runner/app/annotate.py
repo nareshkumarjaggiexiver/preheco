@@ -32,6 +32,11 @@ _GREY = (150, 150, 150)  # staff (excluded from the guest count, still tracked)
 _MAGENTA = (255, 0, 255)
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+#: Label text colour: pure black ink on the chip. Not near-black — every
+#: overlay here is checked by tests that read raw CHANNELS ("no green anywhere
+#: means this face was not kept"), and ink carrying a few counts of green
+#: would quietly make those assertions meaningless.
+_LABEL_INK = (0, 0, 0)
 
 #: Stages that carry a visual overlay (CONTRACTS.md v1); ingest is the raw frame.
 STAGES = ("ingest", "person-detect", "track", "face-detect", "match")
@@ -68,6 +73,69 @@ def downscale(img: np.ndarray, max_w: int = TAP_MAX_WIDTH) -> np.ndarray:
     )
 
 
+#: How much of the surrounding frame a face card keeps, as a fraction of the
+#: face box. A detector box is cropped tight to the features — it clips the
+#: hairline and the chin — and a register thumbnail is for RECOGNISING someone,
+#: which needs the head shape and a little of the shoulders. 0.35 is enough for
+#: that without pulling in the neighbour standing alongside, which is the whole
+#: complaint the card answers.
+FACE_CARD_PAD = 0.35
+
+#: Face cards are encoded at this width. They render in the register at ~40 px
+#: and in a guest's detail at ~140 px, so this is generous for both; going
+#: larger buys nothing a reader can see and costs upload budget inside a tap
+#: round's deadline.
+FACE_CARD_WIDTH = 192
+
+
+def face_crop(
+    img: np.ndarray, box: dict, pad: float = FACE_CARD_PAD, out_w: int = FACE_CARD_WIDTH
+) -> np.ndarray | None:
+    """One guest's face, cut out of the frame — or None if it cannot be cut.
+
+    WHY THIS EXISTS (operator, 2026-08-07): the guest register showed whole
+    annotated frames, and in a busy doorway every frame holds three people, so
+    "which of these is p00003?" had no answer without reading a tiny label.
+    A card is that answer: this guest's face, alone.
+
+    Cropped from the NATIVE frame before any tap downscale, so the card keeps
+    the pixels the camera actually gave — the register is where an operator
+    decides whether two identities are one person, and that decision should not
+    be made on a face that has been through a 3x reduction for unrelated
+    reasons.
+
+    None when the box has no area or lands entirely outside the frame; the
+    caller then simply has no card for that guest, which the console renders as
+    "no picture" rather than as a broken image. Boxes that hang PARTLY over an
+    edge are clamped and kept — a face at the frame edge is still a face, and
+    refusing it would lose exactly the guests who walk in close to the lens.
+    """
+    h, w = img.shape[:2]
+    x, y, bw, bh = (
+        float(box.get("x", 0.0)), float(box.get("y", 0.0)),
+        float(box.get("w", 0.0)), float(box.get("h", 0.0)),
+    )
+    if bw <= 0 or bh <= 0:
+        return None
+    dx, dy = bw * pad, bh * pad
+    x0, x1 = int(round(x - dx)), int(round(x + bw + dx))
+    y0, y1 = int(round(y - dy)), int(round(y + bh + dy))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    crop = img[y0:y1, x0:x1]
+    if crop.shape[1] == out_w:
+        return crop
+    # INTER_AREA down, INTER_CUBIC up: a card from a distant guest is being
+    # enlarged, and area-averaging an upscale just blurs it.
+    interp = cv2.INTER_AREA if crop.shape[1] > out_w else cv2.INTER_CUBIC
+    scale = out_w / float(crop.shape[1])
+    return cv2.resize(
+        crop, (out_w, max(1, int(round(crop.shape[0] * scale)))), interpolation=interp
+    )
+
+
 def to_jpeg(img: np.ndarray, quality: int = 80) -> bytes:
     """Encode a BGR image to raw JPEG bytes (for the multipart frame POST)."""
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
@@ -86,13 +154,55 @@ def _xywh(box: dict) -> tuple[int, int, int, int]:
     )
 
 
+def label_metrics(img: np.ndarray, max_w: int = TAP_MAX_WIDTH) -> tuple[float, int]:
+    """Font scale and stroke thickness that survive the downscale, for ``img``.
+
+    THE BUG THIS FIXES, reported from the field 2026-08-07: "in the frame when
+    you do the facebox the number is not very clear".  Annotations are drawn at
+    NATIVE resolution and the finished frame is then shrunk to
+    ``TAP_MAX_WIDTH`` (see :func:`downscale`) — so a fixed 0.5-scale, 1 px
+    label on a 2560 px camera arrives on screen at an effective 0.25 and one
+    HALF-pixel stroke.  The boxes survived that because they are 2 px of solid
+    colour; six characters of hairline text did not, which is why an operator
+    could see WHICH faces were matched but not WHO to.
+
+    So the label is sized in the coordinates it will be READ in: scale up by
+    exactly the factor the downscale will remove, leaving ~0.5/1 px on screen
+    whatever the camera resolution.  A frame at or under the cap is not
+    downscaled at all, so it gets the plain values.
+    """
+    width = int(img.shape[1])
+    k = max(1.0, width / float(max_w))
+    return 0.5 * k, max(1, int(round(k)))
+
+
 def _rect(img: np.ndarray, box: dict, colour, label: str | None = None) -> None:
-    """Draw one rectangle (+ optional label above it) in place."""
+    """Draw one rectangle (+ optional label above it) in place.
+
+    The label is a FILLED chip in the box's own colour with near-black text,
+    not coloured text on the footage.  Thin yellow glyphs over a bright
+    doorway or a white shirt are unreadable at any size — the identity a
+    disputed count turns on has to be legible against whatever is behind it,
+    so the contrast is supplied rather than hoped for.
+    """
     x, y, w, h = _xywh(box)
     cv2.rectangle(img, (x, y), (x + w, y + h), colour, 2)
-    if label:
-        ty = max(y - 6, 10)
-        cv2.putText(img, label, (x, ty), _FONT, 0.5, colour, 1, cv2.LINE_AA)
+    if not label:
+        return
+    scale, thick = label_metrics(img)
+    (tw, th), base = cv2.getTextSize(label, _FONT, scale, thick)
+    pad = max(2, int(round(2 * scale)))
+    # Prefer above the box; drop inside it when the box is against the top edge,
+    # so a label is never clipped off the frame by a face detected high up.
+    top = y - th - base - 2 * pad
+    ty = top if top >= 0 else y + 2
+    cv2.rectangle(
+        img, (x, ty), (x + tw + 2 * pad, ty + th + base + 2 * pad), colour, -1
+    )
+    cv2.putText(
+        img, label, (x + pad, ty + th + pad), _FONT, scale, _LABEL_INK, thick,
+        cv2.LINE_AA,
+    )
 
 
 def draw_persons(img: np.ndarray, boxes: list[dict]) -> np.ndarray:
@@ -141,10 +251,13 @@ def draw_zones(img: np.ndarray, zones: list[dict]) -> np.ndarray:
     for pts, label in polys:
         cv2.polylines(out, [pts], isClosed=True, color=_MAGENTA, thickness=2)
         if label:
+            # Same sizing rule as every other label: a zone name written at a
+            # fixed 0.5 on a 4K frame is gone by the time the frame is shown.
             x, y = int(pts[0][0]), int(pts[0][1])
+            scale, thick = label_metrics(out)
             cv2.putText(
-                out, str(label), (x, max(y - 6, 10)), _FONT, 0.5, _MAGENTA, 1,
-                cv2.LINE_AA,
+                out, str(label), (x, max(y - 6, 10)), _FONT, scale, _MAGENTA,
+                thick, cv2.LINE_AA,
             )
     return out
 

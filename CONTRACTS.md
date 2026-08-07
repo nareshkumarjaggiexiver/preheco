@@ -1242,3 +1242,82 @@ by `cannot_link`, two below the floor), **2 were asked about, and the real
 duplicate ranked first**.
 
 **Match service 0.11.0** (new endpoint only; no field changed shape).
+
+## v3 addition — the register shows a face, and the label can be read (2026-08-07)
+
+Two operator reports, one root cause each.
+
+### 1. "In the frame when you do the facebox, the number is not very clear"
+
+Not a rendering bug — the label was drawn correctly and then **destroyed**.
+Annotations go on at NATIVE resolution and the finished frame is shrunk to
+`TAP_MAX_WIDTH` (1280), so a fixed `0.5`-scale, 1 px label on a 2560 px camera
+reached the screen at an effective **0.25 with a half-pixel stroke**. The
+BOXES survived that (2 px of solid colour); six characters of hairline text did
+not. An operator could see WHICH faces were matched and not WHO to — on the one
+overlay a disputed count turns on.
+
+- **`annotate.label_metrics(img)`** returns the font scale and stroke that
+  cancel the downscale the frame is about to get: `0.5 × (width / 1280)`,
+  clamped so a frame at or under the cap is never inflated. Used by every
+  label — match verdicts, face gates, zone names.
+- **Labels are a filled chip in the box's own colour with pure-black ink**, not
+  coloured text on the footage. Thin yellow glyphs over a bright doorway or a
+  white shirt are unreadable at any size. The ink is pure black, not
+  near-black, because several overlay tests read raw CHANNELS ("no green
+  anywhere means this face was not kept") and ink carrying a few counts of
+  green would quietly make those assertions meaningless.
+- A label with no room above its box **drops inside it** rather than off the
+  frame: a guest walking close to the lens is exactly when the face box reaches
+  the top edge, and exactly when their identity matters.
+- Measured on a 4K frame, after downscale: **glyph mass 167 px → 1792 px**.
+
+### 2. "All images of that guest come with other people — it is hard to find who it is"
+
+The guest register showed whole annotated frames, and in a busy doorway every
+frame holds three people. Identifying a guest meant reading a tiny label off a
+still. **Face cards** answer it directly: one guest's face, alone.
+
+- **`annotate.face_crop(img, box)`** cuts the face out with **35% padding** —
+  a detector box is tight to the features and clips the hairline and chin,
+  and a thumbnail is for RECOGNISING someone. Encoded at **192 px**. Cut from
+  the **NATIVE** frame, before any tap downscale: the register is where an
+  operator decides whether two identities are one person, and that decision
+  should not be made on a face that has been through a 3× reduction for
+  unrelated reasons. Returns None — "no card", a state the console draws —
+  when the box has no area or lands outside the frame. Boxes hanging PARTLY
+  over an edge are clamped and kept.
+- **BEST face, not first.** Run 0f5c6d minted `p00003` from a 29 px
+  eye-distance face with a phone across it while matching other guests all
+  evening at 44–60 px; a card fixed at mint hands the register exactly the
+  picture that made the identity ambiguous. A later face replaces the card only
+  when it beats the stored one by **`HECO_FACE_CARD_IMPROVE`** (`env_float`,
+  default **1.25**), which bounds cards per guest to a handful however far the
+  guest walks toward the camera.
+- **Cropped in the frame loop, uploaded in the tap round.** Encoding a 192 px
+  JPEG is ~1 ms of CPU; posting it is a network round trip, and network round
+  trips inside the frame loop are what produced the 0.4 fps death spiral the
+  tap duty guard exists to prevent. Cards wait in `_face_pending` and ride the
+  next round, best first, bounded by the same deadline — a card that misses its
+  round rides the next, and only a card superseded by a better crop is dropped.
+- **`POST /api/pipeline/runs/:id/faces`** (multipart: `personKey` + `file`) →
+  `{personKey, bytes}`. **ONE FILE PER GUEST, overwritten** — a card is a
+  portrait, not evidence of a moment (the keyframes are that), so only the
+  latest is kept and the directory stays exactly as large as the guest list.
+  `personKey` becomes a FILENAME and is validated as strictly as a run id.
+- **`GET /api/pipeline/faces/:runId/:key.jpg`** serves one, with the keyframe
+  route's traversal locks. **`GET /api/pipeline/runs/:id/faces`** lists which
+  guests have one, so the console can draw a picture where there is one and say
+  "no face" where there is not, instead of firing a 404 per guest.
+- **Staff never get a card**, guarded twice: they `continue` out of the verdict
+  loop before the call, AND the call refuses them. A staff likeness stored for
+  a register they do not appear in is a consent boundary, not a cosmetic one,
+  and the structural guarantee is a consequence of where a call sits today.
+- **`faceCardsPosted`** joins the run status, notes and results. A run with
+  guests and zero cards means the register is showing pictures nobody can use.
+- **`post_face_card` never raises** — `_require_run()` is inside its try, unlike
+  `post_frame`'s, because it is called from the tap round whose caller has no
+  except clause. A run must never die over a thumbnail.
+- Cards live under the run's frames directory, so the deletion preview's
+  recursive footprint already counts them and the purge already removes them.
+  No new retention path.

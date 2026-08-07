@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+import pytest
 from app import annotate
 
 
@@ -190,3 +191,150 @@ def test_downscale_is_exact_at_the_cap_and_identity_below_it():
     assert annotate.downscale(at_cap) is at_cap  # untouched, not even copied
     over = annotate.downscale(np.zeros((100, 1281, 3), dtype=np.uint8))
     assert over.shape[1] == 1280
+
+
+# ------------------------------- labels that survive the downscale
+#
+# REPORTED FROM THE FIELD, 2026-08-07: "in the frame when you do the facebox
+# the number is not very clear."  It was not a rendering bug — the label was
+# drawn correctly and then destroyed.  Annotations go on at NATIVE resolution
+# and the finished frame is shrunk to TAP_MAX_WIDTH, so a fixed 0.5-scale,
+# 1 px label on a 2560 px camera reaches the screen at an effective 0.25 with
+# a half-pixel stroke.  The BOXES survived (2 px of solid colour); six
+# characters of hairline text did not, so an operator could see which faces
+# were matched and not who to — on the one overlay a disputed count turns on.
+
+
+def test_label_metrics_cancel_the_downscale_the_frame_is_about_to_get():
+    """Sized in the coordinates it will be READ in, not the ones it is drawn in."""
+    at_cap = np.zeros((720, annotate.TAP_MAX_WIDTH, 3), dtype=np.uint8)
+    assert annotate.label_metrics(at_cap) == (0.5, 1), "no downscale, no compensation"
+
+    # 2x the cap: the downscale halves everything, so the label starts double.
+    twice = np.zeros((1440, annotate.TAP_MAX_WIDTH * 2, 3), dtype=np.uint8)
+    scale, thick = annotate.label_metrics(twice)
+    assert scale == 1.0 and thick == 2
+
+    # 4K: the measured camera. Effective on-screen size lands back at ~0.5.
+    uhd = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    scale, thick = annotate.label_metrics(uhd)
+    assert scale == pytest.approx(0.5 * 3840 / annotate.TAP_MAX_WIDTH)
+    assert scale * (annotate.TAP_MAX_WIDTH / 3840) == pytest.approx(0.5)
+
+    # A frame SMALLER than the cap is never upscaled, so it is never compensated.
+    small = np.zeros((240, 320, 3), dtype=np.uint8)
+    assert annotate.label_metrics(small) == (0.5, 1)
+
+
+def test_a_match_label_is_still_legible_after_the_frame_is_shrunk():
+    """THE REGRESSION, end to end: the glyphs survive 4K -> screen.
+
+    Measured as GLYPH MASS — the pixels that form the characters, counted the
+    same way for both designs so the comparison is fair rather than flattering.
+    In each label strip the most common colour is the ground (the footage for
+    the old thin-text label, the chip for the new one) and everything else is
+    ink, so this counts what a reader actually has to read, not how the ink
+    happens to be coloured.
+    """
+    uhd = np.full((2160, 3840, 3), 210, dtype=np.uint8)  # a bright doorway
+    box = {"x": 1500, "y": 900, "w": 300, "h": 380}
+    label = "p00003 0.69"
+
+    now = annotate.downscale(annotate.draw_matches(uhd, [
+        {"box": box, "personKey": "p00003", "cosine": 0.6874, "isNew": False},
+    ]))
+
+    # The old design, rendered identically: fixed 0.5 scale, 1 px, no chip.
+    before = uhd.copy()
+    x, y, w, h = annotate._xywh(box)
+    cv2.rectangle(before, (x, y), (x + w, y + h), (0, 255, 255), 2)
+    cv2.putText(before, label, (x, y - 6), annotate._FONT, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+    before = annotate.downscale(before)
+
+    def glyph_mass(img):
+        """Pixels forming the characters in the label strip, whatever colour."""
+        k = annotate.TAP_MAX_WIDTH / 3840
+        sx, sy = int(x * k), int(y * k)
+        strip = img[max(0, sy - 26):sy, sx:sx + 160].reshape(-1, 3)
+        if not len(strip):
+            return 0
+        colours, counts = np.unique(strip, axis=0, return_counts=True)
+        ground = colours[counts.argmax()]
+        return int((np.abs(strip.astype(int) - ground.astype(int)).sum(axis=1) > 90).sum())
+
+    assert glyph_mass(before) > 0, "the fixture must really draw the old label"
+    assert glyph_mass(now) > 3 * glyph_mass(before), (
+        f"glyph mass after downscale: {glyph_mass(now)} px now "
+        f"vs {glyph_mass(before)} px before"
+    )
+
+
+def test_a_label_on_a_face_at_the_very_top_is_not_clipped_away():
+    """A face detected against the top edge still says who it is.
+
+    The label prefers to sit ABOVE its box and drops inside when there is no
+    room — because a guest walking close to the camera is exactly when the
+    face box reaches the frame edge, and exactly when knowing who they are
+    matters most.
+    """
+    img = _blank()
+    out = annotate.draw_matches(img, [
+        {"box": {"x": 20, "y": 0, "w": 90, "h": 110}, "personKey": "p00001", "isNew": True},
+    ])
+    # Ink inside the top strip of the box means the chip was placed there.
+    assert (out[0:40, 20:150].astype(int).sum(axis=2) > 0).any(), "the label is on the frame"
+
+
+# ------------------------------- face cards (the guest register's own picture)
+#
+# REPORTED 2026-08-07: "sometimes all images of that guest come with other
+# people ... it is hard to find who it is." The register showed whole annotated
+# frames, and in a busy doorway every frame holds three people. A card is one
+# guest's face, cut out of the frame, so the register can show WHO rather than
+# WHERE.
+
+
+def test_a_face_card_is_the_face_plus_a_little_head_and_shoulder():
+    """Padded past the detector box, which clips the hairline and the chin."""
+    img = np.zeros((600, 800, 3), dtype=np.uint8)
+    img[:] = (10, 10, 10)
+    img[200:340, 300:400] = (0, 0, 255)  # the "face"
+    card = annotate.face_crop(img, {"x": 300, "y": 200, "w": 100, "h": 140})
+    assert card is not None
+    assert card.shape[1] == annotate.FACE_CARD_WIDTH
+    # 35% each side of a 100 px box => 170 px of source, so the face fills
+    # roughly 100/170 of the width — most of the card, but not all of it.
+    red = (card[:, :, 2] > 100).sum(axis=0) > 0
+    assert 0.5 < red.mean() < 0.75, f"face fills {red.mean():.2f} of the card"
+
+
+def test_a_face_at_the_frame_edge_still_gets_a_card():
+    """Clamped, not refused — the guests who walk closest to the lens are
+    exactly the ones whose boxes hang over the edge."""
+    img = np.full((600, 800, 3), 40, dtype=np.uint8)
+    assert annotate.face_crop(img, {"x": 0, "y": 0, "w": 90, "h": 110}) is not None
+    assert annotate.face_crop(img, {"x": 740, "y": 520, "w": 90, "h": 110}) is not None
+
+
+def test_an_impossible_box_yields_no_card_rather_than_a_broken_one():
+    """No card is a state the console renders; a 0-px image is not."""
+    img = np.full((600, 800, 3), 40, dtype=np.uint8)
+    assert annotate.face_crop(img, {"x": 10, "y": 10, "w": 0, "h": 110}) is None
+    assert annotate.face_crop(img, {"x": 10, "y": 10, "w": 90, "h": -5}) is None
+    assert annotate.face_crop(img, {"x": 5000, "y": 10, "w": 90, "h": 110}) is None
+    assert annotate.face_crop(img, {}) is None
+
+
+def test_a_card_is_cut_from_the_NATIVE_frame_not_the_downscaled_one():
+    """A distant guest's card must not also pay the tap round's 3x reduction.
+
+    The register is where an operator decides whether two identities are one
+    person. That decision should be made on the pixels the camera gave.
+    """
+    uhd = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    uhd[900:1040, 1500:1600] = (0, 0, 255)
+    card = annotate.face_crop(uhd, {"x": 1500, "y": 900, "w": 100, "h": 140})
+    assert card.shape[1] == annotate.FACE_CARD_WIDTH
+    # Cut from native, a 100 px face becomes 192/170 of its size: UPscaled.
+    # Cut from the 1280-wide tap frame it would have been 33 px first.
+    assert (card[:, :, 2] > 100).sum() > 8000, "the card carries real detail"
