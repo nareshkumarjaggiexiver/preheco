@@ -217,6 +217,10 @@ class RunLoop:
         # _maybe_lock_fold).  Loop-thread only; read under _lock with the
         # locks it guards.
         self._frame_no: int = 0
+        # Set when a frame minted a guest, so the loop forces a tap round and
+        # the planner keeps a keyframe OF that guest (see _maybe_tap). Read
+        # and cleared by the loop thread only.
+        self._mint_frame: bool = False
         # Identities that no longer exist: folded by a lock, a heal, an
         # operator merge, or moved to the staff store.  Rides every match tap
         # so the console can drop cards for keys the count has dropped — a
@@ -631,7 +635,11 @@ class RunLoop:
             if now - last_flush >= self.s.flush_interval_s:
                 self._flush(now - t0)
                 last_flush = now
-            self._maybe_tap(now)  # best-effort debug frames + payloads
+            # A frame that minted a guest forces a round, so that guest has a
+            # keyframe of their own rather than depending on the sampler
+            # happening to fire while they were visible.
+            minted, self._mint_frame = self._mint_frame, False
+            self._maybe_tap(now, forced=minted)
             self._maybe_feedback(now)  # best-effort operator corrections
             self._maybe_purge_staff(now)  # best-effort consent-withdrawal purge
 
@@ -1049,6 +1057,9 @@ class RunLoop:
                     st["subCanonMatches"] += 1
                 if m.get("isNew"):
                     st["unique"] += 1
+                    # A guest just came into existence: this frame is the one
+                    # picture guaranteed to contain them.
+                    self._mint_frame = True
                     self._mints.append({
                         "personKey": m.get("personKey"),
                         "tMs": t_ms,
@@ -2112,8 +2123,11 @@ class RunLoop:
 
     # ---------------------------------------------------------- debug taps
 
-    def _maybe_tap(self, now: float) -> None:
+    def _maybe_tap(self, now: float, forced: bool = False) -> None:
         """Post per-stage payloads and annotated frames if the interval elapsed.
+
+        ``forced`` skips the INTERVAL but never the duty guard — see the
+        mint-frame paragraph at the end.
 
         Entirely best-effort: structured payloads always attempted; annotated
         frames only when the frame decodes (a stub/opaque frame simply skips the
@@ -2154,8 +2168,25 @@ class RunLoop:
         Every round's wall cost is observed as ``tapRoundMs`` on the "count"
         board (the loop-bookkeeping stage), so the next stall is diagnosable
         from the console instead of from a bisection of the box's crontab.
+
+        A MINT FORCES A ROUND, because a mint is the count-changing event and
+        the planner only mints a KEYFRAME when a match-stage frame arrives
+        (server/index.js captureKeyframe).  On the sampled cadence a guest who
+        exists for a second is never photographed: run 6cd269 counted three
+        real people and kept 21 keyframes, of which 19 claimed nobody — two of
+        the three guests had a register card and no picture at all, because
+        each was minted inside a four-second window that no round coincided
+        with.  The frames exist to make a disputed count auditable, and the
+        guests most likely to be disputed are exactly those brief ones.
+
+        ``forced`` therefore bypasses the interval — but NOT the duty guard,
+        deliberately.  The guard is what makes the death spiral structurally
+        impossible, and a run whose matcher minted on every frame would
+        otherwise force a full round per frame and reinstate it exactly.
+        Mints are rare by construction (one per guest, ever), so in a healthy
+        run the guard never sees them and every guest gets their frame.
         """
-        if now - self._last_tap < self.s.tap_interval_s:
+        if not forced and now - self._last_tap < self.s.tap_interval_s:
             return
         if self._tap_cost_s > 0 and self.s.tap_duty_factor > 0:
             quiet = self.s.tap_duty_factor * self._tap_cost_s
