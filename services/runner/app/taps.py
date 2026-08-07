@@ -91,9 +91,50 @@ def quality_band(width_px: float, min_px: float, canon_px: float) -> str:
     return "canon"
 
 
-def ingest_payload(t_ms: int, seq: int | None = None) -> dict:
-    """The raw-frame stage tap: just where we are in the source."""
-    return {"tMs": t_ms, "seq": seq}
+def jpeg_dims(data: bytes) -> tuple[int, int] | None:
+    """(width, height) straight from a JPEG's SOF marker, or None.
+
+    A byte-level scan, no decoder: the forensic path needs the native
+    dimensions of EVERY processed frame so the console can scale ledger box
+    coordinates onto the picture, and decoding a 4K frame per frame just to
+    read two numbers would be the exact per-frame cost the tap duty guard
+    exists to forbid.  Scanning the marker table of a real camera JPEG
+    touches a few hundred bytes.
+    """
+    if not data or len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    i = 2
+    n = len(data)
+    while i + 3 < n:
+        if data[i] != 0xFF:
+            return None  # lost marker sync: not a JPEG we can trust
+        marker = data[i + 1]
+        if marker == 0xD8 or 0xD0 <= marker <= 0xD7:  # standalone markers
+            i += 2
+            continue
+        seg_len = (data[i + 2] << 8) | data[i + 3]
+        # SOF0..SOF15 carry the frame header, minus DHT/JPG/DAC which share
+        # the numeric range but are not frame headers.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 8 >= n:
+                return None
+            height = (data[i + 5] << 8) | data[i + 6]
+            width = (data[i + 7] << 8) | data[i + 8]
+            return (width, height) if width > 0 and height > 0 else None
+        i += 2 + seg_len
+    return None
+
+
+def ingest_payload(
+    t_ms: int,
+    seq: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict:
+    """The raw-frame stage tap: where we are in the source, and how big the
+    NATIVE frame is — the reference the console scales overlay boxes against
+    (the uploaded picture is downscaled; the box coordinates are not)."""
+    return {"tMs": t_ms, "seq": seq, "width": width, "height": height}
 
 
 def person_payload(boxes: list[dict]) -> dict:
@@ -376,7 +417,9 @@ def build_payloads(
     that carry a visual/structured output; the loop posts each best-effort.
     """
     return {
-        "ingest": ingest_payload(last.get("t_ms", 0), last.get("seq")),
+        "ingest": ingest_payload(
+            last.get("t_ms", 0), last.get("seq"), last.get("w"), last.get("h")
+        ),
         "person-detect": person_payload(last.get("boxes", [])),
         "track": track_payload(last.get("tracks", [])),
         "face-detect": face_payload(last.get("faces", []), min_px, canon_px),
