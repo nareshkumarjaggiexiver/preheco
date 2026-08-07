@@ -202,6 +202,15 @@ class SplitRequest(BaseModel):
     b: str
 
 
+class ReviewDuplicatesRequest(BaseModel):
+    """Body of POST /review/duplicates — ask which identities a human should check."""
+
+    runId: str
+    # Bounds the queue, never the analysis: everything is examined and the
+    # count beyond the cap comes back as `dropped` rather than vanishing.
+    limit: int = Field(default=50, ge=1, le=500)
+
+
 class ForgetTemplateRequest(BaseModel):
     """Body of POST /template/forget — retract one wrongly-enrolled template."""
 
@@ -461,6 +470,37 @@ def split(body: SplitRequest) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "galleryN": n}
+
+
+@app.post("/review/duplicates")
+def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
+    """Identity pairs worth a human glance, ranked. Decides nothing.
+
+    Run 0f5c6d counted four people where there were three: one man at the back
+    of the room, phone to his ear, was minted twice at a mutual face score of
+    0.2117.  No automatic rule could have caught it — his duplicate pair
+    agreed on clothing at 0.587 while two genuinely different men in the same
+    run agreed at 0.538, and no threshold lives in that gap.
+
+    So the machine stops guessing and hands over a short, ordered list.  Pairs
+    the gallery already knows are different — a recorded `cannot_link`, from
+    co-presence or from the operator's own false-match click — never appear.
+    Clothing orders the queue; it is not allowed to remove anyone from it.
+
+    Read-only: no template is written, no key is merged, `galleryN` is
+    untouched.  Acting on a row is the operator's existing one-click /merge.
+    """
+    try:
+        report = gallery.review_duplicates(
+            config.data_dir(),
+            body.runId,
+            threshold=config.threshold(),
+            floor=config.nearmiss_weak_floor(),
+            limit=body.limit,
+        )
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"runId": body.runId, "threshold": config.threshold(), **report}
 
 
 @app.post("/template/forget")
