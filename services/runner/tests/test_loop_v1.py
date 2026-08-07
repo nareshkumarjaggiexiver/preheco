@@ -2431,3 +2431,66 @@ def test_a_phone_showing_your_own_face_is_still_one_person():
     # And the fold is NOT blocked: the phone mint folds back into him.
     assert final["lockedTrackFolds"] == 1, "the screen face folds away as it always did"
     assert final["unique"] == 1, "one man, one guest — the phone counted nobody"
+
+
+def test_a_mint_forces_a_tap_round_so_the_guest_gets_a_picture():
+    """A guest who existed for a second must still be photographed.
+
+    The planner mints a KEYFRAME only when a match-stage frame arrives, and
+    those arrive on the sampled tap cadence — so run 6cd269 counted three real
+    people, kept 21 keyframes, and 19 of them claimed nobody: two guests had a
+    register card and no picture, each minted inside a four-second window no
+    round coincided with. The frames exist to make a disputed count auditable,
+    and the briefest guests are the ones most likely to be disputed.
+
+    A long interval here would normally suppress every round after the first;
+    the mint must punch through it.
+    """
+    script = [
+        scripted_verdict("p00001", False, 0.70),   # frame 1: a match, no mint
+        scripted_verdict("p00002", True, 0.10),    # frame 2: a GUEST is born
+    ]
+    fake = V1Fake(n_frames=2, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    # A 10-minute interval: nothing but a forced round can fire after frame 1.
+    # heal_window_s=0 disables the lock/heal — V1Fake serves one track, so the
+    # lock would otherwise fold this synthetic mint straight back into p00001
+    # and there would be no mint left to photograph. Every layer polices the
+    # others; here that would have measured the wrong thing.
+    final = make_loop(fake, request, tap_interval_s=600.0, tap_duty_factor=0.0,
+                      heal_window_s=0.0).run()
+
+    assert final["unique"] == 1
+    # The interval blocks EVERY round here, including the first (the clock
+    # starts when the run does). So any round at all is the forced one, and
+    # without the force this run would post none: the guest would exist in the
+    # count with no frame anywhere naming them.
+    match_rounds = [t for t in fake.taps if t["stage"] == "match"]
+    assert len(match_rounds) == 1, "exactly the minting frame's round, nothing else"
+    assert match_rounds[0]["payload"]["unique"] == 1, (
+        "and it carries the guest who had just been minted — which is what the "
+        "planner reads to name the keyframe (captureKeyframe/person_keys)"
+    )
+
+
+def test_a_forced_round_still_obeys_the_duty_guard():
+    """The mint bypasses the INTERVAL, never the guard that killed the spiral.
+
+    A run whose matcher minted on every frame would otherwise force a full
+    round per frame and reinstate the 0.4 fps lock-in exactly. Mints are rare
+    by construction, so a healthy run never meets this — but a sick one must
+    not be able to take the loop down with it.
+    """
+    script = [scripted_verdict(f"p{i:05d}", True, 0.10) for i in range(1, 5)]
+    fake = V1Fake(n_frames=4, face_widths=(60.0,), match_script=script)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    # A duty factor with a measurable cost: the guard must defer some rounds
+    # even though every single frame minted. heal_window_s=0 for the same
+    # reason as the test above.
+    final = make_loop(fake, request, tap_interval_s=0.0, tap_duty_factor=1e6,
+                      heal_window_s=0.0).run()
+
+    assert final["unique"] == 4, "counting is never what gets sacrificed"
+    assert final["tapRoundsDeferred"] > 0, (
+        "a mint may jump the interval queue; it may not outrun the cost guard"
+    )
