@@ -125,7 +125,7 @@ def test_build_payloads_covers_the_five_stages():
     }
     out = taps.build_payloads(last, 56.0, 80.0, unique=1, staff_crossings=0)
     assert set(out) == {"ingest", "person-detect", "track", "face-detect", "match"}
-    assert out["ingest"] == {"tMs": 500, "seq": 5}
+    assert out["ingest"] == {"tMs": 500, "seq": 5, "width": None, "height": None}
     assert out["match"]["unique"] == 1
 
 
@@ -156,3 +156,25 @@ def test_face_payload_zone_excluded_faces_are_visible_but_uncounted():
     assert row["excludedByZone"] is True
     assert row["zone"] == "frosted partition"
     assert row["gate"] == "zone"
+
+
+def _sof_jpeg(width: int, height: int) -> bytes:
+    """A minimal JPEG head: SOI, one APP0, then an SOF0 with the given size."""
+    app0 = b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof0 = bytes(
+        [0xFF, 0xC0, 0x00, 0x0B, 0x08, height >> 8, height & 0xFF, width >> 8, width & 0xFF, 0x01]
+    )
+    return b"\xff\xd8" + app0 + sof0
+
+
+def test_jpeg_dims_reads_the_sof_header_and_refuses_garbage():
+    """Native dimensions come from a byte scan, not a decoder — and anything
+    that is not a scannable JPEG answers None, never a guess."""
+    assert taps.jpeg_dims(_sof_jpeg(3840, 2160)) == (3840, 2160)
+    assert taps.jpeg_dims(_sof_jpeg(1, 1)) == (1, 1)
+    assert taps.jpeg_dims(b"not a jpeg at all") is None
+    assert taps.jpeg_dims(b"") is None
+    assert taps.jpeg_dims(b"\xff\xd8\xff") is None  # truncated before any SOF
+    # A DHT (0xC4) shares the SOF numeric range but is not a frame header.
+    dht = b"\xff\xc4\x00\x04\x00\x00"
+    assert taps.jpeg_dims(b"\xff\xd8" + dht + _sof_jpeg(640, 480)[2:]) == (640, 480)

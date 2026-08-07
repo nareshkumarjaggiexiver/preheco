@@ -265,6 +265,7 @@ class PlannerClient:
         jpeg: bytes,
         filename: str = "frame.jpg",
         content_type: str = "image/jpeg",
+        extra: dict | None = None,
     ) -> bool:
         """Best-effort multipart POST of one stage's annotated JPEG frame.
 
@@ -275,8 +276,15 @@ class PlannerClient:
         if self.file_transport is None:
             return False
         url = f"{self.base_url}/api/pipeline/runs/{self._require_run()}/frames"
+        # Multipart text fields ride beside the stage name; the forensic path
+        # uses them to hand the planner seq/tMs and the NATIVE dimensions the
+        # overlay scaling needs. None-valued fields are simply not sent.
+        fields = {"stage": stage}
+        for k, v in (extra or {}).items():
+            if v is not None:
+                fields[k] = str(v)
         try:
-            status, _ = self.file_transport(url, {"stage": stage}, filename, jpeg, content_type)
+            status, _ = self.file_transport(url, fields, filename, jpeg, content_type)
         except Exception:  # noqa: BLE001 — best-effort, never propagate
             return False
         return status < 400
