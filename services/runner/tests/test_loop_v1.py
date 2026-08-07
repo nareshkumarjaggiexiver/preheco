@@ -2832,3 +2832,187 @@ def test_one_body_is_one_guest_even_when_its_two_crops_clash():
     assert final["unique"] == 1, "one man and his phone are one guest"
     assert [b for b in fake.match_bodies if b.get("excludeKeys")] == []
     assert fake.forgets == []
+
+
+# ------------------------- face cards (the register's picture of one guest)
+#
+# ASKED FOR 2026-08-07: "sometimes all images of that guest come with other
+# people ... it is hard to find who it is."  The register showed whole
+# annotated frames and a busy doorway holds three people, so identifying a
+# guest meant reading a small label off a still.  A card is that guest's face,
+# cut out of the frame, keyed by identity.
+
+
+class Cards(V1Fake):
+    """V1Fake that records face-card uploads separately from stage frames.
+
+    ``no_bodies`` serves faces with NO person boxes at all — the case that
+    proves a card does not depend on the torso descriptor's geometry.
+    """
+
+    def __init__(self, no_bodies=False, faces_status=201, **kw):
+        kw.setdefault("image_b64", solid_jpeg_b64(RED_BGR, w=320, h=300))
+        super().__init__(**kw)
+        self.no_bodies = no_bodies
+        self.faces_status = faces_status
+        self.cards: list[str] = []  # raw body of each card POST, in order
+
+    def handler(self, request):
+        """Optionally serve a frame with faces but no person boxes."""
+        if self.no_bodies and request.url.host == "persons":
+            self.calls.append("persons /detect")
+            return httpx.Response(200, json={"boxes": []})
+        return super().handler(request)
+
+    def _planner(self, request, path, body):
+        if path.endswith("/faces"):
+            self.cards.append(request.content)
+            return httpx.Response(self.faces_status, json={"ok": self.faces_status < 400})
+        return super()._planner(request, path, body)
+
+
+def test_a_guest_gets_a_face_card_and_it_rides_the_tap_round(monkeypatch):
+    """Cropped in the frame loop, POSTED in the round — never the other way.
+
+    Frame uploads on the hot path are what produced the 0.4 fps death spiral
+    the tap duty guard exists to prevent, and a thumbnail must never cost a
+    guest.  So the crop is CPU inside the loop and the network is inside the
+    budgeted round.
+    """
+    fake = Cards(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.cards, "the guest got a picture"
+    # And the run SAYS so. A register showing "no face" for every guest while
+    # the runner believes it photographed them is the failure this counter
+    # exists to make visible.
+    assert final["faceCardsPosted"] == len(fake.cards)
+    assert fake.run_ended["results"]["faceCardsPosted"] == len(fake.cards), (
+        "the figure on the permanent record, not just the key"
+    )
+    body = fake.cards[0]
+    assert b"personKey" in body, "keyed by identity, because that is the filename"
+    assert b"\xff\xd8\xff" in body, "and it really is a JPEG"
+
+
+def test_a_clearly_better_look_replaces_the_card_and_a_marginal_one_does_not():
+    """BEST face, not first — but not EVERY face either.
+
+    The first look at somebody is often the worst: run 0f5c6d minted p00003
+    from a 29 px face with a phone across it while matching other guests all
+    evening at 44-60 px, so a card fixed at mint hands the register exactly
+    the picture that made the identity ambiguous. But re-uploading on every
+    marginally wider face turns a guest walking towards the camera into
+    hundreds of round trips inside the tap round's budget. So a replacement
+    must beat the last by a MARGIN, which bounds the cards per guest to a
+    handful however far they walk.
+    """
+    fake = Cards(n_frames=1)
+    loop = make_loop(
+        fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}}, face_card_improve=1.25
+    )
+    img = solid_image(RED_BGR, w=320, h=300)
+    at = lambda w: {"box": {"x": 40, "y": 30, "w": w, "h": 78}}  # noqa: E731
+
+    loop._maybe_face_card(img, at(60.0), {"personKey": "p00001"})
+    assert loop._face_pending["p00001"][1] == 60.0
+
+    loop._maybe_face_card(img, at(70.0), {"personKey": "p00001"})  # 1.17x
+    assert loop._face_pending["p00001"][1] == 60.0, "marginal: the card stands"
+
+    loop._maybe_face_card(img, at(80.0), {"personKey": "p00001"})  # 1.33x
+    assert loop._face_pending["p00001"][1] == 80.0, "clearly better: replaced"
+
+
+def test_a_card_the_planner_refused_stays_pending_for_the_next_round():
+    """A dropped upload must not be recorded as a picture that exists.
+
+    Clearing the pending crop on a failed POST would leave the guest with no
+    card and nothing to retry from — the register would show "no face" forever
+    for somebody the runner had photographed perfectly well.
+    """
+    fake = Cards(n_frames=1, faces_status=500)
+    loop = make_loop(fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}})
+    loop.planner.create_run(event_id="ev-1")
+    img = solid_image(RED_BGR, w=320, h=300)
+    face = {"box": {"x": 40, "y": 30, "w": 60, "h": 78}}
+    loop._maybe_face_card(img, face, {"personKey": "p00001"})
+
+    loop._flush_face_cards(time.monotonic() + 5)
+
+    assert fake.cards, "it really tried"
+    assert "p00001" in loop._face_pending, "and kept the crop for the next round"
+    assert loop.status()["faceCardsPosted"] == 0, "a refused upload is not a card"
+
+
+def test_staff_never_get_a_face_card():
+    """They are held out of the guest count, and out of the register with it.
+
+    Putting a staff likeness in a register they do not appear in would store a
+    face for a purpose nobody attested to — the consent boundary the whole
+    staff whitelist is built around.
+    """
+    fake = Cards(n_frames=2, face_widths=(85.0,), staff_width=85.0)
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["staffCrossings"] > 0, "the fixture really produced staff hits"
+    assert fake.cards == []
+
+
+def test_an_undecodable_frame_costs_no_card_and_no_run():
+    """A stub frame yields no picture and no exception — a card is best-effort."""
+    fake = Cards(n_frames=2, face_widths=(85.0,), image_b64="ZmFrZS1qcGVn")
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+    assert fake.cards == []
+    assert final["faceCardsPosted"] == 0
+
+
+def test_a_guest_the_body_detector_missed_still_gets_a_face_card():
+    """A card needs a FACE, not a person box.
+
+    The frame is decoded for two different readers: the torso descriptor,
+    which cannot work without a person box, and the face card, which can. A
+    decode condition written for the first quietly denies a picture to every
+    guest the body detector lost — and a guest the pipeline half-saw is
+    exactly the one an operator will want to look at.
+    """
+    fake = Cards(n_frames=2, face_widths=(85.0,), no_bodies=True)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["matches"] > 0, "the fixture really matched somebody"
+    assert fake.cards, "and they have a picture despite having no person box"
+
+
+def test_maybe_face_card_refuses_staff_a_box_less_face_and_a_dead_frame():
+    """The three refusals, exercised directly.
+
+    Staff are excluded twice over — they `continue` out of the verdict loop
+    before this is ever called, AND this refuses them — because the structural
+    guarantee is a consequence of where the call sits today, and where a call
+    sits is the kind of thing that changes. A staff likeness stored for a
+    register they do not appear in is a consent boundary, not a cosmetic one,
+    so it gets a lock of its own.
+    """
+    fake = Cards(n_frames=1)
+    loop = make_loop(fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}})
+    img = solid_image(RED_BGR, w=320, h=300)
+    face = {"box": {"x": 40, "y": 30, "w": 60, "h": 78}}
+
+    loop._maybe_face_card(img, face, {"personKey": "p00001"})
+    assert "p00001" in loop._face_pending, "an ordinary guest IS carded"
+
+    loop._maybe_face_card(img, face, {"personKey": "st-1", "isStaff": True})
+    assert "st-1" not in loop._face_pending
+
+    loop._maybe_face_card(img, {"box": None}, {"personKey": "p00002"})
+    assert "p00002" not in loop._face_pending
+
+    loop._maybe_face_card(img, {"box": {"x": 1, "y": 1, "w": 0, "h": 9}}, {"personKey": "p00004"})
+    assert "p00004" not in loop._face_pending, "a zero-width box is not a face"
+
+    loop._maybe_face_card(None, face, {"personKey": "p00003"})
+    assert "p00003" not in loop._face_pending
