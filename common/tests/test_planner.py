@@ -318,3 +318,148 @@ def test_a_rejected_token_on_the_best_effort_path_is_counted_not_shrugged_off():
     assert pc.auth_failures == 1, "the refusal is recorded"
     pc.staff_tombstones("site1")
     assert pc.auth_failures == 2
+
+
+# ------------------------------------------------ auth-service tokens (v2)
+
+class StubProvider:
+    """A TokenProvider stand-in that records what the client asked it to do."""
+
+    def __init__(self, tokens=("t1", "t2", "t3")):
+        self._tokens = list(tokens)
+        self.current = self._tokens.pop(0)
+        self.forced = 0
+        self.rejected = 0
+        self.last_error = None
+
+    def auth_header(self, *, block=False):
+        """The header the client would send right now."""
+        return {"Authorization": f"Bearer {self.current}"}
+
+    def force_refresh(self):
+        """Record the forced refresh and advance to the next scripted token."""
+        self.forced += 1
+        if self._tokens:
+            self.current = self._tokens.pop(0)
+        return self.current
+
+    def mark_rejected(self):
+        """Record a flag-only rejection (no network)."""
+        self.rejected += 1
+
+
+def test_a_401_with_a_provider_refreshes_once_and_retries_once():
+    """A rotation must not need a restart. The token in hand was refused, so it
+    is replaced and the call goes again — exactly once, because a second 401 is
+    configuration, not a stale token."""
+    provider = StubProvider()
+    pc, ft, naps = _client([(401, {"code": "auth"}), (200, {"id": 9})], token_provider=provider)
+
+    assert pc.create_run(event_id="e1") == 9
+    assert provider.forced == 1, "exactly one refresh"
+    assert len(ft.calls) == 2, "and exactly one retry"
+    assert naps == [], "the retry is immediate — nothing was hung, only stale"
+
+
+def test_a_second_401_after_refreshing_fails_loudly_and_names_the_variables():
+    """Once the refresh is spent, a 401 is configuration — say what to fix."""
+    provider = StubProvider()
+    provider.last_error = "the auth service refused this application: invalid_client"
+    pc, ft, _ = _client([(401, {}), (401, {})], token_provider=provider, retries=3)
+
+    with pytest.raises(PlannerError) as exc:
+        pc.create_run(event_id="e1")
+    message = str(exc.value)
+    assert "HECO_APP_ID" in message and "HECO_APP_SECRET" in message
+    assert "HECO_AUTH_URL" in message
+    assert "invalid_client" in message, "say what the auth service actually said"
+    assert provider.forced == 1, "no second refresh — that would bury the problem"
+    assert len(ft.calls) == 2
+
+
+def test_the_best_effort_path_flags_a_401_without_spending_a_refresh_inline():
+    """Its latency budget is the frame loop's. Flag it; the next ordinary read
+    picks the refresh up."""
+    provider = StubProvider()
+    pc, _, _ = _client([(401, {}), (401, {})], token_provider=provider)
+    pc.staff_tombstones("site1")
+
+    assert pc.auth_failures == 1
+    assert provider.rejected == 1, "flagged"
+    assert provider.forced == 0, "but not refreshed inline"
+
+
+def test_multipart_uploads_count_their_401s_too():
+    """THE GAP: frames and face cards swallowed their statuses whole, so a
+    runner whose credential had been refused posted into a 401 all night with
+    auth_failures at zero and nothing in any log."""
+    provider = StubProvider()
+
+    def file_transport(url, fields, filename, data, content_type):
+        return 401, {}
+
+    pc = PlannerClient(
+        "http://planner:8787",
+        transport=FakeTransport(),
+        file_transport=file_transport,
+        token_provider=provider,
+    )
+    pc.create_run(event_id="e1")
+
+    assert pc.post_frame("ingest", b"jpegbytes") is False
+    assert pc.auth_failures == 1, "the debug-frame upload must count its refusal"
+    assert pc.post_face_card("p-1", b"jpegbytes") is False
+    assert pc.auth_failures == 2, "and so must the face card"
+    assert provider.rejected == 2
+
+
+def test_a_successful_upload_is_not_counted_as_a_failure():
+    """An accepted upload must not inflate the auth-failure count."""
+    def file_transport(url, fields, filename, data, content_type):
+        return 200, {}
+
+    pc = PlannerClient(
+        "http://planner:8787", transport=FakeTransport(), file_transport=file_transport
+    )
+    pc.create_run(event_id="e1")
+    assert pc.post_frame("ingest", b"x") is True
+    assert pc.auth_failures == 0
+
+
+def test_the_header_is_read_per_request_so_a_rotation_is_invisible():
+    """The predecessor computed Authorization once at construction, which is
+    exactly why rotating meant restarting the runner."""
+    from heco_common.planner import provider_urllib_transport
+
+    provider = StubProvider()
+    sent: list[str] = []
+
+    def fake_urllib(method, url, payload, token=None, extra_headers=None):
+        sent.append((extra_headers or {}).get("Authorization"))
+        return 200, {}
+
+    import heco_common.planner as planner_module
+
+    original = planner_module.urllib_transport
+    planner_module.urllib_transport = fake_urllib
+    try:
+        transport = provider_urllib_transport(provider)
+        transport("POST", "http://p/x", {})
+        provider.force_refresh()
+        transport("POST", "http://p/x", {})
+    finally:
+        planner_module.urllib_transport = original
+
+    assert sent == ["Bearer t1", "Bearer t2"], "the second call carried the NEW token"
+
+
+def test_a_static_token_still_fails_fast_and_offers_both_ways_out():
+    """The legacy path is untouched: with no provider there is nothing to
+    refresh, so a 401 is configuration and must say so immediately."""
+    pc, ft, _ = _client([(401, {}), (200, {})], token="wrong-secret", retries=3)
+    with pytest.raises(PlannerError) as exc:
+        pc.create_run(event_id="e1")
+    assert len(ft.calls) == 1, "no retry without a provider"
+    assert "HECO_APP_ID" in str(exc.value), "point at the new way"
+    assert "HECO_TOKEN" in str(exc.value), "and name the old one that is set"
+    assert "sent the wrong one" in str(exc.value)

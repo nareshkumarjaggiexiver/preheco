@@ -22,9 +22,18 @@ class Settings:
     match_url: str = "http://match:7106"
     # The site-planner app on the host machine (see docker-compose extra_hosts).
     planner_url: str = "http://host.docker.internal:8787"
-    # The planner's shared secret. Required whenever the planner is exposed
-    # beyond loopback — which it refuses to be without one — so any runner
-    # reaching the host across the docker bridge needs this set.
+    # The auth service (apps/heco-auth) and this runner's application
+    # credential. With these three set the runner mints its own short-lived
+    # tokens and refreshes them before they lapse — no restart to rotate, and
+    # nothing long-lived on the wire. This is the way in.
+    auth_url: str | None = None
+    app_id: str | None = None
+    app_secret: str | None = None
+
+    # LEGACY. The planner's shared secret, one string for every process and
+    # every browser. Kept so an existing lab keeps working untouched while the
+    # migration lands; removed at step 7 of the runbook. When the three fields
+    # above are set, this is ignored.
     planner_token: str | None = None
 
     # POC quality gate (CONTRACTS.md "POC geometry"): 2.8 mm camera at 2.0 m,
@@ -320,6 +329,9 @@ def from_env() -> Settings:
         embed_url=os.environ.get("HECO_EMBED_URL", s.embed_url),
         match_url=os.environ.get("HECO_MATCH_URL", s.match_url),
         planner_url=os.environ.get("PLANNER_URL", s.planner_url),
+        auth_url=os.environ.get("HECO_AUTH_URL") or s.auth_url,
+        app_id=os.environ.get("HECO_APP_ID") or s.app_id,
+        app_secret=os.environ.get("HECO_APP_SECRET") or s.app_secret,
         planner_token=os.environ.get("HECO_TOKEN") or s.planner_token,
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),

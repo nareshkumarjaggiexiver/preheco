@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from heco_common.auth import TokenProvider
 from heco_common.logs import safe, setup_logging
 
 from .clients import EvalHttpError, IngestProbe, PlannerReader, RunnerClient
@@ -386,7 +387,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--planner-url", default=os.environ.get("PLANNER_URL", "http://localhost:8787")
     )
-    p.add_argument("--planner-token", default=os.environ.get("HECO_TOKEN"))
+    # The auth service, and this harness's own application credential. It is a
+    # SEPARATE application from the runner's: an eval sweep that goes wrong
+    # should be revocable without stopping a venue from counting.
+    p.add_argument("--auth-url", default=os.environ.get("HECO_AUTH_URL"))
+    p.add_argument("--app-id", default=os.environ.get("HECO_EVAL_APP_ID"))
+    p.add_argument("--app-secret", default=os.environ.get("HECO_EVAL_APP_SECRET"))
+    p.add_argument(
+        "--planner-token",
+        default=os.environ.get("HECO_TOKEN"),
+        help="LEGACY shared secret; prefer --auth-url with --app-id/--app-secret",
+    )
     p.add_argument(
         "--ingest-url", default=os.environ.get("HECO_INGEST_URL", "http://localhost:7101")
     )
@@ -479,9 +490,21 @@ def main(argv: list[str] | None = None) -> int:
         previous = json.loads(json_path.read_text(encoding="utf-8"))
         log.info(f"resuming from {json_path}")
 
+    provider = None
+    if args.auth_url and args.app_id and args.app_secret:
+        provider = TokenProvider(args.auth_url, args.app_id, args.app_secret)
+    elif any((args.auth_url, args.app_id, args.app_secret)):
+        # Half a credential reads as "authentication is configured" and then
+        # fails as 401s hours into a sweep. Refuse before a single clip runs.
+        log.error(
+            "give all of --auth-url, --app-id and --app-secret, or none of them "
+            "(HECO_AUTH_URL / HECO_EVAL_APP_ID / HECO_EVAL_APP_SECRET)"
+        )
+        return 1
+
     clip_runner = ClipRunner(
         RunnerClient(args.runner_url),
-        PlannerReader(args.planner_url, token=args.planner_token),
+        PlannerReader(args.planner_url, token=args.planner_token, token_provider=provider),
         log=log,
     )
     started_at = datetime.now(UTC).isoformat()
