@@ -21,10 +21,17 @@ import time
 import uuid
 
 import httpx
+from heco_common.auth import TokenProvider
 from heco_common.planner import PlannerClient
 
 from .config import Settings
-from .loop import RunLoop, httpx_file_transport, httpx_transport
+from .loop import (
+    RunLoop,
+    auth_for,
+    build_token_provider,
+    httpx_file_transport,
+    httpx_transport,
+)
 
 #: States in which a run is still using its downstream resources (the camera
 #: above all).  Anything else has finished, however it finished.
@@ -34,9 +41,16 @@ LIVE_STATES = frozenset({"starting", "running", "enrolling"})
 class RunManager:
     """Holds this runner process's live runs, and recently settled ones."""
 
-    def __init__(self, settings: Settings) -> None:
-        """Create an empty registry bound to one Settings snapshot."""
+    def __init__(self, settings: Settings, token_provider: TokenProvider | None = None) -> None:
+        """Create an empty registry bound to one Settings snapshot.
+
+        ONE token provider for the whole process, built here and shared by every
+        run: the credential belongs to this runner, not to a run, and a provider
+        per run would mint a token per run and lose the refresh schedule every
+        time a run ended.
+        """
         self.settings = settings
+        self.token_provider = token_provider or build_token_provider(settings)
         self._runs: dict[str, RunLoop] = {}
         self._threads: dict[str, threading.Thread] = {}
         # run_id -> monotonic time we FIRST observed its thread finished.
@@ -61,17 +75,19 @@ class RunManager:
         settings = self.settings
         planner_url = request.get("plannerUrl") or settings.planner_url
         client = httpx.Client(timeout=settings.request_timeout_s)
-        # The planner's token rides on the CLIENT, so both the JSON transports
-        # and the multipart frame upload carry it without each adapter having
-        # to know about auth. Absent when the planner is loopback-only, which
-        # is the default and needs no token.
-        # Passed only when there IS a token, so the loopback default keeps the
-        # plain two-argument construction (which test doubles rely on).
-        auth = (
-            {"headers": {"Authorization": f"Bearer {settings.planner_token}"}}
-            if settings.planner_token
-            else {}
-        )
+        # WHERE THE CREDENTIAL RIDES, and why it moved.
+        #
+        # It used to be a static header baked into the httpx client at
+        # construction — which is exactly why rotating the secret meant
+        # restarting this process, and why a botched restart order cost four
+        # interruptions in one day. httpx.Auth is consulted per request, so the
+        # token these clients send is whatever the provider currently holds,
+        # including one minted seconds ago by a background refresh.
+        #
+        # It still rides on the CLIENT rather than in each call, so the JSON
+        # transports and the multipart frame upload all carry it without any
+        # adapter having to know about auth.
+        auth = auth_for(settings, self.token_provider)
         planner_http = httpx.Client(timeout=settings.planner_timeout_s, **auth)
         report_http = httpx.Client(timeout=settings.report_timeout_s, **auth)
         planner = PlannerClient(
@@ -80,6 +96,7 @@ class RunManager:
             best_effort_transport=httpx_transport(report_http),
             file_transport=httpx_file_transport(report_http),
             token=settings.planner_token,
+            token_provider=self.token_provider,
         )
         loop = RunLoop(run_id, request, settings, client, planner, is_live_run=self._is_live)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)

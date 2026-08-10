@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 from app.appearance import intersection, torso_descriptor
 from app.config import Settings
-from app.loop import RunLoop, httpx_file_transport, httpx_transport
+from app.loop import RunLoop, TokenAuth, httpx_file_transport, httpx_transport
+from heco_common.auth import TokenProvider
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.planner import PlannerClient
 
@@ -89,6 +90,15 @@ class V1Fake:
         self.merge_ok = True  # False once the drop key no longer exists
         self.merge_always_ok = False  # True: distinct drops all succeed (multi-heal)
         self.feedback_sticky = False  # re-serve open items until a PUT lands
+        # AUTH (v2). The fake mints tokens like the real service: `mints`
+        # counts them, and `reject_planner_auth` makes the planner refuse
+        # anything but the newest — so a test can prove that a rotation is
+        # picked up mid-run without restarting anything.
+        self.mints = 0
+        self.token_lifetime = 48 * 3600
+        self.auth_status = 200
+        self.reject_planner_auth = False
+        self.planner_401s = 0
 
     # -- helpers -----------------------------------------------------------
 
@@ -236,7 +246,29 @@ class V1Fake:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 body = {}
 
+        if host == "auth":
+            if path == "/token":
+                self.mints += 1
+                if self.auth_status >= 400:
+                    return httpx.Response(
+                        self.auth_status, json={"code": "invalid_client", "error": "no"}
+                    )
+                return httpx.Response(200, json={
+                    "access_token": f"tok-{self.mints}",
+                    "token_type": "Bearer",
+                    "expires_in": self.token_lifetime,
+                    "scope": "planner:report",
+                })
+            return httpx.Response(404, json={})
+
         if host == "planner":
+            if self.reject_planner_auth:
+                # Only the newest minted token is accepted — which is what a
+                # rotation looks like from this side.
+                sent = request.headers.get("authorization", "")
+                if sent != f"Bearer tok-{self.mints}":
+                    self.planner_401s += 1
+                    return httpx.Response(401, json={"code": "auth", "error": "no"})
             return self._planner(request, path, body)
         if host == "ingest":
             if path == "/open":
@@ -301,6 +333,43 @@ def make_loop(fake: V1Fake, request: dict, **settings_kw) -> RunLoop:
         file_transport=httpx_file_transport(client),
     )
     return RunLoop("run-local", request, settings, client, planner)
+
+
+def make_authed_loop(fake: V1Fake, request: dict, **settings_kw) -> tuple[RunLoop, TokenProvider]:
+    """A RunLoop wired the way RunManager wires production: one provider, its
+    header read per request through httpx.Auth."""
+    settings = Settings(
+        ingest_url="http://ingest:7101", persons_url="http://persons:7102",
+        tracker_url="http://tracker:7103", faces_url="http://faces:7104",
+        embed_url="http://embed:7105", match_url="http://match:7106",
+        planner_url="http://planner:8787",
+        auth_url="http://auth", app_id="runner", app_secret="sekrit",
+        **{"flush_interval_s": 0.0, "source_poll_s": 0.001, "source_stall_s": 0.05,
+           **settings_kw},
+    )
+    mock = httpx.MockTransport(fake.handler)
+    provider = TokenProvider(
+        settings.auth_url, settings.app_id, settings.app_secret,
+        transport=lambda url, payload: _mock_token_call(mock, url, payload),
+        jitter_s=0,
+    )
+    client = httpx.Client(transport=mock)
+    authed = httpx.Client(transport=mock, auth=TokenAuth(provider))
+    planner = PlannerClient(
+        settings.planner_url,
+        transport=httpx_transport(authed),
+        best_effort_transport=httpx_transport(authed),
+        file_transport=httpx_file_transport(authed),
+        token_provider=provider,
+    )
+    return RunLoop("run-local", request, settings, client, planner), provider
+
+
+def _mock_token_call(mock: httpx.MockTransport, url: str, payload: dict) -> tuple[int, dict]:
+    """Speak to the fake auth service through the same MockTransport."""
+    with httpx.Client(transport=mock) as c:
+        r = c.post(url, json=payload)
+        return r.status_code, (r.json() if r.content else {})
 
 
 # --------------------------------------------------------------------------
@@ -3167,3 +3236,100 @@ def test_the_ledger_counters_reach_the_permanent_record():
     results = fake.run_ended["results"]
     assert results["frameRecordsPosted"] == 4
     assert results["frameRecordsDropped"] == 0
+
+
+# ------------------------------------------------- auth service (v2)
+
+
+def test_a_run_mints_one_token_and_reuses_it_for_every_call():
+    """A run is not a reason to mint a credential. One token carries the whole
+    thing — stats, samples, taps, frames — or the auth service becomes a
+    dependency of the frame loop."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    fake.reject_planner_auth = True  # a planner that genuinely gates, as in production
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    loop, provider = make_authed_loop(fake, request, tap_interval_s=0.0)
+
+    final = loop.run()
+    assert final["state"] == "ended"
+    assert fake.mints == 1, f"{fake.mints} tokens minted for one run"
+    assert provider.refresh_failures == 0
+    # NOT ONE refused request, including the very first. A runner that does not
+    # wait for its first token opens every run with a wasted 401 — harmless
+    # once, and indistinguishable from a real problem in a log.
+    assert fake.planner_401s == 0
+    assert final["plannerAuthFailures"] == 0
+    assert fake.run_created is not None, "and the run actually reported"
+
+
+def test_a_rotation_mid_run_is_picked_up_without_restarting_anything():
+    """THE POINT OF THE WHOLE MIGRATION. The planner starts refusing the token
+    in hand; the runner refreshes, retries, and the run continues. Under the
+    old static header this was a restart, and getting the restart order wrong
+    cost four interruptions in a single day."""
+    fake = V1Fake(n_frames=2, face_widths=(85.0,))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    loop, provider = make_authed_loop(fake, request)
+
+    # The credential is rotated at the auth service before the run opens, so
+    # the token this runner is about to present is already stale.
+    fake.reject_planner_auth = True
+    provider.token()          # mints tok-1
+    fake.mints += 1           # the service has moved on; tok-1 is now old
+
+    final = loop.run()
+    assert final["state"] == "ended", "the run survived the rotation"
+    assert fake.planner_401s >= 1, "the stale token really was refused"
+    assert fake.run_created is not None, "and the retry landed"
+
+
+def test_create_run_refused_twice_fails_loudly_and_names_the_variables():
+    """Once the refresh has been spent, a 401 is configuration. It must stop the
+    run with a message an operator can act on, not retry into the dark."""
+    fake = V1Fake(n_frames=1)
+    fake.reject_planner_auth = True
+    fake.auth_status = 401  # and the auth service will not mint a new one either
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    loop, _ = make_authed_loop(fake, request)
+
+    final = loop.run()
+    assert final["state"] == "failed"
+    assert "HECO_APP_ID" in final["error"] or "HECO_APP_SECRET" in final["error"]
+
+
+def test_refused_taps_are_reported_even_when_the_run_has_no_site():
+    """THE OBSERVABILITY GAP, as a regression test. Auth failures used to
+    surface only from the erasure poll, which only runs for a run with a
+    siteId. A bench run could 401 every tap all night and say so nowhere."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}  # NO siteId
+    loop, _ = make_authed_loop(fake, request, tap_interval_s=0.0)
+
+    # Everything is refused except opening and closing the run, so the loop
+    # runs to completion while its reporting is being rejected.
+    original = fake._planner
+
+    def refuse_taps(req, path, body):
+        if path.endswith(("/taps", "/frames", "/stats")):
+            return httpx.Response(401, json={"code": "auth"})
+        return original(req, path, body)
+
+    fake._planner = refuse_taps
+    final = loop.run()
+
+    assert final["state"] == "ended", "reporting failures must never stop the count"
+    assert final["plannerAuthFailures"] > 0, "a refused credential is a fact about the run"
+
+
+def test_an_unreachable_auth_service_is_named_in_the_run_status():
+    """The venue's internet is down and the runner has never held a token. The
+    count still runs; the reason reporting is failing is on the record."""
+    fake = V1Fake(n_frames=2, face_widths=(85.0,))
+    fake.auth_status = 503
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    loop, provider = make_authed_loop(fake, request)
+
+    final = loop.run()
+    assert provider.refresh_failures >= 1
+    assert final["tokenRefreshFailures"] >= 1
+    assert final["tokenLastError"], "say what the auth service said, in the status"

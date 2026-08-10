@@ -59,6 +59,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 import httpx
+from heco_common.auth import TokenProvider
 from heco_common.geometry import dedupe_boxes, point_in_polygon
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
@@ -104,6 +105,66 @@ class StageError(RuntimeError):
         """Record the message and the HTTP status the stage answered with."""
         super().__init__(message)
         self.status_code = status_code
+
+
+class TokenAuth(httpx.Auth):
+    """Attach ``Authorization`` to every request, read AT REQUEST TIME.
+
+    The one line that ends restart-to-rotate. httpx consults an Auth object per
+    request, so a token minted thirty seconds ago by a background refresh is on
+    the very next call — where a header baked into the client at construction
+    would have needed the process restarted to change.
+
+    It waits for the FIRST token and never for a refresh. Without a token
+    there is nothing to send and the request is guaranteed to fail, so waiting
+    is the only sensible thing; once one is in hand a refresh happens on
+    another thread and this returns immediately. When even the first mint fails
+    the header is simply absent and the request goes out unauthenticated — it
+    comes back 401, which is counted and visible in the run's status, rather
+    than stopping the count.
+    """
+
+    def __init__(self, provider: TokenProvider) -> None:
+        self._provider = provider
+
+    def auth_flow(self, request):
+        """httpx calls this per request; the header is decided here, not earlier."""
+        for name, value in self._provider.auth_header(block=True).items():
+            request.headers[name] = value
+        yield request
+
+
+def auth_for(settings, provider: TokenProvider | None) -> dict:
+    """The httpx client kwargs that carry this runner's credential.
+
+    Returns ``{}`` for loopback development with nothing configured — which
+    keeps the plain two-argument client construction the test doubles rely on.
+    """
+    if provider is not None:
+        return {"auth": TokenAuth(provider)}
+    if settings.planner_token:
+        # LEGACY: one shared secret, static for the life of the process.
+        return {"headers": {"Authorization": f"Bearer {settings.planner_token}"}}
+    return {}
+
+
+def build_token_provider(settings) -> TokenProvider | None:
+    """A provider when this runner has an application credential, else None.
+
+    All three of auth_url/app_id/app_secret or nothing: a partial configuration
+    is a deployment mistake that would otherwise show up as unexplained 401s at
+    a venue, so it says so at boot instead.
+    """
+    parts = (settings.auth_url, settings.app_id, settings.app_secret)
+    if not any(parts):
+        return None
+    if not all(parts):
+        raise ValueError(
+            "incomplete auth configuration: set all of HECO_AUTH_URL, HECO_APP_ID "
+            "and HECO_APP_SECRET, or none of them (and keep HECO_TOKEN for the "
+            "pre-migration shared secret)"
+        )
+    return TokenProvider(settings.auth_url, settings.app_id, settings.app_secret)
 
 
 def httpx_transport(client: httpx.Client) -> Transport:
@@ -428,6 +489,8 @@ class RunLoop:
             "manualAdditions": 0,
             "staffPurged": 0,
             "plannerAuthFailures": 0,
+            "tokenRefreshFailures": 0,
+            "tokenLastError": None,
             "sampleCount": 0,
             "samplesDropped": 0,
             "multiFaceFramesSkipped": 0,
@@ -3254,6 +3317,23 @@ class RunLoop:
         except Exception:  # noqa: BLE001 — reporting must never stop counting
             self._bump("plannerReportErrors")
         self._set(samplesDropped=self.samples.dropped)
+        # THE GAP THIS CLOSES: refused credentials were surfaced only from the
+        # erasure poll, which only runs for a run that HAS a siteId. A run
+        # without one — a bench run, a quick gate test — could 401 every tap and
+        # every frame upload all night and say so in no status field anywhere.
+        # Reported here instead, from the flush that runs ~4x a second for every
+        # run there is. Absent is not zero: a rejected credential is a fact
+        # about the run and belongs in the run's own status.
+        if self.planner.auth_failures:
+            self._set(plannerAuthFailures=self.planner.auth_failures)
+        provider = getattr(self.planner, "token_provider", None)
+        if provider is not None and provider.refresh_failures:
+            self._set(
+                tokenRefreshFailures=provider.refresh_failures,
+                # The sentence the auth service actually gave, carried all the
+                # way to the console so nobody has to read a container log.
+                tokenLastError=provider.last_error,
+            )
 
 
 def _fmt(x) -> str:

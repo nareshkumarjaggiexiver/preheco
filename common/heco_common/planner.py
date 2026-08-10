@@ -46,8 +46,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from .schemas import MetricSummary, PlannerRunCreate, PlannerRunEnd, Sample, StageStats
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    # Imported for the annotation alone. This client needs three methods from a
+    # provider (auth_header, force_refresh, mark_rejected) and nothing else, so
+    # it stays structurally typed: a test double is a provider if it behaves
+    # like one, with no base class to inherit.
+    from .auth import TokenProvider
 
 #: Contract cap on samples per POST.
 MAX_SAMPLES_PER_POST = 200
@@ -79,8 +87,27 @@ def bearer_urllib_transport(token: str) -> "Transport":
     return transport
 
 
+def provider_urllib_transport(provider: "TokenProvider") -> "Transport":
+    """A stdlib transport that asks the provider for a header on EVERY call.
+
+    The predecessor computed ``Authorization`` once, when the client was built,
+    which is precisely why rotating the credential meant restarting the runner.
+    One line moved; a whole class of restart disappeared.
+    """
+
+    def transport(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
+        header = provider.auth_header(block=True)
+        return urllib_transport(method, url, payload, extra_headers=header)
+
+    return transport
+
+
 def urllib_transport(
-    method: str, url: str, payload: dict | None, token: str | None = None
+    method: str,
+    url: str,
+    payload: dict | None,
+    token: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, dict]:
     """Default stdlib transport: JSON in, JSON out, 10 s timeout.
 
@@ -95,6 +122,7 @@ def urllib_transport(
         headers={
             **({"Content-Type": "application/json"} if body else {}),
             **({"Authorization": f"Bearer {token}"} if token else {}),
+            **(extra_headers or {}),
         },
     )
     try:
@@ -133,6 +161,7 @@ class PlannerClient:
         sleep: Callable[[float], None] = time.sleep,
         best_effort_transport: Transport | None = None,
         token: str | None = None,
+        token_provider: "TokenProvider | None" = None,
     ) -> None:
         """Configure the client; nothing is sent until create_run.
 
@@ -144,26 +173,44 @@ class PlannerClient:
         and should be wired to a short-timeout client; it defaults to
         ``transport``.
 
-        ``token`` is the planner's shared secret (its ``HECO_TOKEN``).  It is
-        required whenever the planner is exposed beyond loopback, which it
-        refuses to be without one — so a dockerised runner, reaching the host
-        over the bridge network, always needs it.  When set it is sent as
-        ``Authorization: Bearer`` on every call, including the multipart frame
-        upload.  A 401 back is a CONFIGURATION error, not a transient: retrying
-        it forever would only bury the real problem, so the retrying path fails
-        it fast and says what to fix.
+        ``token_provider`` is the modern credential: a
+        :class:`heco_common.auth.TokenProvider` holding this runner's
+        application secret, which mints short-lived tokens and refreshes them
+        before they lapse.  Prefer it.  A 401 on the retrying path then means
+        "the token in hand was refused", which IS worth one refresh and one
+        retry — a rotation should not need a restart.
+
+        ``token`` is the pre-migration shared secret (the planner's
+        ``HECO_TOKEN``), kept so an existing lab keeps working untouched.  It is
+        static: a 401 with only a static token is a CONFIGURATION error, not a
+        transient, so the retrying path fails it fast and says what to fix
+        rather than burying it under retries.
+
+        Both are sent the same way — ``Authorization: Bearer`` on every call,
+        including the multipart frame upload.  The header is computed AT
+        REQUEST TIME, not baked in at construction, which is what makes a
+        rotation invisible to a running process.
         """
         self.base_url = base_url.rstrip("/")
         self.token = token or None
+        self.token_provider = token_provider
         # Best-effort calls swallow failures by design, which is right for taps
         # and stats — but a 401 is not a hiccup, it is a misconfiguration that
         # silently stops erasure purges and operator corrections from ever
         # being seen. Counted here so the runner can surface it instead of
         # quietly doing nothing all night.
         self.auth_failures = 0
-        self.transport = transport or (
-            bearer_urllib_transport(self.token) if self.token else urllib_transport
-        )
+        if transport is not None:
+            self.transport = transport
+        elif token_provider is not None:
+            # Read the header per request, so the token this client sends is
+            # whatever the provider currently holds — including one minted five
+            # seconds ago by a background refresh.
+            self.transport = provider_urllib_transport(token_provider)
+        elif self.token:
+            self.transport = bearer_urllib_transport(self.token)
+        else:
+            self.transport = urllib_transport
         self.best_effort_transport = best_effort_transport or self.transport
         self.file_transport = file_transport
         self.retries = max(1, retries)
@@ -287,7 +334,7 @@ class PlannerClient:
             status, _ = self.file_transport(url, fields, filename, jpeg, content_type)
         except Exception:  # noqa: BLE001 — best-effort, never propagate
             return False
-        return status < 400
+        return self._note_upload_status(status)
 
     #: Frame records per POST. A flush at 4 fps carries ~8, so this only binds
     #: after an outage — and a 4000-record backlog in ONE body would be ~5.6 MB
@@ -351,7 +398,7 @@ class PlannerClient:
             )
         except Exception:  # noqa: BLE001 — best-effort, never propagate
             return False
-        return status < 400
+        return self._note_upload_status(status)
 
     # ---------------------------------------- operator feedback (v1)
 
@@ -438,7 +485,29 @@ class PlannerClient:
             return False, {}
         if status == 401:
             self.auth_failures += 1
+            # Flag it; do NOT refresh inline. These callers are best-effort
+            # because their latency budget is the frame loop's, and a token
+            # round-trip here would cost the very frames the tap was reporting
+            # on. The next ordinary read picks the refresh up.
+            if self.token_provider is not None:
+                self.token_provider.mark_rejected()
         return status < 400, (body or {})
+
+    def _note_upload_status(self, status: int) -> bool:
+        """Record a multipart result the same way ``_send_once`` records a JSON
+        one, and return whether it was accepted.
+
+        THE GAP THIS CLOSES: the two multipart uploads — debug frames and face
+        cards — swallowed their statuses whole, so a runner whose credential had
+        been refused went on posting frames into a 401 all night with
+        ``auth_failures`` sitting at zero and nothing in any log. The JSON paths
+        had counted 401s since v1; these two never did.
+        """
+        if status == 401:
+            self.auth_failures += 1
+            if self.token_provider is not None:
+                self.token_provider.mark_rejected()
+        return status < 400
 
     def _require_run(self) -> int | str:
         """Return the current run id or fail: reporting needs create_run first."""
@@ -447,9 +516,18 @@ class PlannerClient:
         return self.run_id
 
     def _request(self, method: str, path: str, payload: dict | None) -> dict:
-        """Send with retry: 5xx/errors back off and retry, 4xx fail fast."""
+        """Send with retry: 5xx/errors back off and retry, 4xx fail fast.
+
+        A 401 is its own case. With a token provider it means "the token in
+        hand was refused" — a rotation, or a clock — which earns exactly ONE
+        forced refresh and ONE retry, so a rotation never needs a restart. Once
+        that retry also comes back 401 the problem is configuration, and
+        retrying further only buries it, so it fails loudly and names the two
+        variables to check.
+        """
         url = f"{self.base_url}{path}"
         last: str = "no attempt made"
+        refreshed = False
         for attempt in range(self.retries):
             try:
                 status, body = self.transport(method, url, payload)
@@ -460,15 +538,32 @@ class PlannerClient:
                     return body
                 last = f"HTTP {status}: {body!r}"
                 if status == 401:
-                    # A configuration error, not a transient: retrying it would
-                    # bury the real problem behind a wall of failed attempts.
-                    raise PlannerError(
-                        f"{method} {url} refused: the planner requires a token and this "
-                        f"runner {'sent the wrong one' if self.token else 'sent none'}. "
-                        "Set HECO_TOKEN on the runner to the same value the planner uses."
-                    )
+                    if self.token_provider is not None and not refreshed:
+                        refreshed = True
+                        self.token_provider.force_refresh()
+                        continue  # immediately, with no backoff: nothing is hung
+                    raise PlannerError(self._auth_failure_message(method, url))
                 if status < 500:
                     raise PlannerError(f"{method} {url} rejected — {last}")
             if attempt < self.retries - 1:
                 self._sleep(self.backoff_s * (2**attempt))
         raise PlannerError(f"{method} {url} failed after {self.retries} attempts — {last}")
+
+    def _auth_failure_message(self, method: str, url: str) -> str:
+        """Say what to fix. This message is read by someone at a venue with a
+        pipeline that will not report, so it names variables, not concepts."""
+        if self.token_provider is not None:
+            why = self.token_provider.last_error
+            return (
+                f"{method} {url} refused after refreshing this runner's token. "
+                + (f"The auth service said: {why} " if why else "")
+                + "Check HECO_APP_ID and HECO_APP_SECRET on the runner, and that "
+                "HECO_AUTH_URL points at the same auth service the planner verifies "
+                "against."
+            )
+        return (
+            f"{method} {url} refused: the planner requires a token and this "
+            f"runner {'sent the wrong one' if self.token else 'sent none'}. "
+            "Give this runner HECO_APP_ID/HECO_APP_SECRET from the auth service, "
+            "or set HECO_TOKEN to the same value the planner uses."
+        )

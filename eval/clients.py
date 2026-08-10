@@ -15,15 +15,31 @@ tests inject a fake by passing a callable.
 
 from collections.abc import Callable
 
-from heco_common.planner import Transport, bearer_urllib_transport, urllib_transport
+from heco_common.auth import TokenProvider
+from heco_common.planner import (
+    Transport,
+    bearer_urllib_transport,
+    provider_urllib_transport,
+    urllib_transport,
+)
 
 
 class EvalHttpError(RuntimeError):
     """A call the harness cannot proceed without was refused."""
 
 
-def _default_transport(token: str | None = None) -> Transport:
-    """The stdlib transport, with the bearer header when a token is set."""
+def _default_transport(
+    token: str | None = None, provider: "TokenProvider | None" = None
+) -> Transport:
+    """The stdlib transport, carrying whichever credential is configured.
+
+    A provider wins: it mints its own short-lived tokens and the header is read
+    per request, so an eval run spanning hours cannot expire halfway through
+    and report a partial score as a real one. ``token`` is the pre-migration
+    shared secret, kept so existing eval scripts keep working.
+    """
+    if provider is not None:
+        return provider_urllib_transport(provider)
     return bearer_urllib_transport(token) if token else urllib_transport
 
 
@@ -86,11 +102,15 @@ class PlannerReader:
     """Read side of the planner — the durable record a score is taken from."""
 
     def __init__(
-        self, base_url: str, token: str | None = None, transport: Transport | None = None
+        self,
+        base_url: str,
+        token: str | None = None,
+        transport: Transport | None = None,
+        token_provider: "TokenProvider | None" = None,
     ) -> None:
-        """Bind to the planner, carrying its bearer token when one is set."""
+        """Bind to the planner, carrying whichever credential is configured."""
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or _default_transport(token)
+        self.transport = transport or _default_transport(token, token_provider)
 
     def get_run(self, run_id: str) -> dict:
         """GET /api/pipeline/runs/:id — the run row plus its stage stats.
