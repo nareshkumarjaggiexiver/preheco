@@ -216,10 +216,24 @@ services:
       HECO_FACES_URL: http://faces:7104
       HECO_EMBED_URL: http://embed:7105
       HECO_MATCH_URL: http://match:7106
-      # The planner's shared secret. A dockerised runner reaches the planner
-      # across the bridge network, and the planner refuses to listen beyond
-      # loopback without a token — so this is required for this deployment.
-      # Export it in your shell (or a .env) as the same value the planner uses.
+      # THE CREDENTIAL. A dockerised runner reaches the planner across the
+      # bridge network, and the planner refuses to listen beyond loopback
+      # without one.
+      #
+      # These three are the way in: this runner holds an application secret and
+      # exchanges it for short-lived tokens, refreshing them before they lapse.
+      # Rotating the secret does not need this container restarted, and nothing
+      # long-lived travels on the wire. Register the application once with
+      #   curl -X POST $AUTH_URL/apps -H "authorization: Bearer <admin token>" \
+      #        -d '{"name":"runner","scopes":"planner:report"}'
+      # and put what it returns in your .env — it is shown exactly once.
+      HECO_AUTH_URL: ${HECO_AUTH_URL:-}
+      HECO_APP_ID: ${HECO_APP_ID:-}
+      HECO_APP_SECRET: ${HECO_APP_SECRET:-}
+      # LEGACY — remove at step 7 of the auth migration runbook. One shared
+      # secret for every process and every browser; kept only so an existing
+      # lab keeps working while the three variables above are rolled out. When
+      # they are set, this is ignored.
       HECO_TOKEN: ${HECO_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux needs this mapping

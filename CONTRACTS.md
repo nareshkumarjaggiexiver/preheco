@@ -305,10 +305,59 @@ Added: `staffFaceFrames`, `manualAdditions`, `feedbackRejected`,
 `staffCrossings` keeps its name and changes its meaning (see above).
 
 
-## v2 addition — authenticating to the planner (2026-08-05)
+## v3 addition — auth-service tokens (2026-08-10)
+
+The credential is now a short-lived Ed25519 JWT minted by the auth service
+(`apps/heco-auth`, a Cloudflare Worker). The runner holds an APPLICATION SECRET
+and exchanges it; the planner verifies the token LOCALLY against a cached
+public key and never calls the auth service on a request path.
+
+That last property is the constraint the whole design serves: **a venue must
+keep counting when its internet is down.** A planner that has not reached
+Cloudflare in a week still authenticates its runner and still counts guests.
+
+- Runner env: `HECO_AUTH_URL`, `HECO_APP_ID`, `HECO_APP_SECRET`. All three or
+  none — a partial configuration is refused at boot rather than showing up as
+  unexplained 401s at a venue.
+- `POST {auth}/token {app_id, app_secret}` → `{access_token, token_type,
+  expires_in, scope}`. **Refresh is the same call**; there is no refresh token.
+- Machine tokens live **48 h** and are refreshed at **half-life**, so the token
+  in hand always has ≥24 h left. That number is an OUTAGE BUDGET, not a
+  security preference: an internet failure at the worst moment on an event
+  night still leaves a full day of valid reporting. The stated price is that a
+  revoked application keeps working until its token expires.
+- The `Authorization` header is computed **per request** (`TokenAuth`,
+  an `httpx.Auth`), not baked into the client at construction. This is what
+  makes a credential rotation invisible to a running process — the predecessor
+  needed a restart, and getting the restart order wrong cost four separate
+  interruptions in one day.
+- A 401 on the retrying path earns exactly ONE forced refresh and ONE retry.
+  A second 401 is configuration: it fails loudly, naming `HECO_APP_ID`,
+  `HECO_APP_SECRET` and `HECO_AUTH_URL`, and quotes what the auth service said.
+- A 401 on a best-effort path (taps, frames, face cards, the erasure poll) is
+  counted and flagged, never refreshed inline — those paths' latency budget is
+  the frame loop's.
+- Every run reports `plannerAuthFailures`, `tokenRefreshFailures` and
+  `tokenLastError` from its ordinary flush, whether or not it has a `siteId`.
+  Previously refusals surfaced only from the erasure poll, which needs one, so
+  a bench run could 401 all night and say so nowhere.
+- An unreachable auth service never invalidates anything: the current token is
+  kept and used, and the failure is recorded.
+
+Eval uses its OWN application (`HECO_EVAL_APP_ID` / `HECO_EVAL_APP_SECRET`), so
+a sweep that goes wrong can be revoked without stopping a venue counting.
+
+
+## v2 (LEGACY) — the shared planner token (2026-08-05)
+
+**Retired when** every runner, eval host and browser holds an auth-service
+token; then `HECO_TOKEN` is removed from the planner env, the compose file and
+`start-lan.sh`. Until then both are accepted, so the migration deploys onto a
+working lab with no env change and nothing breaks on deploy. When the v3
+variables are set, this one is ignored.
 
 The planner binds loopback only by default and REFUSES to listen on any other
-address without `HECO_TOKEN` set. A dockerised runner reaches it across the
+address without a credential set. A dockerised runner reaches it across the
 bridge network (`host.docker.internal`), so that deployment always needs a
 token on both sides.
 
@@ -319,9 +368,10 @@ token on both sides.
   poll and its status writes, the tombstone poll and its confirmations, and the
   enrolment report. The header rides on the httpx clients so no adapter has to
   know about auth; `PlannerClient(token=…)` also covers the stdlib transport.
-- A 401 is a CONFIGURATION error, not a transient. It fails fast with a message
-  naming `HECO_TOKEN` rather than being retried — retrying would bury the real
-  problem behind a wall of failed attempts.
+- A 401 is a CONFIGURATION error, not a transient, because a static shared
+  secret has nothing to refresh. It fails fast with a message naming both ways
+  out rather than being retried — retrying would bury the real problem behind a
+  wall of failed attempts.
 - With no token configured on either side (loopback development) nothing
   changes.
 
