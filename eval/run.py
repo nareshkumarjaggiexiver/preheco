@@ -475,8 +475,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"would write {json_path} and {text_path}")
         return 0
 
+    # The credential is built BEFORE the slot probe: ingest and the runner
+    # gate their inbound side when the pipeline box arms HECO_REQUIRE_AUTH
+    # (runbook step 8), and a probe that arrives bare at an armed gate would
+    # read as "slot free" and let the sweep collide with a live count.
+    provider = None
+    if args.auth_url and args.app_id and args.app_secret:
+        provider = TokenProvider(args.auth_url, args.app_id, args.app_secret)
+    elif any((args.auth_url, args.app_id, args.app_secret)):
+        # Half a credential reads as "authentication is configured" and then
+        # fails as 401s hours into a sweep. Refuse before a single clip runs.
+        log.error(
+            "give all of --auth-url, --app-id and --app-secret, or none of them "
+            "(HECO_AUTH_URL / HECO_EVAL_APP_ID / HECO_EVAL_APP_SECRET)"
+        )
+        return 1
+
     if not args.skip_slot_check:
-        owner = IngestProbe(args.ingest_url).slot_owner()
+        probe = IngestProbe(args.ingest_url, token=args.planner_token, token_provider=provider)
+        owner = probe.slot_owner()
         if owner:
             log.error(
                 f"ingest's capture slot is held by run {owner!r}. Refusing to start: "
@@ -490,20 +507,8 @@ def main(argv: list[str] | None = None) -> int:
         previous = json.loads(json_path.read_text(encoding="utf-8"))
         log.info(f"resuming from {json_path}")
 
-    provider = None
-    if args.auth_url and args.app_id and args.app_secret:
-        provider = TokenProvider(args.auth_url, args.app_id, args.app_secret)
-    elif any((args.auth_url, args.app_id, args.app_secret)):
-        # Half a credential reads as "authentication is configured" and then
-        # fails as 401s hours into a sweep. Refuse before a single clip runs.
-        log.error(
-            "give all of --auth-url, --app-id and --app-secret, or none of them "
-            "(HECO_AUTH_URL / HECO_EVAL_APP_ID / HECO_EVAL_APP_SECRET)"
-        )
-        return 1
-
     clip_runner = ClipRunner(
-        RunnerClient(args.runner_url),
+        RunnerClient(args.runner_url, token=args.planner_token, token_provider=provider),
         PlannerReader(args.planner_url, token=args.planner_token, token_provider=provider),
         log=log,
     )

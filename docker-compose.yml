@@ -59,6 +59,17 @@ services:
       # camera's own size, which is the default. Face pixels scale with it —
       # see services/ingest/README.md for the numbers before choosing.
       INGEST_MAX_WIDTH: ${INGEST_MAX_WIDTH-}
+      # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
+      # callers must present a bearer credential — an heco-auth Ed25519 token
+      # (verified locally against the JWKS fetched from HECO_AUTH_URL and
+      # cached in-process) or the legacy shared HECO_TOKEN while it survives.
+      # /health stays open for the healthcheck above. All unset = the LAN
+      # door stays open, exactly as before this block existed.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     volumes:
       - source-media:/media   # drop test clips here; /open them by path
 
@@ -70,6 +81,13 @@ services:
       args: { SERVICE: persons, PORT: "7102" }
     image: heco-persons
     ports: ["7102:7102"]
+    environment:
+      # Inbound auth gate — see the ingest service for the whole story.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     volumes:
       - ./services/persons/models:/srv/services/persons/models:ro
 
@@ -91,6 +109,12 @@ services:
       # to latch onto a DIFFERENT person, which is why the runner's clothing
       # guard and the lock's counters exist. Unset renders as "" = the default.
       HECO_TRACKER_MAX_AGE: ${HECO_TRACKER_MAX_AGE-}
+      # Inbound auth gate — see the ingest service for the whole story.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
 
   faces:
     <<: *heco-service
@@ -100,6 +124,13 @@ services:
       args: { SERVICE: faces, PORT: "7104" }
     image: heco-faces
     ports: ["7104:7104"]
+    environment:
+      # Inbound auth gate — see the ingest service for the whole story.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     volumes:
       - ./services/faces/models:/srv/services/faces/models:ro
 
@@ -111,6 +142,13 @@ services:
       args: { SERVICE: embed, PORT: "7105" }
     image: heco-embed
     ports: ["7105:7105"]
+    environment:
+      # Inbound auth gate — see the ingest service for the whole story.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 
@@ -145,6 +183,12 @@ services:
       # WEAK_FLOOR=0 disables the weak band entirely.
       HECO_MATCH_NEARMISS_WEAK_FLOOR: ${HECO_MATCH_NEARMISS_WEAK_FLOOR-}
       HECO_MATCH_NEARMISS_CLOTHES: ${HECO_MATCH_NEARMISS_CLOTHES-}
+      # Inbound auth gate — see the ingest service for the whole story.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_TOKEN: ${HECO_TOKEN-}
+      HECO_AUTH_URL: ${HECO_AUTH_URL-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
 
   runner:
     <<: *heco-service
@@ -235,6 +279,12 @@ services:
       # lab keeps working while the three variables above are rolled out. When
       # they are set, this is ignored.
       HECO_TOKEN: ${HECO_TOKEN:-}
+      # Inbound auth gate — see the ingest service for the whole story. The
+      # runner's HECO_AUTH_URL and HECO_TOKEN above pull double duty: minting
+      # its own outbound tokens AND verifying its inbound callers.
+      HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
+      HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux needs this mapping
     depends_on:

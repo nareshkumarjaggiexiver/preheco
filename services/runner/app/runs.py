@@ -74,7 +74,13 @@ class RunManager:
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         settings = self.settings
         planner_url = request.get("plannerUrl") or settings.planner_url
-        client = httpx.Client(timeout=settings.request_timeout_s)
+        # The STAGE client carries the same credential as the planner clients
+        # below (runbook step 8): once the sibling services arm their inbound
+        # gate (HECO_REQUIRE_AUTH), every /open, /detect, /track and /match
+        # this runner makes must present it. Unconfigured, auth_for is {} and
+        # nothing changes — the same dual-accept story as everywhere else.
+        auth = auth_for(settings, self.token_provider)
+        client = httpx.Client(timeout=settings.request_timeout_s, **auth)
         # WHERE THE CREDENTIAL RIDES, and why it moved.
         #
         # It used to be a static header baked into the httpx client at
@@ -87,7 +93,6 @@ class RunManager:
         # It still rides on the CLIENT rather than in each call, so the JSON
         # transports and the multipart frame upload all carry it without any
         # adapter having to know about auth.
-        auth = auth_for(settings, self.token_provider)
         planner_http = httpx.Client(timeout=settings.planner_timeout_s, **auth)
         report_http = httpx.Client(timeout=settings.report_timeout_s, **auth)
         planner = PlannerClient(

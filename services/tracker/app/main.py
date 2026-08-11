@@ -28,6 +28,7 @@ import time
 
 from fastapi import FastAPI
 from heco_common.config import env_float, env_int
+from heco_common.gate_auth import install_bearer_gate
 from heco_common.schemas import (
     Box,
     Health,
@@ -41,6 +42,11 @@ from . import __version__
 from .sort import SortLite
 
 app = FastAPI(title="heco-tracker", version=__version__)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 
 #: Per-run tracker instances; POC scale keeps this a plain in-process dict.
 _runs: dict[str, SortLite] = {}
