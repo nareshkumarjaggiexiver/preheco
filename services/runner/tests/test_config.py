@@ -87,6 +87,7 @@ from app.loop import _apply_quality_profile  # noqa: E402
 
 
 def test_no_profile_leaves_the_configured_settings_alone():
+    """Sending nothing changes nothing — the identity case, and the default."""
     s = Settings(quality_min_frontality=0.55)
     assert _apply_quality_profile(s, None) is s
     assert _apply_quality_profile(s, {}) is s
