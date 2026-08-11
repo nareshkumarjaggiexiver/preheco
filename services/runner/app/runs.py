@@ -78,7 +78,7 @@ class RunManager:
         # below (runbook step 8): once the sibling services arm their inbound
         # gate (HECO_REQUIRE_AUTH), every /open, /detect, /track and /match
         # this runner makes must present it. Unconfigured, auth_for is {} and
-        # nothing changes — the same dual-accept story as everywhere else.
+        # nothing changes.
         auth = auth_for(settings, self.token_provider)
         client = httpx.Client(timeout=settings.request_timeout_s, **auth)
         # WHERE THE CREDENTIAL RIDES, and why it moved.
@@ -100,7 +100,6 @@ class RunManager:
             transport=httpx_transport(planner_http),
             best_effort_transport=httpx_transport(report_http),
             file_transport=httpx_file_transport(report_http),
-            token=settings.planner_token,
             token_provider=self.token_provider,
         )
         loop = RunLoop(run_id, request, settings, client, planner, is_live_run=self._is_live)

@@ -3335,52 +3335,25 @@ def test_an_unreachable_auth_service_is_named_in_the_run_status():
     assert final["tokenLastError"], "say what the auth service said, in the status"
 
 
-def test_a_failed_mint_falls_back_to_the_legacy_secret():
-    """A venue whose WAN is down must keep REPORTING.
+def test_a_failed_mint_sends_nothing_and_says_so(monkeypatch, tmp_path):
+    """The shared-secret fallback was retired with the secret (runbook step 7).
 
-    Minting a token needs the internet; posting a count to the planner on the
-    LAN does not. Before the fallback, a runner that could not reach the auth
-    service sent no credential at all — every report came back 401 and the
-    night went unrecorded, which is exactly what this project's offline design
-    exists to prevent.
-
-    The failure stays visible: the provider counts it, and the run status
-    carries refresh_failures/last_error, so a genuinely wrong application id
-    still announces itself instead of passing silently forever.
+    What replaced it is not "nothing": the provider now keeps its token on
+    DISK, so the case this fallback used to cover — a restart while the WAN is
+    down — is covered by reusing a still-valid token. With no cache and no
+    network there is genuinely no credential, and the honest outcome is to send
+    none and let the 401 be counted and visible, rather than to lean on a
+    static string that never expires.
     """
     class DeadAuth:
-        """An auth service that cannot be reached."""
-
         def __call__(self, url, payload):
             raise OSError("no route to host")
 
-    provider = TokenProvider("http://auth", "runner", "sekrit", transport=DeadAuth(), jitter_s=0)
-    settings = Settings(planner_token="legacy-shared-secret")
-
-    sent = {}
-
-    def capture(request: httpx.Request) -> httpx.Response:
-        sent["authorization"] = request.headers.get("authorization")
-        return httpx.Response(200, json={})
-
-    kwargs = auth_for(settings, provider)
-    with httpx.Client(transport=httpx.MockTransport(capture), **kwargs) as c:
-        c.post("http://planner:8787/api/pipeline/runs", json={})
-
-    assert sent["authorization"] == "Bearer legacy-shared-secret"
-    assert provider.refresh_failures > 0, "the mint failure must still be counted"
-    assert provider.last_error
-
-
-def test_without_a_legacy_secret_a_failed_mint_still_sends_nothing():
-    """No fallback to reach for: the request goes out bare and the 401 is the
-    honest, visible outcome — unchanged from before."""
-    class DeadAuth:
-        def __call__(self, url, payload):
-            raise OSError("no route to host")
-
-    provider = TokenProvider("http://auth", "runner", "sekrit", transport=DeadAuth(), jitter_s=0)
-    settings = Settings(planner_token="")
+    provider = TokenProvider(
+        "http://auth", "runner", "sekrit", transport=DeadAuth(), jitter_s=0,
+        cache_path=str(tmp_path / "token.json"),
+    )
+    settings = Settings()
 
     sent = {}
 
@@ -3393,3 +3366,34 @@ def test_without_a_legacy_secret_a_failed_mint_still_sends_nothing():
         c.post("http://planner:8787/api/pipeline/runs", json={})
 
     assert sent["authorization"] is None
+    assert provider.refresh_failures > 0, "and the mint failure is counted, not silent"
+
+
+def test_a_cached_token_carries_a_restart_with_no_network(tmp_path):
+    """The replacement for the fallback, end to end at this seam."""
+    cache = tmp_path / "token.json"
+
+    def good(url, payload):
+        return 200, {"access_token": "tok-cached", "expires_in": 48 * 3600}
+
+    first = TokenProvider("http://auth", "runner", "sekrit", transport=good,
+                          jitter_s=0, cache_path=str(cache))
+    assert first.token() == "tok-cached"
+
+    class DeadAuth:
+        def __call__(self, url, payload):
+            raise OSError("no route to host")
+
+    reborn = TokenProvider("http://auth", "runner", "sekrit", transport=DeadAuth(),
+                           jitter_s=0, cache_path=str(cache))
+
+    sent = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        sent["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={})
+
+    with httpx.Client(transport=httpx.MockTransport(capture), **auth_for(Settings(), reborn)) as c:
+        c.post("http://planner:8787/api/pipeline/runs", json={})
+
+    assert sent["authorization"] == "Bearer tok-cached"

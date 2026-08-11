@@ -394,11 +394,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--app-id", default=os.environ.get("HECO_EVAL_APP_ID"))
     p.add_argument("--app-secret", default=os.environ.get("HECO_EVAL_APP_SECRET"))
     p.add_argument(
-        "--planner-token",
-        default=os.environ.get("HECO_TOKEN"),
-        help="LEGACY shared secret; prefer --auth-url with --app-id/--app-secret",
-    )
-    p.add_argument(
         "--ingest-url", default=os.environ.get("HECO_INGEST_URL", "http://localhost:7101")
     )
     p.add_argument("--out-dir", default="eval/results", help="where result files are written")
@@ -492,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not args.skip_slot_check:
-        probe = IngestProbe(args.ingest_url, token=args.planner_token, token_provider=provider)
+        probe = IngestProbe(args.ingest_url, token_provider=provider)
         owner = probe.slot_owner()
         if owner:
             log.error(
@@ -508,8 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"resuming from {json_path}")
 
     clip_runner = ClipRunner(
-        RunnerClient(args.runner_url, token=args.planner_token, token_provider=provider),
-        PlannerReader(args.planner_url, token=args.planner_token, token_provider=provider),
+        RunnerClient(args.runner_url, token_provider=provider),
+        PlannerReader(args.planner_url, token_provider=provider),
         log=log,
     )
     started_at = datetime.now(UTC).isoformat()

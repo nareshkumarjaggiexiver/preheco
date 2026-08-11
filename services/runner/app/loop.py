@@ -120,28 +120,21 @@ class TokenAuth(httpx.Auth):
     is the only sensible thing; once one is in hand a refresh happens on
     another thread and this returns immediately.
 
-    WHEN THE MINT FAILS AND A LEGACY SECRET EXISTS, THAT SECRET IS SENT.
-    Minting needs the internet; reporting does not. Without this fallback a
-    venue whose WAN is down at the moment the runner starts sends NOTHING,
-    every report comes back 401, and a night of counting goes unrecorded —
-    which is the precise failure this project's whole offline design exists to
-    prevent. The failure is not hidden: the provider counts it
-    (``refresh_failures``/``last_error``) and the run status carries those, so
-    a misconfigured application announces itself in the console instead of
-    silently succeeding forever. With no legacy secret to fall back to, the
-    header is simply absent and the 401 is visible as before.
+    WHEN THERE IS NO TOKEN the header is simply absent and the request comes
+    back 401, which is counted and visible in the run's status rather than
+    stopping the count. That used to be softened by falling back to a shared
+    secret; the secret was retired at runbook step 7, and the reason it can be
+    is that the provider now keeps its token ON DISK
+    (heco_common/auth.py) — so a restart during a WAN outage reuses a
+    still-valid token instead of needing a static credential to lean on.
     """
 
-    def __init__(self, provider: TokenProvider, fallback_token: str | None = None) -> None:
+    def __init__(self, provider: TokenProvider) -> None:
         self._provider = provider
-        self._fallback = fallback_token or None
 
     def auth_flow(self, request):
         """httpx calls this per request; the header is decided here, not earlier."""
-        header = self._provider.auth_header(block=True)
-        if not header and self._fallback:
-            header = {"Authorization": f"Bearer {self._fallback}"}
-        for name, value in header.items():
+        for name, value in self._provider.auth_header(block=True).items():
             request.headers[name] = value
         yield request
 
@@ -151,15 +144,9 @@ def auth_for(settings, provider: TokenProvider | None) -> dict:
 
     Returns ``{}`` for loopback development with nothing configured — which
     keeps the plain two-argument client construction the test doubles rely on.
-
-    A provider wins when both are configured, and keeps the legacy secret as
-    its fallback for the window where it cannot reach the auth service.
     """
     if provider is not None:
-        return {"auth": TokenAuth(provider, settings.planner_token)}
-    if settings.planner_token:
-        # LEGACY: one shared secret, static for the life of the process.
-        return {"headers": {"Authorization": f"Bearer {settings.planner_token}"}}
+        return {"auth": TokenAuth(provider)}
     return {}
 
 
@@ -176,8 +163,7 @@ def build_token_provider(settings) -> TokenProvider | None:
     if not all(parts):
         raise ValueError(
             "incomplete auth configuration: set all of HECO_AUTH_URL, HECO_APP_ID "
-            "and HECO_APP_SECRET, or none of them (and keep HECO_TOKEN for the "
-            "pre-migration shared secret)"
+            "and HECO_APP_SECRET, or none of them"
         )
     return TokenProvider(
         settings.auth_url, settings.app_id, settings.app_secret,
