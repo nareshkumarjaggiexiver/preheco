@@ -1,0 +1,25 @@
+{
+  "id": "heco-faces",
+  "displayName": "HECO Face Identity",
+  "version": "1.0.0",
+  "description": "The house pipeline: seven CPU-only services (ingest, persons, tracker, faces, embed, match) conducted by a runner, with per-run galleries, staff enrolment and operator corrections.",
+  "capabilities": {
+    "sources": ["rtsp", "file"],
+    "modes": ["count", "enrol"],
+    "identityScope": "run",
+    "exclusionZones": true,
+    "forensicFrames": true,
+    "staffEnrolment": true,
+    "qualityProfiles": true,
+    "liveTaps": ["ingest", "persons", "tracker", "faces", "embed", "match"],
+    "consentLanes": ["identified"]
+  },
+  "metering": {
+    "unit": "camera-minute",
+    "weight": 1.0
+  },
+  "notes": [
+    "The reference pipeline, so its weight is 1.0 by definition and every other rate is read against it.",
+    "identityScope is `run`: a fresh gallery-<runId>.db per run, swept at HECO_GALLERY_RETENTION_S. Only the consented staff store persists."
+  ]
+}

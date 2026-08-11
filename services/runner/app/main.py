@@ -1,7 +1,7 @@
 """FastAPI app for the runner service (port 7100).
 
 Endpoints (CONTRACTS.md):
-    GET  /health          -> {ok, model, version}
+    GET  /health          -> {ok, model, version, pipeline}
     POST /runs            {eventId, placementId?, source:{url|path}, plannerUrl?,
                            label?, mode?:'count'|'enrol', siteId?, staffId?,
                            exclusionZones?:[{label, points:[[x,y],...]}]}
@@ -13,6 +13,9 @@ staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
 ``staffId``; ``siteId`` on a count run opts it into the staff whitelist.
 """
 
+import json
+import logging
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -23,6 +26,7 @@ from . import config
 from .runs import RunManager
 
 VERSION = "0.1.0"
+log = logging.getLogger("runner")
 
 app = FastAPI(title="heco-runner", version=VERSION)
 # Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
@@ -163,10 +167,47 @@ class RunRequest(BaseModel):
         return self
 
 
+#: The manifest, read once from the repo root. A missing or unreadable file
+#: is not fatal: /health is what the compose healthcheck polls, and refusing
+#: to answer it because a descriptive JSON file is absent would take a
+#: counting pipeline off the air over documentation.
+_MANIFEST_CACHE: dict | None = None
+
+
+def _manifest() -> dict | None:
+    """This pipeline's capability manifest, or None when it cannot be read."""
+    global _MANIFEST_CACHE
+    if _MANIFEST_CACHE is None:
+        path = Path(__file__).resolve().parents[3] / "pipeline.json"
+        try:
+            _MANIFEST_CACHE = json.loads(path.read_text())
+        except (OSError, ValueError):
+            log.warning("no readable pipeline.json at %s — /health will omit the manifest", path)
+            _MANIFEST_CACHE = {}
+    return _MANIFEST_CACHE or None
+
+
 @app.get("/health")
 def health() -> dict:
-    """Liveness + identity; the runner has no ML model, it conducts."""
-    return {"ok": True, "model": "orchestrator", "version": VERSION}
+    """Liveness + identity + the MANIFEST the planner registers.
+
+    ``model`` and ``version`` are unchanged: the compose healthcheck and the
+    deploy runbook read them, and moving a field somebody polls is a wire
+    change dressed as a refactor.
+
+    ``pipeline`` is the addition — the capability manifest from
+    ``pipeline.json`` (apps/heco-pipelines/CONTRACTS.md §1). The planner's
+    registry reads it to decide what the console offers, and it branches on
+    DECLARED CAPABILITY rather than on which pipeline it is talking to. That
+    is the whole mechanism by which a second pipeline becomes offerable by
+    declaring itself rather than by editing the planner.
+    """
+    return {
+        "ok": True,
+        "model": "orchestrator",
+        "version": VERSION,
+        "pipeline": _manifest(),
+    }
 
 
 @app.post("/runs")
