@@ -3397,3 +3397,144 @@ def test_a_cached_token_carries_a_restart_with_no_network(tmp_path):
         c.post("http://planner:8787/api/pipeline/runs", json={})
 
     assert sent["authorization"] == "Bearer tok-cached"
+
+
+# --------------------------------------------------------- re-verify gating
+# Harvested from the sibling face-detection pipeline: a track that has already
+# resolved to an identity is re-searched for a face only every N seconds,
+# while everyone unidentified is searched every frame. Per-person face
+# detection is the dominant per-frame cost, so this is the cheapest saving
+# available — but it must come entirely out of work that cannot change the
+# count, and these tests are what says so.
+
+
+class ReverifyFake(V1Fake):
+    """Records how many person crops each /detect call was asked to search.
+
+    Overrides the person box to one the detected face actually sits inside:
+    the identity lock only exists for a face that :meth:`RunLoop._track_for`
+    can pin to a track (its centre inside the track box), and the base fake's
+    40 px person box cannot contain its own 85 px face. Without that the lock
+    machinery never engages and this gate has nothing to skip.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.within_counts: list[int] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Route as the base fake does, recording the face-search width."""
+        host, path = request.url.host, request.url.path
+        if host == "persons" and path == "/detect":
+            return httpx.Response(
+                200, json={"boxes": [{"x": 0, "y": 0, "w": 160, "h": 120, "conf": 0.9}]}
+            )
+        if host == "faces" and path == "/detect":
+            body = json.loads(request.content or b"{}")
+            self.within_counts.append(len(body.get("within") or []))
+        return super().handler(request)
+
+
+def test_reverify_off_by_default_searches_every_person_every_frame():
+    """The shipped behaviour is unchanged: no interval, no skipping."""
+    fake = ReverifyFake(n_frames=4)
+    loop = make_loop(fake, {"eventId": "e1", "source": {"path": "/x.mp4"}})
+    loop.run()
+    assert loop.status()["faceSearchesSkipped"] == 0
+    assert all(n >= 1 for n in fake.within_counts)
+
+
+def _settling_script(n: int) -> list[dict]:
+    """One guest who mints, then matches themselves comfortably.
+
+    The second verdict is what takes the identity lock (cosine >= the
+    runner's track_lock_min_cosine), which is what makes the track eligible
+    to be skipped at all.
+    """
+    common = {"subCanon": False, "isStaff": False, "staffId": None,
+              "templateN": 2, "templateAdded": False}
+    return [{"personKey": "p1", "isNew": True, "cosine": 0.0, **common}] + [
+        {"personKey": "p1", "isNew": False, "cosine": 0.80, **common}
+        for _ in range(n)
+    ]
+
+
+def test_an_identified_track_is_not_re_searched_within_the_interval():
+    """With the interval armed, the identified person stops being searched
+    once their track holds a lock — and `unique` is unaffected, which is the
+    whole claim: the saving comes out of re-confirmation, not out of counting."""
+    fake = ReverifyFake(n_frames=6, match_script=_settling_script(8))
+    loop = make_loop(
+        fake,
+        {"eventId": "e1", "source": {"path": "/x.mp4"}},
+        face_reverify_interval_s=3600.0,  # never expires inside the test
+    )
+    loop.run()
+    status = loop.status()
+    assert status["faceSearchesSkipped"] >= 1
+    # Someone was searched at the start and nobody by the end.
+    assert fake.within_counts[0] >= 1
+    assert fake.within_counts[-1] == 0
+
+    # Same run with the gate OFF: same count, more work.
+    baseline = ReverifyFake(n_frames=6, match_script=_settling_script(8))
+    plain = make_loop(baseline, {"eventId": "e1", "source": {"path": "/x.mp4"}})
+    plain.run()
+    assert status["unique"] == plain.status()["unique"] == 1
+    assert sum(fake.within_counts) < sum(baseline.within_counts)
+
+
+def test_a_track_with_no_identity_is_searched_every_frame():
+    """The recall-bearing half. A track only becomes skippable once it holds
+    an identity lock, and a lock means a verdict on that track already
+    matched an existing identity comfortably. Everyone else — everyone who
+    can still add to the count — is searched on every single frame."""
+    fake = ReverifyFake(n_frames=4)
+    loop = make_loop(
+        fake,
+        {"eventId": "e1", "source": {"path": "/x.mp4"}},
+        face_reverify_interval_s=3600.0,
+    )
+    # No locks are ever taken, so nothing is ever settled.
+    loop._locks = {}
+
+    class NoLocks(dict):
+        def __setitem__(self, key, value):
+            pass  # refuse every lock
+
+    loop._locks = NoLocks()
+    loop.run()
+    assert loop.status()["faceSearchesSkipped"] == 0
+    assert all(n >= 1 for n in fake.within_counts)
+
+
+def test_the_verify_clock_is_stamped_on_scheduling_not_on_success():
+    """A person who turns away produces no face. If the clock only advanced
+    when a face was FOUND, they would be re-searched every frame for as long
+    as they stayed turned — which is both the most expensive case and the one
+    where searching cannot succeed."""
+    fake = ReverifyFake(n_frames=6, face_widths=())  # detected, never a face
+    loop = make_loop(
+        fake,
+        {"eventId": "e1", "source": {"path": "/x.mp4"}},
+        face_reverify_interval_s=3600.0,
+    )
+    # Pre-seed the lock this track would have earned before turning away.
+    loop._locks[1] = {"key": "p1", "cosine": 0.9, "at": time.monotonic()}
+    loop.run()
+    # Stamped when scheduled, so the second frame onward skips.
+    assert loop.status()["faceSearchesSkipped"] >= 1
+    assert fake.within_counts[-1] == 0
+
+
+def test_the_verify_clock_map_is_pruned_against_live_tracks():
+    """One entry per track for the life of a night is exactly the unbounded
+    per-track dict the sibling pipeline leaked; ours is capped and pruned."""
+    fake = ReverifyFake(n_frames=2)
+    loop = make_loop(
+        fake, {"eventId": "e1", "source": {"path": "/x.mp4"}},
+        face_reverify_interval_s=3600.0,
+    )
+    loop._last_face_verify = {n: 0.0 for n in range(loop._REVERIFY_CAP + 5)}
+    loop.run()
+    assert len(loop._last_face_verify) <= loop._REVERIFY_CAP

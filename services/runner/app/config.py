@@ -7,7 +7,7 @@ bare-metal run (the e2e smoke script points them all at localhost).
 import os
 from dataclasses import dataclass, replace
 
-from heco_common.config import env_float, env_int
+from heco_common.config import env_bool, env_float, env_int
 
 
 @dataclass(frozen=True)
@@ -52,16 +52,69 @@ class Settings:
     # gate, and it is the wrong axis twice over: recognition size is read in
     # inter-eye distance (our 56/80 px width floor is only ~24/34 px IED), and
     # size alone cannot see a face turned side-on or smeared by a walking
-    # guest.  These three floors add those axes.
+    # guest.  These floors add those axes.
     #
-    # EVERY ONE DEFAULTS TO 0.0 = NOT ARMED, so the shipped gate is exactly the
-    # width-only gate it has always been.  That is deliberate: the gate is the
-    # pipeline's only irreversible discard, we have no measured floor for any
-    # of the three yet, and a guessed floor costs guests off an invoice.  Arm
-    # them per camera once the eval harness can price them.
+    # EVERY ONE DEFAULTS TO OFF, so the shipped gate is exactly the width-only
+    # gate it has always been.  That is deliberate: the gate is the pipeline's
+    # only irreversible discard, and a guessed floor costs guests off an
+    # invoice.  Arm them per camera.
+    #
+    # WHAT THEY SHOULD BE SET TO, when armed.  The sibling face-detection
+    # pipeline priced two of these against a camera of this family and
+    # recorded the measurements (docs/planning/13-…): frontal crops scored a
+    # nose-offset/eye-distance of 0.05–0.43 and an eye-span/box-width of
+    # 0.31–0.49, while the off-angle crops that had spawned phantom
+    # identities scored 0.48–1.02 and 0.17–0.29.  Both gaps are clean.
+    #
+    # Their yaw ratio is our `frontality` inverted — frontality = 1 - yaw —
+    # so their 0.45 yaw ceiling is a frontality floor of 0.55, which lands
+    # between the two observed bands (frontal 0.57–0.95, off-angle 0.00–0.52).
+    # Their eye-span floor of 0.30 transfers directly to quality_min_eye_span.
+    #
+    # Those are a STARTING POINT for this camera family, not a default: the
+    # measurements are somebody else's camera, mount and lighting, and the
+    # console's quality profile exists so an operator can arm them and watch
+    # what the gate starts rejecting before committing a live count to it.
     quality_min_ied_px: float = 0.0
     quality_min_frontality: float = 0.0
     quality_min_sharpness: float = 0.0
+    #: Eye separation as a fraction of box width — the pose axis iedPx cannot
+    #: see, because IED in pixels grows as a guest approaches while this
+    #: collapses in profile at any distance.  Suggested when armed: 0.30.
+    quality_min_eye_span: float = 0.0
+    #: Reject detections whose 5 landmarks do not describe a face (eyes above
+    #: nose above mouth, sane eye span, nose near the eye span).  Boolean, not
+    #: a floor: the test is topological.  This is the one gate here that says
+    #: "not a face" rather than "not a good enough face" — it catches the
+    #: clothing and torso detections that satisfy the detector's own
+    #: confidence (measured at 70–91 % on striped shirts) but carry
+    #: effectively random landmarks.
+    quality_require_landmarks: bool = False
+
+    # FACE RE-VERIFY INTERVAL — how often a track that has ALREADY resolved to
+    # an identity is searched for a face again.  0.0 = off (search every track
+    # every frame, the original behaviour).
+    #
+    # Per-person face detection is the dominant per-frame cost: YuNet runs
+    # inside every person crop, and each face it finds is then embedded and
+    # matched.  Ungated, a group of six standing at a gate pays that six times
+    # per frame, forever, to keep re-confirming six identities the run already
+    # knows — while the guest walking in behind them, who is the only one who
+    # can still change the count, waits behind them for the loop.
+    #
+    # A track holding an identity lock (RunLoop._locks) has already been
+    # resolved.  Re-searching it every frame buys re-confirmation of something
+    # settled; searching it every few seconds buys the same at a fraction of
+    # the cost.  Tracks WITHOUT a lock — everyone unidentified, which is
+    # everyone who can still add to the count — are searched every frame,
+    # always.  So the saving is taken entirely out of work that cannot change
+    # the answer.
+    #
+    # The clock is stamped when a track is SCHEDULED for verification, not
+    # when a face is successfully found on it.  Stamping on success would let
+    # a person who turns away reset nothing and be re-searched every frame for
+    # as long as they stay turned — precisely the case the gate exists to stop.
+    face_reverify_interval_s: float = 0.0
 
     flush_interval_s: float = 2.0  # planner stats/samples cadence
     sample_batch_max: int = 200  # planner ingest contract: batch <= 200 rows
@@ -342,6 +395,13 @@ def from_env() -> Settings:
         quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),
         quality_min_frontality=env_float("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality),
         quality_min_sharpness=env_float("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness),
+        quality_min_eye_span=env_float("HECO_QUALITY_MIN_EYE_SPAN", s.quality_min_eye_span),
+        quality_require_landmarks=env_bool(
+            "HECO_QUALITY_REQUIRE_LANDMARKS", s.quality_require_landmarks
+        ),
+        face_reverify_interval_s=env_float(
+            "HECO_FACE_REVERIFY_INTERVAL_S", s.face_reverify_interval_s
+        ),
         run_retention_s=env_float("HECO_RUN_RETENTION_S", s.run_retention_s),
         flush_interval_s=env_float("HECO_FLUSH_INTERVAL_S", s.flush_interval_s),
         request_timeout_s=env_float("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s),

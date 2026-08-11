@@ -84,3 +84,80 @@ def test_sharpness_clamps_a_box_running_off_the_edge():
     """A face at the frame edge is still measurable from the part that is in."""
     img = _textured(100, 100)
     assert crop_sharpness(img, {"x": 60, "y": 60, "w": 80, "h": 80}) is not None
+
+
+# ------------------------------------------- landmark topology and eye span
+# Ported from the sibling face-detection pipeline, which found that YuNet
+# verifies striped shirts as faces at 70-91% confidence. Their landmarks are
+# effectively random, and that is what these two signals see.
+
+from app.quality import eye_span_ratio, landmarks_plausible  # noqa: E402
+
+BOX = {"x": 0, "y": 0, "w": 100, "h": 130}
+
+
+def _face_landmarks(*, eye_y=30.0, nose_y=55.0, mouth_y=80.0, rex=35.0, lex=65.0, nx=50.0):
+    """Five landmarks in YuNet order: right eye, left eye, nose, mouths."""
+    return [[rex, eye_y], [lex, eye_y], [nx, nose_y], [40.0, mouth_y], [60.0, mouth_y]]
+
+
+def test_a_real_face_layout_is_plausible():
+    assert landmarks_plausible(_face_landmarks(), BOX) is True
+
+
+def test_eyes_below_the_nose_are_not_a_face():
+    """The one fact true of every human face at every yaw: eyes, nose, mouth,
+    in that vertical order. Random landmarks on clothing break it."""
+    assert landmarks_plausible(_face_landmarks(eye_y=60.0, nose_y=40.0), BOX) is False
+
+
+def test_the_nose_below_the_mouth_is_not_a_face():
+    assert landmarks_plausible(_face_landmarks(nose_y=90.0, mouth_y=80.0), BOX) is False
+
+
+def test_collapsed_and_impossible_eye_spans_are_not_faces():
+    """Under 15% of box width means both eyes landed on one point; over 85%
+    means they landed on opposite edges of something that is not a head."""
+    assert landmarks_plausible(_face_landmarks(rex=49.0, lex=51.0), BOX) is False
+    assert landmarks_plausible(_face_landmarks(rex=2.0, lex=98.0), BOX) is False
+
+
+def test_a_nose_far_outside_the_eye_span_is_not_a_face():
+    assert landmarks_plausible(_face_landmarks(nx=99.0), BOX) is False
+
+
+def test_a_three_quarter_view_survives_the_nose_margin():
+    """The margin is a fraction of BOX WIDTH, not of eye distance, precisely
+    so a yawed face — eyes compressed to an 18% span, nose projecting well
+    past the far one — stays plausible. Judging whether that pose is good
+    enough to embed is frontality's job and eyeSpanRatio's, not this one's:
+    this test only asks "is it a face", and a turned head is."""
+    turned = _face_landmarks(rex=40.0, lex=58.0, nx=75.0)
+    assert landmarks_plausible(turned, BOX) is True
+    # ...and the pose signals DO see it, which is the division of labour.
+    assert eye_span_ratio(turned, BOX) == 0.18
+
+
+def test_unmeasurable_landmarks_are_unknown_not_implausible():
+    """None, never False: the runner's gate reads None as UNKNOWN and keeps
+    the face, because dropping a guest for a signal nobody measured is worse."""
+    assert landmarks_plausible(None, BOX) is None
+    assert landmarks_plausible([[1, 2], [3, 4]], BOX) is None
+    assert landmarks_plausible(_face_landmarks(), {"w": 0}) is None
+    assert landmarks_plausible([["x", "y"]] * 5, BOX) is None
+
+
+def test_eye_span_ratio_is_pose_not_size():
+    """The signal iedPx cannot give: the same face at two distances has two
+    IEDs in pixels but ONE eye-span ratio, while turning to profile collapses
+    the ratio at any distance."""
+    near = eye_span_ratio(_face_landmarks(rex=35.0, lex=65.0), {"w": 100})
+    far = eye_span_ratio(_face_landmarks(rex=17.5, lex=32.5), {"w": 50})
+    assert near == far == 0.3
+    profile = eye_span_ratio(_face_landmarks(rex=45.0, lex=55.0), {"w": 100})
+    assert profile < near
+
+
+def test_eye_span_ratio_is_none_when_unmeasurable():
+    assert eye_span_ratio(None, BOX) is None
+    assert eye_span_ratio(_face_landmarks(), {"w": 0}) is None
