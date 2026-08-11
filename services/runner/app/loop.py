@@ -55,6 +55,7 @@ import base64
 import contextlib
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -202,6 +203,45 @@ def httpx_file_transport(client: httpx.Client) -> FileTransport:
     return transport
 
 
+#: Wire field -> Settings field for the per-run quality profile.  One table so
+#: the launcher's names and the runner's names are reconciled in exactly one
+#: place; a new floor is a line here and nowhere else.
+_QUALITY_FIELDS = {
+    "minPx": "quality_min_px",
+    "minIedPx": "quality_min_ied_px",
+    "minFrontality": "quality_min_frontality",
+    "minSharpness": "quality_min_sharpness",
+    "minEyeSpan": "quality_min_eye_span",
+    "requireLandmarks": "quality_require_landmarks",
+    "faceReverifyIntervalS": "face_reverify_interval_s",
+}
+
+
+def _apply_quality_profile(settings: Settings, profile: dict | None) -> Settings:
+    """Fold a per-run quality profile onto the runner's configured settings.
+
+    An OVERRIDE, not a reset: a key the launcher omitted keeps whatever the
+    box was configured with, so sending ``{"requireLandmarks": true}`` cannot
+    silently disarm a frontality floor an engineer set on that machine.  A
+    key sent as null is treated as omitted for the same reason — the wire
+    shape has optional fields, and "absent" and "explicitly nothing" mean the
+    same thing to an operator.
+
+    Unknown keys are ignored rather than rejected: the launcher and the
+    runner deploy separately, and a console one version ahead must not be
+    able to fail a run over a field the box has not learned yet.
+    """
+    if not profile:
+        return settings
+    changes = {}
+    for wire, field in _QUALITY_FIELDS.items():
+        value = profile.get(wire)
+        if value is None:
+            continue
+        changes[field] = value
+    return replace(settings, **changes) if changes else settings
+
+
 def _now_iso() -> str:
     """ISO-8601 UTC timestamp for planner reports (e.g. enrolledAt)."""
     return datetime.now(UTC).isoformat()
@@ -251,13 +291,16 @@ class RunLoop:
         """
         self.run_id = run_id
         self.request = request
-        self.s = settings
         self.client = client
         self.planner = planner
         self._is_live_run = is_live_run
         # Resolved once: the gate's floors cannot change under a running run,
         # and re-reading them per face would let a config reload move the
-        # discard threshold half way through a count.
+        # discard threshold half way through a count.  A per-run `quality`
+        # profile from the launcher is folded in HERE, once, for the same
+        # reason — and the resolved settings, not the raw environment, are
+        # what the run row records.
+        self.s = settings = _apply_quality_profile(settings, request.get("quality"))
         self.gate = gate.GateThresholds.from_settings(settings)
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
@@ -318,6 +361,12 @@ class RunLoop:
         # pruned the same way — a lock from minutes ago is not evidence.
         # Guarded by _lock.
         self._locks: dict[int, dict] = {}
+        # track_id -> monotonic time that track was last SCHEDULED for face
+        # verification (see _reverify_within).  Loop-thread only, and pruned
+        # against the live track set once it outgrows _REVERIFY_CAP, so a
+        # night of crossings cannot grow it without bound the way an
+        # unpruned per-track dict does.
+        self._last_face_verify: dict[int, float] = {}
         # Every track id this run has ever seen reported by the tracker.  ONE
         # person produced SIX ids on bench 6e1a5d (2, 5, 6, 7, 8, 12) and that
         # was invisible until someone queried SQLite by hand; the count of
@@ -517,7 +566,21 @@ class RunLoop:
             "gatedByIed": 0,
             "gatedByFrontality": 0,
             "gatedBySharpness": 0,
+            "gatedByEyeSpan": 0,
+            # Detections whose landmarks did not describe a face at all — a
+            # count of NOT-A-FACE, kept apart from the quality reasons above
+            # because it sends an operator somewhere different: a rising
+            # gatedByLandmarks is a detector finding shirts, not a camera
+            # needing a better angle.
+            "gatedByLandmarks": 0,
             "gatedUnmeasured": 0,
+            # RE-VERIFY SAVING: person crops NOT searched for a face this run
+            # because the track already held an identity and had been verified
+            # within face_reverify_interval_s.  Reported because the saving is
+            # only trustworthy if it is visible — an operator turning the
+            # interval up needs to see what it bought and, beside it, that
+            # `unique` did not move.
+            "faceSearchesSkipped": 0,
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -870,6 +933,9 @@ class RunLoop:
             "qualityMinIedPx": self.s.quality_min_ied_px,
             "qualityMinFrontality": self.s.quality_min_frontality,
             "qualityMinSharpness": self.s.quality_min_sharpness,
+            "qualityMinEyeSpan": self.s.quality_min_eye_span,
+            "qualityRequireLandmarks": self.s.quality_require_landmarks,
+            "faceReverifyIntervalS": self.s.face_reverify_interval_s,
             "gateArmed": list(self.gate.armed),
         }
 
@@ -978,6 +1044,12 @@ class RunLoop:
         within = dedupe_boxes(
             list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
         )
+        # RE-VERIFY GATE: skip the crops belonging to tracks that have already
+        # resolved to an identity and were verified recently.  Off by default.
+        # Everyone still unidentified — everyone who can change the count — is
+        # searched every frame regardless, so this only ever removes work that
+        # re-confirms a settled answer.
+        within = self._reverify_within(within, tracks)
         faces_out = self._timed(
             "face-detect",
             "faceDetectMs",
@@ -999,10 +1071,19 @@ class RunLoop:
                 ("iedPx", "faceIedPx"),
                 ("frontality", "frontality"),
                 ("sharpness", "sharpness"),
+                ("eyeSpanRatio", "eyeSpanRatio"),
             ):
                 if key in f:
                     board.observe("face-detect", metric, float(f[key]))
                     sample[metric] = float(f[key])
+            # Boolean, so it is charted as a RATE: the share of detections in
+            # this window whose landmarks described a face.  A dip is the
+            # detector finding shirts, which no continuous quality signal
+            # shows — a torso detection is often wide, sharp and "frontal".
+            if "landmarksPlausible" in f:
+                v = 1.0 if f["landmarksPlausible"] else 0.0
+                board.observe("face-detect", "landmarksPlausible", v)
+                sample["landmarksPlausible"] = v
             samples.add("face-detect", t_ms, sample)
 
         # EXCLUSION ZONES — before the gate, so an excluded face is never
@@ -1759,12 +1840,73 @@ class RunLoop:
         return True
 
     #: gate reason -> the status counter that records it.
+    #: Entries in ``_last_face_verify`` past which it is pruned against the
+    #: live track set.  Well above any plausible simultaneous-track count, so
+    #: pruning is a housekeeping event and not a per-frame cost.
+    _REVERIFY_CAP = 512
+
     _GATE_COUNTER = {
         "width": "gatedByWidth",
+        "landmarks": "gatedByLandmarks",
         "ied": "gatedByIed",
+        "eyespan": "gatedByEyeSpan",
         "frontality": "gatedByFrontality",
         "sharpness": "gatedBySharpness",
     }
+
+    def _reverify_within(self, within: list[dict], tracks: list[dict]) -> list[dict]:
+        """Remove person crops whose track is identified and freshly verified.
+
+        The saving this takes is bounded by construction: a track only becomes
+        eligible once it holds an identity lock, and a lock is only set when a
+        verdict on that track matched an EXISTING identity comfortably.  So a
+        skipped crop can never be a guest who has not been counted — it is a
+        guest who has been counted and is being counted again.
+
+        Everything eligible is stamped as verified NOW, before any face is
+        found.  Stamping on success instead would mean a person who turns away
+        from the camera is re-searched every frame for as long as they stay
+        turned, which is exactly the expensive case: it is also the case where
+        searching cannot succeed.
+
+        The interval trades freshness for cost, and what it costs is not the
+        count but co-presence evidence — two identities are proven distinct by
+        appearing in one frame, and a skipped track cannot contribute that
+        proof on that frame.  At the suggested few seconds every locked track
+        still reports many times per crossing, so the pairs are still observed;
+        an operator pushing the interval into tens of seconds is trading away
+        splits, and the status counter beside `coPresenceSplits` is how they
+        would see it.
+        """
+        interval = float(self.s.face_reverify_interval_s)
+        if interval <= 0.0 or not tracks:
+            return within
+        now = time.monotonic()
+        settled: list[dict] = []
+        with self._lock:
+            locks = dict(self._locks)
+        for t in tracks:
+            tid = t.get("id")
+            if tid is None or tid not in locks:
+                continue  # unidentified: always searched
+            last = self._last_face_verify.get(tid)
+            if last is not None and (now - last) < interval:
+                settled.append(t["box"])
+            else:
+                # Scheduled for verification this frame: stamp NOW, not on a
+                # face we have not found yet.
+                self._last_face_verify[tid] = now
+        # A track that has gone away should not keep an entry for the night.
+        if len(self._last_face_verify) > self._REVERIFY_CAP:
+            live = {t.get("id") for t in tracks}
+            self._last_face_verify = {
+                k: v for k, v in self._last_face_verify.items() if k in live
+            }
+        kept, skipped = gate.reverify_filter(within, settled)
+        if skipped:
+            with self._lock:
+                self._status["faceSearchesSkipped"] += skipped
+        return kept
 
     def _count_gated(self, outcome) -> None:
         """Record this frame's rejections against their reasons.

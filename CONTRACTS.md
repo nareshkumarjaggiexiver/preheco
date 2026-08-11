@@ -22,7 +22,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, loop?, isFile?, owner?, takeover?}, POST /close {owner?} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
-| faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
+| faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?,eyeSpanRatio?,landmarksPlausible?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
 | match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, templateId, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
@@ -493,7 +493,7 @@ faces are kept and *counted* instead, as `gatedUnmeasured` — an armed floor
 that silently evaluates nothing is worse than no floor at all.
 
 **Every rejection reports its reason.** A face carries `gateReason` (the FIRST
-floor it failed: width → ied → frontality → sharpness) into:
+floor it failed: width → landmarks → ied → eyespan → frontality → sharpness) into:
 
 - the `face-detect` tap payload — per row as `gate`, plus a per-frame
   `gatedBy: {reason: n}` breakdown, and the signals themselves so the console
@@ -1515,3 +1515,50 @@ The offline guarantee did not move. It is now carried by
 and reloads it on boot, so a runner restarting during a WAN outage reuses a
 still-valid token. That is what made the secret safe to delete rather than
 merely unused.
+
+
+## v3 addition — two signals harvested from the second pipeline (2026-08-12)
+
+A second, independently written pipeline (`apps/face-detection`, reviewed in
+docs/planning/13-…) turned out to gate on two things we measured nothing for.
+Both are now emitted by `faces` on every detection and both are optional
+floors in the runner's composite gate, **unarmed by default like every other
+floor**.
+
+- **`landmarksPlausible`** (bool) — do the 5 landmarks describe a face at all?
+  Eyes above nose above mouth, eye span 15–85 % of box width, nose within
+  0.30 × box width of the eye span. This is the only test in the gate that
+  says NOT A FACE rather than not-a-good-enough face, which is why it is
+  reported as its own reason: a rising `gatedByLandmarks` means the detector
+  is finding clothing (measured there: striped shirts verifying at 70–91 %),
+  not that a camera needs re-aiming. Armed by `HECO_QUALITY_REQUIRE_LANDMARKS`.
+- **`eyeSpanRatio`** (0..1) — eye separation as a fraction of box width: the
+  pose reading `iedPx` cannot give, because IED in pixels grows as a guest
+  walks toward the lens while this collapses in profile at any distance.
+  Armed by `HECO_QUALITY_MIN_EYE_SPAN` (suggested 0.30).
+
+`HECO_QUALITY_MIN_FRONTALITY` gains a suggested value for the first time
+(0.55) rather than a default: their yaw ratio is our frontality inverted, and
+their measured bands — frontal crops 0.05–0.43, off-angle crops behind phantom
+identities 0.48–1.02 — put the boundary at 1 − 0.45.
+
+### Face re-verification (`HECO_FACE_REVERIFY_INTERVAL_S`, default 0 = off)
+
+A track that already holds an identity lock is searched for a face again only
+every N seconds; every unidentified track is searched on every frame, always.
+The saving therefore comes entirely out of re-confirming a settled answer, and
+`faceSearchesSkipped` on the run status says how much of it was taken. The
+clock is stamped when a track is SCHEDULED, not when a face is found, so a
+person facing away cannot defeat it. The cost is co-presence evidence: a
+skipped track cannot prove distinctness on that frame, so an interval in the
+tens of seconds trades away `coPresenceSplits`.
+
+### Per-run overrides: `POST /runs {quality: {...}}`
+
+`{minPx?, minIedPx?, minFrontality?, minSharpness?, minEyeSpan?,
+requireLandmarks?, faceReverifyIntervalS?}` — an OVERRIDE of the box's
+configuration for one run, never a reset: an omitted or null field keeps what
+the machine was configured with, and an unknown field is ignored so a console
+one version ahead cannot fail a run. Whatever resolves is recorded in the run
+row's gate config, because "which floors were in force when this number was
+produced" has to survive the environment that produced it.

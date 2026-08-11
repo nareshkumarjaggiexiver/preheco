@@ -98,6 +98,37 @@ class ExclusionZone(BaseModel):
         return self
 
 
+class QualityProfile(BaseModel):
+    """Per-run overrides for the composite quality gate.
+
+    The floors are runner-wide environment configuration by default, which is
+    right for "this camera, this mount, always" and wrong for the two things
+    an operator actually does: trying a stricter gate on tonight's footage
+    before trusting it, and running one event under a profile that differs
+    from the box's default because the camera was moved.
+
+    So the launcher may send them per run.  Absent fields keep the runner's
+    configured value — this is an override, never a reset, so a profile that
+    only names ``requireLandmarks`` cannot silently disarm a frontality floor
+    an engineer set on the box.
+
+    Whatever arrives is recorded in the run row's gate config (RunLoop's
+    ``_gate_config``), because the count is an invoice figure and "which
+    floors were in force when this number was produced" has to be recoverable
+    from the record months later.
+    """
+
+    minPx: float | None = Field(default=None, ge=0)
+    minIedPx: float | None = Field(default=None, ge=0)
+    minFrontality: float | None = Field(default=None, ge=0, le=1)
+    minSharpness: float | None = Field(default=None, ge=0)
+    minEyeSpan: float | None = Field(default=None, ge=0, le=1)
+    requireLandmarks: bool | None = None
+    #: Seconds between face re-verifications of a track that already holds an
+    #: identity.  0 disables the saving (search everyone every frame).
+    faceReverifyIntervalS: float | None = Field(default=None, ge=0)
+
+
 class RunRequest(BaseModel):
     """Body of POST /runs — what to run and where to report it.
 
@@ -117,6 +148,8 @@ class RunRequest(BaseModel):
     siteId: str | None = None
     staffId: str | None = None
     exclusionZones: list[ExclusionZone] | None = None
+    #: Per-run quality-gate overrides (see :class:`QualityProfile`).
+    quality: QualityProfile | None = None
     #: Engineering-station bench mode: post the RAW frame for EVERY processed
     #: frame (not just the sampled tap rounds), so the console can scrub the
     #: run frame by frame. Costs one LAN upload per frame — a deliberate,

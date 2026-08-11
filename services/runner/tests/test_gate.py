@@ -144,3 +144,107 @@ def test_gate_faces_counts_faces_that_slipped_past_an_armed_floor():
     assert out.unmeasured == 2
     assert faces[1]["gateUnmeasured"] == ["ied"]
     assert "gateUnmeasured" not in faces[0]
+
+
+# ---------------------------------------- landmarks, eye span, and re-verify
+# Harvested from the sibling face-detection pipeline (docs/planning/13-…):
+# the two signals it gates on that we did not have, and the per-track
+# re-verification saving that is the cheapest idea in that file.
+
+from app.gate import reverify_filter  # noqa: E402
+
+
+def test_the_new_floors_are_unarmed_by_default_too():
+    """Same rule as every other floor: shipped off. A guessed floor costs
+    guests off an invoice, and these two were measured on somebody else's
+    camera, mount and lighting."""
+    t = GateThresholds.from_settings(Settings())
+    assert t.min_eye_span == 0.0
+    assert t.require_landmarks is False
+    assert t.armed == ()
+    # A face with implausible landmarks is KEPT while the switch is off.
+    assert gate_face(face(landmarksPlausible=False), t).kept
+
+
+def test_armed_landmarks_reject_a_detection_that_is_not_a_face():
+    """Armed, the switch turns an implausible layout into a refusal."""
+    t = GateThresholds(require_landmarks=True)
+    assert gate_face(face(landmarksPlausible=False), t).reason == "landmarks"
+    assert gate_face(face(landmarksPlausible=True), t).kept
+    assert t.armed == ("landmarks",)
+
+
+def test_landmarks_are_reported_before_the_quality_floors():
+    """A detection on a shirt must read as NOT-A-FACE, not as a badly-posed
+    face: the two send an operator looking in different places."""
+    t = GateThresholds(require_landmarks=True, min_frontality=0.55)
+    v = gate_face(face(landmarksPlausible=False, frontality=0.1), t)
+    assert v.reason == "landmarks"
+
+
+def test_unmeasured_landmarks_keep_the_face_and_say_so():
+    """Absence is UNKNOWN, never BAD — and an operator who armed the switch
+    needs to know how many faces are slipping past it unmeasured."""
+    t = GateThresholds(require_landmarks=True)
+    v = gate_face(face(), t)
+    assert v.kept
+    assert v.unmeasured == ("landmarks",)
+
+
+def test_armed_eye_span_rejects_a_profile_view():
+    """The pose axis iedPx cannot see: a profile face two feet from the lens
+    has a large IED in pixels and almost no eye span relative to its box."""
+    t = GateThresholds(min_eye_span=0.30)
+    assert gate_face(face(eyeSpanRatio=0.17), t).reason == "eyespan"
+    assert gate_face(face(eyeSpanRatio=0.42), t).kept
+    assert gate_face(face(iedPx=90.0), t).unmeasured == ("eyespan",)
+
+
+def test_the_measured_frontality_floor_splits_the_observed_bands():
+    """The sibling pipeline measured frontal crops at a nose-offset/eye-
+    distance of 0.05-0.43 and the off-angle crops behind phantom identities
+    at 0.48-1.02. Their yaw ratio is our frontality inverted, so their 0.45
+    ceiling is our 0.55 floor — this pins that translation."""
+    t = GateThresholds(min_frontality=0.55)
+    assert gate_face(face(frontality=1 - 0.43), t).kept  # worst frontal: 0.57
+    assert gate_face(face(frontality=1 - 0.48), t).reason == "frontality"  # best off-angle: 0.52
+
+
+def _box(x, y, w=40, h=90):
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def test_reverify_filter_is_a_no_op_with_nothing_settled():
+    """Nothing identified yet means nothing to skip — the common early case."""
+    regions = [_box(0, 0), _box(100, 0)]
+    kept, skipped = reverify_filter(regions, [])
+    assert kept == regions and skipped == 0
+
+
+def test_reverify_filter_drops_only_the_settled_person():
+    """The saving must come out of re-confirming a settled answer, never out
+    of searching someone who could still change the count."""
+    identified, stranger = _box(0, 0), _box(300, 0)
+    kept, skipped = reverify_filter([identified, stranger], [_box(2, 3)])
+    assert kept == [stranger]
+    assert skipped == 1
+
+
+def test_reverify_filter_removes_the_raw_detection_too_not_just_the_track_box():
+    """THE load-bearing property. The search list is the deduped union of raw
+    detection boxes and track boxes, so a settled track's own detection
+    describes the same person. Filtering by track box alone would remove
+    nothing — the person would still be searched via their detection."""
+    track_box = _box(10, 10)
+    raw_detection = _box(12, 11)  # same person, detector's own box
+    kept, skipped = reverify_filter([raw_detection], [track_box])
+    assert kept == [] and skipped == 1
+
+
+def test_reverify_filter_keeps_a_neighbour_standing_close():
+    """Two people shoulder to shoulder are two searches. The overlap rule is
+    the same one that merged the two lists, so the boundary is consistent."""
+    settled = _box(0, 0, w=40, h=90)
+    neighbour = _box(30, 0, w=40, h=90)  # IoU ~0.14, well under the threshold
+    kept, _ = reverify_filter([neighbour], [settled])
+    assert kept == [neighbour]

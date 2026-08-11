@@ -41,6 +41,99 @@ def classify_width(width_px: float, canon_px: int = CANON_PX, floor_px: int = FL
     return "reject"
 
 
+#: Landmark topology bounds.  A real face has its eyes above the nose above
+#: the mouth, eyes spanning a sane fraction of the box, and a nose that stays
+#: near the eye span.  The numbers come from the sibling pipeline's field
+#: measurements against this camera family (see
+#: docs/planning/13-pipeline-review-face-detection.md) and are deliberately
+#: LOOSE: this test exists to reject detections whose landmarks are
+#: effectively random, not to judge pose.  Pose is `frontality` and
+#: `eyeSpanRatio`, which are separate signals with separate floors.
+EYE_SPAN_MIN_FRAC = float(os.environ.get("FACES_EYE_SPAN_MIN_FRAC", "0.15"))
+EYE_SPAN_MAX_FRAC = float(os.environ.get("FACES_EYE_SPAN_MAX_FRAC", "0.85"))
+NOSE_MARGIN_FRAC = float(os.environ.get("FACES_NOSE_MARGIN_FRAC", "0.30"))
+
+
+def landmarks_plausible(landmarks, box: dict) -> bool | None:
+    """Do these 5 landmarks describe a face at all?  None when unmeasurable.
+
+    YuNet reports (right eye, left eye, nose, right mouth corner, left mouth
+    corner).  A detection on clothing or a torso satisfies the detector's own
+    confidence — the sibling pipeline observed striped shirts verifying at
+    70–91 % — but its landmarks land in effectively random positions, because
+    there is no face under them for the regressor to lock onto.  Three cheap
+    topological facts separate the two, and none of them is a pose judgement:
+
+    1. **Eyes above nose above mouth.**  True of every human face at every
+       yaw and every plausible roll for a mounted camera looking down a queue.
+    2. **The eye span is a sane fraction of the box width.**  Under 15 % means
+       the two "eyes" collapsed onto one point; over 85 % means they landed on
+       opposite edges of something that is not a head.
+    3. **The nose sits near the eye span.**  The margin is a fraction of the
+       BOX WIDTH rather than of the eye distance, deliberately: on a
+       three-quarter view the eyes compress together while the nose
+       legitimately projects past the far one, and an eye-distance margin
+       would reject exactly the yawed-but-usable faces that
+       :func:`~app.main._with_quality`'s ``frontality`` is there to score.
+
+    Returns None — meaning UNKNOWN, never BAD — when the landmarks or the box
+    cannot support the test.  The runner's gate is required to read absence
+    that way, because rejecting a face nobody managed to measure would drop a
+    guest from an invoice.
+    """
+    if not landmarks or len(landmarks) < 5:
+        return None
+    try:
+        (rex, rey), (lex, ley), (nx, ny), (rmx, rmy), (lmx, lmy) = (
+            (float(p[0]), float(p[1])) for p in landmarks[:5]
+        )
+        w = float(box.get("w", 0.0))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if w <= 0:
+        return None
+
+    eye_y = (rey + ley) / 2.0
+    mouth_y = (rmy + lmy) / 2.0
+    if not (eye_y < ny < mouth_y):
+        return False
+
+    eye_span = abs(lex - rex)
+    if not (EYE_SPAN_MIN_FRAC * w <= eye_span <= EYE_SPAN_MAX_FRAC * w):
+        return False
+
+    lo, hi = min(rex, lex), max(rex, lex)
+    margin = NOSE_MARGIN_FRAC * w
+    return lo - margin <= nx <= hi + margin
+
+
+def eye_span_ratio(landmarks, box: dict) -> float | None:
+    """Horizontal eye separation as a fraction of box width; None if unknown.
+
+    The pose signal ``iedPx`` cannot give: inter-eye distance in PIXELS says
+    how much of the face the sensor resolved, and grows as a guest walks
+    toward the lens.  The same distance as a fraction of the face's own box
+    says how much of the face is TURNED AWAY — it collapses toward zero in
+    profile at any resolution.  Size and pose fail independently and the two
+    numbers must not be conflated; this is the second one.
+
+    Horizontal separation only (``abs(lex - rex)``, not the euclidean
+    distance) because that is the component yaw actually compresses; roll
+    would shrink the euclidean distance too and roll is not what this gates.
+    """
+    if not landmarks or len(landmarks) < 2:
+        return None
+    try:
+        rex = float(landmarks[0][0])
+        lex = float(landmarks[1][0])
+        w = float(box.get("w", 0.0))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if w <= 0:
+        return None
+    return round(abs(lex - rex) / w, 3)
+
+
 def crop_sharpness(
     img: np.ndarray, box: dict, norm_px: int = SHARPNESS_NORM_PX
 ) -> float | None:

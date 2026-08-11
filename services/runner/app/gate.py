@@ -40,7 +40,12 @@ from dataclasses import dataclass
 #: Rejection reasons, in the order the signals are tested.  A face is reported
 #: against the FIRST signal it fails, not all of them: the console shows one
 #: label per face, and the cheapest, oldest, best-understood test goes first.
-REASONS = ("width", "ied", "frontality", "sharpness")
+#:
+#: ``landmarks`` sits directly after width because it is the only test here
+#: that asks "is this a face at all?" rather than "is this face good enough?".
+#: A detection on a striped shirt should be reported as not-a-face, not as a
+#: badly-posed one — the two send an operator looking in different places.
+REASONS = ("width", "landmarks", "ied", "eyespan", "frontality", "sharpness")
 
 
 @dataclass(frozen=True)
@@ -56,15 +61,22 @@ class GateThresholds:
     min_ied_px: float = 0.0
     min_frontality: float = 0.0
     min_sharpness: float = 0.0
+    min_eye_span: float = 0.0
+    #: Reject faces whose landmarks do not describe a face.  A BOOLEAN switch,
+    #: not a floor, because the underlying test is topological — there is no
+    #: continuum between "eyes above nose above mouth" and not.
+    require_landmarks: bool = False
 
     @classmethod
     def from_settings(cls, s) -> "GateThresholds":
-        """Read the four floors off a runner Settings snapshot."""
+        """Read every floor off a runner Settings snapshot."""
         return cls(
             min_px=float(s.quality_min_px),
             min_ied_px=float(s.quality_min_ied_px),
             min_frontality=float(s.quality_min_frontality),
             min_sharpness=float(s.quality_min_sharpness),
+            min_eye_span=float(s.quality_min_eye_span),
+            require_landmarks=bool(s.quality_require_landmarks),
         )
 
     @property
@@ -74,15 +86,17 @@ class GateThresholds:
         Empty for the default configuration, which is the whole point: the
         composite gate changes nothing until an operator opts in.
         """
-        return tuple(
+        floors = tuple(
             name
             for name, floor in (
                 ("ied", self.min_ied_px),
+                ("eyespan", self.min_eye_span),
                 ("frontality", self.min_frontality),
                 ("sharpness", self.min_sharpness),
             )
             if floor > 0.0
         )
+        return (("landmarks",) if self.require_landmarks else ()) + floors
 
 
 @dataclass(frozen=True)
@@ -122,15 +136,28 @@ def gate_face(face: dict, t: GateThresholds) -> Verdict:
     """Decide one face against every armed floor; report the first failure.
 
     Width is tested against ``face["box"]["w"]``, which the detector always
-    provides; the other three are read from the optional signals the faces
-    service emits (``iedPx``, ``frontality``, ``sharpness``).
+    provides; the rest are read from the optional signals the faces service
+    emits (``landmarksPlausible``, ``iedPx``, ``eyeSpanRatio``,
+    ``frontality``, ``sharpness``).
     """
     if float(face.get("box", {}).get("w", 0.0)) < t.min_px:
         return Verdict("width")
 
     unmeasured: list[str] = []
+    # Is it a face at all?  Tested before the quality floors so a detection on
+    # clothing is reported as such rather than as a badly-posed face.  Same
+    # absence rule as every other signal: a face whose landmarks could not be
+    # judged is UNKNOWN, and unknown never rejects.
+    if t.require_landmarks:
+        plausible = face.get("landmarksPlausible")
+        if plausible is None:
+            unmeasured.append("landmarks")
+        elif not plausible:
+            return Verdict("landmarks")
+
     for name, key, floor in (
         ("ied", "iedPx", t.min_ied_px),
+        ("eyespan", "eyeSpanRatio", t.min_eye_span),
         ("frontality", "frontality", t.min_frontality),
         ("sharpness", "sharpness", t.min_sharpness),
     ):
@@ -174,6 +201,61 @@ class GateOutcome:
     kept: list[dict]
     gated_by: dict[str, int]
     unmeasured: int = 0
+
+
+def reverify_filter(
+    regions: list[dict],
+    settled: list[dict],
+    iou_thr: float = 0.6,
+) -> tuple[list[dict], int]:
+    """Drop the person crops that belong to already-identified, recently
+    verified tracks.  Returns ``(regions_to_search, skipped)``.
+
+    ``settled`` is the box of every track that (a) holds an identity lock and
+    (b) has been face-verified within the re-verify interval.  A region is
+    dropped when it overlaps one of them past ``iou_thr``.
+
+    **Why the filter works on regions rather than on tracks.**  The search
+    list is the DEDUPED union of raw detection boxes and track boxes, so a
+    settled track's own raw detection is in there too, describing the same
+    person.  Removing the track's box alone would remove nothing — the person
+    would still be searched via their detection.  Whether a person is searched
+    is a fact about the person, so the filter has to be applied where people
+    are, which is after the union.
+
+    **Why IoU rather than identity.**  Regions carry no track id by the time
+    they reach here; they are geometry.  The same overlap rule that merged
+    the two lists is the honest one for asking "is this region that track?".
+
+    Pure, so the interval policy is testable without a frame loop: the caller
+    decides WHICH tracks are settled, this decides which crops that removes.
+    """
+    if not settled:
+        return regions, 0
+    keep: list[dict] = []
+    skipped = 0
+    for region in regions:
+        if any(_iou(region, box) >= iou_thr for box in settled):
+            skipped += 1
+            continue
+        keep.append(region)
+    return keep, skipped
+
+
+def _iou(a: dict, b: dict) -> float:
+    """Intersection over union of two contract boxes; 0.0 when disjoint."""
+    ax, ay = float(a.get("x", 0.0)), float(a.get("y", 0.0))
+    aw, ah = float(a.get("w", 0.0)), float(a.get("h", 0.0))
+    bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+    bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    if inter <= 0:
+        return 0.0
+    return inter / (aw * ah + bw * bh - inter)
 
 
 def gate_faces(faces: list[dict], t: GateThresholds) -> GateOutcome:

@@ -3,7 +3,8 @@
 Contract (CONTRACTS.md):
     POST /detect {imageB64, within?: [{x, y, w, h, ...}]}
         -> {faces: [{box, landmarks: [5x[x, y]], conf, widthPx, quality,
-                     iedPx?, frontality?, sharpness?}], inferMs}
+                     iedPx?, frontality?, sharpness?, eyeSpanRatio?,
+                     landmarksPlausible?}], inferMs}
     GET  /health -> {ok, model, version}
 
 With `within`, detection runs per person-box crop and coordinates are mapped
@@ -25,7 +26,7 @@ from . import __version__
 from .codec import b64_to_bgr
 from .detector import MODEL_PATH, FaceDetector
 from .mapping import clamp_box, offset_face
-from .quality import classify_width, crop_sharpness
+from .quality import classify_width, crop_sharpness, eye_span_ratio, landmarks_plausible
 
 log = logging.getLogger("faces")
 
@@ -84,6 +85,14 @@ def _with_quality(face: dict, img: np.ndarray) -> dict:
       for crop size (see :func:`crop_sharpness`).  Size and pose can both be
       perfect while the crop is smeared by a walking guest, and no other signal
       here can see that.
+    - ``eyeSpanRatio`` eye separation as a fraction of box width — the pose
+      reading ``iedPx`` cannot give, because IED in pixels grows as a guest
+      walks toward the lens while the ratio collapses in profile at any
+      distance (:func:`eye_span_ratio`).
+    - ``landmarksPlausible`` whether the 5 landmarks describe a face at all.
+      A detection on clothing satisfies the detector's own confidence — the
+      sibling pipeline measured striped shirts verifying at 70–91 % — but its
+      landmarks are effectively random (:func:`landmarks_plausible`).
 
     ``img`` is the image the face's box coordinates refer to — the FULL frame
     on both paths, because the ``within`` path offsets crop-space boxes back to
@@ -113,6 +122,12 @@ def _with_quality(face: dict, img: np.ndarray) -> dict:
         frontality = max(0.0, 1.0 - abs(nx - eye_mid_x) / ied) if ied > 0 else 0.0
         out["iedPx"] = round(ied, 1)
         out["frontality"] = round(frontality, 3)
+        span = eye_span_ratio(lm, face["box"])
+        if span is not None:
+            out["eyeSpanRatio"] = span
+    plausible = landmarks_plausible(lm, face["box"])
+    if plausible is not None:
+        out["landmarksPlausible"] = plausible
     return out
 
 

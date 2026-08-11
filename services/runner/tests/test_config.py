@@ -74,3 +74,60 @@ def test_co_presence_splits_are_on_by_default_and_switchable_off(monkeypatch):
 
     monkeypatch.setenv("HECO_COPRESENCE_SPLIT", "0")
     assert cfg.from_env().copresence_split == 0, "0 is the off switch"
+
+
+# --------------------------------------------- per-run quality profile
+# The floors are box-wide env config by default. A launcher may override them
+# for ONE run, because the two things an operator actually does are trying a
+# stricter gate on tonight's footage before trusting it, and running one event
+# under a profile that differs from the box's default.
+
+from app.config import Settings  # noqa: E402
+from app.loop import _apply_quality_profile  # noqa: E402
+
+
+def test_no_profile_leaves_the_configured_settings_alone():
+    s = Settings(quality_min_frontality=0.55)
+    assert _apply_quality_profile(s, None) is s
+    assert _apply_quality_profile(s, {}) is s
+
+
+def test_a_profile_overrides_only_what_it_names():
+    """An OVERRIDE, not a reset: sending one field must not disarm a floor an
+    engineer set on the box."""
+    s = Settings(quality_min_frontality=0.55, quality_min_px=56.0)
+    out = _apply_quality_profile(s, {"requireLandmarks": True})
+    assert out.quality_require_landmarks is True
+    assert out.quality_min_frontality == 0.55  # untouched
+    assert out.quality_min_px == 56.0
+
+
+def test_null_means_absent_not_zero():
+    """The wire shape has optional fields; 'absent' and 'explicitly nothing'
+    mean the same thing to an operator, and neither may disarm a floor."""
+    s = Settings(quality_min_frontality=0.55)
+    out = _apply_quality_profile(s, {"minFrontality": None, "minEyeSpan": 0.30})
+    assert out.quality_min_frontality == 0.55
+    assert out.quality_min_eye_span == 0.30
+
+
+def test_unknown_keys_are_ignored_not_fatal():
+    """The console and the box deploy separately: a launcher one version ahead
+    must not be able to fail a run over a field this box has not learned."""
+    s = Settings()
+    out = _apply_quality_profile(s, {"minGlasses": 0.9, "requireLandmarks": True})
+    assert out.quality_require_landmarks is True
+
+
+def test_the_profile_reaches_the_gate_and_the_run_record():
+    """What the operator chose has to be what the gate enforces AND what the
+    run row records — the count is an invoice figure, so 'which floors were in
+    force' must be recoverable months later."""
+    from app.gate import GateThresholds
+
+    s = _apply_quality_profile(
+        Settings(), {"minEyeSpan": 0.30, "requireLandmarks": True, "faceReverifyIntervalS": 5.0}
+    )
+    t = GateThresholds.from_settings(s)
+    assert t.armed == ("landmarks", "eyespan")
+    assert s.face_reverify_interval_s == 5.0
