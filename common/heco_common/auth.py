@@ -40,7 +40,9 @@ models, not on HTTP libraries.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import random
 import threading
 import time
@@ -111,6 +113,7 @@ class TokenProvider:
         jitter_s: float = DEFAULT_JITTER_S,
         now: Callable[[], float] = time.time,
         rng: Callable[[float, float], float] = random.uniform,
+        cache_path: str | None = None,
     ) -> None:
         self.auth_url = auth_url.rstrip("/")
         self.app_id = app_id
@@ -120,6 +123,11 @@ class TokenProvider:
         self._jitter_s = max(0.0, jitter_s)
         self._now = now
         self._rng = rng
+        #: Where a minted token is kept so a RESTART does not need the network.
+        #: None disables persistence entirely, which is the default and what
+        #: every test and ad-hoc script gets — writing a bearer token to disk
+        #: is a decision a caller makes on purpose, never a side effect.
+        self._cache_path = cache_path
 
         self._lock = threading.Lock()
         self._refreshing = threading.Lock()
@@ -135,6 +143,11 @@ class TokenProvider:
         self.refresh_failures = 0
         self.last_error: str | None = None
         self.mints = 0
+        #: True when this process started from a token on disk rather than a
+        #: fresh mint — the observable proof that an offline boot worked.
+        self.loaded_from_cache = False
+
+        self._load_cached()
 
     # ------------------------------------------------------------- reading
 
@@ -294,9 +307,88 @@ class TokenProvider:
             self._next_attempt_at = 0.0
             self.last_error = None
             self.mints += 1
+            token, expires_at = self._token, self._expires_at
+        # Outside the lock: disk I/O must not hold up a caller reading the
+        # token that was just minted.
+        self._store_cached(token, expires_at)
 
     def _fail(self, message: str) -> None:
         with self._lock:
             self.refresh_failures += 1
             self.last_error = message
             self._next_attempt_at = self._now() + RETRY_FLOOR_S
+
+    # ------------------------------------------------------- disk persistence
+
+    def _load_cached(self) -> None:
+        """Adopt a token left on disk by a previous process, if it still has
+        useful life left.
+
+        THIS IS THE OFFLINE BOOT. Without it the provider's memory is the only
+        copy, so a runner that RESTARTS while the venue's internet is down has
+        nothing — even though it held a perfectly good 48 h token a minute
+        earlier — and a night of counting goes unreported. The planner already
+        solves the mirror-image problem by caching the JWKS on disk; this is
+        the same move on the minting side.
+
+        A token close to expiry is still adopted rather than discarded: it is
+        strictly better than nothing, and the ordinary refresh schedule will
+        replace it the moment the network returns. Only an already-expired one
+        is dropped. Anything unreadable, unparseable or foreign is ignored in
+        silence — a corrupt cache must degrade to "mint a fresh one", never to
+        a crash on boot.
+        """
+        if not self._cache_path:
+            return
+        try:
+            with open(self._cache_path, encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(cached, dict):
+            return
+        # A cache written by a DIFFERENT application must never be adopted:
+        # the token would be refused and the failure would look like a broken
+        # auth service rather than a stale file.
+        if cached.get("app_id") != self.app_id:
+            return
+        token = cached.get("access_token")
+        expires_at = cached.get("expires_at")
+        if not isinstance(token, str) or not isinstance(expires_at, (int, float)):
+            return
+        if self._now() >= expires_at:
+            return
+
+        self._token = token
+        self._expires_at = float(expires_at)
+        lead = min(self._refresh_ahead_s, max(0.0, expires_at - self._now()) / 2)
+        jitter = self._rng(0.0, self._jitter_s) if self._jitter_s else 0.0
+        self._refresh_at = max(self._now(), expires_at - lead - jitter)
+        self.loaded_from_cache = True
+
+    def _store_cached(self, token: str, expires_at: float) -> None:
+        """Write the token for the next process to find.
+
+        0600 and written via a temp file in the same directory, then renamed:
+        a live bearer token must not be world-readable, and a crash mid-write
+        must not leave a half-written file that the next boot then refuses.
+        Failure to persist is logged and swallowed — the process has a working
+        token in memory, and refusing to run because a cache could not be
+        written would trade a real outage for a housekeeping problem.
+        """
+        if not self._cache_path:
+            return
+        payload = {"app_id": self.app_id, "access_token": token, "expires_at": expires_at}
+        tmp = f"{self._cache_path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(self._cache_path) or ".", exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, self._cache_path)
+        except OSError as exc:
+            # NEVER the token itself, here or anywhere: this message travels
+            # into logs that are read, shipped and pasted into tickets.
+            print(f"heco auth: could not persist the token cache ({exc})", flush=True)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)

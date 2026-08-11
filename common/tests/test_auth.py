@@ -8,7 +8,10 @@ lifecycle runs in microseconds and nothing touches a socket.
 
 from __future__ import annotations
 
+import json
+import stat
 import threading
+import time
 
 import pytest
 from heco_common.auth import RETRY_FLOOR_S, TokenProvider
@@ -385,3 +388,105 @@ def _settle(p: TokenProvider) -> None:
     for t in threading.enumerate():
         if t.name == "heco-token-refresh":
             t.join(timeout=5)
+
+
+# ---------------------------------------------------- the offline restart
+
+def _stub_transport(token="tok-1", lifetime=48 * 3600, calls=None):
+    def transport(url, payload):
+        if calls is not None:
+            calls.append(url)
+        return 200, {"access_token": token, "expires_in": lifetime}
+    return transport
+
+
+def test_a_minted_token_is_written_to_disk(tmp_path):
+    """The cache is what makes an offline restart possible at all."""
+    cache = tmp_path / "token.json"
+    p = TokenProvider("http://auth", "runner", "sekrit",
+                      transport=_stub_transport(), jitter_s=0, cache_path=str(cache))
+    assert p.token() == "tok-1"
+    assert cache.exists()
+
+    written = json.loads(cache.read_text())
+    assert written["access_token"] == "tok-1"
+    assert written["app_id"] == "runner"
+    assert written["expires_at"] > time.time()
+    # A live bearer token must not be readable by every process on the box.
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o600
+
+
+def test_a_restart_with_no_network_reuses_the_cached_token(tmp_path):
+    """THE POINT OF THE WHOLE FEATURE.
+
+    First process mints and writes. Second process starts with an auth service
+    it cannot reach — and still has a credential, so the night still reports.
+    """
+    cache = tmp_path / "token.json"
+    first = TokenProvider("http://auth", "runner", "sekrit",
+                          transport=_stub_transport(), jitter_s=0, cache_path=str(cache))
+    assert first.token() == "tok-1"
+
+    def dead(url, payload):
+        raise OSError("no route to host")
+
+    second = TokenProvider("http://auth", "runner", "sekrit",
+                           transport=dead, jitter_s=0, cache_path=str(cache))
+    assert second.loaded_from_cache is True
+    assert second.token(block=False) == "tok-1"
+    assert second.auth_header() == {"Authorization": "Bearer tok-1"}
+
+
+def test_an_expired_cache_is_not_adopted(tmp_path):
+    """A dead token is worse than none: it would be refused and read as a
+    broken auth service rather than a stale file."""
+    cache = tmp_path / "token.json"
+    cache.write_text(json.dumps({
+        "app_id": "runner", "access_token": "stale", "expires_at": time.time() - 10,
+    }))
+    calls = []
+    p = TokenProvider("http://auth", "runner", "sekrit",
+                      transport=_stub_transport(calls=calls), jitter_s=0, cache_path=str(cache))
+    assert p.loaded_from_cache is False
+    assert p.token() == "tok-1"
+    assert len(calls) == 1, "it had to mint, because the cache was dead"
+
+
+def test_a_cache_from_a_different_application_is_ignored(tmp_path):
+    """Two applications sharing a volume must not adopt each other's tokens."""
+    cache = tmp_path / "token.json"
+    cache.write_text(json.dumps({
+        "app_id": "eval", "access_token": "not-mine", "expires_at": time.time() + 9999,
+    }))
+    p = TokenProvider("http://auth", "runner", "sekrit",
+                      transport=_stub_transport(), jitter_s=0, cache_path=str(cache))
+    assert p.loaded_from_cache is False
+    assert p.token() == "tok-1"
+
+
+@pytest.mark.parametrize("junk", ["", "{", "null", '{"access_token": 5}', '[]'])
+def test_a_corrupt_cache_degrades_to_minting(tmp_path, junk):
+    """Unreadable is not fatal: boot must never die on a bad cache file."""
+    cache = tmp_path / "token.json"
+    cache.write_text(junk)
+    p = TokenProvider("http://auth", "runner", "sekrit",
+                      transport=_stub_transport(), jitter_s=0, cache_path=str(cache))
+    assert p.loaded_from_cache is False
+    assert p.token() == "tok-1"
+
+
+def test_an_unwritable_cache_never_stops_the_runner(tmp_path, capsys):
+    """A housekeeping failure must not become an outage."""
+    p = TokenProvider("http://auth", "runner", "sekrit",
+                      transport=_stub_transport(), jitter_s=0,
+                      cache_path="/proc/definitely/not/writable/token.json")
+    assert p.token() == "tok-1"
+    # ...and the complaint must not carry the token itself.
+    assert "tok-1" not in capsys.readouterr().out
+
+
+def test_persistence_is_opt_in(tmp_path):
+    """No cache_path, no file: writing a bearer token to disk is a decision."""
+    p = TokenProvider("http://auth", "runner", "sekrit", transport=_stub_transport(), jitter_s=0)
+    assert p.token() == "tok-1"
+    assert list(tmp_path.iterdir()) == []

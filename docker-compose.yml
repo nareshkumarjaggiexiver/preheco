@@ -285,6 +285,13 @@ services:
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
+      # Where the minted token is kept across restarts (see runner-state).
+      HECO_TOKEN_CACHE: ${HECO_TOKEN_CACHE-/srv/state/runner-token.json}
+    volumes:
+      # The token cache MUST outlive the container: the whole point is a
+      # restart during a WAN outage, and `up -d --force-recreate` would
+      # otherwise throw away the one thing that makes that survivable.
+      - runner-state:/srv/state
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Linux needs this mapping
     depends_on:
@@ -298,3 +305,4 @@ services:
 volumes:
   match-data:
   source-media:
+  runner-state:   # the runner's minted-token cache; see the runner service
