@@ -16,6 +16,7 @@ staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
+from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, model_validator
 
 from . import config
@@ -24,6 +25,11 @@ from .runs import RunManager
 VERSION = "0.1.0"
 
 app = FastAPI(title="heco-runner", version=VERSION)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 manager = RunManager(config.from_env())
 
 
@@ -31,12 +37,17 @@ class Source(BaseModel):
     """Where frames come from: an RTSP/HTTP url or a local file path.
 
     Mirrors ingest's OpenSource (exactly one of url/path; `loop` restarts a
-    file at EOF so a short clip behaves like an endless camera).
+    file at EOF so a short clip behaves like an endless camera; `isFile`
+    marks a url as a finite recording — paced to its native FPS, run ends at
+    EOF — which is how the planner's uploaded-video runs arrive).  The loop
+    forwards this dict to ingest verbatim, so the flag must be declared here
+    or validation would silently drop it.
     """
 
     url: str | None = None
     path: str | None = None
     loop: bool = False
+    isFile: bool = False
 
     @model_validator(mode="after")
     def _one_of(self) -> "Source":

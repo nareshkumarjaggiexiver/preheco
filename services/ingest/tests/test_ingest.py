@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from heco_common.imaging import decode_jpeg_b64
 
-from .conftest import VID_H, VID_W
+from .conftest import VID_FRAMES, VID_H, VID_W
 
 
 def _wait_frame(client, timeout_s: float = 3.0) -> dict:
@@ -83,6 +83,44 @@ def test_loop_wraps_past_clip_length(client, synthetic_video):
         time.sleep(0.02)
         seq = client.get("/frame").json()["seq"]
     assert seq > 45
+
+
+def test_url_with_is_file_plays_out_and_ends(client, synthetic_video):
+    """A url declared ``isFile`` gets FILE semantics: paced, ended at EOF.
+
+    This is the uploaded-video contract (planner serves an operator's
+    recording over HTTP as ``{url, isFile: true}``). Under the default live
+    semantics a finite url hits EOF and is treated as a stream hiccup —
+    release, pause, reopen — which replays the recording from frame 0
+    forever: every guest in it is re-counted on every pass and the run never
+    settles as source-ended.
+    """
+    from app.main import state
+
+    # The synthetic clip's path doubles as the "url": VideoCapture takes a
+    # string either way, and what is under test is the semantics switch, not
+    # HTTP transport.
+    res = client.post("/open", json={"url": synthetic_video, "isFile": True})
+    assert res.status_code == 200
+    assert state.worker.is_file is True
+
+    _wait_frame(client)
+    # 40 frames at 100 fps ≈ 0.4 s: the clip must play OUT, not wrap.
+    deadline = time.monotonic() + 5.0
+    body = client.get("/frame").json()
+    while not body["ended"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+        body = client.get("/frame").json()
+    assert body["ended"] is True, "EOF on an isFile url must end the source"
+    assert body["seq"] <= VID_FRAMES, "the clip replayed — isFile url looped like a live stream"
+
+
+def test_url_without_is_file_stays_live(client, synthetic_video):
+    """The default keeps every existing caller bit-for-bit: a url is live."""
+    from app.main import state
+
+    assert client.post("/open", json={"url": synthetic_video}).status_code == 200
+    assert state.worker.is_file is False
 
 
 def test_shutdown_stops_capture_thread(synthetic_video):
@@ -261,3 +299,28 @@ def test_an_unread_frame_is_grabbed_not_retrieved(monkeypatch):
     # ...and taking the frame clears the flag, so the next one is retrieved.
     w.latest()
     assert not w._slot_unread()
+
+
+def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
+    """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
+
+    No credential -> 401 with the machine-readable code; the legacy shared
+    secret passes (the dual-accept leg); /health stays open for the compose
+    healthcheck. The gate sits ahead of routing, so an unknown path proves
+    both halves: 401 without a credential, 404 — the router's own answer —
+    with one. Every other test in this file runs unarmed and is untouched.
+    """
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HECO_REQUIRE_AUTH", "1")
+    monkeypatch.setenv("HECO_TOKEN", "sekrit-armed-test")
+    client = TestClient(app)
+    assert client.get("/health").status_code == 200
+
+    refused = client.get("/gate-probe")
+    assert refused.status_code == 401
+    assert refused.json()["code"] == "auth"
+
+    allowed = client.get("/gate-probe", headers={"Authorization": "Bearer sekrit-armed-test"})
+    assert allowed.status_code == 404, "a valid credential reaches the router itself"
