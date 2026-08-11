@@ -1,5 +1,9 @@
 # match service — runtime + dev, pinned to the fleet versions (Python 3.12).
-# Self-contained on purpose: no heco_common (pure geometry + sqlite + numpy).
+# It WAS self-contained (pure geometry + sqlite + numpy). It no longer is:
+# the shared inbound auth gate lives in heco_common, and match is the one
+# service where an unauthenticated LAN caller could poison a count through
+# /merge — so it is the last place that may skip the gate.
+-e ../../common
 fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
