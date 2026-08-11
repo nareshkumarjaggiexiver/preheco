@@ -2,8 +2,10 @@
 
 Endpoints (CONTRACTS.md):
 
-* ``POST /open``  {url|path, loop, owner?, takeover?} — start capturing.
-  The capture slot is EXCLUSIVE: see "one slot, one owner" below.
+* ``POST /open``  {url|path, loop, isFile?, owner?, takeover?} — start
+  capturing.  ``isFile`` marks a url as a finite recording (paced, ends at
+  EOF) rather than a live stream.  The capture slot is EXCLUSIVE: see "one
+  slot, one owner" below.
 * ``POST /close`` {owner?, force?} — release the slot at end of run.
 * ``GET /frame``  → {tMs, imageB64, w, h, seq, ended} — the LATEST frame only
   (drop-not-queue; see app.capture for the policy).
@@ -36,6 +38,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from heco_common.config import env_int
+from heco_common.gate_auth import install_bearer_gate
 from heco_common.imaging import encode_jpeg_b64
 from heco_common.schemas import CloseSource, Frame, Health, OpenSource
 
@@ -83,6 +86,11 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="heco-ingest", version=__version__, lifespan=_lifespan)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 
 
 @app.post("/open")
@@ -110,7 +118,12 @@ def open_source(body: OpenSource) -> dict:
                     f"re-send with takeover=true to seize its camera"
                 ),
             )
-        source, is_file = (body.path, True) if body.path else (body.url, False)
+        # A url is live unless the caller SAYS it is a finite recording
+        # (isFile): pacing and EOF-ends-the-run semantics must not hinge on
+        # guessing from the url's shape.
+        source, is_file = (
+            (body.path, True) if body.path else (body.url, body.isFile)
+        )
         try:
             worker = CaptureWorker(source=source, is_file=is_file, loop=body.loop)
         except CaptureError as exc:

@@ -98,6 +98,14 @@ class OpenSource(BaseModel):
     ``loop`` applies to file sources only: when true the file restarts at EOF
     so a short clip behaves like an endless camera.
 
+    ``isFile`` declares a ``url`` to be a FINITE RECORDING served over HTTP
+    (the planner's uploaded-video runs), not a live stream.  The distinction
+    is behavioural, not cosmetic: a file source is paced to its native FPS and
+    sets ``ended`` at EOF, while a live url is read flat-out and EOF is
+    treated as a hiccup to reopen — which for a finite file over HTTP means
+    replaying it from the start, forever, silently double-counting everyone in
+    it.  ``path`` sources are files by definition and ignore this flag.
+
     ``owner`` names the run that claims the single capture slot.  Ingest holds
     ONE source at a time, so without an owner a second run silently replaces a
     live run's camera and both loops then read the wrong frames; with one, the
@@ -108,6 +116,7 @@ class OpenSource(BaseModel):
     url: str | None = None
     path: str | None = None
     loop: bool = False
+    isFile: bool = False
     owner: str | None = None
     takeover: bool = False
 
