@@ -54,13 +54,13 @@ def test_unarmed_is_todays_behaviour_bit_for_bit():
     """Until HECO_REQUIRE_AUTH is set, the gate must change NOTHING."""
     g = gate_with({})
     assert call(g)[0] == 200
-    g2 = gate_with({"HECO_REQUIRE_AUTH": "0", "HECO_TOKEN": "sekrit"})
+    g2 = gate_with({"HECO_REQUIRE_AUTH": "0", "HECO_AUTH_ISSUER": ISS})
     assert call(g2)[0] == 200, "a configured but unarmed gate changes nothing"
 
 
 def test_armed_refuses_the_open_lan():
     """Armed, no credential: 401 with the machine-readable code."""
-    g = gate_with({"HECO_REQUIRE_AUTH": "1", "HECO_TOKEN": "sekrit"})
+    g = gate_with({"HECO_REQUIRE_AUTH": "1", "HECO_AUTH_ISSUER": ISS})
     status, body, headers = call(g)
     assert status == 401
     refusal = json.loads(body)
@@ -70,21 +70,26 @@ def test_armed_refuses_the_open_lan():
 
 def test_health_stays_open_for_the_compose_healthchecks():
     """Compose polls /health unauthenticated; the deploy runbook reads it too."""
-    g = gate_with({"HECO_REQUIRE_AUTH": "1", "HECO_TOKEN": "sekrit"})
+    g = gate_with({"HECO_REQUIRE_AUTH": "1", "HECO_AUTH_ISSUER": ISS})
     assert call(g, path="/health")[0] == 200
 
 
-def test_the_legacy_shared_secret_is_the_dual_accept_leg():
-    """HECO_TOKEN works while it exists, constant-time, Bearer scheme only."""
-    g = gate_with({"HECO_REQUIRE_AUTH": "1", "HECO_TOKEN": "sekrit"})
-    assert call(g, headers={"authorization": "Bearer sekrit"})[0] == 200
-    assert call(g, headers={"authorization": "Bearer wrong"})[0] == 401
-    assert call(g, headers={"authorization": "Bearer s"})[0] == 401, (
-        "a short token must not crash the compare"
-    )
-    assert call(g, headers={"authorization": "Basic sekrit"})[0] == 401, (
-        "only the Bearer scheme is a credential"
-    )
+def test_the_retired_shared_secret_opens_nothing(kit):
+    """Runbook step 7: a static string is not a credential here any more.
+
+    HECO_TOKEN is set in the environment on purpose — the gate must ignore it
+    entirely rather than quietly honour a variable that happens to be present.
+    """
+    g = gate_with({
+        "HECO_REQUIRE_AUTH": "1",
+        "HECO_TOKEN": "sekrit",
+        "HECO_JWKS_JSON": json.dumps(kit.jwks),
+        "HECO_AUTH_ISSUER": ISS,
+    })
+    assert call(g, headers={"authorization": "Bearer sekrit"})[0] == 401
+    # ...while a signed token is unaffected.
+    assert call(g, headers={"authorization": f"Bearer {kit.mint(iss=ISS)}"})[0] == 200
+    assert call(g, headers={"authorization": "Basic sekrit"})[0] == 401
 
 
 def test_a_worker_minted_token_is_accepted_via_the_pinned_jwks(kit):
@@ -99,19 +104,6 @@ def test_a_worker_minted_token_is_accepted_via_the_pinned_jwks(kit):
     assert call(g, headers={"authorization": f"Bearer {good}"})[0] == 200
     expired = kit.mint(iss=ISS, exp_in=-3600)
     assert call(g, headers={"authorization": f"Bearer {expired}"})[0] == 401
-
-
-def test_both_legs_may_coexist_during_the_migration(kit):
-    """Dual-accept is what lets the rollout arm before every caller migrates."""
-    env = {
-        "HECO_REQUIRE_AUTH": "1",
-        "HECO_TOKEN": "sekrit",
-        "HECO_JWKS_JSON": json.dumps(kit.jwks),
-        "HECO_AUTH_ISSUER": ISS,
-    }
-    g = gate_with(env)
-    assert call(g, headers={"authorization": "Bearer sekrit"})[0] == 200
-    assert call(g, headers={"authorization": f"Bearer {kit.mint(iss=ISS)}"})[0] == 200
 
 
 def test_an_env_change_rebuilds_the_verifier(kit):

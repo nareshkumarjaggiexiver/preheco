@@ -34,7 +34,6 @@ class Settings:
     # every browser. Kept so an existing lab keeps working untouched while the
     # migration lands; removed at step 7 of the runbook. When the three fields
     # above are set, this is ignored.
-    planner_token: str | None = None
     #: Where the minted token is kept so a RESTART during a WAN outage still
     #: has a credential. Must be on a VOLUME, or `docker compose up
     #: --force-recreate` throws it away and the cache never survives the one
@@ -337,7 +336,6 @@ def from_env() -> Settings:
         auth_url=os.environ.get("HECO_AUTH_URL") or s.auth_url,
         app_id=os.environ.get("HECO_APP_ID") or s.app_id,
         app_secret=os.environ.get("HECO_APP_SECRET") or s.app_secret,
-        planner_token=os.environ.get("HECO_TOKEN") or s.planner_token,
         token_cache_path=os.environ.get("HECO_TOKEN_CACHE", s.token_cache_path),
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),

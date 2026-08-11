@@ -302,7 +302,7 @@ def test_a_401_fails_fast_with_an_actionable_message():
         raise AssertionError("expected PlannerError")
     except PlannerError as exc:
         assert calls["n"] == 1, "a 401 must not be retried"
-        assert "HECO_TOKEN" in str(exc)
+        assert "HECO_APP_ID" in str(exc), "point at the credential that exists"
         assert "sent none" in str(exc)
 
 
@@ -461,5 +461,5 @@ def test_a_static_token_still_fails_fast_and_offers_both_ways_out():
         pc.create_run(event_id="e1")
     assert len(ft.calls) == 1, "no retry without a provider"
     assert "HECO_APP_ID" in str(exc.value), "point at the new way"
-    assert "HECO_TOKEN" in str(exc.value), "and name the old one that is set"
+    assert "auth service" in str(exc.value), "and say where a credential comes from"
     assert "sent the wrong one" in str(exc.value)

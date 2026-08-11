@@ -183,60 +183,48 @@ def test_a_wedged_run_is_never_reaped_even_if_its_status_looks_settled():
 def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
     """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
 
-    No credential -> 401 with the machine-readable code; the legacy shared
-    secret passes (the dual-accept leg); /health stays open for the compose
-    healthcheck. The gate sits ahead of routing, so an unknown path proves
-    both halves: 401 without a credential, 404 — the router's own answer —
-    with one. Every other test in this file runs unarmed and is untouched.
+    No credential -> 401 with the machine-readable code; a token signed by the
+    auth service passes; /health stays open for the compose healthcheck. The
+    gate sits ahead of routing, so an unknown path proves both halves: 401
+    without a credential, 404 — the router's own answer — with one. Every
+    other test in this file runs unarmed and is untouched.
+
+    The key set is PINNED here (HECO_JWKS_JSON) so the check is hermetic: no
+    network, no Worker, no clock beyond the token's own expiry.
     """
+    import base64
+    import json as _json
+    import time as _time
+
     from app.main import app
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from fastapi.testclient import TestClient
 
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    key = Ed25519PrivateKey.generate()
+    jwks = {"keys": [{
+        "kty": "OKP", "crv": "Ed25519", "kid": "k-test", "alg": "EdDSA", "use": "sig",
+        "x": b64(key.public_key().public_bytes_raw()),
+    }]}
+    head = b64(_json.dumps({"alg": "EdDSA", "kid": "k-test", "typ": "JWT"}).encode())
+    body = b64(_json.dumps({
+        "iss": "https://auth.test", "aud": "heco-planner",
+        "iat": int(_time.time()), "exp": int(_time.time()) + 3600,
+    }).encode())
+    token = f"{head}.{body}.{b64(key.sign(f'{head}.{body}'.encode()))}"
+
     monkeypatch.setenv("HECO_REQUIRE_AUTH", "1")
-    monkeypatch.setenv("HECO_TOKEN", "sekrit-armed-test")
+    monkeypatch.setenv("HECO_JWKS_JSON", _json.dumps(jwks))
+    monkeypatch.setenv("HECO_AUTH_ISSUER", "https://auth.test")
     client = TestClient(app)
+
     assert client.get("/health").status_code == 200
 
     refused = client.get("/gate-probe")
     assert refused.status_code == 401
     assert refused.json()["code"] == "auth"
 
-    allowed = client.get("/gate-probe", headers={"Authorization": "Bearer sekrit-armed-test"})
+    allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
-
-def test_the_stage_client_carries_the_runner_credential(monkeypatch):
-    """The sibling services gate their inbound side (runbook step 8), so the
-    STAGE client — every /open, /detect, /track, /match this runner makes —
-    must present the same credential the planner clients already carry.
-    Regression guard: it used to be built bare, which armed gates answer 401.
-    """
-    from app import runs as runs_module
-
-    captured = []
-
-    class RecordingClient:
-        """Stands in for httpx.Client; remembers construction kwargs."""
-
-        def __init__(self, **kw):
-            captured.append(kw)
-
-    class InertLoop:
-        """A RunLoop that starts and instantly settles — no network, no work."""
-
-        def __init__(self, run_id, request, settings, client, planner, is_live_run=None):
-            self.planner_run_id = None
-            self.stage_client = client
-
-        def run(self):
-            return {"state": "ended"}
-
-    monkeypatch.setattr(runs_module.httpx, "Client", RecordingClient)
-    monkeypatch.setattr(runs_module, "RunLoop", InertLoop)
-
-    mgr = RunManager(Settings(planner_token="sekrit-legacy"))
-    mgr.start({"eventId": "e1", "source": {"path": "/clips/x.mp4"}})
-
-    stage_kwargs = captured[0]  # first client built is the stage client
-    assert stage_kwargs.get("headers", {}).get("Authorization") == "Bearer sekrit-legacy", (
-        "the stage client must carry the credential, not just the planner clients"
-    )

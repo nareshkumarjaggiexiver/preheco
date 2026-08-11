@@ -304,23 +304,48 @@ def test_an_unread_frame_is_grabbed_not_retrieved(monkeypatch):
 def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
     """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
 
-    No credential -> 401 with the machine-readable code; the legacy shared
-    secret passes (the dual-accept leg); /health stays open for the compose
-    healthcheck. The gate sits ahead of routing, so an unknown path proves
-    both halves: 401 without a credential, 404 — the router's own answer —
-    with one. Every other test in this file runs unarmed and is untouched.
+    No credential -> 401 with the machine-readable code; a token signed by the
+    auth service passes; /health stays open for the compose healthcheck. The
+    gate sits ahead of routing, so an unknown path proves both halves: 401
+    without a credential, 404 — the router's own answer — with one. Every
+    other test in this file runs unarmed and is untouched.
+
+    The key set is PINNED here (HECO_JWKS_JSON) so the check is hermetic: no
+    network, no Worker, no clock beyond the token's own expiry.
     """
+    import base64
+    import json as _json
+    import time as _time
+
     from app.main import app
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from fastapi.testclient import TestClient
 
+    def b64(raw):
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    key = Ed25519PrivateKey.generate()
+    jwks = {"keys": [{
+        "kty": "OKP", "crv": "Ed25519", "kid": "k-test", "alg": "EdDSA", "use": "sig",
+        "x": b64(key.public_key().public_bytes_raw()),
+    }]}
+    head = b64(_json.dumps({"alg": "EdDSA", "kid": "k-test", "typ": "JWT"}).encode())
+    body = b64(_json.dumps({
+        "iss": "https://auth.test", "aud": "heco-planner",
+        "iat": int(_time.time()), "exp": int(_time.time()) + 3600,
+    }).encode())
+    token = f"{head}.{body}.{b64(key.sign(f'{head}.{body}'.encode()))}"
+
     monkeypatch.setenv("HECO_REQUIRE_AUTH", "1")
-    monkeypatch.setenv("HECO_TOKEN", "sekrit-armed-test")
+    monkeypatch.setenv("HECO_JWKS_JSON", _json.dumps(jwks))
+    monkeypatch.setenv("HECO_AUTH_ISSUER", "https://auth.test")
     client = TestClient(app)
+
     assert client.get("/health").status_code == 200
 
     refused = client.get("/gate-probe")
     assert refused.status_code == 401
     assert refused.json()["code"] == "auth"
 
-    allowed = client.get("/gate-probe", headers={"Authorization": "Bearer sekrit-armed-test"})
+    allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
