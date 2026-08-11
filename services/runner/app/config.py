@@ -35,6 +35,11 @@ class Settings:
     # migration lands; removed at step 7 of the runbook. When the three fields
     # above are set, this is ignored.
     planner_token: str | None = None
+    #: Where the minted token is kept so a RESTART during a WAN outage still
+    #: has a credential. Must be on a VOLUME, or `docker compose up
+    #: --force-recreate` throws it away and the cache never survives the one
+    #: event it exists for. Empty disables persistence.
+    token_cache_path: str | None = "/srv/state/runner-token.json"
 
     # POC quality gate (CONTRACTS.md "POC geometry"): 2.8 mm camera at 2.0 m,
     # subjects at 2-3 m, expected face widths ~64-85 px.  Faces narrower than
@@ -333,6 +338,7 @@ def from_env() -> Settings:
         app_id=os.environ.get("HECO_APP_ID") or s.app_id,
         app_secret=os.environ.get("HECO_APP_SECRET") or s.app_secret,
         planner_token=os.environ.get("HECO_TOKEN") or s.planner_token,
+        token_cache_path=os.environ.get("HECO_TOKEN_CACHE", s.token_cache_path),
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),
         quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),

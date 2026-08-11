@@ -179,7 +179,10 @@ def build_token_provider(settings) -> TokenProvider | None:
             "and HECO_APP_SECRET, or none of them (and keep HECO_TOKEN for the "
             "pre-migration shared secret)"
         )
-    return TokenProvider(settings.auth_url, settings.app_id, settings.app_secret)
+    return TokenProvider(
+        settings.auth_url, settings.app_id, settings.app_secret,
+        cache_path=settings.token_cache_path or None,
+    )
 
 
 def httpx_transport(client: httpx.Client) -> Transport:
