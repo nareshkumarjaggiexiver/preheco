@@ -348,13 +348,13 @@ Eval uses its OWN application (`HECO_EVAL_APP_ID` / `HECO_EVAL_APP_SECRET`), so
 a sweep that goes wrong can be revoked without stopping a venue counting.
 
 
-## v2 (LEGACY) — the shared planner token (2026-08-05)
+## v2 (RETIRED 2026-08-11) — the shared planner token (2026-08-05)
 
-**Retired when** every runner, eval host and browser holds an auth-service
-token; then `HECO_TOKEN` is removed from the planner env, the compose file and
-`start-lan.sh`. Until then both are accepted, so the migration deploys onto a
-working lab with no env change and nothing breaks on deploy. When the v3
-variables are set, this one is ignored.
+**Retired.** `HECO_TOKEN` is gone from the planner env, the compose file,
+`start-lan.sh`, the T440 `.env` and every code path that read it. Nothing
+accepts it any more; the section is kept because the wire history explains
+why later decisions look the way they do. For what replaced it, see the v3
+addition at the end of this file.
 
 The planner binds loopback only by default and REFUSES to listen on any other
 address without a credential set. A dockerised runner reaches it across the
@@ -1477,13 +1477,12 @@ Runbook step 8, closed. Every service installs one ASGI middleware
   paths that brick a lab when auth goes wrong mid-event, so arming is a
   deliberate act after credentials are PROVEN to flow, and rollback is one
   env change plus `docker compose up -d`.
-- **Two credentials accepted while both exist** (the planner's own migration
-  pattern): an heco-auth Ed25519 token, verified LOCALLY against a cached
-  JWKS (`heco_common.verify` — fetched from `HECO_AUTH_URL` six-hourly and on
-  unknown `kid` with a one-minute floor, pinnable via `HECO_JWKS_JSON`,
-  disk-cacheable via `HECO_JWKS_CACHE`; nothing on a request path calls the
-  Worker), or the legacy shared `HECO_TOKEN`, compared constant-time. Both
-  legs die with the shared-secret era at runbook step 7.
+- **One credential**: an heco-auth Ed25519 token, verified LOCALLY against a
+  cached JWKS (`heco_common.verify` — fetched from `HECO_AUTH_URL` six-hourly
+  and on unknown `kid` with a one-minute floor, pinnable via
+  `HECO_JWKS_JSON`, disk-cacheable via `HECO_JWKS_CACHE`; nothing on a request
+  path calls the Worker). The shared secret that briefly sat beside it was
+  retired at runbook step 7.
 - **`aud` is `heco-planner` for every internal surface** — the ONE audience
   heco-auth mints. `scope` is deliberately not enforced yet: every registered
   application carries `planner:report`, so a scope check would refuse nobody
@@ -1497,3 +1496,22 @@ planner carries its own `planner` application via `serviceHeader()`
 (`server/serviceAuth.js` — mint at `/token`, refresh at half-life,
 single-flight, legacy fallback); eval passes its credential to the runner
 client and the ingest slot probe, not just the planner reader.
+
+
+## v3 addition — the shared secret is retired (2026-08-11)
+
+`HECO_TOKEN` no longer exists anywhere in this system: not in the planner, not
+in `docker-compose.yml`, not in the runner, not in eval, and not in any code
+path that reads an environment variable. **RETIRED 2026-08-11**, runbook step 7.
+
+Every credential is now a short-lived Ed25519 token minted by the auth service
+and verified LOCALLY — by the planner against its cached JWKS, and by each
+pipeline service through `heco_common.gate_auth`. Machines hold an application
+secret they exchange for tokens; operators sign in. Nothing long-lived travels
+on the wire, and rotating a machine's secret needs no coordinated restart.
+
+The offline guarantee did not move. It is now carried by
+`heco_common/auth.py`, which persists the minted token (0600, atomic rename)
+and reloads it on boot, so a runner restarting during a WAN outage reuses a
+still-valid token. That is what made the secret safe to delete rather than
+merely unused.

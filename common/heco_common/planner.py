@@ -180,13 +180,10 @@ class PlannerClient:
         "the token in hand was refused", which IS worth one refresh and one
         retry — a rotation should not need a restart.
 
-        ``token`` is the pre-migration shared secret (the planner's
-        ``HECO_TOKEN``), kept so an existing lab keeps working untouched.  It is
-        static: a 401 with only a static token is a CONFIGURATION error, not a
-        transient, so the retrying path fails it fast and says what to fix
-        rather than burying it under retries.
+        The shared secret that used to sit beside it was retired at runbook
+        step 7, so a provider is the only way this client is credentialed.
 
-        Both are sent the same way — ``Authorization: Bearer`` on every call,
+        It is sent as ``Authorization: Bearer`` on every call,
         including the multipart frame upload.  The header is computed AT
         REQUEST TIME, not baked in at construction, which is what makes a
         rotation invisible to a running process.
@@ -564,6 +561,6 @@ class PlannerClient:
         return (
             f"{method} {url} refused: the planner requires a token and this "
             f"runner {'sent the wrong one' if self.token else 'sent none'}. "
-            "Give this runner HECO_APP_ID/HECO_APP_SECRET from the auth service, "
-            "or set HECO_TOKEN to the same value the planner uses."
+            "Give this runner HECO_APP_ID/HECO_APP_SECRET for an application "
+            "registered with the auth service."
         )

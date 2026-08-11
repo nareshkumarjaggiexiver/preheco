@@ -10,16 +10,11 @@ auth goes wrong mid-event. Arming is a deliberate act after the credentials
 are proven to flow (the runbook's verify-then-advance habit); disarming is
 one env change and a `docker compose up -d`, which is the whole rollback.
 
-Two credentials are accepted while both exist, mirroring the planner's own
-migration so the same rollout order works here:
-
-  - an Ed25519 token minted by heco-auth, verified LOCALLY against the cached
-    JWKS (heco_common.verify — offline-safe, nothing on a request path calls
-    the Worker);
-  - the legacy shared secret (``HECO_TOKEN``), compared constant-time — the
-    dual-accept leg that lets a lab arm the gate before every caller has an
-    application registered, and that dies at runbook step 7 with the rest of
-    the shared-secret era.
+ONE kind of credential is accepted: an Ed25519 token minted by heco-auth,
+verified LOCALLY against the cached JWKS (heco_common.verify — offline-safe,
+nothing on a request path calls the Worker). The shared secret that briefly
+sat beside it was retired at runbook step 7; there is no long-lived string
+that opens these services, which is the whole point of the exercise.
 
 ``/health`` stays open: the compose healthchecks poll it unauthenticated,
 the deploy runbook verifies versions through it, and it holds nothing an
@@ -35,7 +30,6 @@ dict lookups.
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 
@@ -76,9 +70,6 @@ class BearerGate:
     def _armed(self) -> bool:
         return self._environ.get("HECO_REQUIRE_AUTH", "").strip().lower() in TRUTHY
 
-    def _static_token(self) -> str:
-        return self._environ.get("HECO_TOKEN", "").strip()
-
     def _current_verifier(self) -> JwksVerifier | None:
         env = (
             self._environ.get("HECO_AUTH_URL", "").strip(),
@@ -106,9 +97,6 @@ class BearerGate:
         return verifier
 
     def _credential_ok(self, token: str) -> bool:
-        static = self._static_token()
-        if static and hmac.compare_digest(token.encode(), static.encode()):
-            return True
         verifier = self._current_verifier()
         if verifier is not None:
             try:
