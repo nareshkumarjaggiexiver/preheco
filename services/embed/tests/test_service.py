@@ -105,3 +105,29 @@ def test_embed_rejects_malformed_landmarks():
     face["landmarks"] = face["landmarks"][:3]
     r = TestClient(app).post("/embed", json={"imageB64": _b64(_frame()), "faces": [face]})
     assert r.status_code == 400
+
+
+def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
+    """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
+
+    No credential -> 401 with the machine-readable code; the legacy shared
+    secret passes (the dual-accept leg); /health stays open for the compose
+    healthcheck. The gate sits ahead of routing, so an unknown path proves
+    both halves: 401 without a credential, 404 — the router's own answer —
+    with one. Every other test in this file runs unarmed and is untouched.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.setenv("HECO_REQUIRE_AUTH", "1")
+    monkeypatch.setenv("HECO_TOKEN", "sekrit-armed-test")
+    client = TestClient(app)
+    assert client.get("/health").status_code == 200
+
+    refused = client.get("/gate-probe")
+    assert refused.status_code == 401
+    assert refused.json()["code"] == "auth"
+
+    allowed = client.get("/gate-probe", headers={"Authorization": "Bearer sekrit-armed-test"})
+    assert allowed.status_code == 404, "a valid credential reaches the router itself"

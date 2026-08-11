@@ -118,18 +118,30 @@ class TokenAuth(httpx.Auth):
     It waits for the FIRST token and never for a refresh. Without a token
     there is nothing to send and the request is guaranteed to fail, so waiting
     is the only sensible thing; once one is in hand a refresh happens on
-    another thread and this returns immediately. When even the first mint fails
-    the header is simply absent and the request goes out unauthenticated — it
-    comes back 401, which is counted and visible in the run's status, rather
-    than stopping the count.
+    another thread and this returns immediately.
+
+    WHEN THE MINT FAILS AND A LEGACY SECRET EXISTS, THAT SECRET IS SENT.
+    Minting needs the internet; reporting does not. Without this fallback a
+    venue whose WAN is down at the moment the runner starts sends NOTHING,
+    every report comes back 401, and a night of counting goes unrecorded —
+    which is the precise failure this project's whole offline design exists to
+    prevent. The failure is not hidden: the provider counts it
+    (``refresh_failures``/``last_error``) and the run status carries those, so
+    a misconfigured application announces itself in the console instead of
+    silently succeeding forever. With no legacy secret to fall back to, the
+    header is simply absent and the 401 is visible as before.
     """
 
-    def __init__(self, provider: TokenProvider) -> None:
+    def __init__(self, provider: TokenProvider, fallback_token: str | None = None) -> None:
         self._provider = provider
+        self._fallback = fallback_token or None
 
     def auth_flow(self, request):
         """httpx calls this per request; the header is decided here, not earlier."""
-        for name, value in self._provider.auth_header(block=True).items():
+        header = self._provider.auth_header(block=True)
+        if not header and self._fallback:
+            header = {"Authorization": f"Bearer {self._fallback}"}
+        for name, value in header.items():
             request.headers[name] = value
         yield request
 
@@ -139,9 +151,12 @@ def auth_for(settings, provider: TokenProvider | None) -> dict:
 
     Returns ``{}`` for loopback development with nothing configured — which
     keeps the plain two-argument client construction the test doubles rely on.
+
+    A provider wins when both are configured, and keeps the legacy secret as
+    its fallback for the window where it cannot reach the auth service.
     """
     if provider is not None:
-        return {"auth": TokenAuth(provider)}
+        return {"auth": TokenAuth(provider, settings.planner_token)}
     if settings.planner_token:
         # LEGACY: one shared secret, static for the life of the process.
         return {"headers": {"Authorization": f"Bearer {settings.planner_token}"}}

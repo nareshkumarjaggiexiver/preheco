@@ -52,10 +52,22 @@ class RunnerClient:
     possible guarantee that the harness cannot touch a live production run.
     """
 
-    def __init__(self, base_url: str, transport: Transport | None = None) -> None:
-        """Bind to one runner base URL, optionally with an injected transport."""
+    def __init__(
+        self,
+        base_url: str,
+        transport: Transport | None = None,
+        token: str | None = None,
+        token_provider: "TokenProvider | None" = None,
+    ) -> None:
+        """Bind to one runner base URL, carrying whichever credential exists.
+
+        The runner gates its inbound side when the pipeline box arms
+        HECO_REQUIRE_AUTH (runbook step 8), so the harness presents the same
+        credential it already holds for the planner — or nothing, which keeps
+        an unarmed lab working exactly as before.
+        """
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or _default_transport()
+        self.transport = transport or _default_transport(token, token_provider)
 
     def start_run(
         self,
@@ -134,10 +146,20 @@ class IngestProbe:
     live count. So the harness asks first and refuses to start at all.
     """
 
-    def __init__(self, base_url: str, transport: Transport | None = None) -> None:
-        """Bind to the ingest service (CONTRACTS.md port 7101)."""
+    def __init__(
+        self,
+        base_url: str,
+        transport: Transport | None = None,
+        token: str | None = None,
+        token_provider: "TokenProvider | None" = None,
+    ) -> None:
+        """Bind to the ingest service (CONTRACTS.md port 7101).
+
+        Credentialed for the same reason as RunnerClient: an armed inbound
+        gate must not turn the slot-courtesy probe into a silent None.
+        """
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or _default_transport()
+        self.transport = transport or _default_transport(token, token_provider)
 
     def slot_owner(self) -> str | None:
         """The run id holding the capture slot, or None if free/unreachable.

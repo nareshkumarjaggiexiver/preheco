@@ -33,6 +33,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, gallery, staff
@@ -111,6 +112,11 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="heco-match", version=VERSION, lifespan=_lifespan)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 
 
 class ResetRequest(BaseModel):

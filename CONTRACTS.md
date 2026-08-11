@@ -19,7 +19,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 
 | service   | port | job |
 | --------- | ---- | --- |
-| ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, owner?, takeover?}, POST /close {owner?} |
+| ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, loop?, isFile?, owner?, takeover?}, POST /close {owner?} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?}]} — YuNet (OpenCV zoo, MIT) |
@@ -1444,3 +1444,56 @@ imagery is not (it is armed by the engineer for a bounded window).
   read; one with sixty is decoration.
 - Schema **v14 → v15** (`run_frames`, cascade-deleted with the run, so the
   existing soft-delete and purge windows already govern it).
+
+
+## v3 addition — a url can be a recording (ingest + runner, 2026-08-11)
+
+`POST {ingest}/open` (and therefore the runner's `source`) grows **`isFile:
+bool = false`**. It exists for exactly one caller: the planner's
+uploaded-video runs, which serve an operator's footage back to the pipeline
+over plain HTTP (`source: {url, isFile: true}`) because ingest's
+`cv2.VideoCapture` cannot present credentials, and a copied file path would
+require the planner and the pipeline box to share a disk they do not share.
+
+The flag is behavioural, not cosmetic. Ingest's capture treats a source as
+either a *file* (paced to its native FPS so the count sees the footage at the
+speed life happened, `ended` set at EOF so the run settles as
+`source-ended`) or a *live stream* (read flat-out, and EOF treated as a
+hiccup: release, wait, reopen). A finite recording fetched over HTTP used to
+fall in the second bucket by virtue of being a url — unpaced, and replayed
+from the start on every "reopen", forever, double-counting every guest on
+each pass. `isFile: true` moves it to the first bucket; `path` sources are
+files by definition and ignore the flag; the default keeps every existing
+caller's behaviour bit-for-bit.
+
+
+## v3 addition — the pipeline gates its inbound side (all services, 2026-08-11)
+
+Runbook step 8, closed. Every service installs one ASGI middleware
+(`heco_common.gate_auth.install_bearer_gate`) ahead of its router:
+
+- **Armed by `HECO_REQUIRE_AUTH=1`** on the pipeline box; unset, behaviour is
+  bit-for-bit what it was — the switch exists because these are exactly the
+  paths that brick a lab when auth goes wrong mid-event, so arming is a
+  deliberate act after credentials are PROVEN to flow, and rollback is one
+  env change plus `docker compose up -d`.
+- **Two credentials accepted while both exist** (the planner's own migration
+  pattern): an heco-auth Ed25519 token, verified LOCALLY against a cached
+  JWKS (`heco_common.verify` — fetched from `HECO_AUTH_URL` six-hourly and on
+  unknown `kid` with a one-minute floor, pinnable via `HECO_JWKS_JSON`,
+  disk-cacheable via `HECO_JWKS_CACHE`; nothing on a request path calls the
+  Worker), or the legacy shared `HECO_TOKEN`, compared constant-time. Both
+  legs die with the shared-secret era at runbook step 7.
+- **`aud` is `heco-planner` for every internal surface** — the ONE audience
+  heco-auth mints. `scope` is deliberately not enforced yet: every registered
+  application carries `planner:report`, so a scope check would refuse nobody
+  and imply a policy that does not exist.
+- **`/health` stays open**: the compose healthchecks poll it bare, and it
+  holds nothing an attacker wants beyond "alive".
+
+Callers all present the credential they already hold: the runner's stage
+client rides the same `TokenProvider` auth as its planner clients; the
+planner carries its own `planner` application via `serviceHeader()`
+(`server/serviceAuth.js` — mint at `/token`, refresh at half-life,
+single-flight, legacy fallback); eval passes its credential to the runner
+client and the ingest slot probe, not just the planner reader.
