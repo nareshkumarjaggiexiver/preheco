@@ -12,6 +12,7 @@ the 56 px floor should reach embedding (sub-canon ones flagged upstream).
 import logging
 
 from fastapi import FastAPI, HTTPException
+from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -21,6 +22,11 @@ from .recognizer import MODEL_PATH, FaceEmbedder
 log = logging.getLogger("embed")
 
 app = FastAPI(title="heco embed", version=__version__)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 
 _embedder: FaceEmbedder | None = None
 _load_error: str | None = None

@@ -178,3 +178,65 @@ def test_a_wedged_run_is_never_reaped_even_if_its_status_looks_settled():
     )
     assert mgr.reap() == []
     assert "run-wedged" in mgr._runs
+
+
+def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
+    """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
+
+    No credential -> 401 with the machine-readable code; the legacy shared
+    secret passes (the dual-accept leg); /health stays open for the compose
+    healthcheck. The gate sits ahead of routing, so an unknown path proves
+    both halves: 401 without a credential, 404 — the router's own answer —
+    with one. Every other test in this file runs unarmed and is untouched.
+    """
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HECO_REQUIRE_AUTH", "1")
+    monkeypatch.setenv("HECO_TOKEN", "sekrit-armed-test")
+    client = TestClient(app)
+    assert client.get("/health").status_code == 200
+
+    refused = client.get("/gate-probe")
+    assert refused.status_code == 401
+    assert refused.json()["code"] == "auth"
+
+    allowed = client.get("/gate-probe", headers={"Authorization": "Bearer sekrit-armed-test"})
+    assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+def test_the_stage_client_carries_the_runner_credential(monkeypatch):
+    """The sibling services gate their inbound side (runbook step 8), so the
+    STAGE client — every /open, /detect, /track, /match this runner makes —
+    must present the same credential the planner clients already carry.
+    Regression guard: it used to be built bare, which armed gates answer 401.
+    """
+    from app import runs as runs_module
+
+    captured = []
+
+    class RecordingClient:
+        """Stands in for httpx.Client; remembers construction kwargs."""
+
+        def __init__(self, **kw):
+            captured.append(kw)
+
+    class InertLoop:
+        """A RunLoop that starts and instantly settles — no network, no work."""
+
+        def __init__(self, run_id, request, settings, client, planner, is_live_run=None):
+            self.planner_run_id = None
+            self.stage_client = client
+
+        def run(self):
+            return {"state": "ended"}
+
+    monkeypatch.setattr(runs_module.httpx, "Client", RecordingClient)
+    monkeypatch.setattr(runs_module, "RunLoop", InertLoop)
+
+    mgr = RunManager(Settings(planner_token="sekrit-legacy"))
+    mgr.start({"eventId": "e1", "source": {"path": "/clips/x.mp4"}})
+
+    stage_kwargs = captured[0]  # first client built is the stage client
+    assert stage_kwargs.get("headers", {}).get("Authorization") == "Bearer sekrit-legacy", (
+        "the stage client must carry the credential, not just the planner clients"
+    )

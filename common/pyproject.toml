@@ -11,6 +11,10 @@ dependencies = [
     "pydantic>=2.7",
     "numpy>=1.26",
     "opencv-python-headless>=4.9",
+    # Ed25519 verification of heco-auth's tokens (heco_common.verify) — the
+    # one primitive the inbound gate needs, and the one thing an auth module
+    # must never hand-roll.
+    "cryptography>=42",
 ]
 
 [tool.setuptools.packages.find]

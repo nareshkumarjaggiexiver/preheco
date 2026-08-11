@@ -17,6 +17,7 @@ import time
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from heco_common.gate_auth import install_bearer_gate
 from heco_common.geometry import dedupe_boxes
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,11 @@ from .quality import classify_width, crop_sharpness
 log = logging.getLogger("faces")
 
 app = FastAPI(title="heco faces", version=__version__)
+# Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
+# LAN callers without a bearer credential — an heco-auth token verified
+# locally, or the legacy shared secret while it survives. /health stays
+# open for the compose healthchecks. Unarmed, nothing changes.
+install_bearer_gate(app)
 
 _detector: FaceDetector | None = None
 _load_error: str | None = None

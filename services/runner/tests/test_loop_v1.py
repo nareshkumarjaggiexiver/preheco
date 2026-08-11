@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from app.appearance import intersection, torso_descriptor
 from app.config import Settings
-from app.loop import RunLoop, TokenAuth, httpx_file_transport, httpx_transport
+from app.loop import RunLoop, TokenAuth, auth_for, httpx_file_transport, httpx_transport
 from heco_common.auth import TokenProvider
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.planner import PlannerClient
@@ -3333,3 +3333,63 @@ def test_an_unreachable_auth_service_is_named_in_the_run_status():
     assert provider.refresh_failures >= 1
     assert final["tokenRefreshFailures"] >= 1
     assert final["tokenLastError"], "say what the auth service said, in the status"
+
+
+def test_a_failed_mint_falls_back_to_the_legacy_secret():
+    """A venue whose WAN is down must keep REPORTING.
+
+    Minting a token needs the internet; posting a count to the planner on the
+    LAN does not. Before the fallback, a runner that could not reach the auth
+    service sent no credential at all — every report came back 401 and the
+    night went unrecorded, which is exactly what this project's offline design
+    exists to prevent.
+
+    The failure stays visible: the provider counts it, and the run status
+    carries refresh_failures/last_error, so a genuinely wrong application id
+    still announces itself instead of passing silently forever.
+    """
+    class DeadAuth:
+        """An auth service that cannot be reached."""
+
+        def __call__(self, url, payload):
+            raise OSError("no route to host")
+
+    provider = TokenProvider("http://auth", "runner", "sekrit", transport=DeadAuth(), jitter_s=0)
+    settings = Settings(planner_token="legacy-shared-secret")
+
+    sent = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        sent["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={})
+
+    kwargs = auth_for(settings, provider)
+    with httpx.Client(transport=httpx.MockTransport(capture), **kwargs) as c:
+        c.post("http://planner:8787/api/pipeline/runs", json={})
+
+    assert sent["authorization"] == "Bearer legacy-shared-secret"
+    assert provider.refresh_failures > 0, "the mint failure must still be counted"
+    assert provider.last_error
+
+
+def test_without_a_legacy_secret_a_failed_mint_still_sends_nothing():
+    """No fallback to reach for: the request goes out bare and the 401 is the
+    honest, visible outcome — unchanged from before."""
+    class DeadAuth:
+        def __call__(self, url, payload):
+            raise OSError("no route to host")
+
+    provider = TokenProvider("http://auth", "runner", "sekrit", transport=DeadAuth(), jitter_s=0)
+    settings = Settings(planner_token="")
+
+    sent = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        sent["authorization"] = request.headers.get("authorization")
+        return httpx.Response(401, json={})
+
+    kwargs = auth_for(settings, provider)
+    with httpx.Client(transport=httpx.MockTransport(capture), **kwargs) as c:
+        c.post("http://planner:8787/api/pipeline/runs", json={})
+
+    assert sent["authorization"] is None
