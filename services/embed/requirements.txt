@@ -1,3 +1,7 @@
+# heco-common (editable) is required for the shared inbound auth gate
+# (heco_common.gate_auth). It was avoided here while nothing needed it;
+# a gate that some services skip is not a gate.
+-e ../../common
 fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
