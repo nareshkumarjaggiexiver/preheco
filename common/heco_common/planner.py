@@ -41,6 +41,7 @@ which never justifies an async dependency at POC scale.
 """
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -197,6 +198,7 @@ class PlannerClient:
         # being seen. Counted here so the runner can surface it instead of
         # quietly doing nothing all night.
         self.auth_failures = 0
+        self._auth_lock = threading.Lock()
         if transport is not None:
             self.transport = transport
         elif token_provider is not None:
@@ -481,7 +483,7 @@ class PlannerClient:
         except Exception:  # noqa: BLE001 — best-effort callers want no exceptions
             return False, {}
         if status == 401:
-            self.auth_failures += 1
+            self._note_auth_failure()
             # Flag it; do NOT refresh inline. These callers are best-effort
             # because their latency budget is the frame loop's, and a token
             # round-trip here would cost the very frames the tap was reporting
@@ -501,10 +503,24 @@ class PlannerClient:
         had counted 401s since v1; these two never did.
         """
         if status == 401:
-            self.auth_failures += 1
-            if self.token_provider is not None:
-                self.token_provider.mark_rejected()
+            self._note_auth_failure()
         return status < 400
+
+    def _note_auth_failure(self) -> None:
+        """Count one refused credential and tell the token provider.
+
+        LOCKED because the runner reports from two threads now: the counting
+        loop polls feedback and confirms tombstones while the reporter thread
+        posts taps, frames and face cards, and ``+= 1`` is a read-modify-write.
+        Lost increments would make ``plannerAuthFailures`` under-report exactly
+        when it matters — a credential refused on every upload is the case this
+        counter exists to surface, and "3" instead of "300" reads like a
+        transient blip rather than an outage.
+        """
+        with self._auth_lock:
+            self.auth_failures += 1
+        if self.token_provider is not None:
+            self.token_provider.mark_rejected()
 
     def _require_run(self) -> int | str:
         """Return the current run id or fail: reporting needs create_run first."""

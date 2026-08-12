@@ -208,7 +208,10 @@ def test_lockstep_hands_out_EVERY_frame_where_the_default_drops(tmp_path):
             got = worker.latest()
             if got is not None and (not seen or got[0] != seen[-1]):
                 seen.append(got[0])
-            if worker.ended and (worker.latest() is None or worker.latest()[0] == (seen[-1] if seen else -1)):
+            stale = worker.latest()
+            if worker.ended and (
+                stale is None or stale[0] == (seen[-1] if seen else -1)
+            ):
                 break
             time.sleep(0.02)  # 50 fps consumer against a 100 fps clip
         return seen

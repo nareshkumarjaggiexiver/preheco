@@ -200,6 +200,14 @@ def make_loop(fake: FakePipeline, no_planner_sleep: bool = False, **settings_kw)
         flush_interval_s=0.0,  # flush every frame — deterministic in tests
         source_poll_s=0.001,
         source_stall_s=0.05,  # stalled-seq EOF detection, test-fast
+        # Reporting on the LOOP thread here, deliberately. These tests assert
+        # what a frame reports — one round per frame, this payload after that
+        # one — which is a property of the synchronous scheduler, not of the
+        # payloads. Async reporting is drop-not-queue by design, so asserting
+        # a per-frame round against it would be asserting a race. The async
+        # scheduler has its own tests in test_reporting.py; the round CONTENT
+        # they both produce is this file's subject and is unchanged.
+        async_reporting=False,
         **settings_kw,
     )
     client = httpx.Client(transport=httpx.MockTransport(fake.handler))

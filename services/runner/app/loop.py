@@ -58,6 +58,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from urllib.parse import urlsplit
 
 import httpx
@@ -71,6 +72,7 @@ from heco_common.schemas import Sample
 from . import annotate, appearance, gate, taps
 from .config import Settings
 from .feedback import plan_action
+from .reporting import Reporter
 from .stats import SampleBuffer, StatsBoard
 
 
@@ -392,8 +394,15 @@ class RunLoop:
         # Whether the cap has already been reported; the warning is worth
         # saying once and worthless once per frame.
         self._copresence_capped: bool = False
-        # Snapshot of the frame just processed, for debug taps (loop-thread only).
+        # Snapshot of the frame just processed, for debug taps.  WRITTEN only
+        # by the loop thread, and always REBOUND to a fresh dict rather than
+        # updated in place — that is what lets the reporter thread hold on to
+        # a published reference and render it a moment later without copying a
+        # megabyte or racing the next frame's decisions into a half-drawn one.
         self._last: dict | None = None
+        # The observability plane (app.reporting), or None when async
+        # reporting is off and the loop does its own tap rounds and flushes.
+        self.reporter = None
         # Native frame dimensions, read ONCE from the first frame's JPEG header
         # (the camera's resolution does not change mid-run) — they ride the
         # ingest tap and the forensic uploads so the console can scale ledger
@@ -760,7 +769,20 @@ class RunLoop:
                     # these notes are permanent, served to the browser, and
                     # exported. Belt and braces with ingest's own redaction.
                     self.planner.end_run(status="failed", notes=safe(str(e)))
+        finally:
+            # The safety net for every path that did not reach the orderly
+            # stop in _run: a failed run must not leave the reporter alive
+            # uploading pictures of a run the operator has been told is over.
+            # Idempotent — _stop_reporter clears the attribute as it goes.
+            self._stop_reporter()
         return self.status()
+
+    def _stop_reporter(self) -> None:
+        """Drain and stop the observability thread, at most once."""
+        reporter, self.reporter = self.reporter, None
+        if reporter is not None:
+            with contextlib.suppress(Exception):
+                reporter.finish()
 
     def _run(self) -> None:
         req = self.request
@@ -802,6 +824,14 @@ class RunLoop:
         self._last_purge = t0
         frames = 0
 
+        # Started AFTER the source opens, so a run that fails to open a camera
+        # never leaves a thread behind, and stopped in the `finally` below for
+        # the same reason on every other exit path.
+        if self.s.async_reporting:
+            self.reporter = Reporter(self, self.s)
+            self.reporter.begin(t0)
+            self.reporter.start()
+
         while not self._stop.is_set():
             frame = self._timed("ingest", "ingestMs", self._next_frame)
             if frame is None:
@@ -822,28 +852,50 @@ class RunLoop:
             # cost one perf_counter pair each per frame — nothing against a
             # loop already spending hundreds of milliseconds.
             loop_t = time.perf_counter()
-            self._timed("count", "stepMs", lambda: self._pipeline_step(planner_run_id, frame, t_ms))
+            self._timed(
+                "count", "stepMs",
+                partial(self._pipeline_step, planner_run_id, frame, t_ms),
+            )
             self._set(frames=frames)
 
             now = time.monotonic()
-            if now - last_flush >= self.s.flush_interval_s:
-                # The planner round trips: stats, samples and the batched
-                # frame ledger. Amortised across the frames between flushes.
-                self._timed("count", "flushMs", lambda: self._flush(now - t0))
-                last_flush = now
             # A frame that minted a guest forces a round, so that guest has a
             # keyframe of their own rather than depending on the sampler
             # happening to fire while they were visible.
             minted, self._mint_frame = self._mint_frame, False
-            # tapRoundMs already times a round that FIRES; this times the
-            # decision plus the round, which is what the loop actually pays.
-            self._timed("count", "tapMs", lambda: self._maybe_tap(now, forced=minted))
-            self._timed("count", "feedbackMs", lambda: self._maybe_feedback(now))
-            self._timed("count", "purgeMs", lambda: self._maybe_purge_staff(now))
+            if self.reporter is not None:
+                # THE ENTIRE COST OF OBSERVABILITY ON THIS THREAD is this one
+                # handover — the rendering, the JPEG encoding and every
+                # planner round trip happen on app.reporting's thread. What
+                # used to be 43-96 ms of tap round plus 15-22 ms of flush per
+                # frame is now a lock and three assignments.
+                self._timed("count", "publishMs", partial(self._publish, minted))
+            else:
+                # The synchronous shape, kept whole for A/B and for reverting
+                # in one env var: flush first, then the tap round, then this
+                # frame's forensic picture — the order the run has always used.
+                if now - last_flush >= self.s.flush_interval_s:
+                    self._timed("count", "flushMs", partial(self._flush, now - t0))
+                    last_flush = now
+                # tapRoundMs already times a round that FIRES; this times the
+                # decision plus the round, which is what the loop actually pays.
+                self._timed("count", "tapMs", partial(self._maybe_tap, now, forced=minted))
+                if self.request.get("forensic") and self._last is not None:
+                    self._timed(
+                        "count", "forensicMs",
+                        partial(self._forensic_upload, self._last),
+                    )
+            self._timed("count", "feedbackMs", partial(self._maybe_feedback, now))
+            self._timed("count", "purgeMs", partial(self._maybe_purge_staff, now))
             # The whole body, so residual = loopMs - (its parts) names any
             # cost still unaccounted for rather than leaving it invisible.
             self.board.observe("count", "loopMs", (time.perf_counter() - loop_t) * 1000.0)
 
+        # Stop the reporter FIRST, so its final rounds and any owed mint
+        # keyframes land while the run is still open — and so the flush below
+        # is genuinely the last word on this run's stats rather than racing a
+        # thread that is still posting them.
+        self._stop_reporter()
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
         notes = (
@@ -1492,9 +1544,23 @@ class RunLoop:
         # (tested there), and a branch here that no test could distinguish from
         # its absence is exactly the dead defence this codebase keeps catching.
         width = float(box.get("w") or 0.0)
-        best = max(self._face_cards.get(key, 0.0), self._face_pending.get(key, (None, 0.0))[1])
+        # LOCKED, because the reporter thread reads this dict while uploading.
+        # _flush_face_cards was always written for a concurrent writer ("a
+        # better crop may have arrived while the upload was in flight") but
+        # under the synchronous loop there was never one, so this side took no
+        # lock and nothing noticed. Now there is: an unlocked insert here lands
+        # inside the reporter's sorted(self._face_pending.items()) and raises
+        # "dictionary changed size during iteration" — once per new guest, i.e.
+        # on every run with people in it, losing the rest of that tap round.
+        with self._lock:
+            best = max(
+                self._face_cards.get(key, 0.0),
+                self._face_pending.get(key, (None, 0.0))[1],
+            )
         if best and width < best * self.s.face_card_improve:
             return
+        # Encoding stays OUTSIDE the lock: ~1 ms of JPEG work holding a lock
+        # the reporter needs would hand back the stall this change removes.
         try:
             crop = annotate.face_crop(frame_img, box)
             if crop is None:
@@ -1502,7 +1568,18 @@ class RunLoop:
             jpeg = annotate.to_jpeg(crop, quality=82)
         except Exception:  # noqa: BLE001 — a thumbnail must never kill a run
             return
-        self._face_pending[key] = (jpeg, width)
+        with self._lock:
+            # Re-checked under the lock: the reporter may have uploaded a
+            # better card for this guest while this crop was encoding, and
+            # publishing a worse one over it would visibly regress the
+            # register thumbnail — the exact complaint cards were built for.
+            current = max(
+                self._face_cards.get(key, 0.0),
+                self._face_pending.get(key, (None, 0.0))[1],
+            )
+            if current and width < current * self.s.face_card_improve:
+                return
+            self._face_pending[key] = (jpeg, width)
 
     def _flush_face_cards(self, deadline: float) -> None:
         """Upload the face cards waiting from recent frames, inside the round.
@@ -2787,6 +2864,17 @@ class RunLoop:
                 # base64 decode of a partial body is legal.
                 self._native_dims = taps.jpeg_dims(base64.b64decode(image_b64[:98304]))
         dims = self._native_dims
+        # PUBLISHED LAST, AND NEVER TOUCHED AGAIN. The reporter thread holds
+        # this reference and draws from it a moment later, so the invariant it
+        # depends on is that _remember is the final statement of the frame and
+        # rebinds a WHOLE fresh dict rather than updating the previous one.
+        # Everything that stamps a box or a face — excludedByZone, inZone, the
+        # verdict updates — happens strictly before this line. Code added after
+        # it that touches boxes/tracks/faces/verdicts would corrupt a
+        # half-drawn console frame silently, with nothing to point at.
+        # zones is COPIED for the same reason: it is immutable today, but it is
+        # the one member of this dict the loop does not rebuild each frame, and
+        # a copy costs nothing against the megabyte beside it.
         self._last = {
             "image_b64": image_b64,
             "seq": seq,
@@ -2797,29 +2885,57 @@ class RunLoop:
             "tracks": tracks,
             "faces": faces,
             "verdicts": verdicts,
-            "zones": self.zones,
+            "zones": list(self.zones),
         }
         self._record_frame()
-        self._maybe_forensic_frame()
+        # The picture itself is published to the reporter by the loop body,
+        # alongside the tap snapshot and from the one place that knows whether
+        # this frame minted — keeping every handover to the observability
+        # plane at a single site instead of two.
 
-    def _maybe_forensic_frame(self) -> None:
-        """Forensic bench mode: upload THIS frame's raw picture, every frame.
+    def _publish(self, minted: bool) -> None:
+        """Hand this frame to the reporter thread; render nothing here.
+
+        ``forensic`` is decided per frame rather than once at open because the
+        run request is the operator's, and a picture of every frame is a
+        retention decision they can only have made deliberately — the flag is
+        read where it is used, so nothing keeps uploading after it is off.
+        """
+        last = self._last
+        if last is None:
+            return
+        self.reporter.publish(
+            last, minted=minted, forensic=bool(self.request.get("forensic"))
+        )
+
+    def _forensic_upload(self, last: dict) -> None:
+        """Forensic bench mode: upload ONE frame's raw picture.
 
         The decision ledger already records every processed frame's reasoning
         (~1 KB); this is its missing other half — the pixels — kept only when
         the run was STARTED forensic, because an always-on copy of every frame
-        is a storage and retention decision, not a default. One best-effort
-        multipart POST per frame on the short report timeout: measured on the
-        bench LAN this is tens of milliseconds against a 300-1200 ms frame,
-        and the operator opted into exactly that trade at the toggle. seq and
-        tMs ride along so the planner's copy joins the decision ledger row
-        exactly; width/height are the NATIVE dimensions the overlay scaling
-        needs. Failures are counted, never raised — a dropped picture is a
-        thinner record, not a broken run.
+        is a storage and retention decision, not a default. seq and tMs ride
+        along so the planner's copy joins the decision ledger row exactly;
+        width/height are the NATIVE dimensions the overlay scaling needs.
+        Failures are counted, never raised — a dropped picture is a thinner
+        record, not a broken run.
+
+        BEST EFFORT, not every frame, since async reporting: the queue in
+        ``app.reporting`` is bounded, so a planner slower than the camera loses
+        the frames past its depth and counts them in ``forensicFramesDropped``.
+        The loop stalling behind a picture is the worse failure — that is what
+        the ledger's own batching exists to avoid — but the promise is weaker
+        than the synchronous shape's and should be read as such.
+
+        THE FRAME IS AN ARGUMENT, not ``self._last``, because the reporter
+        thread uploads it a moment after the loop has moved on: reading the
+        live attribute here would upload whatever frame happened to be current
+        when the socket was free, and stamp it with that frame's seq — a
+        forensic record that quietly disagrees with the ledger row it is meant
+        to complete. Under async reporting this is called from
+        ``app.reporting``; the queue there is bounded and its overflow is
+        counted in the same ``forensicFramesDropped`` this method uses.
         """
-        if not self.request.get("forensic"):
-            return
-        last = self._last
         if not last:
             return
         try:
