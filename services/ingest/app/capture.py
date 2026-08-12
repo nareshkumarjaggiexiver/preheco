@@ -40,16 +40,31 @@ class CaptureWorker(threading.Thread):
     Stop with ``stop()`` — sets an event, joins, and releases the capture.
     """
 
-    def __init__(self, source: str, is_file: bool, loop: bool = False) -> None:
+    def __init__(
+        self, source: str, is_file: bool, loop: bool = False, lockstep: bool = False
+    ) -> None:
         """Open the source (raises CaptureError on failure) and prep the slot."""
         super().__init__(name="ingest-capture", daemon=True)
         self.source = source
         self.is_file = is_file
         self.loop = loop
+        # EVERY FRAME, for a recording — see OpenSource.lockstep for why this
+        # is a file-only idea. Forced off for a live source rather than
+        # trusted to the caller: blocking a camera cannot achieve anything
+        # except making the reader fall behind the stream, and a mistaken
+        # `lockstep: true` on an RTSP url must not be able to wedge a live
+        # count.
+        self.lockstep = bool(lockstep and is_file)
         self.ended = False  # file fully played, loop=False
         # True while the slot holds a frame nobody has taken yet. The loop
-        # grabs (cheap) rather than retrieves (expensive) while it is set.
+        # grabs (cheap) rather than retrieves (expensive) while it is set —
+        # unless lockstep, where it WAITS instead of grabbing, so no frame is
+        # ever skipped.
         self._unread = False
+        # Signalled whenever a consumer takes the frame in the slot. Lockstep
+        # waits on this rather than polling, so a slow consumer costs the
+        # reader nothing while it waits.
+        self._taken_evt = threading.Event()
         # Longest edge to analyse at, 0 = the camera's own size. See _fit.
         self._max_width = env_int("INGEST_MAX_WIDTH", 0)
         self._stop_evt = threading.Event()
@@ -65,10 +80,18 @@ class CaptureWorker(threading.Thread):
 
         The returned array is never mutated afterwards (the reader allocates
         a fresh array per decoded frame), so no copy is taken here.
+
+        Taking the frame RELEASES a lockstep reader, which is blocked waiting
+        for exactly this. Signalled outside the lock: the reader's first act
+        on waking is to take that same lock, and holding it while we wake them
+        would hand them a lock they immediately have to queue for.
         """
         with self._lock:
-            self._unread = False
-            return self._latest
+            was_unread, self._unread = self._unread, False
+            latest = self._latest
+        if was_unread:
+            self._taken_evt.set()
+        return latest
 
     def stop(self, join_timeout_s: float = 5.0) -> None:
         """Signal the thread, wait for it, and release the capture."""
@@ -98,6 +121,22 @@ class CaptureWorker(threading.Thread):
                 # to keep its reference frames — but skips the conversion. So
                 # an unconsumed frame costs the decode and not the copy.
                 if self._slot_unread():
+                    # LOCKSTEP: wait for the consumer instead of skipping past
+                    # it. The frame in the slot has not been taken, so reading
+                    # the next one would discard it — which is precisely what
+                    # this mode exists to prevent. Waiting costs nothing (a
+                    # recording has no clock to fall behind) and bounds memory
+                    # at exactly one frame, where a buffer would grow forever.
+                    if self.lockstep:
+                        self._taken_evt.clear()
+                        # Re-check under the lock before sleeping: the consumer
+                        # may have taken it between _slot_unread and here, and
+                        # a wait that misses its wake-up would stall the run.
+                        if self._slot_unread() and not self._taken_evt.wait(timeout=1.0):
+                            continue  # still unread — loop so stop() is honoured
+                        if self._stop_evt.is_set():
+                            return
+                        continue  # slot free now; decode the next frame
                     ok = self._cap.grab()
                     frame = None
                 else:

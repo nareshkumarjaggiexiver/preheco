@@ -30,16 +30,34 @@ x-heco-service: &heco-service
   # crossings. Override with HECO_CPUSET when the topology differs; set it
   # empty to let the scheduler roam.
   cpuset: ${HECO_CPUSET-0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62}
+  # ASSERT THE BODY, NOT THE STATUS CODE.
+  #
+  # /health is a plain FastAPI dict route, so it answers 200 whether or not
+  # the service's model actually loaded — every service already reports the
+  # truth as `ok` (e.g. faces: `"ok": det is not None`) and this check used to
+  # throw that away by testing only `.status == 200`.
+  #
+  # What that cost, on a real box: a deploy shipped a tree without its .onnx
+  # weights, Docker materialised the missing bind-mount sources as empty
+  # DIRECTORIES, and the stack came up reporting "Up (healthy)" for every
+  # service while YuNet and SFace were dead. Person detection worked, /health
+  # was 200, the manifest was correct — and it detected zero faces for hours.
+  # The only evidence was a line deep in a container log.
+  #
+  # Reading `ok` makes `docker compose ps` mean what an operator reads it to
+  # mean. A service whose model is dead now fails its healthcheck, and
+  # depends_on: service_healthy refuses to start the runner behind it —
+  # refusing to run is the correct failure for a pipeline that cannot count.
   healthcheck:
     test:
       - CMD
       - python
       - -c
       - >
-        import os,urllib.request,sys;
-        sys.exit(0 if urllib.request.urlopen(
+        import json,os,urllib.request,sys;
+        sys.exit(0 if json.load(urllib.request.urlopen(
         f"http://localhost:{os.environ['HECO_PORT']}/health", timeout=3
-        ).status == 200 else 1)
+        )).get("ok") is True else 1)
     interval: 10s
     timeout: 5s
     retries: 5
