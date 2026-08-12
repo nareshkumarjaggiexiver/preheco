@@ -796,20 +796,39 @@ class RunLoop:
             frames += 1
             t_ms = int(frame.get("tMs", (time.monotonic() - t0) * 1000.0))
 
-            self._pipeline_step(planner_run_id, frame, t_ms)
+            # WHERE THE FRAME'S TIME ACTUALLY WENT — every branch of the loop
+            # body, not just the model stages.
+            #
+            # The stage timers (ingest/persons/faces/embed/match) summed to
+            # 196 ms on a 4K bench run whose loop was measurably taking 806 ms
+            # per frame: THREE QUARTERS of the cost sat outside anything
+            # anyone was measuring, and no amount of staring at stage numbers
+            # could find it. These probes close that gap, so the answer to
+            # "why is this 1.2 fps" is a number rather than an argument. They
+            # cost one perf_counter pair each per frame — nothing against a
+            # loop already spending hundreds of milliseconds.
+            loop_t = time.perf_counter()
+            self._timed("count", "stepMs", lambda: self._pipeline_step(planner_run_id, frame, t_ms))
             self._set(frames=frames)
 
             now = time.monotonic()
             if now - last_flush >= self.s.flush_interval_s:
-                self._flush(now - t0)
+                # The planner round trips: stats, samples and the batched
+                # frame ledger. Amortised across the frames between flushes.
+                self._timed("count", "flushMs", lambda: self._flush(now - t0))
                 last_flush = now
             # A frame that minted a guest forces a round, so that guest has a
             # keyframe of their own rather than depending on the sampler
             # happening to fire while they were visible.
             minted, self._mint_frame = self._mint_frame, False
-            self._maybe_tap(now, forced=minted)
-            self._maybe_feedback(now)  # best-effort operator corrections
-            self._maybe_purge_staff(now)  # best-effort consent-withdrawal purge
+            # tapRoundMs already times a round that FIRES; this times the
+            # decision plus the round, which is what the loop actually pays.
+            self._timed("count", "tapMs", lambda: self._maybe_tap(now, forced=minted))
+            self._timed("count", "feedbackMs", lambda: self._maybe_feedback(now))
+            self._timed("count", "purgeMs", lambda: self._maybe_purge_staff(now))
+            # The whole body, so residual = loopMs - (its parts) names any
+            # cost still unaccounted for rather than leaving it invisible.
+            self.board.observe("count", "loopMs", (time.perf_counter() - loop_t) * 1000.0)
 
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
