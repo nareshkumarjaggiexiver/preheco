@@ -18,6 +18,13 @@ ARG SERVICE
 ARG PORT=8000
 
 COPY common /srv/common
+# The capability manifest the runner serves from /health. It lives at the repo
+# root and the runner resolves it as parents[3] of its own main.py — /srv here.
+# Without this COPY the file exists on every dev checkout and in NO container,
+# so /health silently reports "pipeline": null and the planner registers a
+# manifest-less pipeline. Copied into every service image (it is ~1 KB); only
+# the runner reads it.
+COPY pipeline.json /srv/pipeline.json
 WORKDIR /srv/services/${SERVICE}
 
 # Requirements first (layer-cached): mostly satisfied by the base already, so
