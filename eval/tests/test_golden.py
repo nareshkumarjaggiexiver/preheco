@@ -139,3 +139,15 @@ def test_a_missing_or_reordered_frame_is_still_caught(tmp_path):
     a = write(tmp_path, "a.jsonl", [{"seq": 1, "tMs": 0}, {"seq": 2, "tMs": 5}])
     b = write(tmp_path, "b.jsonl", [{"seq": 2, "tMs": 0}, {"seq": 1, "tMs": 5}])
     assert not report(load(a), load(b))[0], "frame identity must still be compared"
+
+
+def test_a_missing_capture_says_so_instead_of_traceback(tmp_path):
+    """The most common failure deserves a sentence, not a stack trace.
+
+    This tool runs from a shell in the middle of a deploy, and "the capture is
+    not where you think it is" is its most frequent outcome — usually a
+    docker cp against a container that was recreated underneath it.
+    """
+    with pytest.raises(SystemExit) as e:
+        load(str(tmp_path / "nope.jsonl"))
+    assert "cannot read capture" in str(e.value)

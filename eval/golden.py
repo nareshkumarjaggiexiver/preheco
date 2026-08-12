@@ -61,8 +61,16 @@ def load(path: str | Path, *, keep_timings: bool = False) -> list[dict]:
     because a capture that cannot be read completely cannot support a claim
     that nothing changed.
     """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        # A clean sentence, not a traceback. This tool is run from a shell in
+        # the middle of a deploy, and "the capture is not where you think it
+        # is" is by far its most common failure — usually a docker cp that
+        # went to a container that had been recreated underneath it.
+        raise SystemExit(f"cannot read capture {path}: {exc.strerror}") from exc
     records = []
-    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+    for n, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line:
             continue
