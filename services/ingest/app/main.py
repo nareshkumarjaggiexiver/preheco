@@ -2,7 +2,7 @@
 
 Endpoints (CONTRACTS.md):
 
-* ``POST /open``  {url|path, loop, isFile?, owner?, takeover?} — start
+* ``POST /open``  {url|path, loop, isFile?, lockstep?, owner?, takeover?} — start
   capturing.  ``isFile`` marks a url as a finite recording (paced, ends at
   EOF) rather than a live stream.  The capture slot is EXCLUSIVE: see "one
   slot, one owner" below.
@@ -125,7 +125,9 @@ def open_source(body: OpenSource) -> dict:
             (body.path, True) if body.path else (body.url, body.isFile)
         )
         try:
-            worker = CaptureWorker(source=source, is_file=is_file, loop=body.loop)
+            worker = CaptureWorker(
+                source=source, is_file=is_file, loop=body.loop, lockstep=body.lockstep
+            )
         except CaptureError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         worker.start()

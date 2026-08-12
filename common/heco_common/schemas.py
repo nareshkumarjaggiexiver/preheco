@@ -111,12 +111,32 @@ class OpenSource(BaseModel):
     live run's camera and both loops then read the wrong frames; with one, the
     second /open is refused (409) naming the run that holds it.  ``takeover``
     is the operator's explicit override for a slot whose owner is gone.
+
+    ``lockstep`` makes a FILE source hand out EVERY frame instead of dropping
+    the ones a slower consumer missed: the reader blocks until the frame in
+    the slot has been taken, then decodes the next.  File sources only, and
+    deliberately so — the two source kinds want opposite things.
+
+      A CAMERA cannot be blocked.  Frames arrive whether or not anyone is
+      ready, so the only choices are drop or buffer, and buffering a 15 fps
+      source into a 3 fps pipeline is not latency but DIVERGENCE: the backlog
+      grows without bound for as long as the camera is on, and the count
+      stops being about tonight.  Dropping is the honest answer, and it is
+      what this reader has always done.
+
+      A RECORDING has no such clock.  Nothing is lost by making the file wait,
+      because the frames are already on disk — so lockstep processes every one
+      of them with NO buffer, NO memory growth and no possibility of
+      divergence, at the cost of running slower than real time.  That is
+      exactly the right trade for an after-the-fact count, and it is the only
+      way to say "every frame was examined" and mean it.
     """
 
     url: str | None = None
     path: str | None = None
     loop: bool = False
     isFile: bool = False
+    lockstep: bool = False
     owner: str | None = None
     takeover: bool = False
 
