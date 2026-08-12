@@ -267,3 +267,33 @@ def test_the_stats_board_survives_a_new_metric_appearing_mid_snapshot():
     for t in threads:
         t.join(timeout=2.0)
     assert not failures, f"snapshot raced observe: {failures[0]!r}"
+
+
+def test_the_duty_guard_delays_a_mint_keyframe_but_never_loses_it():
+    """The guard bounds the reporter's share; it does not get to drop guests.
+
+    Deferring pops the mint frame off the queue to decide about it, so the
+    obvious implementation silently discards exactly the keyframe the forced
+    queue exists to protect. It goes back at the front instead — mint order is
+    the order guests were counted, and a register whose pictures arrive
+    shuffled is harder to audit than one whose pictures arrive late.
+    """
+    loop = FakeLoop(round_delay_s=0.15)
+    # duty_factor 20 against a 150 ms round = ~3 s of enforced quiet, far
+    # longer than this test runs, so every round after the first is deferred.
+    reporter = Reporter(loop, settings(tap_duty_factor=20.0))
+    reporter.start()
+    try:
+        reporter.publish(frame(1))                 # first round, arms the guard
+        assert wait_until(lambda: len(loop.rounds) >= 1)
+        reporter.publish(frame(99), minted=True)   # must be deferred, not dropped
+        time.sleep(0.4)
+        assert not any(f["seq"] == 99 for f in loop.rounds), (
+            "precondition: the guard should be deferring right now"
+        )
+        assert loop.status.get("tapRoundsDeferred", 0) >= 1
+    finally:
+        reporter.finish()
+    assert any(f["seq"] == 99 for f in loop.rounds), (
+        "the deferred mint frame must still be rendered, not discarded"
+    )
