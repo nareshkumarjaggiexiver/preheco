@@ -118,3 +118,24 @@ def test_cli_exit_codes(tmp_path):
     diff = write(tmp_path, "c.jsonl", frames(2))
     assert main([same_a, same_b]) == 0
     assert main([same_a, diff]) == 1
+
+
+def test_a_wall_clock_stamp_is_not_a_decision(tmp_path):
+    """tMs must be ignored, and the reason is a measurement, not a preference.
+
+    The tool's first real use diffed two runs of one 60 s clip on the T440:
+    1802 frames each, every box, face, gate outcome and verdict identical —
+    and it reported DIFFERENT, because frame 1 was read 5 ms later in one run
+    than the other. On a file replay tMs is pure scheduling noise. A guard
+    rail that fires on that gets switched off within a day, so it does not.
+    """
+    a = write(tmp_path, "a.jsonl", [{"seq": 1, "tMs": 15, "verdicts": []}])
+    b = write(tmp_path, "b.jsonl", [{"seq": 1, "tMs": 10, "verdicts": []}])
+    assert report(load(a), load(b))[0], "tMs alone must not be a difference"
+
+
+def test_a_missing_or_reordered_frame_is_still_caught(tmp_path):
+    """seq is NOT a timing key: losing or reordering frames is a real finding."""
+    a = write(tmp_path, "a.jsonl", [{"seq": 1, "tMs": 0}, {"seq": 2, "tMs": 5}])
+    b = write(tmp_path, "b.jsonl", [{"seq": 2, "tMs": 0}, {"seq": 1, "tMs": 5}])
+    assert not report(load(a), load(b))[0], "frame identity must still be compared"

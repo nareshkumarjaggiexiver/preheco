@@ -40,7 +40,18 @@ from pathlib import Path
 
 #: Keys whose values are wall-clock measurements, not decisions.  A refactor
 #: is EXPECTED to change these; that is usually its whole point.
-TIMING_KEYS = ("ms",)
+#:
+#: ``ms`` is the per-stage cost of the frame.  ``tMs`` is when the frame was
+#: read, measured from the run's start — and on a FILE replay it is pure
+#: scheduling noise, because the source is consumed as fast as the pipeline
+#: can take it and every run therefore stamps slightly different offsets.  It
+#: was the first thing this tool ever flagged, on two runs of one clip that
+#: agreed on all 1802 frames' reasoning and disagreed by 5 ms on when frame 1
+#: arrived; a guard rail that fires on that would be turned off within a day.
+#:
+#: ``seq`` is deliberately NOT here.  It identifies the frame, so records
+#: falling out of order or going missing is a real finding.
+TIMING_KEYS = ("ms", "tMs")
 
 
 def load(path: str | Path, *, keep_timings: bool = False) -> list[dict]:
