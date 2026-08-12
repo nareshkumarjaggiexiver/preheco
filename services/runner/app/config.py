@@ -147,6 +147,14 @@ class Settings:
     # it back on the loop: the sync path is kept intact so the two can be
     # A/B'd on one box, and so a bad night at a real gate is one env var from
     # the shape that has been counting all along.
+    # GOLDEN DECISION CAPTURE (loop._write_golden).  A path here makes the run
+    # ALSO append every frame's decision record to a local JSONL file, so a
+    # refactor can be proved to have changed nothing: capture, change, replay
+    # the same clip, diff.  `{runId}` in the path is substituted.  Off by
+    # default — it is an engineer's instrument, not a production behaviour,
+    # and a run that writes a file nobody asked for is a surprise on a box.
+    golden_path: str | None = None
+
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
     # keyframe is uploaded promptly, long enough that an empty scene does not
@@ -443,6 +451,7 @@ def from_env() -> Settings:
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
+        golden_path=os.environ.get("HECO_GOLDEN_PATH") or s.golden_path,
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),

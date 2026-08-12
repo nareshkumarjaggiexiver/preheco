@@ -403,6 +403,9 @@ class RunLoop:
         # The observability plane (app.reporting), or None when async
         # reporting is off and the loop does its own tap rounds and flushes.
         self.reporter = None
+        # Open file handle for the golden decision capture, or None (default).
+        # See _write_golden: this is the artifact a refactor is proved against.
+        self._golden = None
         # Native frame dimensions, read ONCE from the first frame's JPEG header
         # (the camera's resolution does not change mid-run) — they ride the
         # ingest tap and the forensic uploads so the console can scale ledger
@@ -773,8 +776,9 @@ class RunLoop:
             # The safety net for every path that did not reach the orderly
             # stop in _run: a failed run must not leave the reporter alive
             # uploading pictures of a run the operator has been told is over.
-            # Idempotent — _stop_reporter clears the attribute as it goes.
+            # Idempotent — both clear their handles as they go.
             self._stop_reporter()
+            self._close_golden()
         return self.status()
 
     def _stop_reporter(self) -> None:
@@ -783,6 +787,34 @@ class RunLoop:
         if reporter is not None:
             with contextlib.suppress(Exception):
                 reporter.finish()
+
+    def _open_golden(self) -> None:
+        """Open the decision-capture file if HECO_GOLDEN_PATH names one.
+
+        Opened per RUN and stamped with the run id, so two runs on one box
+        cannot interleave their reasoning into a file whose whole purpose is
+        line-by-line comparability. A path that cannot be opened is reported
+        in the run's status and then ignored: a missing capture must not cost
+        the count.
+        """
+        if not self.s.golden_path:
+            return
+        path = self.s.golden_path.replace("{runId}", str(self.run_id))
+        try:
+            self._golden = open(path, "w", encoding="utf-8")  # noqa: SIM115
+        except OSError as e:
+            self._golden = None
+            self._set(goldenError=f"{type(e).__name__}: {e}")
+            self.log.error(f"golden capture disabled: {e}")
+        else:
+            self.log.info(f"golden capture -> {path}")
+
+    def _close_golden(self) -> None:
+        """Flush and close the decision capture, at most once."""
+        golden, self._golden = self._golden, None
+        if golden is not None:
+            with contextlib.suppress(Exception):
+                golden.close()
 
     def _run(self) -> None:
         req = self.request
@@ -823,6 +855,8 @@ class RunLoop:
         self._last_feedback = t0
         self._last_purge = t0
         frames = 0
+
+        self._open_golden()
 
         # Started AFTER the source opens, so a run that fails to open a camera
         # never leaves a thread behind, and stopped in the `finally` below for
@@ -896,6 +930,7 @@ class RunLoop:
         # is genuinely the last word on this run's stats rather than racing a
         # thread that is still posting them.
         self._stop_reporter()
+        self._close_golden()
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
         notes = (
@@ -2982,12 +3017,46 @@ class RunLoop:
         except Exception:  # noqa: BLE001 — the ledger must never stop counting
             self._bump("frameRecordsDropped")
             return
+        self._write_golden(record)
         with self._lock:
             self._frame_ledger.append(record)
             if len(self._frame_ledger) > taps.FRAME_LEDGER_CAP:
                 dropped = len(self._frame_ledger) - taps.FRAME_LEDGER_CAP
                 del self._frame_ledger[:dropped]
                 self._status["frameRecordsDropped"] += dropped
+
+    def _write_golden(self, record: dict) -> None:
+        """Also append this frame's reasoning to a local file, if asked.
+
+        WHAT THIS IS FOR. The planner copy of the ledger is the operator's;
+        this one is the engineer's, and it exists to make a REFACTOR provable.
+        The accuracy harness in ``eval/`` answers "is the count right", which
+        needs labelled footage and human ground truth. A refactor asks a
+        different and much sharper question — "did anything change at all" —
+        and that one needs no labels: capture every frame's decisions before
+        the change, replay the same clip after, and diff. Any difference is
+        the refactor altering reasoning, whatever the totals say.
+
+        Written HERE rather than at flush because this is the only point where
+        each record passes exactly once and in order: the flush path re-queues
+        a failed batch, which would duplicate rows in a file whose whole value
+        is being comparable line by line.
+
+        Written from the LOOP thread, deliberately unbuffered by us and left
+        to the OS: a ~1 KB append is a couple of microseconds, and the
+        alternative — handing it to the reporter — would put the one artifact
+        that must be complete behind a queue that is allowed to drop.
+
+        Failures are counted and never raised. A capture that cannot be
+        written is a lost experiment, and losing the run as well would be a
+        strictly worse trade.
+        """
+        if self._golden is None:
+            return
+        try:
+            self._golden.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:  # noqa: BLE001 — a capture must never stop counting
+            self._bump("goldenWriteErrors")
 
     def _count_stage(self) -> None:
         """Record the count stage: the running unique total, once per frame."""

@@ -241,3 +241,32 @@ which is exactly the rung that went to zero on 2026-08-05. Pinned by
 Runs recorded before that change report `embeds: null` — **unknown, which is
 not zero** — and the `embed-ran` check stands down rather than accusing an old
 run of a collapse it did not have.
+
+---
+
+## Two harnesses, two questions
+
+`eval/` answers **"is the count right?"** — it needs labelled footage and a
+human count of record, and it refuses to call a change an improvement when
+accuracy went backwards.
+
+`eval.golden` answers **"did anything change at all?"** — and that one needs
+no labels. It diffs the runner's own per-frame decision ledger between two
+runs of the same clip:
+
+```bash
+# capture on the code you have
+HECO_GOLDEN_PATH=/tmp/before.jsonl   # set on the runner, then run the clip
+# ... make the change, redeploy, run the same clip again ...
+make golden BEFORE=/tmp/before.jsonl AFTER=/tmp/after.jsonl
+```
+
+A clean diff is the strongest statement available about a refactor: not "the
+totals matched" but "every frame reasoned identically". Totals matching is the
+weaker claim that lets two compensating errors through — a guest lost here and
+a phantom minted there sum to the same number and are not the same run.
+
+Use a **recording in lockstep mode**, never a live camera: the diff is only
+meaningful when both runs saw exactly the same frames, and a sampled run sees
+different ones each time. This is the guard rail every step of the
+architecture migration is held to.
