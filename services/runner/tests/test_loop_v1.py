@@ -14,12 +14,12 @@ import cv2
 import httpx
 import numpy as np
 import pytest
-from app.appearance import intersection, torso_descriptor
 from app.config import Settings
 from app.loop import RunLoop, TokenAuth, auth_for, httpx_file_transport, httpx_transport
 from heco_common.auth import TokenProvider
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.planner import PlannerClient
+from heco_counting.appearance import intersection, torso_descriptor
 
 
 def real_jpeg_b64() -> str:

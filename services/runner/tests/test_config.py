@@ -124,7 +124,7 @@ def test_the_profile_reaches_the_gate_and_the_run_record():
     """What the operator chose has to be what the gate enforces AND what the
     run row records — the count is an invoice figure, so 'which floors were in
     force' must be recoverable months later."""
-    from app.gate import GateThresholds
+    from heco_counting.gate import GateThresholds
 
     s = _apply_quality_profile(
         Settings(), {"minEyeSpan": 0.30, "requireLandmarks": True, "faceReverifyIntervalS": 5.0}

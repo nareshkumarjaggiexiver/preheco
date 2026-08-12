@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heco-counting"
+version = "0.1.0"
+description = "The counting decisions: quality gate, zones, association, folds, co-presence and the identity ledger. No transport, no framework, no camera."
+requires-python = ">=3.12"
+# DELIBERATELY THIN. The counting logic reads pixels for one thing only (the
+# torso descriptor) and does arithmetic for everything else. No httpx, no
+# fastapi, no pydantic — a test in counting/tests/test_boundaries.py asserts
+# that importing this package pulls none of them in, because the moment it
+# does, a worker or a fusion process inherits the runner's whole world just to
+# ask whether two faces are two people.
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+]
+
+[tool.setuptools.packages.find]
+include = ["heco_counting*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

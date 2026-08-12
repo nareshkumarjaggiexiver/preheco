@@ -14,7 +14,7 @@ per-frame counts are always exact even when the row list is truncated.
 
 import json
 
-from .gate import reported_reason
+from heco_counting.gate import reported_reason
 
 
 def _near_miss(v: dict) -> dict | None:
