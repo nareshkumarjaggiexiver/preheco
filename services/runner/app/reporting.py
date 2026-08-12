@@ -155,7 +155,23 @@ class Reporter(threading.Thread):
 
             forced = self._take_forced()
             due = forced is not None or now - last_tap >= self.s.tap_interval_s
-            if due and self._duty_allows(now):
+            if due and not self._duty_allows(now):
+                # A deferred MINT frame goes back at the FRONT of the queue.
+                # The guard may delay a guest's keyframe; it may never be the
+                # reason one is lost, which is exactly what dropping the
+                # snapshot we just popped would do.
+                if forced is not None:
+                    self._return_forced(forced)
+                # RESTART THE INTERVAL on a deferral, exactly as the
+                # synchronous guard does, so `tapRoundsDeferred` counts ROUNDS
+                # the guard skipped in both schedulers. Without this the
+                # reporter re-asks every poll and the counter measures its
+                # 50 ms wake-up rate instead: a 158 s run reported 153
+                # deferrals against 79 possible rounds, which reads like a
+                # reporter in trouble rather than one behaving.
+                last_tap = now
+                due = False
+            if due:
                 snapshot = forced if forced is not None else self._take_pending()
                 if snapshot is not None:
                     started = time.monotonic()
@@ -207,6 +223,16 @@ class Reporter(threading.Thread):
         """Take the oldest mint frame still owed a keyframe, if any."""
         with self._lock:
             return self._forced.popleft() if self._forced else None
+
+    def _return_forced(self, frame: dict) -> None:
+        """Put an untaken mint frame back at the FRONT, still owed a keyframe.
+
+        The front, not the back: mint order is the order guests were counted,
+        and a register whose pictures arrive shuffled is harder to audit than
+        one whose pictures arrive late.
+        """
+        with self._lock:
+            self._forced.appendleft(frame)
 
     def _duty_allows(self, now: float) -> bool:
         """True when the last round's cost has been repaid in quiet time."""
