@@ -323,8 +323,10 @@ def make_loop(fake: V1Fake, request: dict, **settings_kw) -> RunLoop:
         # Harness defaults, overridable: flushing every frame lets a test read
         # its stats immediately, but a test ABOUT batching has to be able to
         # ask for the production cadence instead.
+        # async_reporting False: these tests assert per-frame reporting, which
+        # only the synchronous scheduler guarantees (see test_loop.make_loop).
         **{"flush_interval_s": 0.0, "source_poll_s": 0.001, "source_stall_s": 0.05,
-           **settings_kw},
+           "async_reporting": False, **settings_kw},
     )
     client = httpx.Client(transport=httpx.MockTransport(fake.handler))
     planner = PlannerClient(
@@ -344,8 +346,10 @@ def make_authed_loop(fake: V1Fake, request: dict, **settings_kw) -> tuple[RunLoo
         embed_url="http://embed:7105", match_url="http://match:7106",
         planner_url="http://planner:8787",
         auth_url="http://auth", app_id="runner", app_secret="sekrit",
+        # async_reporting False: these tests assert per-frame reporting, which
+        # only the synchronous scheduler guarantees (see test_loop.make_loop).
         **{"flush_interval_s": 0.0, "source_poll_s": 0.001, "source_stall_s": 0.05,
-           **settings_kw},
+           "async_reporting": False, **settings_kw},
     )
     mock = httpx.MockTransport(fake.handler)
     provider = TokenProvider(
@@ -3538,3 +3542,43 @@ def test_the_verify_clock_map_is_pruned_against_live_tracks():
     loop._last_face_verify = {n: 0.0 for n in range(loop._REVERIFY_CAP + 5)}
     loop.run()
     assert len(loop._last_face_verify) <= loop._REVERIFY_CAP
+
+
+# --------------------------------------------------------- async reporting
+
+
+@pytest.mark.parametrize("n_frames,face_widths", [
+    (6, (85.0,)),
+    (8, (85.0, 60.0)),
+    (4, (44.0,)),
+])
+def test_async_reporting_does_not_change_the_count(n_frames, face_widths):
+    """THE claim the whole change rests on: moving reporting changes nothing.
+
+    Async reporting is allowed to drop PICTURES — that is drop-not-queue,
+    stated and tested in test_reporting.py.  It is never allowed to alter a
+    verdict.  The line that guarantees it is that the reporter runs only work
+    that reports: the gallery, the folds and the co-presence graph stay on the
+    loop thread, so the two schedulers must agree on the count exactly.
+
+    Run identically-scripted footage through both and compare the settled
+    status, not just the unique total: matches, staff crossings and manual
+    additions all have to land the same way, because a difference in any of
+    them is a difference in reasoning that happened to leave the total alone.
+    """
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    settled = []
+    for async_reporting in (False, True):
+        fake = V1Fake(
+            n_frames=n_frames, face_widths=face_widths, image_b64=real_jpeg_b64()
+        )
+        st = make_loop(
+            fake, dict(request), async_reporting=async_reporting
+        ).run()
+        settled.append(
+            {k: st.get(k) for k in ("unique", "matches", "staffCrossings",
+                                    "manualAdditions", "frames", "state")}
+        )
+    assert settled[0] == settled[1], (
+        f"async reporting changed the run: sync={settled[0]} async={settled[1]}"
+    )
