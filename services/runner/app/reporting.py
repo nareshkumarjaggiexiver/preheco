@@ -151,7 +151,15 @@ class Reporter(threading.Thread):
 
             # Forensic pictures first: they are per-frame and the operator
             # turned them on to see THIS frame, so a queued one ages worst.
-            self._drain_forensic()
+            #
+            # BOUNDED PER PASS, not per queue-empty. Draining until the deque
+            # is empty starves everything below it: in forensic mode with a
+            # planner slower than the camera — the exact case the queue exists
+            # for — the loop keeps refilling it, so tap rounds, flushes AND
+            # mint keyframes never run at all and the console goes dark for
+            # the rest of the run. A slice per pass keeps the pictures moving
+            # while leaving the plane responsive.
+            self._drain_forensic(budget_s=self.s.reporter_poll_s * 4)
 
             if now - last_flush >= self.s.flush_interval_s:
                 self._guarded(self._loop._flush, now - self._t0)
@@ -216,13 +224,23 @@ class Reporter(threading.Thread):
         ``timeout`` because a planner that has gone away must not hold the
         run's settle open.
         """
+        # MINT KEYFRAMES FIRST, and with most of the budget. Draining forensic
+        # pictures first spent the whole 5 s on frames an operator opted into
+        # for a bench run and then discarded the keyframes of guests who were
+        # actually counted — the record that a disputed invoice rests on,
+        # traded for debug pixels.
         deadline = time.monotonic() + timeout
-        self._drain_forensic(deadline=deadline)
-        while time.monotonic() < deadline:
+        mint_deadline = time.monotonic() + timeout * 0.7
+        while time.monotonic() < mint_deadline:
             forced = self._take_forced()
             if forced is None:
                 break
-            self._guarded(self._loop._tap_round, forced)
+            self._guarded(self._loop._keyframe_round, forced)
+        with self._lock:
+            owed = len(self._forced)
+        if owed:
+            self._loop._bump("tapFramesDropped", owed)
+        self._drain_forensic(deadline=deadline)
         self._stopping.set()
         self._wake.set()
         # `is_alive()` rather than an unconditional join: _stop_reporter runs
@@ -267,8 +285,19 @@ class Reporter(threading.Thread):
             return True
         return now - self._round_ended >= self.s.tap_duty_factor * self._round_cost_s
 
-    def _drain_forensic(self, deadline: float | None = None) -> None:
-        """Upload every queued forensic picture, oldest first."""
+    def _drain_forensic(
+        self, deadline: float | None = None, budget_s: float | None = None
+    ) -> None:
+        """Upload queued forensic pictures, oldest first, within a bound.
+
+        ``budget_s`` bounds ONE pass (the scheduling loop's slice); ``deadline``
+        bounds an absolute instant (the settle). Either may be None, but the
+        run loop must always pass one of them — an unbounded drain is how the
+        observability plane starves.
+        """
+        if budget_s is not None:
+            stop_at = time.monotonic() + budget_s
+            deadline = stop_at if deadline is None else min(deadline, stop_at)
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 return
