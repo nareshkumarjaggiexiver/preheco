@@ -1167,10 +1167,17 @@ class RunLoop:
         # a guest whose body the detector missed still deserves a picture.
         frame_img = None
         if boxes or kept:
+            # TIMED, and per-person by construction: an empty scene never
+            # reaches this decode, which is exactly why the loop's residual
+            # measured zero on an empty bench and ~135 ms with one person in
+            # frame — a full 4K JPEG decode is ~50-80 ms on its own, and it
+            # was invisible to every stage timer.
+            td = time.perf_counter()
             try:
                 frame_img = decode_jpeg_b64(image_b64)
             except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
                 frame_img = None
+            board.observe("count", "frameDecodeMs", (time.perf_counter() - td) * 1000.0)
 
         # match (one call per embedding; gallery keyed by the planner run id;
         # staff checked first when the run carries a siteId)
@@ -1196,9 +1203,13 @@ class RunLoop:
             pbox_id = id(pbox) if pbox is not None else None
             face_desc = None
             if frame_img is not None and pbox is not None:
+                # Per FACE, on the full-resolution frame — timed because it is
+                # part of the per-person residual the stage timers never saw.
+                ta = time.perf_counter()
                 face_desc = appearance.torso_descriptor(
                     frame_img, face["box"], pbox
                 )
+                board.observe("count", "appearanceMs", (time.perf_counter() - ta) * 1000.0)
             body = {"runId": planner_run_id, "embedding": emb, "quality": w}
             if face_desc is not None:
                 body["appearance"] = face_desc
@@ -1247,6 +1258,14 @@ class RunLoop:
                 }
             )
             decided.append((face, m, face_desc, pbox_id))
+
+        # Everything from here to the ledger write is the frame's VERDICT
+        # PASS: same-key splits, co-presence assertions, fold/heal decisions,
+        # face cards. It makes its own match-service round trips (splits and
+        # cannot_link posts) that no stage timer sees, and it only runs when
+        # people are in frame — which is exactly the shape of the residual
+        # that measured zero on an empty bench and ~135 ms with one person.
+        tvp = time.perf_counter()
 
         # SAME-FRAME SAME-KEY GUARD, run first of all: co-presence can only
         # constrain two DIFFERENT keys, so a frame in which two bodies were
@@ -1380,6 +1399,8 @@ class RunLoop:
             else:
                 self._maybe_heal(planner_run_id, track_id, m, face_desc, frame_bodies)
                 self._note_lock(track_id, m, face_desc)
+
+        board.observe("count", "verdictPassMs", (time.perf_counter() - tvp) * 1000.0)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
