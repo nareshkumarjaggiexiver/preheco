@@ -228,3 +228,50 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 
     allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+
+# ------------------------------------------------------------------ build id
+
+
+def test_health_reports_a_build_id_that_changes_with_the_source():
+    """The question a deploy raises is 'is this box running what I think'.
+
+    VERSION has read "0.1.0" on every box through every deploy this pipeline
+    has ever had, so it cannot answer it. Two of the four boxes are not git
+    checkouts, so a sha would not be askable there — and a sha would not
+    notice a file edited in place on the box either. So the build id hashes
+    the SOURCE.
+    """
+    from app.main import BUILD_ID, _build_id
+
+    assert BUILD_ID != "unknown", "the build id must compute in a normal tree"
+    assert len(BUILD_ID) == 12 and all(c in "0123456789abcdef" for c in BUILD_ID)
+    assert _build_id() == BUILD_ID, "it must be stable across calls"
+
+
+def test_the_build_id_is_deterministic_and_content_sensitive(tmp_path, monkeypatch):
+    """Same content -> same id; one changed byte -> different id.
+
+    Both halves matter. Without determinism two identical boxes would report
+    different builds and every deploy check would cry wolf; without content
+    sensitivity a stale container would report the same build as a fresh one,
+    which is the failure this exists to catch.
+    """
+    import hashlib
+    from pathlib import Path
+
+    def digest_of(root: Path) -> str:
+        d = hashlib.sha256()
+        for p in sorted(root.rglob("*.py")):
+            d.update(str(p.relative_to(root)).encode())
+            d.update(p.read_bytes())
+        return d.hexdigest()[:12]
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for root in (a, b):
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg" / "m.py").write_text("x = 1\n")
+    assert digest_of(a) == digest_of(b), "identical trees must agree"
+
+    (b / "pkg" / "m.py").write_text("x = 2\n")
+    assert digest_of(a) != digest_of(b), "one changed byte must be visible"

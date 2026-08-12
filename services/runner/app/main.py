@@ -13,6 +13,7 @@ staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
 ``staffId``; ``siteId`` on a count run opts it into the staff whitelist.
 """
 
+import importlib
 import json
 import logging
 from pathlib import Path
@@ -25,7 +26,62 @@ from pydantic import BaseModel, Field, model_validator
 from . import config
 from .runs import RunManager
 
+
+def _build_id() -> str:
+    """Hash every .py this process could be running, by path and content.
+
+    Deterministic across machines: paths are made relative to each root and
+    the roots are walked in sorted order, so two boxes with identical source
+    produce an identical digest regardless of where the tree happens to live
+    or what order the filesystem returns entries in.
+
+    Truncated to 12 hex characters — the same length a short git sha uses,
+    for the same reason: long enough that a collision is not a practical
+    concern, short enough to read out over the phone.
+
+    Never raises. A build id is diagnostic, and a health endpoint that fails
+    because it could not compute its own diagnostic would be the joke that
+    writes itself.
+    """
+    import hashlib
+
+    roots = [Path(__file__).resolve().parent]
+    for mod in ("heco_common", "heco_counting"):
+        try:
+            roots.append(Path(importlib.import_module(mod).__file__).resolve().parent)
+        except Exception:  # noqa: BLE001 — an absent library is not a crash here
+            continue
+    digest = hashlib.sha256()
+    try:
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                digest.update(str(path.relative_to(root)).encode())
+                digest.update(path.read_bytes())
+    except Exception:  # noqa: BLE001 — see the docstring
+        return "unknown"
+    return digest.hexdigest()[:12]
+
+
 VERSION = "0.1.0"
+
+#: A content hash of the source this process is actually running.
+#:
+#: WHY THIS EXISTS. ``VERSION`` is a declared string. Every box in the fleet
+#: has reported "0.1.0" through every deploy the pipeline has ever had, so it
+#: cannot answer the question a deploy actually raises — is this box running
+#: what I think it is? Two of the four boxes are not even git checkouts (they
+#: are tar copies), so a git sha would not be askable there, and a sha would
+#: not notice a file edited in place on the box either.
+#:
+#: So this hashes the SOURCE, not the provenance: every .py under the app and
+#: the two installed libraries, by path and content. Two boxes reporting the
+#: same build are running the same code, full stop. It is computed once at
+#: import, costs a few milliseconds on a tree this size, and degrades to
+#: "unknown" rather than failing a health check it exists to inform.
+#:
+#: This is the missing half of the deploy-integrity guards: models.lock says
+#: the WEIGHTS are what they should be, and this says the CODE is.
+BUILD_ID = _build_id()
 log = logging.getLogger("runner")
 
 app = FastAPI(title="heco-runner", version=VERSION)
@@ -201,6 +257,14 @@ def health() -> dict:
     deploy runbook read them, and moving a field somebody polls is a wire
     change dressed as a refactor.
 
+    ``build`` is a content hash of the source actually running — see
+    :data:`BUILD_ID`. ``version`` is a declared string that every box has
+    reported as "0.1.0" through every deploy this pipeline has ever had, so
+    it cannot answer the one question a deploy raises: is this box running
+    what I think it is? Two boxes reporting the same ``build`` are running the
+    same code; two reporting different ones are not, whatever either says
+    about its version, and whether or not the box is even a git checkout.
+
     ``pipeline`` is the addition — the capability manifest from
     ``pipeline.json`` (apps/heco-pipelines/CONTRACTS.md §1). The planner's
     registry reads it to decide what the console offers, and it branches on
@@ -212,6 +276,7 @@ def health() -> dict:
         "ok": True,
         "model": "orchestrator",
         "version": VERSION,
+        "build": BUILD_ID,
         "pipeline": _manifest(),
     }
 
