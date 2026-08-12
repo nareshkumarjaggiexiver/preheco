@@ -22,6 +22,7 @@ class FakeLoop:
     def __init__(self, *, round_delay_s: float = 0.0, raises: bool = False) -> None:
         self.board = StatsBoard()
         self.rounds: list[dict] = []
+        self.keyframes: list[dict] = []
         self.flushes: list[float] = []
         self.uploads: list[dict] = []
         self.status: dict[str, int] = {}
@@ -35,6 +36,22 @@ class FakeLoop:
         if self._round_delay_s:
             time.sleep(self._round_delay_s)
         with self._lock:
+            self.rounds.append(last)
+
+    def _keyframe_round(self, last: dict) -> None:
+        """The cheap path a MINT takes: match payload + match frame only.
+
+        Modelled at a QUARTER of a full round, which is roughly the real
+        ratio — two planner calls and one 4K render instead of ten and five.
+        Both lists are appended so tests can assert a guest's picture was
+        produced without caring which path produced it.
+        """
+        if self._raises:
+            raise RuntimeError("planner exploded mid-round")
+        if self._round_delay_s:
+            time.sleep(self._round_delay_s / 4)
+        with self._lock:
+            self.keyframes.append(last)
             self.rounds.append(last)
 
     def _flush(self, elapsed_s: float) -> None:
@@ -326,3 +343,59 @@ def test_a_waiting_mint_frame_is_not_counted_as_a_deferred_round():
         "measuring polls, not rounds"
     )
     assert any(f["seq"] == 2 for f in loop.rounds), "and it must still be rendered"
+
+
+def test_a_group_arriving_together_all_get_their_keyframe():
+    """THE case the forced queue exists for, and the one it used to fail.
+
+    Eight friends walk in together — ordinary at a wedding or a corporate
+    event — and mint within a few seconds of each other. The old shape charged
+    every mint a FULL tap round: ten planner calls and five 4K renders. At a
+    measured 4K round of ~1.2 s and the default duty factor of 3, that is one
+    keyframe every ~4.8 s, so the queue (then capped at 4) overflowed and four
+    of the eight lost their picture. Run 6cd269 again, reached from the other
+    direction.
+
+    A mint now takes the cheap path — the match payload and the match frame,
+    which is all the planner needs to keep a keyframe — and the queue is sized
+    for a group. Every guest must come out the other side.
+    """
+    loop = FakeLoop(round_delay_s=0.08)   # keyframe path costs a quarter of this
+    reporter = Reporter(loop, settings(tap_interval_s=999.0, tap_duty_factor=3.0))
+    reporter.start()
+    try:
+        for seq in range(1, 9):
+            reporter.publish(frame(seq), minted=True)
+            time.sleep(0.01)              # a burst, not a trickle
+        assert wait_until(lambda: len(loop.keyframes) >= 8, timeout=15.0), (
+            f"only {len(loop.keyframes)} of 8 guests were rendered"
+        )
+    finally:
+        reporter.finish()
+    seen = {f["seq"] for f in loop.keyframes}
+    assert seen == set(range(1, 9)), f"guests without a picture: {set(range(1, 9)) - seen}"
+    assert loop.status.get("tapFramesDropped", 0) == 0, "no guest may be shed"
+
+
+def test_a_mint_takes_the_cheap_path_and_the_cadence_takes_the_full_one():
+    """The routing itself, pinned: it is what makes the burst drain.
+
+    If a future change sends mints back through _tap_round the group test
+    above would still pass on a fast machine and fail at a real 4K gate, so
+    the distinction is asserted directly rather than inferred from timing.
+    """
+    loop = FakeLoop()
+    reporter = Reporter(loop, settings(tap_interval_s=0.0))
+    reporter.start()
+    try:
+        reporter.publish(frame(1), minted=True)
+        assert wait_until(lambda: loop.keyframes)
+        reporter.publish(frame(2))
+        assert wait_until(lambda: any(
+            f["seq"] == 2 for f in loop.rounds if f not in loop.keyframes
+        ))
+    finally:
+        reporter.finish()
+    assert all(f["seq"] != 2 for f in loop.keyframes), (
+        "an ordinary cadence frame must NOT take the keyframe path"
+    )

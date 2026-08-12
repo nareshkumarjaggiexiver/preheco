@@ -60,10 +60,14 @@ import threading
 import time
 from collections import deque
 
-# One mint frame per guest is the healthy case; four in flight means the
-# gallery is minting faster than the planner accepts pictures, and the fifth
-# is worth less than bounding the memory.
-FORCED_CAP = 4
+# Mint keyframes waiting to be rendered. Sized for a GROUP arriving together,
+# which is the ordinary case at a gate and the one that broke the old value:
+# at four, eight friends walking in lost four pictures. Each entry is a
+# reference to a snapshot the loop already holds, so the real cost is holding
+# its base64 text alive — ~1.9 MB per 4K frame, so sixteen is a ~30 MB ceiling
+# on the burst. Beyond that the oldest is shed and counted; a queue deep enough
+# for every conceivable arrival rate would be a memory leak with a nicer name.
+FORCED_CAP = 16
 
 # ~1.9 MB per 4K frame as base64 text: eight frames is a ~15 MB ceiling on the
 # forensic backlog.  Forensic mode is an opt-in bench setting, so a deep queue
@@ -166,9 +170,18 @@ class Reporter(threading.Thread):
                     forced = self._take_forced()
                     snapshot = forced if forced is not None else self._take_pending()
                     if snapshot is not None:
+                        # A mint takes the CHEAP path — the match payload and
+                        # the match frame, which is all the planner needs to
+                        # keep a keyframe. Charging it a full ten-call round
+                        # capped the drain at one guest per round-plus-quiet
+                        # and lost four of every eight who walked in together.
+                        run_round = (
+                            self._loop._keyframe_round if forced is not None
+                            else self._loop._tap_round
+                        )
                         started = time.monotonic()
                         try:
-                            self._guarded(self._loop._tap_round, snapshot)
+                            self._guarded(run_round, snapshot)
                         finally:
                             self._round_ended = time.monotonic()
                             self._round_cost_s = self._round_ended - started
