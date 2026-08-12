@@ -119,12 +119,30 @@ class CaptureWorker(threading.Thread):
                         continue  # keep retrying until stopped
                     continue
                 seq += 1
-                if frame is None:
-                    continue  # grabbed only: the slot still holds an unread frame
-                t_ms = int((time.monotonic() - t0) * 1000)
-                with self._lock:
-                    self._latest = (seq, t_ms, self._fit(frame))
-                    self._unread = True
+                # Only a RETRIEVED frame fills the slot; a grabbed one was
+                # decoded to keep the reference chain and then discarded.
+                if frame is not None:
+                    t_ms = int((time.monotonic() - t0) * 1000)
+                    with self._lock:
+                        self._latest = (seq, t_ms, self._fit(frame))
+                        self._unread = True
+                # PACE EVERY FRAME, GRABBED OR RETRIEVED — and this line's
+                # placement is the whole fix.
+                #
+                # It used to sit after a `continue` that skipped it whenever
+                # the slot was still unread, i.e. whenever the consumer was
+                # slower than the file. That is exactly when pacing matters,
+                # so a file was paced only while nothing needed pacing. With
+                # any real consumer the loop then span through grab() as fast
+                # as the disk allowed: measured on a 60 s / 1803-frame clip,
+                # `seq=2, ended=True` after 0.9 s, and runs settling
+                # `source-ended` having processed one to three frames. It read
+                # as a broken source and was not one.
+                #
+                # A LIVE source is unaffected: `_pace_s` is 0 for anything not
+                # a file (see __init__), so this is a no-op there — the camera
+                # does the pacing, and sleeping would make the reader fall
+                # behind the stream it is meant to be keeping up with.
                 if self._pace_s and self._stop_evt.wait(self._pace_s):
                     return
         finally:
