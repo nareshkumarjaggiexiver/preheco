@@ -68,7 +68,7 @@ from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
-from heco_counting import appearance, gate
+from heco_counting import appearance, association, gate
 
 from . import annotate, taps
 from .config import Settings
@@ -1302,7 +1302,7 @@ class RunLoop:
             # (not only when a frame decoded): co-presence needs it to tell
             # two guests apart from one guest and their reflection.
             pbox = self._person_box_for(face, boxes)
-            pbox_id = id(pbox) if pbox is not None else None
+            pbox_id = association.body_token(pbox)
             face_desc = None
             if frame_img is not None and pbox is not None:
                 # Per FACE, on the full-resolution frame — timed because it is
@@ -1520,27 +1520,8 @@ class RunLoop:
 
     @staticmethod
     def _different_bodies(bodies: dict, a: str | None, b: str | None) -> bool:
-        """Were these two identities seen on DIFFERENT bodies in one frame?
-
-        The one certain identity signal this system has, stated precisely.  Two
-        faces in TWO person boxes are two bodies, so two people — that is what
-        licenses a cannot_link and what forbids a fold.  Two faces in ONE box
-        are one body: a guest and the phone, mirror or photo they are holding
-        (measured on the 2026-08-06 bench, where a man's phone showed his own
-        face and the heal correctly folded it away).  Calling that pair "two
-        people" would both assert a false constraint and block a correct fold.
-
-        A face with no containing box pairs with everything: we cannot show it
-        shares a body, and asserting difference fails toward OVER-count, which
-        is the visible direction.  An identity absent from this frame is not
-        co-present with anything here.
-        """
-        ba, bb = bodies.get(a), bodies.get(b)
-        if not ba or not bb:
-            return False
-        if None in ba or None in bb:
-            return True
-        return ba.isdisjoint(bb)
+        """Delegates to :func:`heco_counting.association.different_bodies`."""
+        return association.different_bodies(bodies, a, b)
 
     def _maybe_face_card(self, frame_img, face: dict, m: dict) -> None:
         """Keep this guest's best face so far, cropped, for the register.
@@ -2269,29 +2250,8 @@ class RunLoop:
 
     @staticmethod
     def _track_for(face: dict, tracks: list) -> int | None:
-        """The track a face belongs to: box centre inside the track box.
-
-        Ties (overlapping tracks both containing the centre) go to the track
-        whose box CENTRE is nearest the face centre.  None when no track
-        contains it — a face with no track cannot carry heal bookkeeping,
-        because "the SAME track matched someone else" is the entire evidence
-        the heal acts on.
-        """
-        box = face.get("box") or {}
-        cx = float(box.get("x", 0.0)) + float(box.get("w", 0.0)) / 2.0
-        cy = float(box.get("y", 0.0)) + float(box.get("h", 0.0)) / 2.0
-        best_id: int | None = None
-        best_d = 0.0
-        for t in tracks:
-            tb = t.get("box") or {}
-            tx, ty = float(tb.get("x", 0.0)), float(tb.get("y", 0.0))
-            tw, th = float(tb.get("w", 0.0)), float(tb.get("h", 0.0))
-            if not (tx <= cx <= tx + tw and ty <= cy <= ty + th):
-                continue
-            d = (tx + tw / 2.0 - cx) ** 2 + (ty + th / 2.0 - cy) ** 2
-            if best_id is None or d < best_d:
-                best_id, best_d = t.get("id"), d
-        return best_id
+        """Delegates to :func:`heco_counting.association.track_for`."""
+        return association.track_for(face, tracks)
 
     def _note_tracks(self, tracks: list) -> None:
         """Remember every track id this frame reported, and publish the count.
@@ -2324,32 +2284,8 @@ class RunLoop:
 
     @staticmethod
     def _person_box_for(face: dict, boxes: list) -> dict | None:
-        """The person box a face belongs to: box centre inside the person box.
-
-        Same association rule as :meth:`_track_for` (centre containment, ties
-        to the nearest box centre) but over the RAW detector boxes, because the
-        torso crop needs the person's full extent this frame — a track box can
-        be a stale prediction, and a descriptor histogrammed off background
-        would manufacture exactly the clashes the veto must only see in real
-        tracker swaps.  None when no box contains the face (a face detected
-        outside every person box carries no torso to describe), and per the
-        absent-is-not-zero convention None disables the veto rather than
-        feeding it.
-        """
-        fb = face.get("box") or {}
-        cx = float(fb.get("x", 0.0)) + float(fb.get("w", 0.0)) / 2.0
-        cy = float(fb.get("y", 0.0)) + float(fb.get("h", 0.0)) / 2.0
-        best: dict | None = None
-        best_d = 0.0
-        for b in boxes:
-            bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
-            bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
-            if not (bx <= cx <= bx + bw and by <= cy <= by + bh):
-                continue
-            d = (bx + bw / 2.0 - cx) ** 2 + (by + bh / 2.0 - cy) ** 2
-            if best is None or d < best_d:
-                best, best_d = b, d
-        return best
+        """Delegates to :func:`heco_counting.association.person_box_for`."""
+        return association.person_box_for(face, boxes)
 
     #: At most this many un-healed mints remembered per track.  A real track
     #: double- or maybe triple-mints in a blurry crossing; dozens would mean
