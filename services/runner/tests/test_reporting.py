@@ -297,3 +297,32 @@ def test_the_duty_guard_delays_a_mint_keyframe_but_never_loses_it():
     assert any(f["seq"] == 99 for f in loop.rounds), (
         "the deferred mint frame must still be rendered, not discarded"
     )
+
+
+def test_a_waiting_mint_frame_is_not_counted_as_a_deferred_round():
+    """The deferral counter must measure rounds, never the reporter's polls.
+
+    A queued mint frame makes a round OWED on every poll, so counting the duty
+    guard's refusal there turns tapRoundsDeferred into a wake-up counter. It
+    was measured twice: 153 deferrals against 79 possible rounds on a 848x478
+    run, then 1142 against 200 on a 4K run with 37 guests. A counter that
+    reads like an emergency during a healthy run is worse than no counter,
+    because the next real emergency looks exactly like it.
+    """
+    loop = FakeLoop(round_delay_s=0.15)
+    # ~3 s of enforced quiet after the first round, against a 5 ms poll.
+    reporter = Reporter(loop, settings(tap_duty_factor=20.0, tap_interval_s=999.0))
+    reporter.start()
+    try:
+        reporter.publish(frame(1), minted=True)     # first round, arms the guard
+        assert wait_until(lambda: len(loop.rounds) >= 1)
+        reporter.publish(frame(2), minted=True)     # owed, but the guard says wait
+        time.sleep(0.5)                             # ~100 polls at 5 ms
+        deferred = loop.status.get("tapRoundsDeferred", 0)
+    finally:
+        reporter.finish()
+    assert deferred == 0, (
+        f"a waiting mint frame counted {deferred} deferrals — the counter is "
+        "measuring polls, not rounds"
+    )
+    assert any(f["seq"] == 2 for f in loop.rounds), "and it must still be rendered"
