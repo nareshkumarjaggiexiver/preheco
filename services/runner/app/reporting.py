@@ -153,36 +153,45 @@ class Reporter(threading.Thread):
                 self._guarded(self._loop._flush, now - self._t0)
                 last_flush = now
 
-            forced = self._take_forced()
-            due = forced is not None or now - last_tap >= self.s.tap_interval_s
-            if due and not self._duty_allows(now):
-                # A deferred MINT frame goes back at the FRONT of the queue.
-                # The guard may delay a guest's keyframe; it may never be the
-                # reason one is lost, which is exactly what dropping the
-                # snapshot we just popped would do.
-                if forced is not None:
-                    self._return_forced(forced)
-                # RESTART THE INTERVAL on a deferral, exactly as the
-                # synchronous guard does, so `tapRoundsDeferred` counts ROUNDS
-                # the guard skipped in both schedulers. Without this the
-                # reporter re-asks every poll and the counter measures its
-                # 50 ms wake-up rate instead: a 158 s run reported 153
-                # deferrals against 79 possible rounds, which reads like a
-                # reporter in trouble rather than one behaving.
-                last_tap = now
-                due = False
-            if due:
-                snapshot = forced if forced is not None else self._take_pending()
-                if snapshot is not None:
-                    started = time.monotonic()
-                    try:
-                        self._guarded(self._loop._tap_round, snapshot)
-                    finally:
-                        self._round_ended = time.monotonic()
-                        self._round_cost_s = self._round_ended - started
-                        self._loop.board.observe(
-                            "count", "tapRoundMs", self._round_cost_s * 1000.0
-                        )
+            # A round is owed either because the cadence came round or because
+            # a guest was minted and is owed a keyframe.  The two are kept
+            # apart deliberately — see the deferral branch.
+            interval_due = now - last_tap >= self.s.tap_interval_s
+            with self._lock:
+                mint_owed = bool(self._forced)
+            if interval_due or mint_owed:
+                if self._duty_ok(now):
+                    # Taken only once the guard has agreed, so a mint frame is
+                    # never popped just to be handed back.
+                    forced = self._take_forced()
+                    snapshot = forced if forced is not None else self._take_pending()
+                    if snapshot is not None:
+                        started = time.monotonic()
+                        try:
+                            self._guarded(self._loop._tap_round, snapshot)
+                        finally:
+                            self._round_ended = time.monotonic()
+                            self._round_cost_s = self._round_ended - started
+                            self._loop.board.observe(
+                                "count", "tapRoundMs", self._round_cost_s * 1000.0
+                            )
+                        last_tap = now
+                elif interval_due:
+                    # COUNTED AND RESTARTED ONLY WHEN THE CADENCE WAS THE
+                    # TRIGGER, so `tapRoundsDeferred` means the same thing here
+                    # as in the synchronous guard: rounds the guard skipped.
+                    #
+                    # Both halves of this were measured wrong first. Not
+                    # restarting made the reporter re-ask every 50 ms poll:
+                    # 153 deferrals against 79 possible rounds. Counting a
+                    # WAITING MINT FRAME as a deferral did the same thing
+                    # again for a different reason — a queued keyframe makes
+                    # the loop due on every poll — and a 4K run with 37 guests
+                    # reported 1142 deferrals against 200 possible rounds. A
+                    # counter that reads like an emergency during a healthy
+                    # run is worse than no counter, because the next real
+                    # emergency looks like it.
+                    self._loop._bump("tapRoundsDeferred")
                     last_tap = now
 
     def finish(self, timeout: float = 5.0) -> None:
@@ -234,14 +243,16 @@ class Reporter(threading.Thread):
         with self._lock:
             self._forced.appendleft(frame)
 
-    def _duty_allows(self, now: float) -> bool:
-        """True when the last round's cost has been repaid in quiet time."""
+    def _duty_ok(self, now: float) -> bool:
+        """True when the last round's cost has been repaid in quiet time.
+
+        A PURE predicate — it does not count anything. The caller decides
+        whether a refusal is a deferred round worth reporting, because only
+        the caller knows whether the cadence or a waiting mint frame asked.
+        """
         if self._round_cost_s <= 0 or self.s.tap_duty_factor <= 0:
             return True
-        if now - self._round_ended >= self.s.tap_duty_factor * self._round_cost_s:
-            return True
-        self._loop._bump("tapRoundsDeferred")
-        return False
+        return now - self._round_ended >= self.s.tap_duty_factor * self._round_cost_s
 
     def _drain_forensic(self, deadline: float | None = None) -> None:
         """Upload every queued forensic picture, oldest first."""
