@@ -3582,3 +3582,40 @@ def test_async_reporting_does_not_change_the_count(n_frames, face_widths):
     assert settled[0] == settled[1], (
         f"async reporting changed the run: sync={settled[0]} async={settled[1]}"
     )
+
+
+def test_golden_capture_records_every_frame_and_replays_identically(tmp_path):
+    """The refactor guard rail, end to end against the real loop.
+
+    Two runs of identically-scripted footage must produce byte-identical
+    decision captures. That is the property every migration step will be held
+    to — not "the totals matched", which two compensating errors also satisfy,
+    but "every frame reasoned the same".
+    """
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    paths = []
+    for arm in ("a", "b"):
+        path = tmp_path / f"golden-{arm}.jsonl"
+        fake = V1Fake(n_frames=6, face_widths=(85.0, 60.0), image_b64=real_jpeg_b64())
+        make_loop(fake, dict(request), golden_path=str(path)).run()
+        paths.append(path)
+
+    lines = [p.read_text().strip().splitlines() for p in paths]
+    assert lines[0], "the capture must not be empty"
+    assert len(lines[0]) == 6, f"one record per processed frame, got {len(lines[0])}"
+    stripped = [
+        [{k: v for k, v in json.loads(line).items() if k != "ms"} for line in arm]
+        for arm in lines
+    ]
+    assert stripped[0] == stripped[1], "the same footage must reason identically"
+
+
+def test_a_golden_path_that_cannot_be_opened_does_not_cost_the_run(tmp_path):
+    """A lost experiment must never become a lost count."""
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), image_b64=real_jpeg_b64())
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    st = make_loop(
+        fake, request, golden_path=str(tmp_path / "no-such-dir" / "g.jsonl")
+    ).run()
+    assert st["state"] == "ended", "the run must still settle normally"
+    assert "goldenError" in st, "and must say why the capture is missing"
