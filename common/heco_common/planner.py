@@ -483,13 +483,12 @@ class PlannerClient:
         except Exception:  # noqa: BLE001 — best-effort callers want no exceptions
             return False, {}
         if status == 401:
+            # Counts the failure and flags the token; does NOT refresh inline.
+            # These callers are best-effort because their latency budget is
+            # the frame loop's, and a token round-trip here would cost the
+            # very frames the tap was reporting on. The next ordinary read
+            # picks the refresh up.
             self._note_auth_failure()
-            # Flag it; do NOT refresh inline. These callers are best-effort
-            # because their latency budget is the frame loop's, and a token
-            # round-trip here would cost the very frames the tap was reporting
-            # on. The next ordinary read picks the refresh up.
-            if self.token_provider is not None:
-                self.token_provider.mark_rejected()
         return status < 400, (body or {})
 
     def _note_upload_status(self, status: int) -> bool:

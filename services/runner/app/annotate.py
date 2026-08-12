@@ -14,8 +14,7 @@ each other.
 
 import cv2
 import numpy as np
-
-from .gate import reported_reason
+from heco_counting.gate import reported_reason
 
 # BGR palette.
 _GREEN = (0, 200, 0)  # person boxes / canon-quality faces

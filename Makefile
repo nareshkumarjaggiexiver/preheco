@@ -18,7 +18,7 @@ SERVICE_DIRS := $(patsubst %/Makefile,%,$(wildcard services/*/Makefile))
 # The accuracy harness (eval/) is not a service, but it owns a venv and a test
 # suite like one, so it joins venv-all / test-all / lint on the same terms.
 EVAL_DIR := $(patsubst %/Makefile,%,$(wildcard eval/Makefile))
-ALL_DIRS := common $(SERVICE_DIRS) $(EVAL_DIR)
+ALL_DIRS := common counting $(SERVICE_DIRS) $(EVAL_DIR)
 
 # `eval` is also a DIRECTORY, so without .PHONY make would call the target
 # up to date and do nothing.
