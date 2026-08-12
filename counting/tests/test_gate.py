@@ -4,10 +4,33 @@ The gate is the pipeline's only irreversible discard — a face it rejects is
 never embedded, never matched and therefore never counted — so its boundaries
 and, above all, its DEFAULTS are pinned here rather than inferred from a loop
 test. Pure functions, no I/O.
+
+WHY THE SETTINGS STAND-IN. ``from_settings`` is duck-typed and this package
+must not import the runner (that is the whole point of it being a package).
+So the defaults are declared HERE, as the library's own documented shipped
+gate. The other half of that claim — that the RUNNER's Settings still produce
+exactly these numbers — is pinned on the runner's side, in
+services/runner/tests/test_gate_binding.py. Split deliberately: one file says
+what the gate is, the other says the host still agrees, and a drift between
+them fails the second rather than hiding inside the first.
 """
 
-from app.config import Settings
-from app.gate import GateThresholds, gate_face, gate_faces
+from dataclasses import dataclass
+
+from heco_counting.gate import GateThresholds, gate_face, gate_faces
+
+
+@dataclass(frozen=True)
+class Settings:
+    """The seven quality fields ``from_settings`` reads, at shipped defaults."""
+
+    quality_min_px: float = 56.0
+    quality_canon_px: float = 80.0
+    quality_min_ied_px: float = 0.0
+    quality_min_frontality: float = 0.0
+    quality_min_sharpness: float = 0.0
+    quality_min_eye_span: float = 0.0
+    quality_require_landmarks: bool = False
 
 
 def face(w=85.0, **signals):
@@ -151,7 +174,7 @@ def test_gate_faces_counts_faces_that_slipped_past_an_armed_floor():
 # the two signals it gates on that we did not have, and the per-track
 # re-verification saving that is the cheapest idea in that file.
 
-from app.gate import reverify_filter  # noqa: E402
+from heco_counting.gate import reverify_filter  # noqa: E402
 
 
 def test_the_new_floors_are_unarmed_by_default_too():

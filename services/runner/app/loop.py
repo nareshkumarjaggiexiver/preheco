@@ -68,8 +68,9 @@ from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
+from heco_counting import appearance, gate
 
-from . import annotate, appearance, gate, taps
+from . import annotate, taps
 from .config import Settings
 from .feedback import plan_action
 from .reporting import Reporter

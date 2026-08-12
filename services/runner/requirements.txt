@@ -1,6 +1,11 @@
 # runner service — runtime + dev, pinned to the fleet versions (Python 3.12).
 # heco-common (editable) brings the wire schemas and the PlannerClient.
 -e ../../common
+# heco-counting (editable) brings the decisions: gate, zones, association,
+# folds, the identity ledger. Separate from heco-common on purpose — see
+# counting/README.md: heco_common installs into every service including
+# match, and the count must have exactly one writer.
+-e ../../counting
 fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
