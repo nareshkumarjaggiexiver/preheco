@@ -52,6 +52,12 @@ class Source(BaseModel):
     path: str | None = None
     loop: bool = False
     isFile: bool = False
+    #: Process EVERY frame of a recording rather than the ones a slower
+    #: pipeline happened to be free for — ingest holds each frame until this
+    #: loop takes it. File sources only (ingest forces it off for a camera);
+    #: the run then takes longer than the footage, which is the honest cost
+    #: of examining all of it. See heco_common.schemas.OpenSource.lockstep.
+    lockstep: bool = False
 
     @model_validator(mode="after")
     def _one_of(self) -> "Source":

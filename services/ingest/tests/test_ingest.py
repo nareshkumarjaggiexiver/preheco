@@ -175,6 +175,86 @@ def test_a_file_is_paced_even_when_NOBODY_is_reading_it(tmp_path):
         worker.stop()
 
 
+def test_lockstep_hands_out_EVERY_frame_where_the_default_drops(tmp_path):
+    """A recording processed exhaustively: no frame skipped, no buffer.
+
+    THE PROBLEM IT SOLVES. The reader drops whatever a slow consumer was not
+    free for — correct for a camera, where frames arrive whether or not
+    anyone is ready and the only alternative is a backlog that grows for as
+    long as the camera is on. But a RECORDING has no clock: nothing is lost
+    by making it wait, and waiting is what lets a count say "every frame was
+    examined" and mean it.
+
+    Both halves are asserted against ONE clip and ONE deliberately slow
+    consumer, because the claim is comparative: the same footage that loses
+    frames by default must lose none in lockstep, at exactly one frame of
+    memory either way.
+    """
+    fps, frames = 100.0, 30  # fast clip, so the default certainly outruns us
+    path = str(tmp_path / "every.avi")
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), fps, (VID_W, VID_H))
+    assert vw.isOpened()
+    for i in range(frames):
+        img = np.zeros((VID_H, VID_W, 3), np.uint8)
+        cv2.rectangle(img, (i, 10), (i + 6, 26), (0, 255, 0), -1)
+        vw.write(img)
+    vw.release()
+
+    def drain(worker, budget_s=15.0):
+        """Consume like a slow pipeline: take a frame, then 'work' on it."""
+        seen = []
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            got = worker.latest()
+            if got is not None and (not seen or got[0] != seen[-1]):
+                seen.append(got[0])
+            if worker.ended and (worker.latest() is None or worker.latest()[0] == (seen[-1] if seen else -1)):
+                break
+            time.sleep(0.02)  # 50 fps consumer against a 100 fps clip
+        return seen
+
+    strict = CaptureWorker(source=path, is_file=True, loop=False, lockstep=True)
+    strict.start()
+    try:
+        seen = drain(strict)
+    finally:
+        strict.stop()
+
+    # EVERY frame, in order, none missing.
+    assert seen == list(range(1, frames + 1)), (
+        f"lockstep skipped frames: got {len(seen)} of {frames} — {seen[:12]}…"
+    )
+    assert strict.ended is True, "the clip must still end at EOF"
+
+    # And the contrast that makes the claim mean something: the same clip
+    # with the same consumer, default behaviour, loses frames.
+    loose = CaptureWorker(source=path, is_file=True, loop=False, lockstep=False)
+    loose.start()
+    try:
+        dropped_seen = drain(loose)
+    finally:
+        loose.stop()
+    assert len(dropped_seen) < frames, (
+        "the default kept every frame too — the clip is not fast enough for "
+        "this test to be measuring anything"
+    )
+
+
+def test_lockstep_is_refused_for_a_live_source(synthetic_video):
+    """A camera can never be blocked, whatever the caller asked for.
+
+    Frames arrive on the camera's clock; holding the reader cannot slow that
+    down, it can only make the reader fall behind the stream it is meant to
+    keep up with. So the flag is forced off rather than trusted — a mistaken
+    `lockstep: true` on an RTSP url must not be able to wedge a live count.
+    """
+    worker = CaptureWorker(source=synthetic_video, is_file=False, lockstep=True)
+    try:
+        assert worker.lockstep is False
+    finally:
+        worker.stop()
+
+
 def test_shutdown_stops_capture_thread(synthetic_video):
     """Leaving the app context joins the worker and releases the capture."""
     from app.main import app, state
