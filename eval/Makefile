@@ -32,5 +32,8 @@ eval: ## Run the harness: make eval MANIFEST=path/to/manifest.json LABEL=name
 compare: ## A/B two result files: make compare BEFORE=a.json AFTER=b.json
 	cd .. && eval/$(VENV)/bin/python -m eval.compare $(BEFORE) $(AFTER)
 
+golden: ## Diff two decision captures: make golden BEFORE=a.jsonl AFTER=b.jsonl
+	cd .. && eval/$(VENV)/bin/python -m eval.golden $(BEFORE) $(AFTER)
+
 clean: ## Remove venv and caches
 	rm -rf $(VENV) .pytest_cache .ruff_cache
