@@ -3088,6 +3088,86 @@ class RunLoop:
             self._tap_cost_s = self._tap_ended - started
             self.board.observe("count", "tapRoundMs", self._tap_cost_s * 1000.0)
 
+    def _keyframe_round(self, last: dict) -> None:
+        """The cheap round a MINT needs: the guest's picture, and nothing else.
+
+        WHY THIS IS NOT ``_tap_round``. A mint is owed a keyframe because the
+        planner only keeps one when a match-stage frame arrives
+        (server/index.js: ``if (stage === 'match') captureKeyframe(...)``, and
+        that function reads the match tap payload to know who is in it). So a
+        keyframe costs exactly two calls — the match payload and the match
+        frame — where a full round costs ten, plus four annotated 4K renders
+        nobody is waiting for.
+
+        THE FAILURE THIS FIXES, which is the one the forced queue exists to
+        prevent, reintroduced in a new shape. Charging a mint a full round
+        capped the drain rate at one guest per round-plus-duty-quiet: measured
+        4K rounds of ~1.2 s and the default duty factor of 3 give one keyframe
+        every ~4.8 s. Eight friends walking in together — the ordinary case at
+        a wedding — mint faster than that, overflow ``FORCED_CAP``, and four of
+        them lose their picture. Exactly run 6cd269 again, arrived at from the
+        other direction.
+
+        At two calls the same burst drains several times faster, and the duty
+        guard now prices a small operation instead of a large one, so it also
+        enforces proportionally less quiet after it.
+
+        Face cards ride along: a guest who has just been minted is precisely
+        the guest whose card the register is missing, and the deadline bounds
+        it exactly as it bounds everything else here.
+        """
+        deadline = time.monotonic() + self.s.tap_budget_s
+        st = self.status()
+        with self._lock:
+            mints = list(self._mints)
+            retired = list(self._retired)
+            co_present = list(self._copresence_pairs)
+        payloads = taps.build_payloads(
+            last, self.s.quality_min_px, self.s.quality_canon_px,
+            st["unique"], st["staffCrossings"],
+            staff_face_frames=st["staffFaceFrames"],
+            manual_additions=st["manualAdditions"],
+            mints=mints,
+            retired=retired,
+            co_present=co_present,
+        )
+        match_payload = payloads.get("match")
+        if match_payload is not None:
+            self._shed_match_payload(match_payload)
+            self.planner.post_tap("match", match_payload)
+        if time.monotonic() >= deadline:
+            self._bump("tapRoundsAbandoned")
+            return
+        try:
+            img = decode_jpeg_b64(last["image_b64"])
+        except Exception:  # noqa: BLE001 — opaque/stub frame: no picture to keep
+            return
+        try:
+            jpeg = annotate.render(
+                "match", img, last, self.s.quality_min_px, self.s.quality_canon_px
+            )
+        except Exception:  # noqa: BLE001 — a bad overlay must not lose the guest
+            return
+        self.planner.post_frame("match", jpeg)
+        self._bump("keyframeRoundsPosted")
+        self._flush_face_cards(deadline)
+
+    def _shed_match_payload(self, mp: dict) -> None:
+        """Trim a match payload to the CONTRACTS.md 32 KB tap ceiling.
+
+        Degrades in the order that loses least: the ledger window first (older
+        mints already rode earlier rounds), then verdict rows, and retirements
+        LAST because they are the smallest list and the one that keeps the
+        register from showing folded guests.
+        """
+        if taps.within_budget(mp):
+            return
+        mp["mints"] = mp.get("mints", [])[-20:]
+        if not taps.within_budget(mp):
+            mp["matches"] = mp.get("matches", [])[:10]
+        if not taps.within_budget(mp):
+            mp["retired"] = mp.get("retired", [])[-20:]
+
     def _tap_round(self, last: dict) -> None:
         """One tap round: the 5 structured payloads, then the 5 annotated JPEGs."""
         deadline = time.monotonic() + self.s.tap_budget_s
@@ -3113,14 +3193,8 @@ class RunLoop:
         # so it degrades in the order that loses least: ledger window first
         # (older mints already rode earlier rounds), then verdict rows.
         mp = payloads.get("match")
-        if mp is not None and not taps.within_budget(mp):
-            mp["mints"] = mp.get("mints", [])[-20:]
-            if not taps.within_budget(mp):
-                mp["matches"] = mp.get("matches", [])[:10]
-            if not taps.within_budget(mp):
-                # Retirements shed LAST: they are the smallest list and the
-                # one that keeps the register from showing folded guests.
-                mp["retired"] = mp.get("retired", [])[-20:]
+        if mp is not None:
+            self._shed_match_payload(mp)
         for stage, payload in payloads.items():
             if time.monotonic() >= deadline:
                 self._bump("tapRoundsAbandoned")

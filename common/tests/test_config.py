@@ -34,7 +34,7 @@ def test_env_float(monkeypatch):
 def test_env_bool(monkeypatch):
     """Bool getter accepts the documented spellings and rejects the rest."""
     for raw, want in [("1", True), ("true", True), ("YES", True), ("on", True),
-                      ("0", False), ("False", False), ("no", False), ("", False)]:
+                      ("0", False), ("False", False), ("no", False)]:
         monkeypatch.setenv("HECO_T_B", raw)
         assert config.env_bool("HECO_T_B", not want) is want
     assert config.env_bool("HECO_T_MISSING", True) is True
@@ -57,6 +57,23 @@ def test_an_empty_value_counts_as_unset(monkeypatch):
 
     monkeypatch.setenv("HECO_T_FLOAT", "")
     assert config.env_float("HECO_T_FLOAT", 1.5) == 1.5
+
+    # env_bool followed the same rule LAST, and its exception cost something.
+    # It read "" as False, which is invisible while every boolean default is
+    # False and inverts the moment one is True: HECO_ASYNC_REPORTING shipped
+    # defaulting to True, and a plain `docker compose up` therefore ran the
+    # SYNCHRONOUS reporter while the code, the tests and the commit message
+    # all said async. Nothing failed — the box was just quietly slower than
+    # the thing that had been measured. Both directions are pinned here.
+    monkeypatch.setenv("HECO_T_BOOL", "")
+    assert config.env_bool("HECO_T_BOOL", True) is True, "empty must not force False"
+    assert config.env_bool("HECO_T_BOOL", False) is False
+    monkeypatch.setenv("HECO_T_BOOL", "   ")
+    assert config.env_bool("HECO_T_BOOL", True) is True
+    # An operator who means false still has four spellings; nobody means
+    # false by typing nothing.
+    monkeypatch.setenv("HECO_T_BOOL", "off")
+    assert config.env_bool("HECO_T_BOOL", True) is False
 
     # Genuine rubbish must still fail loudly — this is not a licence to guess.
     monkeypatch.setenv("HECO_T_INT", "wide")
