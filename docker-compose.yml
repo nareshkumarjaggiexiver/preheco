@@ -263,6 +263,17 @@ services:
       # UNDER-counts silently. Fixed mirrors/screens are exclusion-zone work.
       HECO_COPRESENCE_SPLIT: ${HECO_COPRESENCE_SPLIT-}
       HECO_TAP_DUTY_FACTOR: ${HECO_TAP_DUTY_FACTOR-}
+      # Reporting scheduler. Default (unset) is the async plane in
+      # app.reporting; 0 puts tap rounds and flushes back on the counting loop,
+      # which is the shape that has been counting all along and is one env var
+      # away if a live event ever needs it back.
+      HECO_ASYNC_REPORTING: ${HECO_ASYNC_REPORTING-}
+      # Golden decision capture (eval/golden.py). A path here makes the run
+      # also write every frame's reasoning to a JSONL file, so a refactor can
+      # be proved to have changed nothing. `{runId}` is substituted. Points
+      # into the state volume by default so a capture survives the container
+      # and can be read out with `docker cp`.
+      HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
