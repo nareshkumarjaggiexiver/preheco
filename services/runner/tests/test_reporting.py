@@ -399,3 +399,46 @@ def test_a_mint_takes_the_cheap_path_and_the_cadence_takes_the_full_one():
     assert all(f["seq"] != 2 for f in loop.keyframes), (
         "an ordinary cadence frame must NOT take the keyframe path"
     )
+
+
+def test_forensic_pictures_cannot_starve_the_rest_of_the_plane():
+    """The console must keep updating while forensic mode floods the queue.
+
+    _drain_forensic used to return only when the deque was empty. In forensic
+    mode with a planner slower than the camera — the exact case the queue
+    exists for — the loop keeps refilling it faster than it drains, so tap
+    rounds, flushes and mint keyframes never ran at all and the console went
+    dark for the rest of the run.
+    """
+    loop = FakeLoop()
+    reporter = Reporter(loop, settings(flush_interval_s=0.0, tap_interval_s=0.0))
+    reporter.start()
+    try:
+        stop = time.monotonic() + 1.0
+        while time.monotonic() < stop:
+            reporter.publish(frame(1), forensic=True)   # a relentless flood
+            time.sleep(0.002)
+        assert loop.uploads, "forensic pictures must still be uploading"
+        assert loop.flushes, "a flood of pictures must not starve the flush"
+        assert loop.rounds, "a flood of pictures must not starve the console"
+    finally:
+        reporter.finish()
+
+
+def test_settle_spends_its_budget_on_guests_before_debug_pixels():
+    """A disputed invoice rests on keyframes, not on forensic frames.
+
+    finish() used to drain the whole forensic queue first, so a slow planner
+    consumed the entire 5 s budget on pictures an operator opted into for a
+    bench run, and the keyframes of guests who were actually COUNTED were
+    discarded. Owed keyframes now go first, and whatever is still owed after
+    that is counted rather than silently dropped.
+    """
+    loop = FakeLoop()
+    reporter = Reporter(loop, settings(tap_interval_s=999.0))
+    for seq in (1, 2, 3):
+        reporter.publish(frame(seq), minted=True, forensic=True)
+    reporter.finish()
+    assert {f["seq"] for f in loop.keyframes} == {1, 2, 3}, (
+        "every counted guest's keyframe must survive the settle"
+    )
