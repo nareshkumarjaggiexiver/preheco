@@ -138,6 +138,22 @@ class Settings:
     tap_interval_s: float = 2.0
     feedback_poll_s: float = 3.0
 
+    # ASYNC REPORTING (app.reporting).  When on — the default — tap rounds,
+    # planner flushes and forensic uploads run on their own thread and the
+    # frame loop pays only a handover.  Measured on a live 4K camera, the work
+    # this moves cost 43-96 ms per frame for tap rounds plus 15-22 ms for
+    # flushes; the console keeps its ~2 s cadence, because the fix is to make
+    # observability cheap rather than rare.  Set HECO_ASYNC_REPORTING=0 to put
+    # it back on the loop: the sync path is kept intact so the two can be
+    # A/B'd on one box, and so a bad night at a real gate is one env var from
+    # the shape that has been counting all along.
+    async_reporting: bool = True
+    # How long the reporter sleeps when idle.  Short enough that a mint's
+    # keyframe is uploaded promptly, long enough that an empty scene does not
+    # spin a core: at 50 ms it wakes ~20x a second, and each wake that finds
+    # nothing due is a couple of comparisons.
+    reporter_poll_s: float = 0.05
+
     # Whole-budget ceiling for ONE tap round (up to 5 payloads + 5 JPEGs).
     # Timeouts bound each call; this bounds the round, so a planner that
     # answers slowly-but-successfully cannot cost the loop 10 x report_timeout.
@@ -427,6 +443,8 @@ def from_env() -> Settings:
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
+        async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
+        reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
         enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
     )
