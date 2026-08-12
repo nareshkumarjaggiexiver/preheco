@@ -9,7 +9,10 @@ set env per-case.
 import os
 
 _TRUTHY = {"1", "true", "yes", "on"}
-_FALSY = {"0", "false", "no", "off", ""}
+#: "" is NOT here: an empty value means the operator did not choose,
+#: because that is what docker compose's `${VAR-}` idiom renders. See
+#: env_bool for the incident that established it.
+_FALSY = {"0", "false", "no", "off"}
 
 
 def env_str(name: str, default: str) -> str:
@@ -53,12 +56,30 @@ def env_float(name: str, default: float) -> float:
 def env_bool(name: str, default: bool) -> bool:
     """Return env var ``name`` as bool.
 
-    Truthy: 1/true/yes/on; falsy: 0/false/no/off/empty (case-insensitive).
+    Truthy: 1/true/yes/on; falsy: 0/false/no/off (case-insensitive).
+    EMPTY or absent means "not chosen" and yields ``default``.
     Anything else raises ValueError naming the variable — a misspelled flag
     should fail loudly, not silently pick a side.
     """
     raw = os.environ.get(name)
-    if raw is None:
+    # EMPTY MEANS UNSET, and that is a compose fact, not a preference. Every
+    # optional setting in docker-compose.yml is passed as `${HECO_X-}`, which
+    # renders as the EMPTY STRING when the operator has not set it — so a
+    # container always receives the variable, always with "" for "I did not
+    # choose". Reading "" as False silently forces every default-True flag off
+    # in the only environment that ships, and reports nothing.
+    #
+    # It cost a real one: HECO_ASYNC_REPORTING is the first env_bool in this
+    # repo whose default is True, so it was the first to notice. A plain
+    # `docker compose up` ran the synchronous reporter while the code, the
+    # tests and the commit message all said async was the default. Nothing
+    # failed; the box was just quietly slower than the thing that had been
+    # measured.
+    #
+    # An operator who genuinely means false has four spellings to choose from
+    # (0/false/no/off), all of which still work. Nobody means false by typing
+    # nothing.
+    if raw is None or raw.strip() == "":
         return default
     v = raw.strip().lower()
     if v in _TRUTHY:
