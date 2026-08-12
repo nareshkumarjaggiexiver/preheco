@@ -5,8 +5,10 @@ All in-process (TestClient) against a synthetic MJPG clip — no network.
 
 import time
 
+import cv2
 import numpy as np
 import pytest
+from app.capture import CaptureWorker
 from heco_common.imaging import decode_jpeg_b64
 
 from .conftest import VID_FRAMES, VID_H, VID_W
@@ -121,6 +123,56 @@ def test_url_without_is_file_stays_live(client, synthetic_video):
 
     assert client.post("/open", json={"url": synthetic_video}).status_code == 200
     assert state.worker.is_file is False
+
+
+def test_a_file_is_paced_even_when_NOBODY_is_reading_it(tmp_path):
+    """A slow consumer must not make a clip race to EOF.
+
+    THE BUG THIS PINS, found on a live bench. The read loop takes the cheap
+    ``grab()`` branch whenever the slot still holds an unread frame — i.e.
+    whenever the consumer is slower than the file — and that branch used to
+    ``continue`` past the pacing sleep. So a file was paced only while nothing
+    needed pacing. With any real consumer (the pipeline runs ~1 fps against a
+    15 fps source) ingest span through the whole clip as fast as the disk
+    allowed: measured on a 60 s / 1803-frame recording, ``seq=2,
+    ended=True`` after 0.9 s, with runs settling ``source-ended`` having
+    processed one to three frames. It presented as a broken source, a dead
+    camera, a pipeline fault — anything but what it was.
+
+    The test reproduces the condition exactly: open a file and NEVER read the
+    slot, so every iteration after the first takes the grab branch. A paced
+    20 fps clip must still be playing after a fraction of a second; an
+    unpaced one is finished within milliseconds.
+    """
+    fps, frames = 20.0, 40  # 2.0 s of footage
+    path = str(tmp_path / "slow.avi")
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), fps, (VID_W, VID_H))
+    assert vw.isOpened()
+    for i in range(frames):
+        img = np.zeros((VID_H, VID_W, 3), np.uint8)
+        cv2.rectangle(img, (i, 10), (i + 8, 26), (0, 255, 0), -1)
+        vw.write(img)
+    vw.release()
+
+    worker = CaptureWorker(source=path, is_file=True, loop=False)
+    worker.start()
+    try:
+        # Long enough that an unpaced loop is certainly done (it needs only
+        # milliseconds for 40 tiny frames), short enough that a correctly
+        # paced 2.0 s clip is certainly NOT.
+        time.sleep(0.5)
+        assert worker.ended is False, (
+            "the clip reached EOF in 0.5 s of a 2.0 s recording — the grab() "
+            "branch is skipping the pacing sleep again"
+        )
+        latest = worker.latest()
+        assert latest is not None, "the first frame should still have been retrieved"
+        seq = latest[0]
+        # At 20 fps, ~10 frames belong in 0.5 s. Generous ceiling: anything
+        # near `frames` means it raced.
+        assert seq < frames, f"seq={seq} of {frames} in 0.5 s — the file was not paced"
+    finally:
+        worker.stop()
 
 
 def test_shutdown_stops_capture_thread(synthetic_video):
