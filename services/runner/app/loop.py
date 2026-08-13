@@ -903,6 +903,7 @@ class RunLoop:
                     "forensic": bool(req.get("forensic", False)),
                     "siteId": req.get("siteId"),
                     **self._gate_config(),
+                    "models": self._models_config(),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
                 },
             )
@@ -1125,6 +1126,36 @@ class RunLoop:
         one.
         """
         return counting_config.gate_config(self.s, self.gate.armed)
+
+    def _models_config(self) -> dict:
+        """Which model each stage ACTUALLY had loaded when this run started.
+
+        Asked of each service's own /health rather than read from env or the
+        manifest, because the run record must say what RAN, not what was
+        intended — the deploy lesson behind this is a stack that reported
+        healthy while its model files were dead directories.  Best-effort per
+        stage: an unreachable service stamps "unreachable" and the run
+        proceeds to fail on its own terms at the first frame, with the config
+        already telling that story.  ``reid`` is stamped explicitly as
+        ``none``: the stage exists in the catalog and no implementation is
+        loaded, which is a statement, not an omission
+        (docs/planning/15-model-configurations.md).
+        """
+        stages = {
+            "persons": self.s.persons_url,
+            "tracker": self.s.tracker_url,
+            "faces": self.s.faces_url,
+            "embed": self.s.embed_url,
+        }
+        models: dict[str, str] = {}
+        for stage, url in stages.items():
+            try:
+                reply = self.client.get(f"{url}/health", timeout=5.0).json()
+                models[stage] = str(reply.get("model") or "unknown")
+            except Exception:
+                models[stage] = "unreachable"
+        models["reid"] = "none"
+        return models
 
     def _release_run_state(self) -> None:
         """Give back every piece of per-run state this run created downstream.
