@@ -1,7 +1,7 @@
 # embed service — venv, model download, lint, test, run.
 PY ?= python3.12
 SERVICE := embed
-LOCK := ../../models.lock
+LOCK ?= ../../models.lock
 PORT ?= 7105
 
 .PHONY: venv models lint test run
@@ -15,6 +15,7 @@ venv:
 # Downloads into models/ (gitignored) and hard-fails on checksum mismatch.
 models:
 	@mkdir -p models
+	@[ -f $(LOCK) ] || { echo "no lock file at $(LOCK)" >&2; exit 1; }
 	@awk -v s=$(SERVICE) '$$1==s {print $$2, $$3, $$4}' $(LOCK) | while read f sha url; do \
 		if [ -f "models/$$f" ] && echo "$$sha  models/$$f" | sha256sum --check --status -; then \
 			echo "models/$$f already present and verified"; \

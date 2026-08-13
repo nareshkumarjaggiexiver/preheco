@@ -982,3 +982,54 @@ def test_an_honoured_profile_is_stamped_beside_the_live_models():
     config = fake.run_created["config"]
     assert config["modelProfile"] == {"id": "house", "stages": {"persons": "yolox-nano"}}
     assert config["models"]["persons"] == "fake-persons", "the truth is still probed, not copied"
+
+
+def test_a_dead_model_probes_as_unloaded_and_refuses_with_a_health_remedy():
+    """ok:false with the right filename is the bind-mount incident's exact
+    shape — the stamp must not record it as running, and the refusal must
+    send the operator to the HEALTH fix, not the restart-with-profile one."""
+    from app.loop import refuse_model_profile
+
+    fake = FakePipeline(n_frames=1)
+    original = fake.handler
+
+    def handler(request):
+        if request.url.host == "embed" and request.url.path == "/health":
+            return httpx.Response(200, json={
+                "ok": False, "model": "face_recognition_sface_2021dec.onnx", "version": "0",
+            })
+        return original(request)
+
+    fake.handler = handler
+    make_loop(fake).run()
+    stamped = fake.run_created["config"]["models"]["embed"]
+    assert stamped == "unloaded (face_recognition_sface_2021dec.onnx)"
+
+    refusal = refuse_model_profile(
+        {"stages": {"embed": "sface-2021dec"}},
+        {"models": {"embed": [{"id": "sface-2021dec", "file": "face_recognition_sface_2021dec.onnx"}]}},
+        {"embed": stamped},
+    )
+    assert "no profile can be honoured until it is healthy" in refusal
+    assert "restart the stack with the profile" not in refusal
+
+
+def test_the_run_thread_rechecks_the_profile_against_what_it_stamps():
+    """TOCTOU guard: the POST gate and the run thread probe independently. A
+    service that swapped models in between must FAIL the run before a single
+    frame is counted — a refused promise that counts anyway is worse than no
+    gate at all."""
+    fake = FakePipeline(n_frames=1)
+    loop = make_loop(fake)
+    loop.request["modelProfile"] = {"id": "p", "stages": {"persons": "yolox-s"}}
+    loop.request["_manifest"] = {
+        "models": {"persons": [
+            {"id": "yolox-nano", "file": "fake-persons", "default": True},
+            {"id": "yolox-s", "file": "yolox_s.onnx"},
+        ]}
+    }
+    final = loop.run()
+    assert final["state"] == "failed"
+    assert "profile" in (final.get("error") or "")
+    assert fake.opened is None, "the source was never opened"
+    assert fake.run_ended is not None and fake.run_ended.get("status") == "failed"

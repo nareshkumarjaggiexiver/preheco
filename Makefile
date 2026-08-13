@@ -22,7 +22,7 @@ ALL_DIRS := common counting $(SERVICE_DIRS) $(EVAL_DIR)
 
 # `eval` is also a DIRECTORY, so without .PHONY make would call the target
 # up to date and do nothing.
-.PHONY: venv-all test-all lint models-all models-restricted clean-venvs eval eval-compare help
+.PHONY: venv-all test-all lint models-all models-restricted verify-models up clean-venvs eval eval-compare help
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'

@@ -31,7 +31,9 @@ fail=0
 rows=0
 
 # Rows are: <service> <filename> <sha256> <url>; comments and blanks skipped.
-while read -r service file sha _url; do
+# `|| [ -n "$service" ]`: a lock whose last row lacks a trailing newline
+# still verifies that row — read returns non-zero at EOF but fills the vars.
+while read -r service file sha _url || [ -n "${service:-}" ]; do
     case "$service" in ''|'#'*) continue ;; esac
     [ -n "${file:-}" ] && [ -n "${sha:-}" ] || continue
     rows=$((rows + 1))
@@ -71,9 +73,25 @@ done < "$LOCK"
 # DIRECTORY for an unfetched one is still the bind-mount trap and fatal.
 RLOCK="$ROOT/models-restricted.lock"
 if [ -f "$RLOCK" ]; then
-    while read -r service file sha _url; do
+    while read -r service file sha _url || [ -n "${service:-}" ]; do
         case "$service" in ''|'#'*) continue ;; esac
         [ -n "${file:-}" ] && [ -n "${sha:-}" ] || continue
+        if [ ! -d "$ROOT/services/$service" ]; then
+            # A typo'd service name must FAIL, not read as an opt-out choice
+            # forever — nothing would ever fetch or verify it.
+            echo "UNKNOWN SERVICE in models-restricted.lock: '$service' ($file)" >&2
+            fail=1
+            continue
+        fi
+        if grep -q "^$service  *$file " "$LOCK" 2>/dev/null; then
+            # The two tiers share services/<svc>/models/: a filename in both
+            # locks means whichever fetch ran LAST clobbered the other's
+            # verified bytes, and the SHA MISMATCH that follows blames the
+            # wrong tier. Refuse the ambiguity itself.
+            echo "DUPLICATE FILENAME across lock tiers: $service/$file is pinned in both models.lock and models-restricted.lock" >&2
+            fail=1
+            continue
+        fi
         path="$ROOT/services/$service/models/$file"
         if [ -d "$path" ]; then
             echo "MISSING (a DIRECTORY, not a file — Docker made a placeholder): services/$service/models/$file (restricted tier)" >&2

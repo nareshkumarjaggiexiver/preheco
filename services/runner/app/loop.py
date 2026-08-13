@@ -226,10 +226,19 @@ def probe_models(client, settings: Settings) -> dict:
     models: dict[str, str] = {}
     for stage, url in stages.items():
         try:
-            reply = client.get(f"{url}/health", timeout=5.0).json()
-            models[stage] = str(reply.get("model") or "unknown")
+            reply = client.get(f"{url}/health", timeout=2.0).json()
+            name = str(reply.get("model") or "unknown")
+            # ok:false means the service ANSWERED and its model is dead — a
+            # directory-shadowed bind mount serves the right filename with
+            # ok:false, and stamping that filename as "running" would repeat
+            # the healthy-while-dead incident inside the audit trail itself.
+            models[stage] = name if reply.get("ok") is True else f"unloaded ({name})"
         except Exception:  # noqa: BLE001 — best-effort by design, see _models_config
             models[stage] = "unreachable"
+    # reid is ASSERTED, not probed: no reid service exists to ask, and the
+    # catalog's only entry is `none`. The day a real reid stage ships, it
+    # gets a /health like every other stage and joins the probe — until
+    # then a profile naming any other reid id refuses here, correctly.
     models["reid"] = "none"
     return models
 
@@ -268,6 +277,15 @@ def refuse_model_profile(
             )
         expected = entry.get("file") or entry.get("id")
         running = live.get(stage)
+        if running == "unreachable" or (isinstance(running, str) and running.startswith("unloaded")):
+            # Not a mismatch — a HEALTH problem, with a health remedy. The
+            # mismatch sentence's "restart with the profile applied" would
+            # send an operator to exactly the wrong fix.
+            return (
+                f"the {stage} service is {running} on this install — no profile can be "
+                "honoured until it is healthy; check the service's /health and the "
+                "model files (verify-models names a dead bind-mount explicitly)"
+            )
         if running != expected:
             return (
                 f"this install runs `{running}` for {stage}; the profile wants "
@@ -958,6 +976,13 @@ class RunLoop:
     def _run(self) -> None:
         req = self.request
         label = req.get("label") or f"runner {source_label(req['source'])}"
+        # THE GATE, AGAIN, AGAINST THE STAMP (review finding: TOCTOU). The
+        # POST-time check and this run thread probe independently; a service
+        # restarted onto different weights in between would stamp a truth the
+        # gate never saw. Re-check against the very map being stamped, and
+        # fail the run BEFORE it opens a source — a refused promise must not
+        # count a single frame.
+        models_now = None  # assigned inside the config expression below
         planner_run_id = str(
             self.planner.create_run(
                 req["eventId"],
@@ -969,7 +994,7 @@ class RunLoop:
                     "forensic": bool(req.get("forensic", False)),
                     "siteId": req.get("siteId"),
                     **self._gate_config(),
-                    "models": self._models_config(),
+                    "models": (models_now := self._models_config()),
                     # The profile is the PROMISE, the models map the TRUTH —
                     # both stamped, because the gate that keeps them equal
                     # (refuse_model_profile) runs at POST time and the record
@@ -982,6 +1007,18 @@ class RunLoop:
                 },
             )
         )
+        if req.get("modelProfile"):
+            recheck = refuse_model_profile(
+                req["modelProfile"], req.get("_manifest"), models_now or {}
+            )
+            if recheck:
+                self._set(plannerRunId=planner_run_id, state="failed", error=recheck)
+                self.log.error(f"model profile refused at run start: {recheck}")
+                self.planner.end_run(
+                    status="failed",
+                    notes=f"model profile refused at start: {recheck}",
+                )
+                return
         self._set(plannerRunId=planner_run_id, state="running")
 
         # Fresh per-run state downstream, then open the source.

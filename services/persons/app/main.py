@@ -6,6 +6,7 @@ Contract (CONTRACTS.md):
 """
 
 import logging
+import threading
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
@@ -28,16 +29,52 @@ _detector: PersonDetector | None = None
 _load_error: str | None = None
 
 
+_load_lock = threading.Lock()
+_failed_stat: tuple | None = None  # (mtime_ns, size) of the file that failed
+
+
 def _get_detector() -> PersonDetector | None:
-    """Load the detector lazily so the app can boot (unhealthy) without weights."""
-    global _detector, _load_error
-    if _detector is None and _load_error is None:
+    """Load the detector lazily so the app can boot (unhealthy) without weights.
+
+    Three review findings live here (2026-08-14), each with its rule:
+      * ANY load failure is caught, not just a missing file — a truncated
+        weight raises InvalidProtobuf, an OpenVINO compile raises
+        RuntimeError, and an exception escaping /health turns the documented
+        "boot unhealthy" contract into a 500 per probe;
+      * the failure is sticky per FILE STATE, not per process: /health keeps
+        answering ok:false cheaply, but when the weights CHANGE on disk (the
+        live bind-mount delivering them, or a re-fetch fixing a truncation)
+        the next probe retries — "ok is false until the weights are
+        loadable" now means what it says, without a manual restart;
+      * one lock: two concurrent first-probes must not both build a
+        multi-second session.
+    """
+    global _detector, _load_error, _failed_stat
+    if _detector is not None:
+        return _detector
+    with _load_lock:
+        if _detector is not None:
+            return _detector
+        if _load_error is not None and _current_stat() == _failed_stat:
+            return None  # same broken file — stay cheap, stay unhealthy
         try:
             _detector = PersonDetector()
-        except FileNotFoundError as exc:
-            _load_error = str(exc)
-            log.error("model load failed: %s", exc)
+            _load_error = None
+            _failed_stat = None
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            _load_error = f"{type(exc).__name__}: {exc}"
+            _failed_stat = _current_stat()
+            log.error("model load failed: %s", _load_error)
     return _detector
+
+
+def _current_stat() -> tuple | None:
+    """(mtime_ns, size) of the model file, or None while it is absent."""
+    try:
+        st = MODEL_PATH.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 class DetectRequest(BaseModel):

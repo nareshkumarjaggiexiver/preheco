@@ -103,6 +103,15 @@ services:
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
+      # The model-catalog knobs (doc 15 M2). Without these passthroughs the
+      # host's HECO_DEVICE=GPU never reached the process and every "iGPU"
+      # number was silently a CPU number — the exact dishonesty the device
+      # truth in /health exists to catch. Empty renders as "" and the service
+      # treats "" as unset (review finding, 2026-08-14).
+      HECO_DEVICE: ${HECO_DEVICE-}
+      PERSONS_MODEL: ${PERSONS_MODEL-}
+      PERSONS_INPUT_SIZE: ${PERSONS_INPUT_SIZE-}
+      PERSONS_FAMILY: ${PERSONS_FAMILY-}
     volumes:
       - ./services/persons/models:/srv/services/persons/models:ro
 
