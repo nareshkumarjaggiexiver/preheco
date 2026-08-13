@@ -718,6 +718,46 @@ def merge(
         return merged, store.distinct_count()
 
 
+def review_order(candidate: dict) -> tuple:
+    """Sort key for the review queue: face first, clothes the tiebreak.
+
+    A module-level function rather than an inline lambda so the ORDER itself
+    is testable without engineering two probes into an exact cosine tie —
+    which the embedding helpers cannot produce deterministically, as the
+    first attempt at that test demonstrated by flapping.
+    """
+    return (
+        -candidate["cosine"],
+        candidate["clothes"] is None,   # measured before unmeasured, at a tie
+        -(candidate["clothes"] or 0.0),
+    )
+
+
+def best_cosine(data_dir: Path, run_id: str, embedding: list[float]) -> float | None:
+    """The best guest-gallery cosine for a probe, READ-ONLY — no mint, no enrol.
+
+    Exists for exactly one caller: the staff check in ``/match``. Staff used to
+    be resolved FIRST and returned on any hit at threshold, without ever
+    consulting the guest gallery — so a weak staff score shadowed a strong
+    guest match. Run 27ca33 measured the cost: a guest whose face matched
+    p00020 at 0.6476 one frame earlier and 0.5998 one frame later was tagged
+    STAFF at 0.4234 in between, and 281 of the run's 339 danger-zone verdicts
+    were staff hits hugging the threshold. Deciding "staff or guest" needs both
+    scores, and fetching the guest side must not have the side effects a full
+    :func:`match` carries.
+
+    None when the gallery does not exist yet or holds nothing — absent is not
+    zero, and a first-ever sighting must not lose to a 0.0.
+    """
+    path = db_path(data_dir, run_id)
+    if not path.exists():
+        return None
+    store = open_store(path)
+    with store.reading():
+        hit = store.search(embedding)
+    return float(hit.cosine) if hit is not None else None
+
+
 def review_duplicates(
     data_dir: Path,
     run_id: str,
@@ -782,11 +822,26 @@ def review_duplicates(
             )
             candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes})
 
-    # Measured clothing first, best agreement leading; unmeasured pairs keep
-    # their place in the queue behind them, ordered by face score.
-    candidates.sort(
-        key=lambda c: (c["clothes"] is None, -(c["clothes"] or 0.0), -c["cosine"])
-    )
+    # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
+    # measurement. The clothes-first order was built for run 0f5c6d, where
+    # clothing (0.587 vs 0.538) was the only signal separating a genuine
+    # duplicate from noise. Run 27ca33 — a lobby full of dark formal wear —
+    # inverted it: clothing agreement ~0.9 was GENERIC, 34 of the top-50 pairs
+    # had face scores below 0.30 (noise wearing a rank), and the one confirmed
+    # same-person pair in the entire queue (p00014/p00015 at 0.3526, the 4th-
+    # highest face score in the band) sat at #53 — past the caller's limit,
+    # silently dropped, invisible to the operator who then reported exactly
+    # that pair as missing.
+    #
+    # The band is [floor, threshold): the face score IS the distance from
+    # "the gallery already calls them one person", so it is the band's own
+    # metric and ranks by it. Clothing still breaks ties and is still
+    # returned, because at equal face evidence a matching torso is worth the
+    # operator's glance first. Neither order finds every needle — 0f5c6d's
+    # 0.2117 pair ranks lower under this sort — which is why the LIMIT fix
+    # rides with it: nothing is silently dropped any more, so a lower rank is
+    # a later look rather than no look at all.
+    candidates.sort(key=review_order)
     kept = candidates[: max(0, limit)]
     return {
         "pairs": kept,
@@ -821,6 +876,17 @@ def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:
 def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
     """Record a *false-match* do-not-merge constraint; returns galleryN.
 
+    BOTH KEYS MUST EXIST in the run's gallery. The store beneath deliberately
+    accepts constraints on any pair of identifiers ("a statement about a pair
+    of identifiers, not about stored rows") — and run 27ca33 measured what
+    that costs at this boundary: an operator's false-match correction arrived
+    with truncated keys (p0004 for p00004), wrote a dead cannot_link row, and
+    the operator walked away believing the correction had applied. A
+    correction that silently protects nobody is worse than a refused one, so
+    the unknown key is named in a ValueError here — the operator's feedback
+    ledger records the rejection, and the runner's co-presence path treats
+    the 4xx as settled, which for a key that does not exist is the truth.
+
     Both keys keep their templates, so the distinct count is unchanged — the
     effect is forward-looking, and it is now THREE effects: a later
     :func:`merge` of the pair is refused, the gallery-overlap banner is
@@ -848,6 +914,14 @@ def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
     """
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():
+        known = set(store.keys())
+        missing = [k for k in (a, b) if k not in known]
+        if missing:
+            raise ValueError(
+                f"unknown person key{'s' if len(missing) > 1 else ''} "
+                f"{', '.join(missing)} — the constraint would protect nobody. "
+                "Check the key against the register (keys are like p00004)."
+            )
         store.split(a, b)
         return store.distinct_count()
 
