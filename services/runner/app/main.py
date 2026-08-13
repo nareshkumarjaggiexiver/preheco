@@ -62,7 +62,7 @@ def _build_id() -> str:
     return digest.hexdigest()[:12]
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"  # 0.2.0: models stamped into every run config (doc 15 M1)
 
 #: A content hash of the source this process is actually running.
 #:
