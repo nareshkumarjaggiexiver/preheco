@@ -67,7 +67,7 @@ class RunManager:
         A short-lived client with the runner's own credential: the probe must
         see exactly what a run would see, including through an armed gate.
         """
-        client = httpx.Client(timeout=5.0, **auth_for(self.settings, self.token_provider))
+        client = httpx.Client(timeout=2.0, **auth_for(self.settings, self.token_provider))
         try:
             return probe_models(client, self.settings)
         finally:

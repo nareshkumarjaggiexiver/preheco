@@ -197,11 +197,17 @@ class QualityProfile(BaseModel):
 
 
 class ModelProfile(BaseModel):
-    """A named selection from this pipeline's declared model catalog."""
+    """A named selection from this pipeline's declared model catalog.
+
+    ``stages`` must select at least one model: an empty selection would pass
+    the gate vacuously and stamp an empty promise into the permanent run
+    record (review finding, 2026-08-14) — a profile that chooses nothing is
+    a request with no meaning, refused as such.
+    """
 
     id: str | None = None
     name: str | None = None
-    stages: dict[str, str]
+    stages: dict[str, str] = Field(min_length=1)
 
 
 class RunRequest(BaseModel):
@@ -305,7 +311,12 @@ def create_run(body: RunRequest) -> dict:
         )
         if refusal:
             raise HTTPException(status_code=400, detail=refusal)
-    run_id = manager.start(body.model_dump(exclude_none=True))
+    request = body.model_dump(exclude_none=True)
+    if body.modelProfile is not None:
+        # The run thread re-checks the profile against the models it STAMPS
+        # (TOCTOU guard) and needs the same catalog this gate used.
+        request["_manifest"] = _manifest()
+    run_id = manager.start(request)
     return {"runId": run_id, "state": "starting"}
 
 

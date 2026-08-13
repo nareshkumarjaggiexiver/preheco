@@ -72,13 +72,24 @@ def providers_for(device: str) -> tuple[list[str], list[dict]]:
     )
 
 
-MODEL_PATH = Path(os.environ.get("PERSONS_MODEL", str(DEFAULT_MODEL)))
+# `or` rather than a default argument throughout: compose passthroughs render
+# an unset variable as the EMPTY STRING, and Path("")/int("") would turn an
+# unset knob into a boot failure. Review finding, 2026-08-14.
+MODEL_PATH = Path(os.environ.get("PERSONS_MODEL") or str(DEFAULT_MODEL))
 _SPEC = spec_for(MODEL_PATH)
-INPUT_SIZE = int(os.environ.get("PERSONS_INPUT_SIZE", str(_SPEC["input"])))
-FAMILY = os.environ.get("PERSONS_FAMILY", _SPEC["family"])
-DEVICE = os.environ.get("HECO_DEVICE", "CPU")
-CONF_MIN = float(os.environ.get("PERSONS_CONF_MIN", "0.30"))
-NMS_IOU = float(os.environ.get("PERSONS_NMS_IOU", "0.45"))
+# For models the SPECS table knows, the table is authoritative — a lingering
+# env var tuned for the previous model must not misconfigure the next one
+# (a 416 blob into the static-640 yolox_s graph fails EVERY /detect while
+# /health says healthy — the exact incident class the healthcheck exists to
+# stop). The env override applies only to models outside the table, which is
+# what it was for: experiments.
+_KNOWN = MODEL_PATH.name in MODEL_SPECS
+INPUT_SIZE = (_SPEC["input"] if _KNOWN
+              else int(os.environ.get("PERSONS_INPUT_SIZE") or _SPEC["input"]))
+FAMILY = _SPEC["family"] if _KNOWN else (os.environ.get("PERSONS_FAMILY") or _SPEC["family"])
+DEVICE = os.environ.get("HECO_DEVICE") or "CPU"
+CONF_MIN = float(os.environ.get("PERSONS_CONF_MIN") or "0.30")
+NMS_IOU = float(os.environ.get("PERSONS_NMS_IOU") or "0.45")
 
 def _default_threads() -> int:
     """How many intra-op threads onnxruntime should use.
@@ -147,7 +158,26 @@ class PersonDetector:
             f"[heco-device] persons requested={self.device_requested} "
             f"active={self.providers_active}\n"
         )
-        self._input_name = self._session.get_inputs()[0].name
+        # THE GRAPH IS THE GROUND TRUTH. A static export knows its own input
+        # size and arity; configuration that disagrees would load cleanly and
+        # then fail every /detect while /health reported healthy. Reconcile
+        # here, loudly, so a mismatch is a boot failure the healthcheck sees.
+        inputs = self._session.get_inputs()
+        shape = inputs[0].shape
+        static_hw = [d for d in shape[-2:] if isinstance(d, int)]
+        if static_hw and any(d != input_size for d in static_hw):
+            raise ValueError(
+                f"{model_path.name} expects {static_hw[-1]}x{static_hw[-1]} input, "
+                f"configured {input_size} — check PERSONS_INPUT_SIZE against MODEL_SPECS"
+            )
+        graph_family = "rtdetr" if len(inputs) > 1 else "yolox"
+        if family != graph_family:
+            raise ValueError(
+                f"{model_path.name} is a {graph_family}-shaped graph "
+                f"({len(inputs)} input(s)), configured family `{family}` — "
+                "check PERSONS_FAMILY against MODEL_SPECS"
+            )
+        self._input_name = inputs[0].name
         self._lock = threading.Lock()
 
     def detect(
