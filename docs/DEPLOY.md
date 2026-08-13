@@ -22,3 +22,16 @@ whatever the transport was.
 
 Prefer `rsync -a --delete` over `tar -x` for these boxes; where tar is all
 there is, remove moved files by hand and re-check the build.
+
+## Never silence the pull
+
+`git pull --ff-only ... >/dev/null 2>&1` in a deploy one-liner hides the one
+error that matters. It happened twice on 2026-08-13: a bundle whose base
+commit the box did not have printed `Repository lacks these prerequisite
+commits` straight into /dev/null, the build and restart ran happily on the OLD
+tree, and the box reported healthy.
+
+Both times the `build` id in /health was the only thing that noticed. Deploy
+with the pull UNSILENCED and `set -e`, then compare the build across the fleet.
+A bundle is `--not <the box's HEAD>`, not `--not <your last deploy>` — those
+diverge the moment one box misses a commit.
