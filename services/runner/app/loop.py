@@ -404,6 +404,9 @@ class RunLoop:
         # The observability plane (app.reporting), or None when async
         # reporting is off and the loop does its own tap rounds and flushes.
         self.reporter = None
+        # The current frame's timestamp in seconds, or None before the first
+        # frame. Every count-bearing time window reads it through _now().
+        self._frame_clock_s: float | None = None
         # Open file handle for the golden decision capture, or None (default).
         # See _write_golden: this is the artifact a refactor is proved against.
         self._golden = None
@@ -1107,6 +1110,9 @@ class RunLoop:
         self._frame_ms: dict[str, float] = {}
         self._frame_events: list[str] = []
         self._frame_no += 1
+        # THE FRAME'S OWN CLOCK, in seconds, for every count-bearing window.
+        # See _now() for why this is not time.monotonic().
+        self._frame_clock_s: float | None = t_ms / 1000.0
         s, board, samples = self.s, self.board, self.samples
         image_b64 = frame["imageB64"]
         site_id = self.request.get("siteId")
@@ -2029,7 +2035,7 @@ class RunLoop:
         interval = float(self.s.face_reverify_interval_s)
         if interval <= 0.0 or not tracks:
             return within
-        now = time.monotonic()
+        now = self._now()
         settled: list[dict] = []
         with self._lock:
             locks = dict(self._locks)
@@ -2292,6 +2298,45 @@ class RunLoop:
     #: the tracker is churning ids and the bookkeeping must not amplify it.
     _MINTS_PER_TRACK_CAP = 4
 
+    def _now(self) -> float:
+        """Seconds on the FRAME's clock — the time every counting window uses.
+
+        WHY NOT ``time.monotonic()``, which is what this used to be. The heal
+        window, the track-identity lock and the staff crossing debounce all ask
+        "how long ago", and their answers change the count: a mint inside
+        ``heal_window_s`` can be folded away, one outside it cannot. Measured
+        against a wall clock, "20 seconds" means one thing on a live camera and
+        something else entirely on a replay, because a recording in lockstep is
+        consumed as fast as the pipeline can take it. The same clip through a
+        faster box covers MORE footage inside the same 20 wall-clock seconds,
+        so it heals more, and can settle on a different number.
+
+        That made the pipeline's own speed an input to its answer, which is the
+        one thing a counting system must never do — and it made every
+        performance change a potential counting change that no golden diff
+        could see, because the ledger records decisions, not the clock behind
+        them.
+
+        The frame's ``tMs`` fixes both. On a live camera it IS elapsed wall
+        time, so nothing about a real run changes. On a recording it is footage
+        time, so a replay finally reasons the way the camera that recorded it
+        would have — which is the entire premise of replaying footage to
+        predict what a gate will do.
+
+        Falls back to the monotonic clock before the first frame, for the
+        callers that can run outside a step (lock pruning at settle).
+
+        THE SENTINEL IS None, NOT ZERO, and the distinction is not academic:
+        the FIRST frame legitimately carries tMs 0, which is falsy. Testing
+        truthiness sent frame 1 to the monotonic clock and every later frame
+        to the frame clock, so the first "how long ago" comparison subtracted
+        a number near zero from a machine uptime and got a huge negative — and
+        a staff member's second sighting was silently not counted as a
+        crossing. Caught by the cooldown test; it would have been invisible in
+        a run.
+        """
+        return time.monotonic() if self._frame_clock_s is None else self._frame_clock_s
+
     def _record_mint(
         self, track_id: int, verdict: dict, face_desc: list[float] | None = None
     ) -> None:
@@ -2318,7 +2363,7 @@ class RunLoop:
         """
         if self.s.heal_window_s <= 0:
             return  # healing disabled: record nothing rather than leak
-        now = time.monotonic()
+        now = self._now()
         with self._lock:
             for tid in [
                 t for t, entries in self._minted.items()
@@ -2422,7 +2467,7 @@ class RunLoop:
             return
         if cosine is None or float(cosine) < self.s.heal_min_cosine:
             return  # not comfortable enough to outrank the impostor ceiling
-        now = time.monotonic()
+        now = self._now()
         with self._lock:
             entries = self._minted.get(track_id, [])
             live = [e for e in entries if now - e["at"] <= self.s.heal_window_s]
@@ -2600,7 +2645,7 @@ class RunLoop:
             return
         if float(cosine) < self.s.track_lock_min_cosine:
             return  # inside impostor range: proves nothing about whose track this is
-        now = time.monotonic()
+        now = self._now()
         with self._lock:
             self._prune_locks(now)
             self._locks[track_id] = {
@@ -2701,7 +2746,7 @@ class RunLoop:
         # visibly standing elsewhere right now and cannot also be this mint.
         # Whatever the track box says, two faces at two positions are two
         # people — the one certain identity signal available.
-        now = time.monotonic()
+        now = self._now()
         with self._lock:
             self._prune_locks(now)
             lock = self._locks.get(track_id)
@@ -2804,7 +2849,7 @@ class RunLoop:
         crossing count and no longer pretends to be.
         """
         staff_id = verdict.get("staffId") or verdict.get("personKey") or "staff:unknown"
-        now = time.monotonic()
+        now = self._now()
         last = self._staff_last_seen.get(staff_id)
         self._staff_last_seen[staff_id] = now
         with self._lock:

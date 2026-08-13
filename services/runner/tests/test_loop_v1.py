@@ -285,7 +285,14 @@ class V1Fake:
                 if not exhausted:
                     self.frame_i += 1
                 return httpx.Response(200, json={
-                    "imageB64": self.image_b64, "tMs": i * 100, "w": 160, "h": 120,
+                    "imageB64": self.image_b64,
+                    # Footage time between frames. Overridable so a test can
+                    # put minutes of RECORDING between frames that a run
+                    # processes in milliseconds — which is exactly what
+                    # lockstep replay does, and what the counting windows must
+                    # reason about rather than the wall clock.
+                    "tMs": i * getattr(self, "t_ms_step", 100),
+                    "w": 160, "h": 120,
                     "seq": i, "ended": exhausted,
                 })
         if host == "persons" and path == "/detect":
@@ -1529,7 +1536,14 @@ def test_frame_wait_measures_the_stall_when_the_source_is_the_bottleneck():
                 if not exhausted:
                     self.frame_i += 1
                 return httpx.Response(200, json={
-                    "imageB64": self.image_b64, "tMs": i * 100, "w": 160, "h": 120,
+                    "imageB64": self.image_b64,
+                    # Footage time between frames. Overridable so a test can
+                    # put minutes of RECORDING between frames that a run
+                    # processes in milliseconds — which is exactly what
+                    # lockstep replay does, and what the counting windows must
+                    # reason about rather than the wall clock.
+                    "tMs": i * getattr(self, "t_ms_step", 100),
+                    "w": 160, "h": 120,
                     "seq": i, "ended": exhausted,
                 })
             return super().handler(request)
@@ -3619,3 +3633,44 @@ def test_a_golden_path_that_cannot_be_opened_does_not_cost_the_run(tmp_path):
     ).run()
     assert st["state"] == "ended", "the run must still settle normally"
     assert "goldenError" in st, "and must say why the capture is missing"
+
+
+def test_counting_windows_run_on_the_FRAMES_clock_not_the_wall_clock():
+    """The pipeline's own speed must never be an input to its answer.
+
+    The heal window, the track-identity lock and the staff debounce all ask
+    "how long ago", and their answers change the count. Measured against a
+    wall clock, "20 seconds" means one thing on a live camera and another on a
+    replay, because a recording in lockstep is consumed as fast as the box can
+    take it — so the same clip on a faster machine covers more footage inside
+    the same 20 wall-clock seconds, heals more, and can settle on a different
+    number.
+
+    Here the fake stamps frame times far apart while the run itself takes
+    milliseconds. Under the wall clock every sighting falls inside a 60 s
+    cooldown and reads as one crossing; on the frame clock they are minutes
+    apart and are the separate passes they actually were.
+    """
+    fake = V1Fake(n_frames=4, face_widths=(99.0,), staff_width=99.0)
+    fake.t_ms_step = 120_000  # two minutes of FOOTAGE between frames
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, staff_cooldown_s=60.0).run()
+    assert final["staffCrossings"] == 4, (
+        "four sightings two footage-minutes apart are four crossings, however "
+        f"fast the box ran: got {final['staffCrossings']}"
+    )
+
+
+def test_the_first_frames_zero_timestamp_is_a_real_clock_reading():
+    """tMs 0 is falsy, and treating it as 'no clock yet' corrupts the first
+    comparison.
+
+    Testing truthiness sent frame 1 to the monotonic clock and every later
+    frame to the frame clock, so the first "how long ago" subtracted a number
+    near zero from a machine uptime, got a huge negative, and silently failed
+    to count a staff member's second crossing. The sentinel is None.
+    """
+    fake = V1Fake(n_frames=6, face_widths=(99.0,), staff_width=99.0)
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, staff_cooldown_s=0.0).run()
+    assert final["staffCrossings"] == final["staffFaceFrames"] == 6
