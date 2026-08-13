@@ -22,6 +22,26 @@ from heco_common.planner import PlannerClient
 B64 = "ZmFrZS1qcGVn"  # the runner treats frames as opaque base64
 
 
+def frame_b64(i: int) -> str:
+    """A distinct opaque payload per frame — the fake's stand-in for pixels.
+
+    The services must infer WHICH frame they were handed from the payload
+    itself, exactly as the real ones do from the pixels: with the prefetcher
+    overlapping frame N+1's fetch with frame N's stages, a counter read at
+    /detect time is off by one, and only content can be trusted.
+    """
+    import base64
+
+    return base64.b64encode(f"fake-jpeg-{i}".encode()).decode()
+
+
+def frame_index(image_b64: str) -> int:
+    import base64
+
+    text = base64.b64decode(image_b64).decode()
+    return int(text.rsplit("-", 1)[1]) if text.startswith("fake-jpeg-") else 0
+
+
 class FakePipeline:
     """Scripted stand-ins for all six stage services plus the planner."""
 
@@ -106,7 +126,8 @@ class FakePipeline:
                 return httpx.Response(
                     200,
                     json={
-                        "imageB64": B64, "tMs": i * 100, "w": 320, "h": 240, "seq": i,
+                        "imageB64": frame_b64(i), "tMs": i * 100, "w": 320, "h": 240,
+                        "seq": i,
                         "ended": exhausted and not self.stall_forever,
                     },
                 )
@@ -119,7 +140,7 @@ class FakePipeline:
             )
 
         if host == "persons" and path == "/detect":
-            i = self.frame_i - 1  # frame currently in flight
+            i = frame_index(body["imageB64"])  # the frame actually POSTED
             boxes = [
                 {"x": 10, "y": 20, "w": 40, "h": 100.0 + 10 * i, "conf": 0.9}
                 for _ in range(self.boxes_per_frame)
@@ -196,6 +217,7 @@ def make_loop(fake: FakePipeline, no_planner_sleep: bool = False, **settings_kw)
     ``no_planner_sleep`` removes the retry backoff so an outage test can drive
     dozens of failing planner calls in milliseconds.
     """
+    settings_kw.setdefault("frame_prefetch", False)  # order pins need the serial scheduler
     settings = Settings(
         ingest_url="http://ingest:7101",
         persons_url="http://persons:7102",
@@ -1033,3 +1055,21 @@ def test_the_run_thread_rechecks_the_profile_against_what_it_stamps():
     assert "profile" in (final.get("error") or "")
     assert fake.opened is None, "the source was never opened"
     assert fake.run_ended is not None and fake.run_ended.get("status") == "failed"
+
+
+def test_prefetch_changes_the_schedule_and_none_of_the_decisions():
+    """The prefetcher's whole contract (path-to-15fps): one frame in flight,
+    the fetch overlapped with the previous frame's stages — and byte-for-byte
+    the same decisions. Two identical clips, prefetch off vs on: every count,
+    every tracked box, the same."""
+    serial = FakePipeline(n_frames=4, face_widths=(85.0, 64.0))
+    final_serial = make_loop(serial).run()
+    overlapped = FakePipeline(n_frames=4, face_widths=(85.0, 64.0))
+    final_overlapped = make_loop(overlapped, frame_prefetch=True).run()
+
+    assert final_overlapped["unique"] == final_serial["unique"]
+    assert overlapped.tracked_boxes == serial.tracked_boxes, (
+        "same boxes, same order — the schedule moved, the decisions did not"
+    )
+    assert overlapped.match_qualities == serial.match_qualities
+    assert final_overlapped["state"] == final_serial["state"] == "ended"

@@ -52,6 +52,7 @@ not just disk).  See :meth:`RunLoop._release_run_state`.
 """
 
 import base64
+import concurrent.futures
 import contextlib
 import json
 import threading
@@ -458,6 +459,11 @@ class RunLoop:
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
+        # The single-slot frame prefetcher (see _next_frame_prefetched).
+        self._prefetch: concurrent.futures.Future | None = None
+        self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="frame-prefetch"
+        )
         self._lock = threading.Lock()
         self._last_seq: int | None = None
         self._last_ms: float = 0.0
@@ -859,6 +865,28 @@ class RunLoop:
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
 
+    def _next_frame_prefetched(self) -> dict | None:
+        """_next_frame, overlapped: hand back the frame fetched DURING the
+        previous frame's processing, then immediately start fetching the next.
+
+        Exactly one fetch in flight, ever — fixed latency, no divergence, and
+        the poller's own state (_last_seq, _end_reason, the stop flag) is only
+        ever touched by whichever single thread is running it at the time.
+        ``ingestMs`` becomes the time the LOOP actually stood waiting on the
+        hand-off, which is the number the stall diagnosis always wanted: a
+        fast source reads ~0 here while the worker's frameWaitMs still tells
+        the source's own story.
+        """
+        if not self.s.frame_prefetch:
+            return self._timed("ingest", "ingestMs", self._next_frame)
+        fut, self._prefetch = self._prefetch, None
+        t0 = time.perf_counter()
+        frame = fut.result() if fut is not None else self._next_frame()
+        self.board.observe("ingest", "ingestMs", (time.perf_counter() - t0) * 1000.0)
+        if frame is not None and not self._stop.is_set():
+            self._prefetch = self._prefetch_pool.submit(self._next_frame)
+        return frame
+
     def _open_source(self) -> None:
         """Claim ingest's exclusive capture slot for this run.
 
@@ -1056,7 +1084,7 @@ class RunLoop:
             self.reporter.start()
 
         while not self._stop.is_set():
-            frame = self._timed("ingest", "ingestMs", self._next_frame)
+            frame = self._next_frame_prefetched()
             if frame is None:
                 break
             self.board.frame("ingest")
@@ -1119,6 +1147,11 @@ class RunLoop:
         # is genuinely the last word on this run's stats rather than racing a
         # thread that is still posting them.
         self._stop_reporter()
+        # Drain the prefetcher before the final flush: _stop is set, so an
+        # in-flight poll exits within one poll interval, and shutting down
+        # AFTER it keeps the fetch thread from touching a closing client.
+        self._prefetch = None
+        self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
         self._close_golden()
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
