@@ -78,6 +78,7 @@ similarity and :meth:`search` is a single matrix-vector multiply.
 """
 
 import contextlib
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -117,7 +118,29 @@ CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS store_meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
 """
+
+
+#: Which embedder's vectors this process writes and expects. The catalog id
+#: (pipeline.json models.embed), not a filename — one string, shared by every
+#: store this service opens. Overridable per deploy so a future stack running
+#: a different embedder names itself, and every store it touches is stamped.
+EMBEDDER_ID = os.environ.get("HECO_EMBEDDER_ID", "sface-2021dec")
+
+
+class EmbedderMismatchError(RuntimeError):
+    """A store holds vectors from a DIFFERENT embedder than this process runs.
+
+    The failure this makes loud (docs/planning/15-model-configurations.md M3):
+    two embedders with the SAME dimension pass every dim check and then match
+    garbage SILENTLY — cosine between vectors from different spaces is noise
+    wearing a decimal point, and against a persistent staff store it produces
+    confidently wrong bills. Refusal names both identities and the way out.
+    """
 
 
 @dataclass
@@ -201,6 +224,35 @@ class VectorStore:
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(vectors)")}
         if "appearance" not in cols:
             self.conn.execute("ALTER TABLE vectors ADD COLUMN appearance BLOB")
+        # THE EMBEDDER GUARD (doc 15 M3). Every store knows WHOSE vectors it
+        # holds, stamped at first open and checked at every open after:
+        #   * a new or legacy-unstamped file ADOPTS this process's embedder —
+        #     legacy adoption is correct, not lenient, because every store in
+        #     existence predates the second embedder by construction;
+        #   * a stamped file that disagrees REFUSES, loudly, naming both ids
+        #     and the way out. A same-dimension different embedder passes the
+        #     dim check and matches garbage silently — this is the only gate
+        #     between that and a confidently wrong bill.
+        stored = self.conn.execute(
+            "SELECT v FROM store_meta WHERE k = 'embedderId'"
+        ).fetchone()
+        if stored is None:
+            self.conn.execute(
+                "INSERT INTO store_meta (k, v) VALUES ('embedderId', ?)", (EMBEDDER_ID,)
+            )
+            self.conn.commit()
+            self.embedder_id = EMBEDDER_ID
+        elif stored[0] != EMBEDDER_ID:
+            self.conn.close()
+            raise EmbedderMismatchError(
+                f"{self.path.name} holds vectors from embedder `{stored[0]}`; this "
+                f"process runs `{EMBEDDER_ID}`. Cosines across embedding spaces are "
+                "noise — refuse rather than bill on them. Either point the stack "
+                f"back at `{stored[0]}`, or use a fresh store for `{EMBEDDER_ID}` "
+                "(staff re-enrolment is a real operational step, not a file rename)."
+            )
+        else:
+            self.embedder_id = stored[0]
         # In-memory index, loaded lazily and kept write-through afterwards.
         # None means "not loaded / invalidated" — the next read reloads it.
         self._keys: list[str] | None = None

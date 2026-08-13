@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .store import Neighbour, open_store
+from .store import EMBEDDER_ID, Neighbour, open_store
 
 _SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -39,10 +39,22 @@ class BadSiteIdError(ValueError):
 
 
 def db_path(data_dir: Path, site_id: str) -> Path:
-    """Return the staff store path for a site, validating the id first."""
+    """Return the staff store path for a site, validating the id first.
+
+    PER-EMBEDDER STORES (doc 15 M3): staff enrolment is bound to the embedder
+    that wrote it, so a stack running a non-default embedder gets its own
+    file — ``staff-<siteId>--<embedderId>.db`` — and re-enrolment is the
+    explicit, operational step the filename makes visible. The DEFAULT
+    embedder keeps the legacy name for continuity: every existing store in
+    the fleet is an sface store, and renaming them would orphan enrolments
+    (and their erasure tombstone trail) for zero information.
+    """
     if not _SITE_ID_RE.match(site_id):
         raise BadSiteIdError(f"siteId must match {_SITE_ID_RE.pattern!r}")
-    return data_dir / f"staff-{site_id}.db"
+    if EMBEDDER_ID == "sface-2021dec":
+        return data_dir / f"staff-{site_id}.db"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", EMBEDDER_ID)
+    return data_dir / f"staff-{site_id}--{safe}.db"
 
 
 def enrol(

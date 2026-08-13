@@ -1404,6 +1404,13 @@ class RunLoop:
         board.frame("embed")
         samples.add("embed", t_ms, {"embedMs": self._last_ms})
         embeddings = embedded.get("embeddings", [])
+        # The sweep's raw material (doc 15 M3): kept-face order IS embedding
+        # order IS verdict order — the one in-order contract, again. Golden
+        # file only, never the ledger (see Settings.golden_embeddings).
+        self._frame_embeddings = (
+            [[float(x) for x in e] for e in embeddings]
+            if self.s.golden_embeddings else []
+        )
         # HOW MANY FACE CROPS ACTUALLY REACHED THE EMBEDDER — a funnel rung
         # nothing else reports. The stage's own counter counts FRAMES, and the
         # gate-survivor count is what was OFFERED, not what came back: the
@@ -3010,6 +3017,8 @@ class RunLoop:
         if self._golden is None:
             return
         try:
+            if self.s.golden_embeddings and getattr(self, "_frame_embeddings", None):
+                record = {**record, "embeddings": self._frame_embeddings}
             self._golden.write(json.dumps(record, sort_keys=True) + "\n")
         except Exception:  # noqa: BLE001 — a capture must never stop counting
             self._bump("goldenWriteErrors")
