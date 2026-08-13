@@ -302,7 +302,20 @@ def match(body: MatchRequest) -> dict:
     canon_px = config.canon_px()
     sub_canon = body.quality is not None and body.quality < canon_px
 
-    # Staff FIRST — a hit is tagged and kept out of the guest count.
+    # Staff is checked first but must now COMPETE — it no longer shadows.
+    # The old shape returned on any staff hit >= threshold without ever
+    # consulting the guest gallery, and run 27ca33 measured what that costs: a
+    # guest matching p00020 at 0.6476 one frame earlier and 0.5998 one frame
+    # later was tagged STAFF at 0.4234 in between, and 281 of 339 danger-zone
+    # verdicts were staff hits hugging the threshold. A weak staff score is
+    # not evidence AGAINST a strong guest identity.
+    #
+    # The rule: a staff hit wins only when it is at least as strong as the
+    # best guest-gallery score for the same probe. Ties go to STAFF, because
+    # at equal evidence keeping a possible staff member out of the guest
+    # count is the conservative direction for the invoice. The guest lookup
+    # is read-only (gallery.best_cosine) — deciding needs both numbers, and
+    # fetching one must not mint anybody.
     if body.siteId:
         try:
             hit = staff.check(data_dir, body.siteId, body.embedding, threshold)
@@ -310,6 +323,13 @@ def match(body: MatchRequest) -> dict:
             raise HTTPException(status_code=422, detail=str(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        if hit is not None:
+            guest_best = gallery.best_cosine(data_dir, body.runId, body.embedding)
+            if guest_best is not None and guest_best > hit.cosine:
+                # The gallery knows this face better than the staff store
+                # does: fall through to the ordinary guest path below, which
+                # will bind to that stronger identity.
+                hit = None
         if hit is not None:
             return {
                 "personKey": hit.key,
@@ -501,7 +521,11 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             config.data_dir(),
             body.runId,
             threshold=config.threshold(),
-            floor=config.nearmiss_weak_floor(),
+            # Its own knob since 2026-08-13: borrowing nearmiss_weak_floor
+            # meant the documented weak-band off switch (=0) silently turned
+            # the review floor to 0 and flooded the queue with every pair in
+            # the gallery.
+            floor=config.review_floor(),
             limit=body.limit,
         )
     except gallery.BadRunIdError as e:
