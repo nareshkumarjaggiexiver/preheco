@@ -56,21 +56,20 @@ import contextlib
 import json
 import threading
 import time
-from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from urllib.parse import urlsplit
 
 import httpx
 from heco_common.auth import TokenProvider
-from heco_common.geometry import dedupe_boxes, point_in_polygon
+from heco_common.geometry import dedupe_boxes
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
-from heco_counting import appearance, association, gate
+from heco_counting import appearance, association, gate, zones
 from heco_counting import config as counting_config
-from heco_counting import zones
+from heco_counting.ports import MatchRefused
 
 from . import annotate, taps
 from .config import Settings
@@ -220,6 +219,71 @@ def _apply_quality_profile(settings: Settings, profile: dict | None) -> Settings
     generic over any frozen dataclass precisely so both callers share one rule.
     """
     return counting_config.fold_quality_profile(settings, profile)
+
+
+class MatchClient:
+    """Adapts a RunLoop's HTTP client to :class:`heco_counting.ports.MatchPort`.
+
+    THE RUN ID IS BOUND HERE, once, and appears in no method signature. A
+    gallery is per-run, and a call site that could pass a runId is a call site
+    that could pass the WRONG one — which merges two events' guests into a
+    single number and cannot be undone afterwards. Binding it at construction
+    makes that mistake unavailable rather than merely discouraged.
+
+    StageError becomes MatchRefused, carrying the status through, because the
+    4xx/5xx distinction is a decision input and not an error detail: 4xx means
+    the gallery answered no and the caller must stop asking, 5xx means nothing
+    was decided and the caller must leave its state alone for the next frame.
+    """
+
+    def __init__(self, loop, run_id: str) -> None:
+        """Bind this port to one run's gallery."""
+        self._loop = loop
+        self._run_id = run_id
+
+    def _call(self, path: str, body: dict) -> dict:
+        try:
+            return self._loop._post(f"{self._loop.s.match_url}{path}", body)
+        except StageError as e:
+            raise MatchRefused(str(e), e.status_code) from e
+
+    def match(
+        self,
+        *,
+        embedding: list[float],
+        quality: float,
+        appearance: list[float] | None = None,
+        site_id: str | None = None,
+        exclude_keys: list[str] | None = None,
+    ) -> dict:
+        """Resolve one embedding against this run's gallery."""
+        body: dict = {
+            "runId": self._run_id, "embedding": embedding, "quality": quality,
+        }
+        if appearance is not None:
+            body["appearance"] = appearance
+        if site_id:
+            body["siteId"] = site_id
+        if exclude_keys:
+            body["excludeKeys"] = exclude_keys
+        return self._call("/match", body)
+
+    def merge(self, *, doomed: str, keeper: str, only_if_singleton: bool = True) -> dict:
+        """Fold one identity into another."""
+        return self._call("/merge", {
+            "runId": self._run_id, "keep": keeper, "drop": doomed,
+            "onlyIfSingleton": only_if_singleton,
+        })
+
+    def split(self, *, a: str, b: str) -> dict:
+        """Assert two identities are different people."""
+        return self._call("/split", {"runId": self._run_id, "a": a, "b": b})
+
+    def forget_template(self, *, template_id: int) -> dict:
+        """Retract a template that turned out to belong to somebody else."""
+        return self._call("/template/forget", {
+            "runId": self._run_id, "templateId": template_id,
+        })
 
 
 class LoopObserver:
@@ -865,6 +929,10 @@ class RunLoop:
         self._last_purge = t0
         frames = 0
 
+        # The gallery, behind the library's port. Constructed once the planner
+        # run id exists, because that id IS the gallery's identity.
+        self.match_port = MatchClient(self, planner_run_id)
+
         self._open_golden()
 
         # Started AFTER the source opens, so a run that fails to open a camera
@@ -1318,9 +1386,11 @@ class RunLoop:
                 body["appearance"] = face_desc
             if site_id:
                 body["siteId"] = site_id
-            m = self._timed(
-                "match", "matchMs", lambda b=body: self._post(f"{s.match_url}/match", b)
-            )
+            m = self._timed("match", "matchMs", partial(
+                self.match_port.match,
+                embedding=body["embedding"], quality=body["quality"],
+                appearance=body.get("appearance"), site_id=body.get("siteId"),
+            ))
             board.frame("match")
             if m.get("cosine") is not None:
                 board.observe("match", "matchCosine", float(m["cosine"]))
@@ -1789,11 +1859,8 @@ class RunLoop:
         template_id = m.get("templateId")
         if template_id is not None:
             try:
-                self._post(
-                    f"{self.s.match_url}/template/forget",
-                    {"runId": planner_run_id, "templateId": int(template_id)},
-                )
-            except StageError as e:
+                self.match_port.forget_template(template_id=int(template_id))
+            except MatchRefused as e:
                 # Not fatal: the split is still worth making. Say so, because a
                 # surviving poisoned template is exactly what re-merges these
                 # two in a later frame.
@@ -1951,11 +2018,8 @@ class RunLoop:
         counter stays a tally of assertions the gallery actually holds.
         """
         try:
-            self._post(
-                f"{self.s.match_url}/split",
-                {"runId": planner_run_id, "a": a, "b": b},
-            )
-        except StageError as e:
+            self.match_port.split(a=a, b=b)
+        except MatchRefused as e:
             if 400 <= e.status_code < 500:
                 # Understood and refused: retrying cannot help, so stop asking.
                 self._copresence_sent.add(f"{a}|{b}")
@@ -2334,15 +2398,7 @@ class RunLoop:
             ):
                 continue
             try:
-                r = self._post(
-                    f"{self.s.match_url}/merge",
-                    {
-                        "runId": planner_run_id,
-                        "keep": matched_key,
-                        "drop": minted_key,
-                        "onlyIfSingleton": True,
-                    },
-                )
+                r = self.match_port.merge(doomed=minted_key, keeper=matched_key)
             except Exception as e:  # noqa: BLE001 — a heal must never stop the count
                 # Transient (match hiccup): put the bookkeeping back; the next
                 # verdict on this track retries while the window lasts.
@@ -2613,15 +2669,7 @@ class RunLoop:
                 self._locks.pop(track_id, None)
             return False
         try:
-            r = self._post(
-                f"{self.s.match_url}/merge",
-                {
-                    "runId": planner_run_id,
-                    "keep": locked_key,
-                    "drop": minted_key,
-                    "onlyIfSingleton": True,
-                },
-            )
+            r = self.match_port.merge(doomed=minted_key, keeper=locked_key)
         except Exception as e:  # noqa: BLE001 — a fold must never stop the count
             # Transient (match hiccup): the lock stays, and the mint falls
             # through to the heal bookkeeping, so both mechanisms still have a

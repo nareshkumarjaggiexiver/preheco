@@ -75,8 +75,16 @@ class MatchPort(Protocol):
         """Assert two identities are different people (co-presence)."""
         ...
 
-    def forget_template(self, *, person_key: str, template_id: str) -> dict:
-        """Retract a template that turned out to belong to somebody else."""
+    def forget_template(self, *, template_id: int) -> dict:
+        """Retract a template that turned out to belong to somebody else.
+
+        Addressed by TEMPLATE id alone, with no person key. The template is
+        the thing being retracted and the gallery already knows whose it is —
+        naming the person too would let a caller retract a template from the
+        wrong identity's record, which is unrecoverable. (Learned by wiring
+        it: an earlier draft of this signature sent a personKey the service
+        does not accept, and the runner's own test refused the wire change.)
+        """
         ...
 
 
