@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,11 @@ JOIN_IOU = 0.5
 SWEEP_LO, SWEEP_HI, SWEEP_STEP = 0.15, 0.70, 0.005
 #: A proposed threshold must beat the impostor tail by at least this margin.
 SEPARATION_MARGIN = 0.02
+#: Observations per identity entering the pairwise pools. A staff member seen
+#: 500 times would otherwise contribute 125k genuine pairs — quadratically
+#: drowning every transient guest's evidence AND the runtime (review finding).
+#: Evenly-strided sampling keeps the identity's whole time span represented.
+MAX_OBS_PER_IDENTITY = 40
 
 
 def iou(a: dict, b: dict) -> float:
@@ -70,6 +76,11 @@ def kept_faces_with_embeddings(golden_record: dict) -> list[tuple[dict, list[flo
         return []
     faces = (golden_record.get("faces") or {}).get("faces") or []
     kept = [f for f in faces if f.get("gate") == "kept"]
+    if len(kept) != len(embeddings):
+        # The in-order contract broke for this record (a capture from a
+        # mismatched build, a truncated line). Positional pairing would bind
+        # vectors to the wrong faces — contribute nothing instead.
+        return []
     return [
         (face, emb)
         for face, emb in zip(kept, embeddings)
@@ -94,17 +105,28 @@ def collect_observations(labels: dict, golden_lines: list[dict]) -> dict[str, li
         if not labelled:
             continue
         pairs = kept_faces_with_embeddings(record)
-        for lab in labelled:
-            best, best_iou = None, JOIN_IOU
-            for face, emb in pairs:
+        # Greedy ONE-TO-ONE at the IoU floor: best pair first, each side used
+        # once. Without this, two labelled boxes straddling one detection both
+        # collected ITS embedding — the same vector under two identities, a
+        # fabricated impostor pair at cosine 1.0 poisoning the whole tail
+        # (review finding).
+        scored = []
+        for li, lab in enumerate(labelled):
+            for pi, (face, _emb) in enumerate(pairs):
                 v = iou(lab, face["box"])
-                if v >= best_iou:
-                    best, best_iou = emb, v
-            if best is not None:
-                vec = np.asarray(best, dtype=np.float32)
-                norm = float(np.linalg.norm(vec))
-                if norm > 0:
-                    out.setdefault(lab["identity"], []).append(vec / norm)
+                if v >= JOIN_IOU:
+                    scored.append((v, li, pi))
+        scored.sort(reverse=True)
+        used_l, used_p = set(), set()
+        for v, li, pi in scored:
+            if li in used_l or pi in used_p:
+                continue
+            used_l.add(li)
+            used_p.add(pi)
+            vec = np.asarray(pairs[pi][1], dtype=np.float32)
+            norm = float(np.linalg.norm(vec))
+            if norm > 0:
+                out.setdefault(labelled[li]["identity"], []).append(vec / norm)
     return out
 
 
@@ -118,17 +140,25 @@ def pair_cosines(observations: dict[str, list[np.ndarray]]) -> tuple[np.ndarray,
     whole point: it is precisely the worst impostor pair that sets a floor.
     """
     ids = sorted(observations)
-    genuine, impostor = [], []
+    capped: dict[str, np.ndarray] = {}
+    for name in ids:
+        vs = observations[name]
+        if len(vs) > MAX_OBS_PER_IDENTITY:
+            idx = np.linspace(0, len(vs) - 1, MAX_OBS_PER_IDENTITY).astype(int)
+            vs = [vs[i] for i in idx]
+        capped[name] = np.stack(vs)
+    genuine_parts, impostor_parts = [], []
     for i, a in enumerate(ids):
-        va = observations[a]
-        for x in range(len(va)):
-            for y in range(x + 1, len(va)):
-                genuine.append(float(va[x] @ va[y]))
+        va = capped[a]
+        sims = va @ va.T
+        iu = np.triu_indices(len(va), k=1)
+        if iu[0].size:
+            genuine_parts.append(sims[iu])
         for b in ids[i + 1:]:
-            for u in va:
-                for w in observations[b]:
-                    impostor.append(float(u @ w))
-    return np.asarray(genuine), np.asarray(impostor)
+            impostor_parts.append((va @ capped[b].T).ravel())
+    genuine = np.concatenate(genuine_parts) if genuine_parts else np.empty(0)
+    impostor = np.concatenate(impostor_parts) if impostor_parts else np.empty(0)
+    return genuine.astype(np.float64), impostor.astype(np.float64)
 
 
 def percentiles(xs: np.ndarray) -> dict:
@@ -216,6 +246,14 @@ def propose_pack(
     # Best total-error point at or above the impostor floor. Equal weighting
     # here — the curve is in the pack so a different cost ratio is one read.
     viable = [c for c in curve if c["threshold"] >= floor]
+    if not viable:
+        pack["proposal"] = None
+        pack["refusal"] = (
+            f"the impostor tail ({istats['p999']}) sits above the swept range "
+            f"({SWEEP_HI}) — cosines this high across identities mean duplicate or "
+            "mislabelled identities in the label set, not a threshold"
+        )
+        return pack
     best = min(viable, key=lambda c: (c["missRate"] + c["falseMatchRate"], c["threshold"]))
     threshold = best["threshold"]
     pack["proposal"] = {
@@ -225,8 +263,12 @@ def propose_pack(
         "templateConfidence": 0.05,
         # Heal/lock floors are reasoned from the measured impostor ceiling —
         # exactly how 0.45 was reasoned from 0.377, now per-venue.
-        "healMinCosine": round(min(0.9, istats["max"] + 0.05), 3),
-        "trackLockMinCosine": round(min(0.9, istats["max"] + 0.05), 3),
+        # Uncapped by 0.9: the floor's one job is clearing the worst measured
+        # impostor, and a cap under it would defeat the floor exactly when it
+        # matters most (review finding). 0.98 is the physical ceiling —
+        # consecutive same-face frames sit ~0.99.
+        "healMinCosine": round(min(0.98, istats["max"] + 0.05), 3),
+        "trackLockMinCosine": round(min(0.98, istats["max"] + 0.05), 3),
         "nearmissFloor": round(max(0.0, gstats["p01"] - 0.01), 3),
         "atProposal": {"missRate": best["missRate"], "falseMatchRate": best["falseMatchRate"]},
     }
@@ -261,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(text)
     if pack.get("refusal"):
-        print(f"REFUSED: {pack['refusal']}")
+        # stderr, so a piped `sweep ... > pack.json` stays valid JSON.
+        print(f"REFUSED: {pack['refusal']}", file=sys.stderr)
         return 2
     return 0
 

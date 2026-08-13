@@ -224,8 +224,7 @@ def probe_models(client, settings: Settings) -> dict:
         "faces": settings.faces_url,
         "embed": settings.embed_url,
     }
-    models: dict[str, str] = {}
-    for stage, url in stages.items():
+    def one(stage: str, url: str) -> tuple[str, str]:
         try:
             reply = client.get(f"{url}/health", timeout=2.0).json()
             name = str(reply.get("model") or "unknown")
@@ -233,9 +232,15 @@ def probe_models(client, settings: Settings) -> dict:
             # directory-shadowed bind mount serves the right filename with
             # ok:false, and stamping that filename as "running" would repeat
             # the healthy-while-dead incident inside the audit trail itself.
-            models[stage] = name if reply.get("ok") is True else f"unloaded ({name})"
+            return stage, (name if reply.get("ok") is True else f"unloaded ({name})")
         except Exception:  # noqa: BLE001 — best-effort by design, see _models_config
-            models[stage] = "unreachable"
+            return stage, "unreachable"
+
+    # In PARALLEL: four serial 2 s worst cases stacked an 8 s pause inside
+    # the planner's 10 s forward window (review finding) — the wall time is
+    # now one slowest probe, not their sum.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(stages)) as pool:
+        models: dict[str, str] = dict(pool.map(lambda kv: one(*kv), stages.items()))
     # reid is ASSERTED, not probed: no reid service exists to ask, and the
     # catalog's only entry is `none`. The day a real reid stage ships, it
     # gets a /health like every other stage and joins the probe — until
@@ -1042,10 +1047,13 @@ class RunLoop:
             if recheck:
                 self._set(plannerRunId=planner_run_id, state="failed", error=recheck)
                 self.log.error(f"model profile refused at run start: {recheck}")
-                self.planner.end_run(
-                    status="failed",
-                    notes=f"model profile refused at start: {recheck}",
-                )
+                with contextlib.suppress(Exception):
+                    # end_run must not add ITS failure on top of the refusal
+                    # (and _run's caller must not end the run a second time).
+                    self.planner.end_run(
+                        status="failed",
+                        notes=f"model profile refused at start: {recheck}",
+                    )
                 return
         self._set(plannerRunId=planner_run_id, state="running")
 
@@ -1328,6 +1336,10 @@ class RunLoop:
 
     def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
         """Run stages 2..8 for one frame, timing and measuring each."""
+        # THIS frame's embeddings start EMPTY: a zero-kept frame never reaches
+        # the embed stage, and without this reset the previous frame's vectors
+        # would ride into its golden record (review finding, 2026-08-14).
+        self._frame_embeddings = []
         # THIS frame's own wall times and count-changing decisions, for the
         # frame ledger. Reset here rather than in _remember so a stage that
         # raises still leaves the partial timings it did spend.
