@@ -21,7 +21,11 @@ DEFAULT_MODEL = (
     Path(__file__).resolve().parent.parent / "models" / "face_recognition_sface_2021dec.onnx"
 )
 
-MODEL_PATH = Path(os.environ.get("EMBED_MODEL", str(DEFAULT_MODEL)))
+# `or`, not a default argument: compose renders ${EMBED_MODEL-} as an empty
+# string, and Path("") silently resolves to the working directory — the
+# service then boots ok:false with model "" (bitten live on the T440 the
+# night the passthrough shipped; review finding made flesh).
+MODEL_PATH = Path(os.environ.get("EMBED_MODEL") or str(DEFAULT_MODEL))
 
 
 class FaceEmbedder:
