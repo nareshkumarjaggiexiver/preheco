@@ -69,6 +69,7 @@ from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
 from heco_counting import appearance, association, gate
+from heco_counting import config as counting_config
 
 from . import annotate, taps
 from .config import Settings
@@ -210,40 +211,14 @@ def httpx_file_transport(client: httpx.Client) -> FileTransport:
 #: Wire field -> Settings field for the per-run quality profile.  One table so
 #: the launcher's names and the runner's names are reconciled in exactly one
 #: place; a new floor is a line here and nowhere else.
-_QUALITY_FIELDS = {
-    "minPx": "quality_min_px",
-    "minIedPx": "quality_min_ied_px",
-    "minFrontality": "quality_min_frontality",
-    "minSharpness": "quality_min_sharpness",
-    "minEyeSpan": "quality_min_eye_span",
-    "requireLandmarks": "quality_require_landmarks",
-    "faceReverifyIntervalS": "face_reverify_interval_s",
-}
-
-
 def _apply_quality_profile(settings: Settings, profile: dict | None) -> Settings:
-    """Fold a per-run quality profile onto the runner's configured settings.
+    """Delegates to :func:`heco_counting.config.fold_quality_profile`.
 
-    An OVERRIDE, not a reset: a key the launcher omitted keeps whatever the
-    box was configured with, so sending ``{"requireLandmarks": true}`` cannot
-    silently disarm a frontality floor an engineer set on that machine.  A
-    key sent as null is treated as omitted for the same reason — the wire
-    shape has optional fields, and "absent" and "explicitly nothing" mean the
-    same thing to an operator.
-
-    Unknown keys are ignored rather than rejected: the launcher and the
-    runner deploy separately, and a console one version ahead must not be
-    able to fail a run over a field the box has not learned yet.
+    Kept as a module function because the run request arrives here and the
+    runner folds the profile onto its FULL Settings — the library's version is
+    generic over any frozen dataclass precisely so both callers share one rule.
     """
-    if not profile:
-        return settings
-    changes = {}
-    for wire, field in _QUALITY_FIELDS.items():
-        value = profile.get(wire)
-        if value is None:
-            continue
-        changes[field] = value
-    return replace(settings, **changes) if changes else settings
+    return counting_config.fold_quality_profile(settings, profile)
 
 
 def _now_iso() -> str:
@@ -1051,17 +1026,7 @@ class RunLoop:
         omitted, so a config with no IED key means an OLD run, not an unarmed
         one.
         """
-        return {
-            "qualityMinPx": self.s.quality_min_px,
-            "qualityCanonPx": self.s.quality_canon_px,
-            "qualityMinIedPx": self.s.quality_min_ied_px,
-            "qualityMinFrontality": self.s.quality_min_frontality,
-            "qualityMinSharpness": self.s.quality_min_sharpness,
-            "qualityMinEyeSpan": self.s.quality_min_eye_span,
-            "qualityRequireLandmarks": self.s.quality_require_landmarks,
-            "faceReverifyIntervalS": self.s.face_reverify_interval_s,
-            "gateArmed": list(self.gate.armed),
-        }
+        return counting_config.gate_config(self.s, self.gate.armed)
 
     def _release_run_state(self) -> None:
         """Give back every piece of per-run state this run created downstream.
