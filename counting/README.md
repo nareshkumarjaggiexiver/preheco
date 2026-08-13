@@ -7,7 +7,16 @@ assertion, and the ledger that owns the unique count.
 
 It holds none of the machinery around those decisions — no HTTP client, no
 FastAPI app, no camera, no planner. Those belong to whichever process is
-hosting the decisions.
+hosting the decisions, and `tests/test_boundaries.py` enforces it: importing
+this package in a fresh interpreter must pull in no transport and no
+framework, and no module here may import its host.
+
+It does depend on `heco-common`, for one module: `heco_common.geometry`, the
+pure stdlib box and polygon maths that `faces/` and the runner already share.
+Duplicating it would let the exclusion-zone polygon test drift away from the
+one that draws the polygons. The direction is what matters — counting depends
+on common, never the reverse — so counting stays off the **match** service's
+import path and the count keeps exactly one writer.
 
 ## Why it is not in `common/`
 
