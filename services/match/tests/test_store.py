@@ -273,3 +273,66 @@ def test_reset_closes_the_store_before_deleting_the_file(tmp_path):
 
     after = gallery.match(tmp_path, "r", sighting(c), 85.0, **kw)
     assert after.is_new is True and after.gallery_n == 1
+
+
+# ---------------------------------------------------- the embedder guard
+
+
+def test_a_new_store_is_stamped_with_this_process_embedder(tmp_path):
+    from app import store as store_mod
+    from app.store import VectorStore
+
+    s = VectorStore(tmp_path / "g.db")
+    assert s.embedder_id == store_mod.EMBEDDER_ID
+    row = s.conn.execute("SELECT v FROM store_meta WHERE k='embedderId'").fetchone()
+    assert row[0] == store_mod.EMBEDDER_ID
+    s.conn.close()
+
+
+def test_a_legacy_unstamped_store_adopts_rather_than_refuses(tmp_path):
+    """Every store in existence predates the second embedder by construction,
+    so adoption of an unstamped file is CORRECT, not lenient — refusing would
+    orphan every staff enrolment in the fleet for zero information."""
+    import sqlite3
+
+    from app.store import VectorStore
+
+    path = tmp_path / "legacy.db"
+    first = VectorStore(path)
+    first.conn.execute("DELETE FROM store_meta")  # simulate a pre-guard file
+    first.conn.commit()
+    first.conn.close()
+
+    reopened = VectorStore(path)
+    assert reopened.embedder_id is not None, "adopted, stamped, open for business"
+    reopened.conn.close()
+
+
+def test_a_same_dim_different_embedder_refuses_loudly(tmp_path, monkeypatch):
+    """THE M3 EXIT TEST (doc 15): the silent-corruption failure. A different
+    embedder with the SAME dimension passes every dim check — this guard is
+    the only thing between that and a confidently wrong bill."""
+    import pytest
+
+    from app import store as store_mod
+    from app.store import EmbedderMismatchError, VectorStore
+
+    path = tmp_path / "staff-site1.db"
+    VectorStore(path).conn.close()  # stamped sface-2021dec (the default)
+
+    monkeypatch.setattr(store_mod, "EMBEDDER_ID", "arcface-512")
+    with pytest.raises(EmbedderMismatchError) as e:
+        VectorStore(path)
+    msg = str(e.value)
+    assert "sface-2021dec" in msg and "arcface-512" in msg, "names both identities"
+    assert "re-enrolment" in msg, "and the way out"
+
+
+def test_staff_paths_split_per_embedder_but_sface_keeps_the_legacy_name(tmp_path, monkeypatch):
+    from app import staff as staff_mod
+
+    assert staff_mod.db_path(tmp_path, "site1").name == "staff-site1.db", (
+        "the default embedder keeps the legacy name — renaming would orphan enrolments"
+    )
+    monkeypatch.setattr(staff_mod, "EMBEDDER_ID", "arcface-512")
+    assert staff_mod.db_path(tmp_path, "site1").name == "staff-site1--arcface-512.db"

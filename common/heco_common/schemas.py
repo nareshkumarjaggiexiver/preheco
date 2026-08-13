@@ -24,6 +24,7 @@ They are gone. What remains is what is genuinely shared: ingest's wire types
 runner), and the planner ingest models (used by the PlannerClient).
 """
 
+import os
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -53,8 +54,13 @@ Stage = Literal[
     "count",
 ]
 
-#: SFace embedding dimensionality (OpenCV zoo model, fixed by CONTRACTS.md).
-EMBEDDING_DIM = 128
+#: Embedding dimensionality — pinned by DEPLOYMENT, no longer by contract
+#: (doc 15 M3). 128 is SFace's dim and the fleet default; a stack running a
+#: different embedder sets HECO_EMBEDDING_DIM beside EMBED_MODEL and
+#: HECO_EMBEDDER_ID so the three travel together. The wire check below stays
+#: exact ON PURPOSE: within one stack, every embedding must be the configured
+#: length — flexibility ACROSS stacks must never become sloppiness within one.
+EMBEDDING_DIM = int(os.environ.get("HECO_EMBEDDING_DIM", "128"))
 
 #: POC quality gate (CONTRACTS.md geometry): floor to enter embedding, and the
 #: band below production canon that must be flagged "sub-canon" in reports.

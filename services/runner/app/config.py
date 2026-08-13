@@ -154,6 +154,13 @@ class Settings:
     # default — it is an engineer's instrument, not a production behaviour,
     # and a run that writes a file nobody asked for is a surprise on a box.
     golden_path: str | None = None
+    #: Capture per-face EMBEDDINGS into the golden file (doc 15 M3): the
+    #: calibration sweep's raw material. Opt-in and golden-only on purpose —
+    #: embeddings are biometric data, and the run LEDGER (posted to the
+    #: planner) deliberately never carries them; this flag writes them only
+    #: into the engineer's local capture file, which already holds the run's
+    #: whole reasoning and lives under the same handling.
+    golden_embeddings: bool = False
 
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
@@ -452,6 +459,7 @@ def from_env() -> Settings:
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
         golden_path=os.environ.get("HECO_GOLDEN_PATH") or s.golden_path,
+        golden_embeddings=os.environ.get("HECO_GOLDEN_EMBEDDINGS", "") == "1",
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
