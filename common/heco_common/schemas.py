@@ -60,7 +60,7 @@ Stage = Literal[
 #: HECO_EMBEDDER_ID so the three travel together. The wire check below stays
 #: exact ON PURPOSE: within one stack, every embedding must be the configured
 #: length — flexibility ACROSS stacks must never become sloppiness within one.
-EMBEDDING_DIM = int(os.environ.get("HECO_EMBEDDING_DIM", "128"))
+EMBEDDING_DIM = int(os.environ.get("HECO_EMBEDDING_DIM") or "128")
 
 #: POC quality gate (CONTRACTS.md geometry): floor to enter embedding, and the
 #: band below production canon that must be flagged "sub-canon" in reports.

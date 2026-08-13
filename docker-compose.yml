@@ -170,6 +170,9 @@ services:
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
+      # The three travel together: model, its id, its dimension.
+      EMBED_MODEL: ${EMBED_MODEL-}
+      HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 
@@ -209,6 +212,12 @@ services:
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
+      # The embedder identity travels WITH the model (doc 15 M3): without
+      # this passthrough the guard was inert in every compose deploy — the
+      # match container could only ever run the default id while different
+      # vectors flowed in, certifying the exact corruption it exists to block.
+      HECO_EMBEDDER_ID: ${HECO_EMBEDDER_ID-}
+      HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
 
   runner:
     <<: *heco-service

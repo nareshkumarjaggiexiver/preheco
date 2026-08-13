@@ -167,14 +167,18 @@ class PersonDetector:
         static_hw = [d for d in shape[-2:] if isinstance(d, int)]
         if static_hw and any(d != input_size for d in static_hw):
             raise ValueError(
-                f"{model_path.name} expects {static_hw[-1]}x{static_hw[-1]} input, "
-                f"configured {input_size} — check PERSONS_INPUT_SIZE against MODEL_SPECS"
+                f"{model_path.name} expects a {'x'.join(str(d) for d in static_hw)} "
+                f"input, configured {input_size} — check PERSONS_INPUT_SIZE against MODEL_SPECS"
             )
-        graph_family = "rtdetr" if len(inputs) > 1 else "yolox"
+        # Family by input NAME, not arity: the rtdetr contract is the named
+        # second input `orig_target_sizes`; arity alone would misread any
+        # future multi-input export (review finding).
+        has_sizes_input = any(i.name == "orig_target_sizes" for i in inputs)
+        graph_family = "rtdetr" if has_sizes_input else "yolox"
         if family != graph_family:
             raise ValueError(
                 f"{model_path.name} is a {graph_family}-shaped graph "
-                f"({len(inputs)} input(s)), configured family `{family}` — "
+                f"(inputs: {[i.name for i in inputs]}), configured family `{family}` — "
                 "check PERSONS_FAMILY against MODEL_SPECS"
             )
         self._input_name = inputs[0].name

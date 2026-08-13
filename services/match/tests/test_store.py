@@ -293,8 +293,7 @@ def test_a_legacy_unstamped_store_adopts_rather_than_refuses(tmp_path):
     """Every store in existence predates the second embedder by construction,
     so adoption of an unstamped file is CORRECT, not lenient — refusing would
     orphan every staff enrolment in the fleet for zero information."""
-    import sqlite3
-
+    from app import store as store_mod
     from app.store import VectorStore
 
     path = tmp_path / "legacy.db"
@@ -304,7 +303,11 @@ def test_a_legacy_unstamped_store_adopts_rather_than_refuses(tmp_path):
     first.conn.close()
 
     reopened = VectorStore(path)
-    assert reopened.embedder_id is not None, "adopted, stamped, open for business"
+    assert reopened.embedder_id == store_mod.EMBEDDER_ID, (
+        "adopted with THIS process's identity — a lost stamp would leave None"
+    )
+    row = reopened.conn.execute("SELECT v FROM store_meta WHERE k='embedderId'").fetchone()
+    assert row[0] == store_mod.EMBEDDER_ID, "and the stamp is durable, not just in memory"
     reopened.conn.close()
 
 
@@ -329,10 +332,14 @@ def test_a_same_dim_different_embedder_refuses_loudly(tmp_path, monkeypatch):
 
 
 def test_staff_paths_split_per_embedder_but_sface_keeps_the_legacy_name(tmp_path, monkeypatch):
+    """staff.py reads store.EMBEDDER_ID LIVE, never an import-time copy —
+    the review found the early-bound copy could diverge and stamp a
+    legacy-named file with a foreign identity."""
     from app import staff as staff_mod
+    from app import store as store_mod
 
     assert staff_mod.db_path(tmp_path, "site1").name == "staff-site1.db", (
         "the default embedder keeps the legacy name — renaming would orphan enrolments"
     )
-    monkeypatch.setattr(staff_mod, "EMBEDDER_ID", "arcface-512")
+    monkeypatch.setattr(store_mod, "EMBEDDER_ID", "arcface-512")
     assert staff_mod.db_path(tmp_path, "site1").name == "staff-site1--arcface-512.db"

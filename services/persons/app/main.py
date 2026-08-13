@@ -57,13 +57,17 @@ def _get_detector() -> PersonDetector | None:
             return _detector
         if _load_error is not None and _current_stat() == _failed_stat:
             return None  # same broken file — stay cheap, stay unhealthy
+        # Stat BEFORE the attempt: a writer replacing the file DURING a failed
+        # load must invalidate the memo, not be masked by a post-failure stat
+        # of the new file (review finding).
+        attempt_stat = _current_stat()
         try:
             _detector = PersonDetector()
             _load_error = None
             _failed_stat = None
         except Exception as exc:  # noqa: BLE001 — see the docstring
             _load_error = f"{type(exc).__name__}: {exc}"
-            _failed_stat = _current_stat()
+            _failed_stat = attempt_stat
             log.error("model load failed: %s", _load_error)
     return _detector
 

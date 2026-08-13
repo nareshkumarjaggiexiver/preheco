@@ -129,7 +129,11 @@ CREATE TABLE IF NOT EXISTS store_meta (
 #: (pipeline.json models.embed), not a filename — one string, shared by every
 #: store this service opens. Overridable per deploy so a future stack running
 #: a different embedder names itself, and every store it touches is stamped.
-EMBEDDER_ID = os.environ.get("HECO_EMBEDDER_ID", "sface-2021dec")
+# Empty means unset, the service-wide convention: compose renders ${VAR-} as
+# an empty string, and an empty id would stamp every store with '' and move
+# staff lookups to staff-<site>--.db — every enrolled member billed as a
+# guest, silently (review finding, 2026-08-14).
+EMBEDDER_ID = os.environ.get("HECO_EMBEDDER_ID", "").strip() or "sface-2021dec"
 
 
 class EmbedderMismatchError(RuntimeError):
@@ -237,11 +241,23 @@ class VectorStore:
             "SELECT v FROM store_meta WHERE k = 'embedderId'"
         ).fetchone()
         if stored is None:
+            # OR IGNORE + re-read: two processes adopting one unstamped
+            # legacy file must both land on ONE stamp, not an IntegrityError.
             self.conn.execute(
-                "INSERT INTO store_meta (k, v) VALUES ('embedderId', ?)", (EMBEDDER_ID,)
+                "INSERT OR IGNORE INTO store_meta (k, v) VALUES ('embedderId', ?)",
+                (EMBEDDER_ID,),
             )
             self.conn.commit()
-            self.embedder_id = EMBEDDER_ID
+            stored = self.conn.execute(
+                "SELECT v FROM store_meta WHERE k = 'embedderId'"
+            ).fetchone()
+            if stored[0] != EMBEDDER_ID:
+                self.conn.close()
+                raise EmbedderMismatchError(
+                    f"{self.path.name} was stamped `{stored[0]}` by a concurrent open; "
+                    f"this process runs `{EMBEDDER_ID}` — same refusal, same way out."
+                )
+            self.embedder_id = stored[0]
         elif stored[0] != EMBEDDER_ID:
             self.conn.close()
             raise EmbedderMismatchError(

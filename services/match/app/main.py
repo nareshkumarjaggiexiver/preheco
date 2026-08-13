@@ -37,7 +37,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, gallery, staff
-from .store import close_all_stores
+from .store import EmbedderMismatchError, close_all_stores
 
 
 def _env_s(name: str, default: float) -> float:
@@ -112,6 +112,19 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="heco-match", version=VERSION, lifespan=_lifespan)
+
+
+# A wrong-embedder store is a PERMANENT conflict between the file's stamped
+# identity and this process's configuration — a 409, not a 500: the runner's
+# refusal convention (4xx = understood-you-no, settle it; 5xx = try again)
+# must see this as settled, or every /match against a mismatched staff store
+# becomes an indefinite retry storm at frame rate with the guard's
+# carefully-written way-out message never reaching the wire.
+@app.exception_handler(EmbedderMismatchError)
+async def _embedder_mismatch(request, exc):  # noqa: ANN001, D401
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 # Inbound auth (runbook step 8): armed by HECO_REQUIRE_AUTH=1, this refuses
 # LAN callers without a bearer credential — an heco-auth token verified
 # locally, or the legacy shared secret while it survives. /health stays

@@ -29,7 +29,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .store import EMBEDDER_ID, Neighbour, open_store
+from . import store as _store
+from .store import Neighbour, open_store
 
 _SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -51,9 +52,9 @@ def db_path(data_dir: Path, site_id: str) -> Path:
     """
     if not _SITE_ID_RE.match(site_id):
         raise BadSiteIdError(f"siteId must match {_SITE_ID_RE.pattern!r}")
-    if EMBEDDER_ID == "sface-2021dec":
+    if _store.EMBEDDER_ID == "sface-2021dec":
         return data_dir / f"staff-{site_id}.db"
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", EMBEDDER_ID)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", _store.EMBEDDER_ID)
     return data_dir / f"staff-{site_id}--{safe}.db"
 
 
