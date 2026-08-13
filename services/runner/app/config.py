@@ -161,6 +161,14 @@ class Settings:
     #: into the engineer's local capture file, which already holds the run's
     #: whole reasoning and lives under the same handling.
     golden_embeddings: bool = False
+    #: Fetch frame N+1 while frame N is still being processed — ONE frame in
+    #: flight, never more (docs/planning memory path-to-15fps: fixed latency,
+    #: not the unbounded-buffer divergence). Hides ingest transport plus the
+    #: source's frameWaitMs behind the loop's own work — the measured stall
+    #: was up to ~75 ms/frame of pure idleness on a live 4K camera. Lockstep
+    #: file replays are frame-for-frame identical either way (the poller
+    #: returns the NEXT seq whenever it is asked), so golden diffs hold.
+    frame_prefetch: bool = True
 
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
@@ -460,6 +468,7 @@ def from_env() -> Settings:
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),
         golden_path=os.environ.get("HECO_GOLDEN_PATH") or s.golden_path,
         golden_embeddings=os.environ.get("HECO_GOLDEN_EMBEDDINGS", "") == "1",
+        frame_prefetch=os.environ.get("HECO_FRAME_PREFETCH", "1") != "0",
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
