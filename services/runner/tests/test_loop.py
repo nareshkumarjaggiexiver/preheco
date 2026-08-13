@@ -917,3 +917,68 @@ def test_detections_zone_with_no_frame_dims_filters_nothing_and_says_so():
     out = loop._apply_detection_zones([{"x": 1, "y": 1, "w": 2, "h": 2}], {})
     assert len(out) == 1, "nothing filtered without geometry"
     assert loop.status()["personsZoneUnmeasured"] == 1
+
+
+# ------------------------------------------------- the M-mode-1 profile gate
+
+MANIFEST_FOR_GATE = {
+    "models": {
+        "persons": [
+            {"id": "yolox-nano", "file": "yolox_nano.onnx", "default": True},
+            {"id": "yolox-s", "file": "yolox_s.onnx"},
+        ],
+        "tracker": [{"id": "sort-lite-iou-velocity"}],
+    }
+}
+LIVE_FOR_GATE = {
+    "persons": "yolox_nano.onnx",
+    "tracker": "sort-lite-iou-velocity",
+    "faces": "face_detection_yunet_2023mar.onnx",
+    "embed": "face_recognition_sface_2021dec.onnx",
+    "reid": "none",
+}
+
+
+def test_a_profile_matching_the_install_is_honoured():
+    from app.loop import refuse_model_profile
+
+    profile = {"id": "house", "stages": {"persons": "yolox-nano", "tracker": "sort-lite-iou-velocity"}}
+    assert refuse_model_profile(profile, MANIFEST_FOR_GATE, LIVE_FOR_GATE) is None
+    assert refuse_model_profile(None, MANIFEST_FOR_GATE, LIVE_FOR_GATE) is None, (
+        "no profile, no gate — the default install keeps working"
+    )
+
+
+def test_a_profile_naming_a_model_this_install_did_not_load_is_refused():
+    """The M-mode-1 truth (doc 15 §6): a profile is a promise about which
+    models produce the number, and an install that loaded different weights
+    must refuse rather than stamp the promise over a different reality."""
+    from app.loop import refuse_model_profile
+
+    profile = {"stages": {"persons": "yolox-s"}}
+    refusal = refuse_model_profile(profile, MANIFEST_FOR_GATE, LIVE_FOR_GATE)
+    assert "runs `yolox_nano.onnx` for persons" in refusal
+    assert "restart the stack" in refusal, "the sentence names the way out"
+
+
+def test_a_profile_naming_an_undeclared_model_is_refused_with_the_catalog():
+    from app.loop import refuse_model_profile
+
+    refusal = refuse_model_profile(
+        {"stages": {"persons": "yolo-v99"}}, MANIFEST_FOR_GATE, LIVE_FOR_GATE)
+    assert "not in this install's `persons` catalog" in refusal
+    assert "yolox-nano" in refusal, "the refusal lists what IS offered"
+    no_catalog = refuse_model_profile({"stages": {"persons": "yolox-nano"}}, {}, LIVE_FOR_GATE)
+    assert "declares no model catalog" in no_catalog
+
+
+def test_an_honoured_profile_is_stamped_beside_the_live_models():
+    """The profile is the PROMISE, the models map the TRUTH — the run record
+    carries both so an auditor can re-run the gate's comparison later."""
+    fake = FakePipeline(n_frames=1)
+    loop = make_loop(fake)
+    loop.request["modelProfile"] = {"id": "house", "stages": {"persons": "yolox-nano"}}
+    loop.run()
+    config = fake.run_created["config"]
+    assert config["modelProfile"] == {"id": "house", "stages": {"persons": "yolox-nano"}}
+    assert config["models"]["persons"] == "fake-persons", "the truth is still probed, not copied"

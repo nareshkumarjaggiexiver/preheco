@@ -1,0 +1,27 @@
+# models-restricted.lock — the OPEN CATALOG's second tier
+# (docs/planning/15-model-configurations.md §3).
+#
+# Everything here is admissible for EVALUATION and blocked from billable
+# events until a per-client procurement record exists (M4). Same machine
+# columns as models.lock (service filename sha256 url) — the structured
+# grant/provenance story lives in pipeline.json's models block, where the
+# planner reads and enforces it; this file only pins bytes.
+#
+# Fetched ONLY by an explicit `make models-restricted`, always from the
+# vendor's own distribution point — this repo never re-hosts weights it has
+# no grant to redistribute. `make models` and a fresh deploy stay exactly as
+# clean as they always were; verify-models treats an UNFETCHED restricted
+# weight as a choice, and a wrong or placeholder one as fatal.
+#
+# THE ONE HARD EXCLUSION that survives the open-catalog decision: a model
+# whose terms forbid internal benchmarking never enters this file at all.
+#
+# columns: service  filename  sha256  url
+#
+# (No fetchable rows yet. The first candidates, for the record:
+#  - rtdetrv2_s.onnx — Apache-2.0 code/weights (lyuwenyu/RT-DETR) but no
+#    official ONNX asset; requires a local export, so it is pinned only once
+#    an export is reproducible. The persons service already speaks its
+#    contract (family "rtdetr", MODEL_SPECS).
+#  - ultralytics RT-DETR / RF-DETR-large — AGPL-3.0 / PML respectively;
+#    grant "contact" — enter here the day a vendor conversation starts.)

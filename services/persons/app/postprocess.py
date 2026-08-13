@@ -112,3 +112,43 @@ def select_persons(
         }
         for i in keep
     ]
+
+
+def select_persons_rtdetr(
+    labels: np.ndarray,
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    conf_min: float,
+    img_w: int,
+    img_h: int,
+) -> list[dict]:
+    """RT-DETR outputs into contract person boxes.
+
+    The lyuwenyu export returns per-query (labels, boxes, scores) with boxes
+    ALREADY in original-image xyxy pixels (the graph consumes
+    `orig_target_sizes` and undoes its own resize), COCO class ids, and no
+    NMS needed — DETR's set prediction is one box per object by construction,
+    which is why there is deliberately no NMS step here. Same contract shape
+    out as the YOLOX path: `{x, y, w, h, conf}` best first.
+    """
+    labels = np.asarray(labels).reshape(-1)
+    boxes = np.asarray(boxes).reshape(-1, 4)
+    scores = np.asarray(scores).reshape(-1)
+    mask = (labels == PERSON_CLASS) & (scores >= conf_min)
+    if not mask.any():
+        return []
+    kept = boxes[mask].astype(np.float64)
+    kept[:, 0::2] = kept[:, 0::2].clip(0, img_w)
+    kept[:, 1::2] = kept[:, 1::2].clip(0, img_h)
+    kept_scores = scores[mask]
+    order = np.argsort(-kept_scores)
+    return [
+        {
+            "x": round(float(kept[i, 0]), 1),
+            "y": round(float(kept[i, 1]), 1),
+            "w": round(float(kept[i, 2] - kept[i, 0]), 1),
+            "h": round(float(kept[i, 3] - kept[i, 1]), 1),
+            "conf": round(float(kept_scores[i]), 4),
+        }
+        for i in order
+    ]
