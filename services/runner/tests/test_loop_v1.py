@@ -88,6 +88,11 @@ class V1Fake:
         self.run_ended: dict | None = None
         self.drop_resolve = 0  # PUT /api/feedback/:id to swallow (dropped reply)
         self.merge_ok = True  # False once the drop key no longer exists
+        #: HTTP status to answer /merge and /split with, or None for success.
+        #: A 4xx/5xx here is the gallery REFUSING, which the loop must treat
+        #: differently from it not answering at all.
+        self.merge_status: int | None = None
+        self.split_status: int | None = None
         self.merge_always_ok = False  # True: distinct drops all succeed (multi-heal)
         self.feedback_sticky = False  # re-serve open items until a PUT lands
         # AUTH (v2). The fake mints tokens like the real service: `mints`
@@ -167,6 +172,11 @@ class V1Fake:
             return httpx.Response(200, json={"ok": True})
         if path == "/merge":
             self.merges.append(body)
+            # Injectable failure, so a test can tell the two apart: a STATUS is
+            # the gallery answering no, an EXCEPTION is it not answering at
+            # all, and the loop must roll back only for the second.
+            if self.merge_status is not None:
+                return httpx.Response(self.merge_status, json={"detail": "no"})
             merged = self.merge_ok
             if not self.merge_always_ok:
                 self.merge_ok = False  # a merge is one-shot (drop key is gone)
@@ -182,6 +192,8 @@ class V1Fake:
             })
         if path == "/split":
             self.splits.append(body)
+            if self.split_status is not None:
+                return httpx.Response(self.split_status, json={"detail": "no"})
             return httpx.Response(200, json={"ok": True, "galleryN": self.guest_n})
         if path == "/mark-staff":
             self.mark_staff.append(body)
@@ -3674,3 +3686,45 @@ def test_the_first_frames_zero_timestamp_is_a_real_clock_reading():
     request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request, staff_cooldown_s=0.0).run()
     assert final["staffCrossings"] == final["staffFaceFrames"] == 6
+
+
+# ------------------------------------- pinned against the REAL loop, not a copy
+
+
+def test_a_co_presence_split_refused_4xx_is_never_re_sent():
+    """Understood and refused: the loop must stop asking, for the whole run.
+
+    Pinned against the real loop rather than a model of it, because this is
+    one of the mechanisms about to move. Without it the pair is re-asserted on
+    every one of the next frames they share — synchronous round trips inside
+    the frame loop, which is the shape of the 0.4 fps death spiral.
+    """
+    fake = V1Fake(n_frames=8, face_widths=(60.0, 85.0),
+                  match_script=list(CO_PRESENT_SCRIPT) * 8)
+    fake.split_status = 422
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request, copresence_split=1).run()
+    pairs = {f"{b.get('a')}|{b.get('b')}" for b in fake.splits}
+    assert len(fake.splits) == len(pairs), (
+        f"a 4xx-refused pair was re-sent: {len(fake.splits)} calls for "
+        f"{len(pairs)} distinct pairs"
+    )
+
+
+def test_a_co_presence_split_that_5xxs_is_retried_while_they_share_a_frame():
+    """Nothing was decided, so the constraint is still owed.
+
+    Memoising a 5xx would silently abandon a cannot_link that should exist,
+    and a later heal could then fold two co-present guests into one — a silent
+    under-count, which is the worst failure this product has.
+    """
+    fake = V1Fake(n_frames=8, face_widths=(60.0, 85.0),
+                  match_script=list(CO_PRESENT_SCRIPT) * 8)
+    fake.split_status = 503
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    make_loop(fake, request, copresence_split=1).run()
+    pairs = {f"{b.get('a')}|{b.get('b')}" for b in fake.splits}
+    if pairs:
+        assert len(fake.splits) > len(pairs), (
+            "an undecided split must be retried while the pair share a frame"
+        )
