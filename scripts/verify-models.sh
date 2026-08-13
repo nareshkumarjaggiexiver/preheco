@@ -65,6 +65,33 @@ done < "$LOCK"
 
 [ "$rows" -gt 0 ] || { echo "verify-models: models.lock named no artefacts — is it truncated?" >&2; exit 1; }
 
+# The restricted tier (models-restricted.lock) is opt-in: an UNFETCHED weight
+# is a choice, not a fault — but a fetched one that is wrong, empty or a
+# Docker placeholder directory is exactly as fatal as a main-tier one, and a
+# DIRECTORY for an unfetched one is still the bind-mount trap and fatal.
+RLOCK="$ROOT/models-restricted.lock"
+if [ -f "$RLOCK" ]; then
+    while read -r service file sha _url; do
+        case "$service" in ''|'#'*) continue ;; esac
+        [ -n "${file:-}" ] && [ -n "${sha:-}" ] || continue
+        path="$ROOT/services/$service/models/$file"
+        if [ -d "$path" ]; then
+            echo "MISSING (a DIRECTORY, not a file — Docker made a placeholder): services/$service/models/$file (restricted tier)" >&2
+            fail=1
+        elif [ ! -f "$path" ]; then
+            echo "skip $service/$file (restricted tier, not fetched — 'make models-restricted' to opt in)"
+        elif [ ! -s "$path" ]; then
+            echo "EMPTY: services/$service/models/$file (restricted tier, 0 bytes)" >&2
+            fail=1
+        elif ! echo "$sha  $path" | sha256sum --check --status -; then
+            echo "SHA MISMATCH: services/$service/models/$file vs models-restricted.lock" >&2
+            fail=1
+        else
+            echo "ok  $service/$file (restricted tier)"
+        fi
+    done < "$RLOCK"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "Refusing to deploy: at least one pinned model artefact is missing or wrong." >&2

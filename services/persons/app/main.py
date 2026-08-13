@@ -55,6 +55,14 @@ def health() -> dict:
         "ok": det is not None,
         "model": det.model_name if det else MODEL_PATH.name,
         "version": __version__,
+        # The device TRUTH, not the request: both ORT accelerator EPs fall
+        # back to CPU silently, so /health serves the session's ACTIVE
+        # provider list — the benchmark-honesty line, queryable.
+        "device": {
+            "requested": det.device_requested,
+            "active": det.providers_active,
+            "family": det.family,
+        } if det else None,
     }
 
 
