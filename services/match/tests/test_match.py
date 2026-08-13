@@ -8,6 +8,7 @@ No network access: FastAPI's TestClient drives the ASGI app in-process.
 """
 
 import math
+import pathlib
 
 import numpy as np
 import pytest
@@ -585,6 +586,29 @@ def _split(client, run_id, a, b):
     return res.json()
 
 
+def _split_raw(run_id, a, b):
+    """Write a constraint at the STORE layer, bypassing the API's validation.
+
+    The store's documented contract is that a constraint is "a statement
+    about a pair of identifiers, not about stored rows" — it accepts any
+    pair. The API boundary now refuses keys the gallery does not hold (run
+    27ca33: a truncated key wrote a dead row and the operator believed their
+    correction had applied), which closed the shortcut these fixtures used:
+    splitting against a key BEFORE its mint, so the mint is born settled.
+
+    No production caller can reach that state — the operator and the runner
+    can only name keys that exist — so the tests that need it construct it
+    where it is legal: at the store, whose contract explicitly allows it.
+    """
+    import os
+
+    from app.gallery import db_path, open_store
+
+    store = open_store(db_path(pathlib.Path(os.environ["HECO_MATCH_DATA_DIR"]), run_id))
+    with store.transaction():
+        store.split(a, b)
+
+
 def test_settled_pair_carries_no_face_basis_rider(client):
     """THE 05b3b7 REPLAY: a face-band mint against a known-different key is silent.
 
@@ -595,7 +619,7 @@ def test_settled_pair_carries_no_face_basis_rider(client):
     """
     seed = _match_full(client, "run-cl1", _e(0).tolist(), appearance=_desc({0: 1.0}))
     assert seed["personKey"] == "p00001"
-    _split(client, "run-cl1", "p00001", "p00002")
+    _split_raw("run-cl1", "p00001", "p00002")
 
     out = _match_full(
         client, "run-cl1", _at_cosine(0.3464), appearance=_desc({0: 0.94, 1: 0.06})
@@ -619,7 +643,7 @@ def test_settled_pair_carries_no_clothing_basis_rider(client):
     """
     seed = _match_full(client, "run-cl2", _e(0).tolist(), appearance=_desc({0: 1.0}))
     assert seed["personKey"] == "p00001"
-    _split(client, "run-cl2", "p00001", "p00002")
+    _split_raw("run-cl2", "p00001", "p00002")
 
     out = _match_full(
         client, "run-cl2", _at_cosine(0.212), appearance=_desc({0: 0.797, 1: 0.203})
@@ -642,7 +666,7 @@ def test_the_suppression_is_per_pair_not_a_global_gag(client):
     a = _match_full(client, "run-cl3", _e(0).tolist())
     b = _match_full(client, "run-cl3", _e(5).tolist())
     assert (a["personKey"], b["personKey"]) == ("p00001", "p00002")
-    _split(client, "run-cl3", "p00001", "p00003")
+    _split_raw("run-cl3", "p00001", "p00003")
 
     settled = _match_full(client, "run-cl3", _at_cosine(0.3464, ortho=1))
     assert settled["personKey"] == "p00003"
@@ -681,7 +705,7 @@ def test_cannot_link_changes_the_suggestion_and_nothing_else(client):
     loud = _match_full(client, "run-cl4", probe, appearance=worn)
 
     _match_full(client, "run-cl5", _e(0).tolist(), appearance=outfit)
-    _split(client, "run-cl5", "p00001", "p00002")
+    _split_raw("run-cl5", "p00001", "p00002")
     quiet = _match_full(client, "run-cl5", probe, appearance=worn)
 
     assert loud["nearMiss"] is not None and quiet["nearMiss"] is None
@@ -1043,30 +1067,62 @@ def test_review_ignores_pairs_outside_the_band(client):
     assert review(client, run="r2")["pairs"] == [], "orthogonal strangers are not a question"
 
 
-def test_clothing_ranks_the_queue_and_never_removes_anyone(client):
-    """THE 0.587/0.538 RULE, pinned with the measured numbers.
+def test_the_queue_ranks_by_face_score_and_clothing_never_removes_anyone(client):
+    """FACE FIRST, clothes the tiebreak — reversed 2026-08-13 on run 27ca33.
 
-    In run 0f5c6d the DUPLICATE pair agreed on clothing at 0.587 and two
-    genuinely DIFFERENT men agreed at 0.538. Both readings are reproduced
-    here. The stronger agreement must LEAD the queue, and the weaker must
-    still BE in it: any clothing bar between those two numbers would have put
-    the real duplicate and an unrelated pair on opposite sides of a coin toss,
-    and the losing side of that toss is a merged guest nobody ever sees.
+    The clothes-first order was built for run 0f5c6d, where clothing (0.587 vs
+    0.538) was the only signal separating a real duplicate from noise. Run
+    27ca33 — a lobby of dark formal wear — inverted it: clothing ~0.9 was
+    GENERIC, 34 of the top-50 pairs had face scores below 0.30, and the one
+    CONFIRMED same-person pair in the whole queue (face 0.3526, 4th-highest in
+    the band, clothes 0.886) ranked #53 — past the caller's limit and silently
+    dropped. The operator then reported exactly that pair as missing.
+
+    The band is [floor, threshold): the face score is the distance from "the
+    gallery already calls them one person", so it is the band's own metric.
+    Reproduced here: a HIGH-face pair with clashing clothes must outrank a
+    near-noise pair in perfectly matching clothes — that is the 27ca33
+    geometry — while both remain in the queue, because clothing ranks and
+    never filters.
     """
-    dup_a = hist(b0=0.587, b1=0.413)
-    dup_b = hist(b0=0.587, b2=0.413)          # intersects dup_a at 0.587
-    oth_a = hist(b3=0.538, b4=0.462)
-    oth_b = hist(b3=0.538, b5=0.462)          # intersects oth_a at 0.538, dup_* at 0
+    match_a = hist(b0=0.95, b1=0.05)
+    match_b = hist(b0=0.95, b2=0.05)          # clothes agree at ~0.95
+    clash_a = hist(b3=0.9, b4=0.1)
+    clash_b = hist(b5=0.9, b6=0.1)            # clothes intersect at ~0
 
-    dup = band_pair(client, "r", person_centroid(), dup_a, dup_b)
-    oth = band_pair(client, "r", person_centroid(), oth_a, oth_b)
+    # near-noise face score, perfect clothing — the 27ca33 flood shape
+    noise = band_pair(client, "r", person_centroid(), match_a, match_b, cosine=0.20)
+    # strong in-band face score, clashing clothing — the buried genuine pair
+    strong = band_pair(client, "r", person_centroid(), clash_a, clash_b, cosine=0.34)
 
     got = review(client)
-    ranked = [(frozenset((p["a"], p["b"])), p["clothes"]) for p in got["pairs"]]
-    assert ranked[0][0] == frozenset(dup)
-    assert ranked[0][1] == pytest.approx(0.587, abs=1e-3)
-    assert frozenset(oth) in [r[0] for r in ranked], "the weaker pair is still asked about"
-    assert dict(ranked)[frozenset(oth)] == pytest.approx(0.538, abs=1e-3)
+    ranked = [frozenset((p["a"], p["b"])) for p in got["pairs"]]
+    assert ranked[0] == frozenset(strong), "the face score leads the queue"
+    assert frozenset(noise) in ranked, "clothing still never removes a pair"
+    by_pair = {frozenset((p["a"], p["b"])): p for p in got["pairs"]}
+    assert by_pair[frozenset(strong)]["cosine"] > by_pair[frozenset(noise)]["cosine"]
+
+
+def test_clothes_break_ties_at_equal_face_evidence():
+    """At the same face score, the matching torso is worth the first glance.
+
+    Tested against the comparator directly: the embedding helpers cannot
+    build two pairs at an EXACTLY equal cosine, so an endpoint-level tie test
+    flaps on which pair drew the marginally higher score — it did, which is
+    why review_order is a named function rather than an inline lambda.
+    """
+    from app.gallery import review_order
+
+    agree = {"cosine": 0.30, "clothes": 0.95}
+    clash = {"cosine": 0.30, "clothes": 0.05}
+    unmeasured = {"cosine": 0.30, "clothes": None}
+    stronger_face = {"cosine": 0.34, "clothes": None}
+
+    ranked = sorted([clash, unmeasured, agree, stronger_face], key=review_order)
+    assert ranked[0] is stronger_face, "face score always leads"
+    assert ranked[1] is agree, "then the matching torso at equal faces"
+    assert ranked[2] is clash, "then the clashing one"
+    assert ranked[3] is unmeasured, "unmeasured ranks last at a tie — absent is not zero"
 
 
 def test_an_unmeasured_torso_still_gets_reviewed(client):
@@ -1183,3 +1239,100 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 
     allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+
+def test_a_split_with_a_typoed_key_is_refused_and_names_the_key(client):
+    """A correction that silently protects nobody is worse than a refused one.
+
+    Run 27ca33: an operator's false-match correction arrived with truncated
+    keys (p0004 for p00004), wrote a dead cannot_link row, and the operator
+    walked away believing it had applied. The store deliberately accepts
+    constraints on any identifiers; this boundary is where the typo can be
+    caught and NAMED, so the feedback ledger records a rejection instead of a
+    lie.
+    """
+    base = person_centroid()
+    a, b = band_pair(client, "r-typo", base, cosine=0.30)
+    # the real pair still splits fine
+    ok = client.post("/split", json={"runId": "r-typo", "a": a, "b": b})
+    assert ok.status_code == 200
+
+    bad = client.post("/split", json={"runId": "r-typo", "a": a[:5], "b": b})
+    assert bad.status_code == 400
+    assert a[:5] in bad.json()["detail"], "the unknown key is named"
+    assert "p00004" in bad.json()["detail"], "and the expected shape is shown"
+
+
+def test_a_weak_staff_hit_does_not_shadow_a_stronger_guest_match(client):
+    """The 27ca33 staff bug, pinned end to end.
+
+    A guest whose face matched p00020 at 0.6476 one frame earlier was tagged
+    STAFF at 0.4234 in between, because /match returned on the first staff hit
+    at threshold without ever consulting the guest gallery. 281 of that run's
+    339 danger-zone verdicts were staff hits hugging the threshold.
+
+    Here: a person is well-known to the GUEST gallery (repeat sightings, high
+    cosine); a staff member exists whose template is only weakly similar. The
+    same probe must resolve to the guest, not the staff shadow.
+    """
+    base = person_centroid()
+    # a guest with two strong sightings
+    r1 = client.post("/match", json={"runId": "r-shadow", "embedding": sighting(base),
+                                     "quality": 90.0, "siteId": "site-shadow"}).json()
+    assert r1["isNew"] is True and r1["isStaff"] is False
+    guest = r1["personKey"]
+
+    # staff enrolled with a template WEAKLY similar to the guest (in the
+    # danger zone above threshold, but far below the guest's own score)
+    weak = view_at(base, 0.40)
+    enrol = client.post("/staff/enrol", json={
+        "siteId": "site-shadow", "staffId": "anon-weak",
+        "samples": [{"embedding": weak, "quality": 90.0}],
+    })
+    assert enrol.status_code == 200
+
+    # the guest walks past again: near-identical face, strong guest score
+    again = client.post("/match", json={"runId": "r-shadow", "embedding": sighting(base),
+                                        "quality": 90.0, "siteId": "site-shadow"}).json()
+    assert again["isStaff"] is False, "a weak staff hit must not shadow a strong guest"
+    assert again["personKey"] == guest
+    assert again["cosine"] > 0.5
+
+
+def test_a_genuinely_stronger_staff_hit_still_wins(client):
+    """The competition is a comparison, not a demotion of staff.
+
+    Staff exist to stay out of the guest count; when the staff store knows the
+    face BETTER than the guest gallery does, the verdict is staff — ties
+    included, because at equal evidence keeping a possible staff member off
+    the invoice is the conservative direction.
+    """
+    staff_face = person_centroid()
+    client.post("/staff/enrol", json={
+        "siteId": "site-strong", "staffId": "anon-strong",
+        "samples": [{"embedding": sighting(staff_face), "quality": 90.0}],
+    })
+    # an unrelated guest exists in the gallery, weakly similar at best
+    client.post("/match", json={"runId": "r-strong", "embedding": view_at(staff_face, 0.30),
+                                "quality": 90.0, "siteId": "site-strong"})
+    # the staff member crosses: their own template is the best evidence there is
+    hit = client.post("/match", json={"runId": "r-strong", "embedding": sighting(staff_face),
+                                      "quality": 90.0, "siteId": "site-strong"}).json()
+    assert hit["isStaff"] is True
+    assert hit["staffId"] == "anon-strong"
+
+
+def test_staff_with_no_guest_gallery_still_resolves_staff(client):
+    """A staff member's first-ever crossing must not mint them as a guest.
+
+    best_cosine returns None on an absent gallery — absent is not zero — and
+    None must lose to any real staff score.
+    """
+    face = person_centroid()
+    client.post("/staff/enrol", json={
+        "siteId": "site-first", "staffId": "anon-first",
+        "samples": [{"embedding": sighting(face), "quality": 90.0}],
+    })
+    hit = client.post("/match", json={"runId": "r-fresh-gallery", "embedding": sighting(face),
+                                      "quality": 90.0, "siteId": "site-first"}).json()
+    assert hit["isStaff"] is True

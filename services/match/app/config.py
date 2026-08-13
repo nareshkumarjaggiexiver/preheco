@@ -248,6 +248,20 @@ def nearmiss_clothes() -> float:
     return _env_f("HECO_MATCH_NEARMISS_CLOTHES", DEFAULT_NEARMISS_CLOTHES)
 
 
+def review_floor() -> float:
+    """Floor of the duplicate-REVIEW band (env HECO_REVIEW_FLOOR).
+
+    Its own knob, no longer borrowed from :func:`nearmiss_weak_floor`.
+    Borrowing meant the documented weak-band off switch
+    (``HECO_MATCH_NEARMISS_WEAK_FLOOR=0``) silently turned the review floor to
+    0 as well and flooded the queue with every pair in the gallery — the two
+    knobs answer different questions and must not share a value. Run 27ca33
+    measured what the band carries at 0.15: 34 of the top-50 review pairs sat
+    below face 0.30, which is noise wearing a rank.
+    """
+    return _env_f("HECO_REVIEW_FLOOR", 0.15)
+
+
 def appearance_clash() -> float:
     """Torso-intersection floor for the enrolment veto (below = clash).
 
