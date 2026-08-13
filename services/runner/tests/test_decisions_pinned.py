@@ -42,7 +42,6 @@ import time
 import pytest
 from app.loop import enrol_score
 
-
 # --------------------------------------------------------------- the folds
 
 
@@ -131,7 +130,7 @@ def test_a_refused_merge_consumes_the_entry_and_leaves_the_count_alone():
     """`merged: false` is an answer, so it is not retried — and not counted."""
     led = Ledger(cap=4, window_s=20.0)
     led.record(7, "p00002", now=100.0)
-    entry = led.minted[7].pop()
+    led.minted[7].pop()          # the loop pops before attempting the merge
     unique = 5
     reply = {"merged": False}
     if reply.get("merged"):
@@ -362,3 +361,83 @@ def test_every_pinned_window_uses_the_frames_clock_not_the_wall_clock():
     )
     started = time.monotonic()
     assert started > 0  # sanity: the wall clock still exists, it is just not this
+
+
+# ------------------------------------------------------------- the match port
+
+
+class Recorder:
+    """A RunLoop stand-in that records what MatchClient would put on the wire."""
+
+    class S:
+        match_url = "http://match:7106"
+
+    def __init__(self, raises=None):
+        self.s = self.S()
+        self.sent = []
+        self._raises = raises
+
+    def _post(self, url, body):
+        self.sent.append((url, body))
+        if self._raises:
+            raise self._raises
+        return {"ok": True}
+
+
+def test_the_port_binds_the_run_id_and_no_method_can_change_it():
+    """A gallery is per-run, and a call site that CAN pass a runId can pass the
+    wrong one — which merges two events' guests into one number, permanently.
+
+    Binding at construction makes that mistake unavailable rather than merely
+    discouraged, so this asserts the signatures as much as the behaviour.
+    """
+    import inspect
+
+    from app.loop import MatchClient
+
+    rec = Recorder()
+    port = MatchClient(rec, "prun-42")
+    port.match(embedding=[0.1], quality=0.9)
+    port.merge(doomed="p2", keeper="p1")
+    port.split(a="p1", b="p2")
+    port.forget_template(template_id=13)
+
+    assert [b["runId"] for _, b in rec.sent] == ["prun-42"] * 4
+    for name in ("match", "merge", "split", "forget_template"):
+        params = inspect.signature(getattr(MatchClient, name)).parameters
+        assert "run_id" not in params and "runId" not in params, (
+            f"{name} exposes a run id — a caller could address another gallery"
+        )
+
+
+def test_the_port_translates_a_stage_error_into_MatchRefused_keeping_the_status():
+    """The 4xx/5xx distinction is a DECISION INPUT, so it must survive the seam.
+
+    If the status were lost here, a settled refusal and a transient failure
+    would look identical to the caller — and the caller's two responses to
+    them are opposite: stop asking forever, or leave state alone and retry.
+    """
+    from app.loop import MatchClient, StageError
+    from heco_counting.ports import MatchRefused
+
+    for status, settled in ((422, True), (503, False)):
+        port = MatchClient(Recorder(raises=StageError("no", status)), "prun-1")
+        with pytest.raises(MatchRefused) as e:
+            port.split(a="p1", b="p2")
+        assert e.value.status_code == status
+        assert e.value.settled is settled
+
+
+def test_the_merge_body_keeps_only_if_singleton():
+    """The guard that makes a heal refuse rather than erase a real guest.
+
+    Dropping it would let a fold merge away an identity that has since gained
+    a second template — i.e. one the gallery has more evidence for, not less.
+    """
+    rec = Recorder()
+    from app.loop import MatchClient
+
+    MatchClient(rec, "prun-1").merge(doomed="p2", keeper="p1")
+    _, body = rec.sent[0]
+    assert body["onlyIfSingleton"] is True
+    assert (body["keep"], body["drop"]) == ("p1", "p2"), "keeper keeps, doomed drops"
