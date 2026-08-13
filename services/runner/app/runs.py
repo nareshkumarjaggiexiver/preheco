@@ -31,6 +31,7 @@ from .loop import (
     build_token_provider,
     httpx_file_transport,
     httpx_transport,
+    probe_models,
 )
 
 #: States in which a run is still using its downstream resources (the camera
@@ -59,6 +60,18 @@ class RunManager:
         # put a clock in the hot path for a housekeeping job's benefit.
         self._settled_at: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def probe_live_models(self) -> dict:
+        """The live model per stage, for the POST /runs profile gate.
+
+        A short-lived client with the runner's own credential: the probe must
+        see exactly what a run would see, including through an armed gate.
+        """
+        client = httpx.Client(timeout=5.0, **auth_for(self.settings, self.token_provider))
+        try:
+            return probe_models(client, self.settings)
+        finally:
+            client.close()
 
     def start(self, request: dict) -> str:
         """Spawn a RunLoop thread for a validated POST /runs body; returns runId.

@@ -38,3 +38,18 @@ def test_no_normalisation_raw_pixel_range():
 def test_rejects_non_3channel():
     with pytest.raises(ValueError):
         letterbox(np.zeros((4, 4), dtype=np.uint8), (8, 8))
+
+
+def test_rtdetr_blob_is_rgb_unit_range_chw():
+    """The RT-DETR contract differs from YOLOX in all three ways that silently
+    break accuracy if crossed: RGB not BGR, 0-1 not 0-255, stretch not
+    letterbox. Pin each."""
+    import numpy as np
+    from app.preprocess import rtdetr_blob
+
+    img = np.zeros((100, 200, 3), dtype=np.uint8)
+    img[:, :, 0] = 255  # pure blue in BGR
+    blob = rtdetr_blob(img, (640, 640))
+    assert blob.shape == (3, 640, 640), "stretched to the square, no letterbox"
+    assert blob.max() <= 1.0 and blob.min() >= 0.0, "unit range"
+    assert blob[2].mean() > 0.99 and blob[0].mean() < 0.01, "BGR became RGB"

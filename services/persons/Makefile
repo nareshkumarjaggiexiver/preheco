@@ -1,7 +1,7 @@
 # persons service — venv, model download, lint, test, run.
 PY ?= python3.12
 SERVICE := persons
-LOCK := ../../models.lock
+LOCK ?= ../../models.lock
 PORT ?= 7102
 
 .PHONY: venv models lint test run

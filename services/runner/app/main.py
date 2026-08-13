@@ -24,6 +24,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, model_validator
 
 from . import config
+from .loop import refuse_model_profile
 from .runs import RunManager
 
 
@@ -195,6 +196,14 @@ class QualityProfile(BaseModel):
     faceReverifyIntervalS: float | None = Field(default=None, ge=0)
 
 
+class ModelProfile(BaseModel):
+    """A named selection from this pipeline's declared model catalog."""
+
+    id: str | None = None
+    name: str | None = None
+    stages: dict[str, str]
+
+
 class RunRequest(BaseModel):
     """Body of POST /runs — what to run and where to report it.
 
@@ -207,6 +216,12 @@ class RunRequest(BaseModel):
 
     eventId: str
     placementId: str | None = None
+    #: The planner's named model selection (doc 15 §5). Honoured only when
+    #: this install's LIVE models are the ones it names — checked at POST
+    #: time against each service's /health, refused with a sentence naming
+    #: the mismatch (contract §2.2: a 400, never a silently different model
+    #: under a stamped profile name).
+    modelProfile: ModelProfile | None = None
     source: Source
     plannerUrl: str | None = None
     label: str | None = None
@@ -284,6 +299,12 @@ def health() -> dict:
 @app.post("/runs")
 def create_run(body: RunRequest) -> dict:
     """Start a run in a background thread; poll GET /runs/{id} for progress."""
+    if body.modelProfile is not None:
+        refusal = refuse_model_profile(
+            body.modelProfile.model_dump(), _manifest(), manager.probe_live_models()
+        )
+        if refusal:
+            raise HTTPException(status_code=400, detail=refusal)
     run_id = manager.start(body.model_dump(exclude_none=True))
     return {"runId": run_id, "state": "starting"}
 

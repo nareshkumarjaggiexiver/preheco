@@ -22,7 +22,7 @@ ALL_DIRS := common counting $(SERVICE_DIRS) $(EVAL_DIR)
 
 # `eval` is also a DIRECTORY, so without .PHONY make would call the target
 # up to date and do nothing.
-.PHONY: venv-all test-all lint models-all clean-venvs eval eval-compare help
+.PHONY: venv-all test-all lint models-all models-restricted clean-venvs eval eval-compare help
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -61,6 +61,14 @@ models-all: ## Download pinned model weights for services that need them
 
 verify-models: ## Fail if any pinned weight is missing, wrong, or a Docker placeholder
 	@./scripts/verify-models.sh
+
+models-restricted: ## Fetch the OPT-IN restricted tier (doc 15 §3) — never part of a default deploy
+	@for d in services/*; do \
+		if grep -q '^models:' $$d/Makefile 2>/dev/null; then \
+			echo "==> models-restricted: $$d"; \
+			$(MAKE) -C $$d models LOCK=../../models-restricted.lock || exit 1; \
+		fi; \
+	done
 
 up: verify-models ## Bring the stack up, but ONLY once every pinned weight checks out
 	@docker compose up -d

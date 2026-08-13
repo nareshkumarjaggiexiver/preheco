@@ -211,6 +211,72 @@ def httpx_file_transport(client: httpx.Client) -> FileTransport:
 #: Wire field -> Settings field for the per-run quality profile.  One table so
 #: the launcher's names and the runner's names are reconciled in exactly one
 #: place; a new floor is a line here and nowhere else.
+def probe_models(client, settings: Settings) -> dict:
+    """The live model per stage, asked of each service's own /health.
+
+    Shared by the run's config stamp and the POST /runs profile gate, so the
+    two can never disagree about what "this install runs" means.
+    """
+    stages = {
+        "persons": settings.persons_url,
+        "tracker": settings.tracker_url,
+        "faces": settings.faces_url,
+        "embed": settings.embed_url,
+    }
+    models: dict[str, str] = {}
+    for stage, url in stages.items():
+        try:
+            reply = client.get(f"{url}/health", timeout=5.0).json()
+            models[stage] = str(reply.get("model") or "unknown")
+        except Exception:  # noqa: BLE001 — best-effort by design, see _models_config
+            models[stage] = "unreachable"
+    models["reid"] = "none"
+    return models
+
+
+def refuse_model_profile(
+    profile: dict | None, manifest: dict | None, live: dict
+) -> str | None:
+    """The M-mode-1 gate (doc 15 §6): why this profile cannot run HERE, or None.
+
+    A profile is a promise about which models produce the number, and this
+    install can only keep it if the models it has LOADED are the ones the
+    profile names.  Contract §2.2: refuse a field you cannot honour — a 400,
+    not a silently different model under a stamped profile name.  Catalog ids
+    map to live model names through each entry's ``file`` (the id itself for
+    stages whose "model" is an algorithm name), so the comparison is between
+    the profile's meaning and the /health truth, never between two labels.
+    """
+    if not profile:
+        return None
+    catalog = (manifest or {}).get("models") or {}
+    if not catalog:
+        return (
+            "this install declares no model catalog — a modelProfile cannot be "
+            "honoured here; start without one, or deploy a manifest that declares models"
+        )
+    for stage, wanted_id in (profile.get("stages") or {}).items():
+        entries = catalog.get(stage)
+        if not entries:
+            return f"this install's catalog has no `{stage}` stage — the profile cannot be honoured"
+        entry = next((e for e in entries if e.get("id") == wanted_id), None)
+        if entry is None:
+            offered = ", ".join(e.get("id", "?") for e in entries)
+            return (
+                f"`{wanted_id}` is not in this install's `{stage}` catalog "
+                f"(offered: {offered}) — the profile cannot be honoured here"
+            )
+        expected = entry.get("file") or entry.get("id")
+        running = live.get(stage)
+        if running != expected:
+            return (
+                f"this install runs `{running}` for {stage}; the profile wants "
+                f"`{wanted_id}` (`{expected}`) — restart the stack with the profile's "
+                "models applied, or pick the profile that matches this install"
+            )
+    return None
+
+
 def _apply_quality_profile(settings: Settings, profile: dict | None) -> Settings:
     """Delegates to :func:`heco_counting.config.fold_quality_profile`.
 
@@ -904,6 +970,14 @@ class RunLoop:
                     "siteId": req.get("siteId"),
                     **self._gate_config(),
                     "models": self._models_config(),
+                    # The profile is the PROMISE, the models map the TRUTH —
+                    # both stamped, because the gate that keeps them equal
+                    # (refuse_model_profile) runs at POST time and the record
+                    # must let an auditor re-check it later.
+                    **(
+                        {"modelProfile": req["modelProfile"]}
+                        if req.get("modelProfile") else {}
+                    ),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
                 },
             )
@@ -1141,21 +1215,7 @@ class RunLoop:
         loaded, which is a statement, not an omission
         (docs/planning/15-model-configurations.md).
         """
-        stages = {
-            "persons": self.s.persons_url,
-            "tracker": self.s.tracker_url,
-            "faces": self.s.faces_url,
-            "embed": self.s.embed_url,
-        }
-        models: dict[str, str] = {}
-        for stage, url in stages.items():
-            try:
-                reply = self.client.get(f"{url}/health", timeout=5.0).json()
-                models[stage] = str(reply.get("model") or "unknown")
-            except Exception:
-                models[stage] = "unreachable"
-        models["reid"] = "none"
-        return models
+        return probe_models(self.client, self.s)
 
     def _release_run_state(self) -> None:
         """Give back every piece of per-run state this run created downstream.

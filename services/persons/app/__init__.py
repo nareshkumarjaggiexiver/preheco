@@ -5,4 +5,4 @@ frames returning person boxes, plus GET /health. Model weights are downloaded
 by `make models` (see repo-root models.lock); nothing model-shaped is committed.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # 0.2.0: model families (yolox/rtdetr), device selection, /health device truth

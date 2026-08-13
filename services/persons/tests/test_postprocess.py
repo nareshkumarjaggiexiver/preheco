@@ -96,3 +96,39 @@ def test_select_persons_clamps_to_image():
 def test_select_persons_none_above_threshold():
     decoded = _pred_row(10, 10, 5, 5, 0.1, 0, 0.1)[None, :]
     assert select_persons(decoded, 1.0, 0.3, 0.45, 100, 100) == []
+
+
+# ------------------------------------------------------------------ rtdetr
+
+def test_rtdetr_selects_persons_clamps_and_sorts():
+    """The DETR path: filter class 0, clamp to the frame, best first, no NMS.
+
+    Boxes arrive ALREADY in source pixels (the graph consumes the original
+    size), so unlike the YOLOX path there is no ratio to undo — a wrongly
+    applied ratio here would shrink every box by the resize factor, which is
+    the kind of bug only a pinned expectation catches.
+    """
+    import numpy as np
+    from app.postprocess import select_persons_rtdetr
+
+    labels = np.array([[0, 56, 0, 0]])          # person, chair, person, person
+    boxes = np.array([[
+        [10.0, 20.0, 110.0, 220.0],
+        [0.0, 0.0, 50.0, 50.0],                  # chair — dropped by class
+        [-5.0, 10.0, 60.0, 700.0],               # clamps to frame
+        [30.0, 30.0, 90.0, 200.0],               # lower score — sorts second
+    ]])
+    scores = np.array([[0.9, 0.99, 0.8, 0.85]])
+    out = select_persons_rtdetr(labels, boxes, scores, 0.5, 640, 480)
+    assert [b["conf"] for b in out] == [0.9, 0.85, 0.8], "best first, chair gone"
+    assert out[2]["x"] == 0.0 and out[2]["h"] == 470.0, "clamped into the frame"
+
+
+def test_rtdetr_below_threshold_is_empty_not_an_error():
+    import numpy as np
+    from app.postprocess import select_persons_rtdetr
+
+    out = select_persons_rtdetr(
+        np.array([[0]]), np.array([[[1.0, 1.0, 2.0, 2.0]]]), np.array([[0.1]]),
+        0.5, 100, 100)
+    assert out == []

@@ -31,3 +31,21 @@ def letterbox(img: np.ndarray, input_size: tuple[int, int]) -> tuple[np.ndarray,
     padded[:rh, :rw] = resized
     blob = padded.transpose(2, 0, 1).astype(np.float32)
     return np.ascontiguousarray(blob), ratio
+
+
+def rtdetr_blob(img: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
+    """RT-DETR preprocessing: plain resize, RGB, 0-1 floats, CHW.
+
+    The lyuwenyu RT-DETRv2 ONNX export contract, deliberately different from
+    YOLOX's: no letterbox (the model was trained on stretched resizes and
+    takes the ORIGINAL size as a second input, so geometry is restored inside
+    the graph, not by a ratio here), RGB channel order, and normalised 0-1
+    floats rather than raw 0-255.
+    """
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError("rtdetr_blob expects an HWC 3-channel image")
+    h, w = input_size
+    resized = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    blob = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
+    return np.ascontiguousarray(blob)

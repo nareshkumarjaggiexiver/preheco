@@ -4,15 +4,33 @@
   "version": "1.0.0",
   "description": "The house pipeline: seven CPU-only services (ingest, persons, tracker, faces, embed, match) conducted by a runner, with per-run galleries, staff enrolment and operator corrections.",
   "capabilities": {
-    "sources": ["rtsp", "file"],
-    "modes": ["count", "enrol"],
-    "identityScope": { "guests": "run", "staff": "venue" },
+    "sources": [
+      "rtsp",
+      "file"
+    ],
+    "modes": [
+      "count",
+      "enrol"
+    ],
+    "identityScope": {
+      "guests": "run",
+      "staff": "venue"
+    },
     "exclusionZones": true,
     "forensicFrames": true,
     "staffEnrolment": true,
     "qualityProfiles": true,
-    "liveTaps": ["ingest", "persons", "tracker", "faces", "embed", "match"],
-    "consentLanes": ["identified"]
+    "liveTaps": [
+      "ingest",
+      "persons",
+      "tracker",
+      "faces",
+      "embed",
+      "match"
+    ],
+    "consentLanes": [
+      "identified"
+    ]
   },
   "models": {
     "persons": [
@@ -20,11 +38,70 @@
         "id": "yolox-nano",
         "family": "yolox",
         "default": true,
-        "provides": ["boxes"],
-        "device": ["cpu", "igpu", "cuda"],
-        "grant": { "spdx": "Apache-2.0", "commercial": "granted" },
-        "provenance": { "status": "caveat", "note": "COCO-trained; docs/planning/07-licensing.md Stage-2 caveat applies" },
-        "calibration": null
+        "provides": [
+          "boxes"
+        ],
+        "device": [
+          "cpu",
+          "igpu",
+          "cuda"
+        ],
+        "grant": {
+          "spdx": "Apache-2.0",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "caveat",
+          "note": "COCO-trained; docs/planning/07-licensing.md Stage-2 caveat applies"
+        },
+        "calibration": null,
+        "file": "yolox_nano.onnx"
+      },
+      {
+        "id": "yolox-s",
+        "family": "yolox",
+        "default": false,
+        "provides": [
+          "boxes"
+        ],
+        "device": [
+          "cpu",
+          "igpu",
+          "cuda"
+        ],
+        "grant": {
+          "spdx": "Apache-2.0",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "caveat",
+          "note": "COCO-trained; 07's Stage-2 caveat applies"
+        },
+        "calibration": null,
+        "note": "The stronger arm: 640-squared input, ~5x nano's compute — measured 147 ms/frame on a laptop CPU, which is why its home is the CUDA box. Same family, same decode path; a models.lock row away on any box.",
+        "file": "yolox_s.onnx"
+      },
+      {
+        "id": "rtdetrv2-s",
+        "family": "rtdetr",
+        "default": false,
+        "provides": [
+          "boxes"
+        ],
+        "device": [
+          "cuda"
+        ],
+        "grant": {
+          "spdx": "Apache-2.0",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "caveat",
+          "note": "COCO-trained (lyuwenyu/RT-DETR)"
+        },
+        "calibration": null,
+        "note": "Declared ahead of its weights, deliberately: the service speaks the rtdetr family contract (two-input export, no NMS) and models-restricted.lock documents why no pin exists yet (no official ONNX asset — needs a reproducible local export). An install that has not fetched it simply refuses profiles naming it, which is the M-mode-1 truth.",
+        "file": "rtdetrv2_s.onnx"
       }
     ],
     "tracker": [
@@ -32,9 +109,17 @@
         "id": "sort-lite-iou-velocity",
         "family": "inhouse",
         "default": true,
-        "provides": ["trackIds"],
-        "grant": { "spdx": "proprietary-heco", "commercial": "granted" },
-        "provenance": { "status": "clean", "note": "no trained weights — motion-only association" },
+        "provides": [
+          "trackIds"
+        ],
+        "grant": {
+          "spdx": "proprietary-heco",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "clean",
+          "note": "no trained weights — motion-only association"
+        },
         "calibration": null
       }
     ],
@@ -43,11 +128,23 @@
         "id": "yunet-2023mar",
         "family": "yunet",
         "default": true,
-        "provides": ["boxes", "landmarks5"],
-        "device": ["cpu"],
-        "grant": { "spdx": "MIT", "commercial": "granted" },
-        "provenance": { "status": "gray", "note": "docs/planning/07-licensing.md: ship with disclosure" },
-        "calibration": null
+        "provides": [
+          "boxes",
+          "landmarks5"
+        ],
+        "device": [
+          "cpu"
+        ],
+        "grant": {
+          "spdx": "MIT",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "gray",
+          "note": "docs/planning/07-licensing.md: ship with disclosure"
+        },
+        "calibration": null,
+        "file": "face_detection_yunet_2023mar.onnx"
       }
     ],
     "embed": [
@@ -55,20 +152,43 @@
         "id": "sface-2021dec",
         "family": "sface",
         "default": true,
-        "requires": ["landmarks5"],
-        "provides": ["embedding:sface-128"],
-        "device": ["cpu"],
-        "grant": { "spdx": "Apache-2.0", "commercial": "granted" },
-        "provenance": { "status": "gray", "note": "docs/planning/07-licensing.md: ship with disclosure" },
-        "calibration": { "status": "calibrated", "packId": "sface-128/poc-defaults", "note": "the paper's 1:1 operating point plus bench-measured bands; venue calibration is the M3 gap" }
+        "requires": [
+          "landmarks5"
+        ],
+        "provides": [
+          "embedding:sface-128"
+        ],
+        "device": [
+          "cpu"
+        ],
+        "grant": {
+          "spdx": "Apache-2.0",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "gray",
+          "note": "docs/planning/07-licensing.md: ship with disclosure"
+        },
+        "calibration": {
+          "status": "calibrated",
+          "packId": "sface-128/poc-defaults",
+          "note": "the paper's 1:1 operating point plus bench-measured bands; venue calibration is the M3 gap"
+        },
+        "file": "face_recognition_sface_2021dec.onnx"
       }
     ],
     "reid": [
       {
         "id": "none",
         "default": true,
-        "grant": { "spdx": "n/a", "commercial": "granted" },
-        "provenance": { "status": "clean", "note": "no implementation loaded — long-term identity is the gallery's job (docs/planning/02, core design principle)" },
+        "grant": {
+          "spdx": "n/a",
+          "commercial": "granted"
+        },
+        "provenance": {
+          "status": "clean",
+          "note": "no implementation loaded — long-term identity is the gallery's job (docs/planning/02, core design principle)"
+        },
         "calibration": null
       }
     ]
