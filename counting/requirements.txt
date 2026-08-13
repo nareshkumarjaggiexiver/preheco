@@ -1,5 +1,6 @@
 # Dev/test environment for the counting library itself.
 # Runtime deps are declared in pyproject.toml and pulled in by the -e install.
+-e ../common
 -e .
 pytest>=8.0
 ruff>=0.5

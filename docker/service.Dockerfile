@@ -49,7 +49,9 @@ COPY services/${SERVICE}/app ./app
 # time, where it costs a failed build instead of a failed event.
 RUN python -c "import importlib, sys; \
     mods = ['heco_common']; \
-    mods += ['heco_counting', 'heco_counting.gate', 'heco_counting.appearance'] \
+    mods += ['heco_counting', 'heco_counting.gate', 'heco_counting.appearance', \
+             'heco_counting.association', 'heco_counting.config', \
+             'heco_counting.zones', 'heco_counting.ports'] \
             if '${SERVICE}' == 'runner' else []; \
     [importlib.import_module(m) for m in mods]; \
     print('imports ok:', ', '.join(mods))"

@@ -7,15 +7,21 @@ name = "heco-counting"
 version = "0.1.0"
 description = "The counting decisions: quality gate, zones, association, folds, co-presence and the identity ledger. No transport, no framework, no camera."
 requires-python = ">=3.12"
-# DELIBERATELY THIN. The counting logic reads pixels for one thing only (the
-# torso descriptor) and does arithmetic for everything else. No httpx, no
-# fastapi, no pydantic — a test in counting/tests/test_boundaries.py asserts
-# that importing this package pulls none of them in, because the moment it
-# does, a worker or a fusion process inherits the runner's whole world just to
-# ask whether two faces are two people.
+# DELIBERATELY THIN, and the test in tests/test_boundaries.py says exactly how
+# thin: importing this package must not pull in an HTTP client or a web
+# framework. The moment it does, a worker or a fusion process inherits the
+# runner's whole world just to ask whether two faces are two people.
+#
+# heco-common is here for one module — heco_common.geometry, pure stdlib box
+# and polygon maths that faces/ and the runner already share. Duplicating it
+# would let the exclusion-zone polygon test drift away from the one that draws
+# the polygons, which is a worse trade than the dependency. Note the direction:
+# counting depends on common, never the reverse, so counting stays off the
+# MATCH service's import path and the count keeps one writer.
 dependencies = [
     "numpy>=1.26",
     "opencv-python-headless>=4.9",
+    "heco-common",
 ]
 
 [tool.setuptools.packages.find]
