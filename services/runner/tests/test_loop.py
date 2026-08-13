@@ -111,6 +111,13 @@ class FakePipeline:
                     },
                 )
 
+        if path == "/health":
+            # Every stage service answers /health with its model identity —
+            # the loop stamps these into the run's permanent config.
+            return httpx.Response(
+                200, json={"ok": True, "model": f"fake-{host}", "version": "0"}
+            )
+
         if host == "persons" and path == "/detect":
             i = self.frame_i - 1  # frame currently in flight
             boxes = [
@@ -227,10 +234,19 @@ def test_orchestration_order():
     final = loop.run()
     assert final["state"] == "ended"
 
-    non_planner = [c for c in fake.calls if not c.startswith("planner")]
+    # /health probes are stateless liveness reads, not orchestration: the
+    # loop asks every stage for its model identity BEFORE the run row is
+    # created, because the models in force are part of the birth record.
+    # They are excluded from the order pin, which is about per-run STATE.
+    health = [i for i, c in enumerate(fake.calls) if c.endswith("/health")]
+    created = fake.calls.index("planner /api/pipeline/runs")
+    assert health and max(health) < created, "models are stamped before the run exists"
+
+    calls = [c for c in fake.calls if not c.endswith("/health")]
+    non_planner = [c for c in calls if not c.startswith("planner")]
     # Setup: gallery + tracker reset, then source open — after the planner
     # run exists (its id keys all downstream per-run state).
-    assert fake.calls[0] == "planner /api/pipeline/runs"
+    assert calls[0] == "planner /api/pipeline/runs"
     assert non_planner[0] == "match /reset"
     assert non_planner[1] == "tracker /reset"
     assert non_planner[2] == "ingest /open"
@@ -738,6 +754,42 @@ def test_an_armed_floor_never_rejects_a_face_it_could_not_measure():
     assert fake.embed_face_counts == [1, 1], "unmeasured is not rejected"
     assert final["gatedByIed"] == 0
     assert final["gatedUnmeasured"] == 2
+
+
+def test_the_models_in_force_are_recorded_on_the_run_row():
+    """The run row must say which models produced its number — asked of each
+    service's own /health at start, not read from env, because the record has
+    to state what RAN (the deploy lesson: a stack reporting healthy while its
+    model files were dead directories). reid is stamped 'none' explicitly —
+    the stage exists and nothing is loaded, which is a statement, not an
+    omission (docs/planning/15-model-configurations.md)."""
+    fake = FakePipeline(n_frames=1)
+    make_loop(fake).run()
+    assert fake.run_created["config"]["models"] == {
+        "persons": "fake-persons",
+        "tracker": "fake-tracker",
+        "faces": "fake-faces",
+        "embed": "fake-embed",
+        "reid": "none",
+    }
+
+
+def test_an_unreachable_stage_stamps_unreachable_not_a_crash():
+    """Stamping is best-effort: a dead service must not turn run CREATION into
+    the failure — the run will fail on its own terms at the first frame, and
+    the config will already be telling that story."""
+    fake = FakePipeline(n_frames=1)
+    original = fake.handler
+
+    def handler(request):
+        if request.url.host == "embed" and request.url.path == "/health":
+            raise httpx.ConnectError("refused")
+        return original(request)
+
+    fake.handler = handler
+    make_loop(fake).run()
+    assert fake.run_created["config"]["models"]["embed"] == "unreachable"
+    assert fake.run_created["config"]["models"]["persons"] == "fake-persons"
 
 
 def test_the_gate_in_force_is_recorded_on_the_run_row():

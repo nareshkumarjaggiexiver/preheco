@@ -6,7 +6,7 @@
   "capabilities": {
     "sources": ["rtsp", "file"],
     "modes": ["count", "enrol"],
-    "identityScope": "run",
+    "identityScope": { "guests": "run", "staff": "venue" },
     "exclusionZones": true,
     "forensicFrames": true,
     "staffEnrolment": true,
@@ -14,12 +14,73 @@
     "liveTaps": ["ingest", "persons", "tracker", "faces", "embed", "match"],
     "consentLanes": ["identified"]
   },
+  "models": {
+    "persons": [
+      {
+        "id": "yolox-nano",
+        "family": "yolox",
+        "default": true,
+        "provides": ["boxes"],
+        "device": ["cpu", "igpu", "cuda"],
+        "grant": { "spdx": "Apache-2.0", "commercial": "granted" },
+        "provenance": { "status": "caveat", "note": "COCO-trained; docs/planning/07-licensing.md Stage-2 caveat applies" },
+        "calibration": null
+      }
+    ],
+    "tracker": [
+      {
+        "id": "sort-lite-iou-velocity",
+        "family": "inhouse",
+        "default": true,
+        "provides": ["trackIds"],
+        "grant": { "spdx": "proprietary-heco", "commercial": "granted" },
+        "provenance": { "status": "clean", "note": "no trained weights — motion-only association" },
+        "calibration": null
+      }
+    ],
+    "faces": [
+      {
+        "id": "yunet-2023mar",
+        "family": "yunet",
+        "default": true,
+        "provides": ["boxes", "landmarks5"],
+        "device": ["cpu"],
+        "grant": { "spdx": "MIT", "commercial": "granted" },
+        "provenance": { "status": "gray", "note": "docs/planning/07-licensing.md: ship with disclosure" },
+        "calibration": null
+      }
+    ],
+    "embed": [
+      {
+        "id": "sface-2021dec",
+        "family": "sface",
+        "default": true,
+        "requires": ["landmarks5"],
+        "provides": ["embedding:sface-128"],
+        "device": ["cpu"],
+        "grant": { "spdx": "Apache-2.0", "commercial": "granted" },
+        "provenance": { "status": "gray", "note": "docs/planning/07-licensing.md: ship with disclosure" },
+        "calibration": { "status": "calibrated", "packId": "sface-128/poc-defaults", "note": "the paper's 1:1 operating point plus bench-measured bands; venue calibration is the M3 gap" }
+      }
+    ],
+    "reid": [
+      {
+        "id": "none",
+        "default": true,
+        "grant": { "spdx": "n/a", "commercial": "granted" },
+        "provenance": { "status": "clean", "note": "no implementation loaded — long-term identity is the gallery's job (docs/planning/02, core design principle)" },
+        "calibration": null
+      }
+    ]
+  },
   "metering": {
     "unit": "camera-minute",
     "weight": 1.0
   },
   "notes": [
     "The reference pipeline, so its weight is 1.0 by definition and every other rate is read against it.",
-    "identityScope is `run`: a fresh gallery-<runId>.db per run, swept at HECO_GALLERY_RETENTION_S. Only the consented staff store persists."
+    "identityScope is split per docs/planning/15-model-configurations.md §12.4: guests are `run`-scoped (a fresh gallery-<runId>.db per run, swept at HECO_GALLERY_RETENTION_S — a returning guest at next month's event is a new billable guest) and staff are `venue`-scoped (the consented staff-<siteId>.db persists, with the tombstone erasure flow attached).",
+    "The `models` block is the open catalog's declaration (docs/planning/15-model-configurations.md §3): what this install can run per stage, with grant and provenance carried as separate fields because the grant is purchasable and the provenance is not. Today it declares exactly the models that have always run; restricted entries arrive with M2.",
+    "The run's config stamps which models actually RAN (asked of each service's /health at start) — the catalog declares what is offerable, the stamp records what happened."
   ]
 }
