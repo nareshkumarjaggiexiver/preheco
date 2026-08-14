@@ -55,3 +55,18 @@ def test_providers_always_end_in_cpu_and_cuda_maps_cleanly():
     assert ov == ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
     assert opts[0] == {"device_type": "GPU"}
     assert providers_for(None)[0] == ["CPUExecutionProvider"], "unset means CPU"
+
+
+def test_persons_model_env_speaks_filenames_like_everything_else():
+    """The lock, the specs and the catalog all say `yolox_s.onnx`; the env
+    must map that same word to the models dir — a bare name resolved against
+    the working directory booted a container that could not find weights it
+    was mounted with (bitten live on the .94 CUDA arm)."""
+    from pathlib import Path
+
+    from app.model import DEFAULT_MODEL, _model_path
+
+    assert _model_path(None) == DEFAULT_MODEL
+    assert _model_path("") == DEFAULT_MODEL
+    assert _model_path("yolox_s.onnx") == DEFAULT_MODEL.parent / "yolox_s.onnx"
+    assert _model_path("/tmp/exp/custom.onnx") == Path("/tmp/exp/custom.onnx")
