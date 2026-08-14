@@ -25,14 +25,18 @@ FROM ${BASE}
 
 USER root
 
+# cu13, not cu12: onnxruntime-gpu 1.28 links libcublasLt.so.13 and cuDNN 9
+# for CUDA 13 — the cu12 wheels install cleanly and then the EP fails to
+# dlopen at session creation, which the /health device truth catches as
+# requested=CUDA active=[CPU] (bitten live on the .94 first build).
 RUN pip uninstall -y onnxruntime \
     && pip install --no-cache-dir \
         onnxruntime-gpu \
-        nvidia-cuda-runtime-cu12 \
-        nvidia-cublas-cu12 \
-        nvidia-cudnn-cu12 \
-        nvidia-cufft-cu12 \
-        nvidia-curand-cu12
+        nvidia-cuda-runtime-cu13 \
+        nvidia-cublas-cu13 \
+        nvidia-cudnn-cu13 \
+        nvidia-cufft-cu13 \
+        nvidia-curand-cu13
 
 # ORT dlopens the CUDA userspace at session creation; the pip wheels land
 # under site-packages/nvidia/*/lib and are not on the default search path.
