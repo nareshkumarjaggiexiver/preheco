@@ -25,19 +25,24 @@ FROM ${BASE}
 
 USER root
 
-# cu13, not cu12: onnxruntime-gpu 1.28 links libcublasLt.so.13 and cuDNN 9
-# for CUDA 13 — the cu12 wheels install cleanly and then the EP fails to
-# dlopen at session creation, which the /health device truth catches as
-# requested=CUDA active=[CPU] (bitten live on the .94 first build).
+# CUDA 13 userspace, not cu12: onnxruntime-gpu 1.28 links
+# libcublasLt.so.13 and cuDNN 9-for-13 — the cu12 wheels install cleanly
+# and then the EP fails to dlopen at session creation, which the /health
+# device truth catches as requested=CUDA active=[CPU] (bitten live on the
+# .94 first build). NAMING, verified empirically on that box: the CUDA-13
+# generation DROPPED the -cu13 suffix for the toolkit wheels (nvidia-cublas,
+# nvidia-cuda-runtime, nvidia-cufft, nvidia-curand — they land under
+# site-packages/nvidia/cu13/lib) while cuDNN keeps it (nvidia-cudnn-cu13,
+# under nvidia/cudnn/lib).
 RUN pip uninstall -y onnxruntime \
     && pip install --no-cache-dir \
         onnxruntime-gpu \
-        nvidia-cuda-runtime-cu13 \
-        nvidia-cublas-cu13 \
+        nvidia-cuda-runtime \
+        nvidia-cublas \
         nvidia-cudnn-cu13 \
-        nvidia-cufft-cu13 \
-        nvidia-curand-cu13
+        nvidia-cufft \
+        nvidia-curand
 
 # ORT dlopens the CUDA userspace at session creation; the pip wheels land
 # under site-packages/nvidia/*/lib and are not on the default search path.
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/site-packages/nvidia/cufft/lib:/usr/local/lib/python3.12/site-packages/nvidia/curand/lib
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
