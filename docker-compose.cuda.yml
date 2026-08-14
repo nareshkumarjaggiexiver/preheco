@@ -1,0 +1,22 @@
+# CUDA overlay — the accelerator arm for a box with the nvidia container
+# runtime (the .94 RTX 4060 is the first). Repo-owned, unlike the iGPU
+# overlay it is modelled on, so the arm survives its box.
+#
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-persons \
+#     -t heco-persons:cuda .
+#   HECO_DEVICE=CUDA PERSONS_MODEL=yolox_s.onnx \
+#     docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d
+#
+# Only `persons` is overlaid: the measured verdicts are per-stage — CUDA
+# pays on person detection; YuNet and SFace ride OpenCV, which the iGPU
+# bench already showed ignores acceleration targets. The base compose
+# already passes HECO_DEVICE/PERSONS_MODEL through; unset they render
+# empty, and the services read empty as unset — so this overlay with no
+# env exported is exactly the CPU stack plus an idle GPU reservation.
+#
+# Rollback is total: `docker compose -f docker-compose.yml up -d` puts the
+# untouched CPU image back; nothing to un-patch.
+services:
+  persons:
+    image: heco-persons:cuda
+    gpus: all
