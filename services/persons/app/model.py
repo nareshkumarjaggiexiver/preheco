@@ -75,7 +75,20 @@ def providers_for(device: str) -> tuple[list[str], list[dict]]:
 # `or` rather than a default argument throughout: compose passthroughs render
 # an unset variable as the EMPTY STRING, and Path("")/int("") would turn an
 # unset knob into a boot failure. Review finding, 2026-08-14.
-MODEL_PATH = Path(os.environ.get("PERSONS_MODEL") or str(DEFAULT_MODEL))
+def _model_path(value: str | None) -> Path:
+    """PERSONS_MODEL as a path — or as a bare FILENAME under models/.
+
+    The lock, the specs table and the catalog all speak filenames
+    (yolox_s.onnx); making the env do the same means a profile's model id
+    maps to one obvious deploy line. A value containing a separator is
+    still taken as an explicit path for experiments outside models/.
+    """
+    if not value:
+        return DEFAULT_MODEL
+    return Path(value) if "/" in value else DEFAULT_MODEL.parent / value
+
+
+MODEL_PATH = _model_path(os.environ.get("PERSONS_MODEL"))
 _SPEC = spec_for(MODEL_PATH)
 # For models the SPECS table knows, the table is authoritative — a lingering
 # env var tuned for the previous model must not misconfigure the next one
