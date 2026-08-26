@@ -46,6 +46,14 @@ OPEN_PATHS = ("/health",)
 #: one, until its rotation) could switch models on an armed install. The
 #: table is consulted only when the gate is armed; unarmed boxes are open
 #: LAN exactly as before.
+#:
+#: HECO_SCOPE_ENFORCE=0 suspends the table on an armed box — a TEMPORARY,
+#: per-box bridge for exactly one situation: the box armed before its
+#: planner held an operate-scoped credential (scopes are immutable in
+#: hecoa, so the upgrade is a new application + a .env change, not a
+#: rotation). The default is ON because a security rule that ships
+#: disarmed is a policy that does not exist; the runbook's step is
+#: register-verify-delete-the-line, never "leave it".
 SCOPE_RULES: dict[tuple[str, str], str] = {
     ("POST", "/models/apply"): "planner:operate",
 }
@@ -93,6 +101,11 @@ class BearerGate:
 
     def _armed(self) -> bool:
         return self._environ.get("HECO_REQUIRE_AUTH", "").strip().lower() in TRUTHY
+
+    def _scopes_enforced(self) -> bool:
+        # Default ON: only the literal opt-out suspends the table (see the
+        # SCOPE_RULES comment for the one legitimate reason it exists).
+        return self._environ.get("HECO_SCOPE_ENFORCE", "1").strip().lower() in TRUTHY
 
     def _current_verifier(self) -> JwksVerifier | None:
         env = (
@@ -154,7 +167,11 @@ class BearerGate:
             await self._refuse(send, "the credential was refused")
             return
         required = SCOPE_RULES.get((scope.get("method", ""), scope.get("path", "")))
-        if required and required not in str(claims.get("scope", "")).split():
+        if (
+            required
+            and self._scopes_enforced()
+            and required not in str(claims.get("scope", "")).split()
+        ):
             await self._refuse_scope(send, required)
             return
         await self.app(scope, receive, send)
