@@ -26,7 +26,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, model_validator
 
 from . import config
-from .loop import refuse_model_profile
+from .loop import apply_models, refuse_model_profile
 from .runs import RunManager
 
 
@@ -367,6 +367,37 @@ def get_run(run_id: str) -> dict:
     if st is None:
         raise HTTPException(status_code=404, detail="unknown run")
     return st
+
+
+class ApplyModelsRequest(BaseModel):
+    """Body of POST /models/apply — filenames per hot-swappable stage."""
+
+    stages: dict[str, str] = Field(min_length=1)
+
+
+@app.post("/models/apply")
+def apply_models_route(body: ApplyModelsRequest) -> dict:
+    """The planner's no-DevOps switch: hot-swap persons/faces to other
+    INSTALLED weights, atomically per service, with rollback compensation
+    across them (see loop.apply_models). Refused while any count is live —
+    a swap under a running count would falsify that run's own stamp — and
+    refused entirely for the embedder, which is a deployment, not a click.
+    Auth rides the standard planner:operate gate.
+    """
+    live = manager.live_run_ids()
+    if live:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a live count keeps its models — stop {', '.join(live)} first",
+        )
+    client = manager.probe_client()
+    try:
+        result = apply_models(client, manager.settings, body.stages)
+    finally:
+        client.close()
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
 
 
 @app.post("/runs/{run_id}/stop")

@@ -272,6 +272,70 @@ def probe_devices(client, settings: Settings) -> dict:
     return out
 
 
+#: Stages the planner may hot-swap through /models/apply. embed is ABSENT
+#: by design: an embedder change renames the per-site staff store and
+#: invalidates every match threshold (doc 15 M3) — that is a deployment
+#: with HECO_EMBEDDER_ID and HECO_EMBEDDING_DIM travelling together, never
+#: a request. tracker holds no weights; reid holds nothing yet.
+SWAPPABLE_STAGES = ("persons", "faces")
+
+
+def apply_models(client, settings: Settings, stages: dict) -> dict:
+    """Orchestrate hot-swaps across services, with ROLLBACK compensation.
+
+    Validate-everything-first is impossible across processes (each service
+    validates its own graph), so the enterprise contract is compensation:
+    remember each stage's model BEFORE its swap, and if a later stage
+    refuses, swap the earlier ones back — the box ends the request either
+    fully on the new selection or fully on the old one, never half-way.
+    A rollback that itself fails is reported loudly with the truth of what
+    is now running; the caller (the planner) re-probes and shows it.
+    """
+    urls = {"persons": settings.persons_url, "faces": settings.faces_url}
+    unknown = [k for k in stages if k not in SWAPPABLE_STAGES]
+    if "embed" in stages:
+        return {"ok": False, "error": (
+            "the embedder is not hot-swappable, deliberately: changing it renames "
+            "the staff store and invalidates every threshold (doc 15 M3) — apply "
+            "an embedder change as a deployment, with HECO_EMBEDDER_ID and "
+            "HECO_EMBEDDING_DIM set together")}
+    if unknown:
+        return {"ok": False, "error": f"not hot-swappable: {', '.join(sorted(unknown))} "
+                f"(only {', '.join(SWAPPABLE_STAGES)})"}
+
+    before: dict[str, str] = {}
+    applied: list[str] = []
+    for stage in SWAPPABLE_STAGES:
+        if stage not in stages:
+            continue
+        url = urls[stage]
+        try:
+            reply = client.get(f"{url}/health", timeout=2.0).json()
+            before[stage] = str(reply.get("model") or "")
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": f"the {stage} service is unreachable — nothing was changed"}
+        r = client.post(f"{url}/model", content=json.dumps({"file": stages[stage]}),
+                        headers={"content-type": "application/json"}, timeout=30.0)
+        if r.status_code >= 400:
+            # COMPENSATE: put every already-swapped stage back.
+            rollback_failures = []
+            for done in applied:
+                rb = client.post(f"{urls[done]}/model",
+                                 content=json.dumps({"file": before[done]}),
+                                 headers={"content-type": "application/json"}, timeout=30.0)
+                if rb.status_code >= 400:
+                    rollback_failures.append(done)
+            detail = _detail(r)
+            if rollback_failures:
+                return {"ok": False, "error": (
+                    f"{stage} refused ({detail}) AND rolling back "
+                    f"{', '.join(rollback_failures)} failed — the box is in a mixed "
+                    "state; re-probe /health per service for the truth")}
+            return {"ok": False, "error": f"{stage} refused: {detail} — every other stage rolled back"}
+        applied.append(stage)
+    return {"ok": True, "applied": {s: stages[s] for s in applied}, "before": before}
+
+
 def refuse_model_profile(
     profile: dict | None, manifest: dict | None, live: dict
 ) -> str | None:

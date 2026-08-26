@@ -10,6 +10,7 @@ the 56 px floor should reach embedding (sub-canon ones flagged upstream).
 """
 
 import logging
+import threading
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .codec import b64_to_bgr
-from .recognizer import MODEL_PATH, FaceEmbedder
+from .recognizer import MODEL_PATH, FaceEmbedder, build_embedder
 
 log = logging.getLogger("embed")
 
@@ -30,17 +31,24 @@ install_bearer_gate(app)
 
 _embedder: FaceEmbedder | None = None
 _load_error: str | None = None
+_load_lock = threading.Lock()
 
 
 def _get_embedder() -> FaceEmbedder | None:
-    """Load SFace lazily so the app can boot (unhealthy) without weights."""
+    """Load the configured family lazily so the app can boot (unhealthy)
+    without weights. Any failure is caught, not just a missing file — the
+    persons review rule: a truncated weight raises InvalidProtobuf, and an
+    exception escaping /health is a 500 per probe."""
     global _embedder, _load_error
-    if _embedder is None and _load_error is None:
-        try:
-            _embedder = FaceEmbedder()
-        except FileNotFoundError as exc:
-            _load_error = str(exc)
-            log.error("model load failed: %s", exc)
+    if _embedder is not None:
+        return _embedder
+    with _load_lock:
+        if _embedder is None and _load_error is None:
+            try:
+                _embedder = build_embedder()
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                _load_error = f"{type(exc).__name__}: {exc}"
+                log.error("model load failed: %s", _load_error)
     return _embedder
 
 
@@ -67,6 +75,15 @@ def health() -> dict:
         "ok": emb is not None,
         "model": emb.model_name if emb else MODEL_PATH.name,
         "version": __version__,
+        # Family, device truth AND dimension: the runner cross-checks dim
+        # against the deployment's HECO_EMBEDDING_DIM story, and the family
+        # says which alignment produced these vectors.
+        "device": {
+            "requested": emb.device_requested,
+            "active": emb.providers_active,
+            "family": emb.family,
+            "dim": emb.dim,
+        } if emb else None,
     }
 
 

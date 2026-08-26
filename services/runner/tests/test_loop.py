@@ -1105,3 +1105,80 @@ def test_an_old_persons_build_stamps_no_devices_block_at_all():
     fake = FakePipeline(n_frames=1)  # the stock fake serves no device block
     make_loop(fake).run()
     assert "devices" not in fake.run_created["config"]
+
+
+# ---------------------------------------------- hot-swap orchestration
+
+def _apply_client(handler):
+    transport = httpx.MockTransport(handler)
+    return httpx.Client(transport=transport)
+
+
+def _apply_settings():
+    return Settings(
+        ingest_url="http://ingest:7101", persons_url="http://persons:7102",
+        tracker_url="http://tracker:7103", faces_url="http://faces:7104",
+        embed_url="http://embed:7105", match_url="http://match:7106",
+        planner_url="http://planner:8787",
+    )
+
+
+def test_apply_models_swaps_and_reports_before_state():
+    from app.loop import apply_models
+
+    swapped = {}
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"ok": True, "model": f"old-{host}.onnx"})
+        if path == "/model":
+            swapped[host] = json.loads(request.content)["file"]
+            return httpx.Response(200, json={"ok": True, "model": swapped[host]})
+        raise AssertionError(f"unexpected {host}{path}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "scrfd_2.5g_kps.onnx"})
+    assert out["ok"] is True
+    assert swapped == {"persons": "yolox_s.onnx", "faces": "scrfd_2.5g_kps.onnx"}
+    assert out["before"] == {"persons": "old-persons.onnx", "faces": "old-faces.onnx"}
+
+
+def test_apply_models_refuses_embed_with_the_deployment_sentence():
+    from app.loop import apply_models
+
+    out = apply_models(_apply_client(lambda r: httpx.Response(500)), _apply_settings(),
+                       {"embed": "arcface.onnx"})
+    assert out["ok"] is False
+    assert "staff store" in out["error"] and "deployment" in out["error"]
+
+
+def test_a_refused_second_stage_rolls_the_first_back():
+    """The compensation contract: the box ends fully-new or fully-old,
+    never half-way — a persons swap that succeeded is swapped BACK when the
+    faces swap refuses."""
+    from app.loop import apply_models
+
+    posts = []
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"ok": True, "model": f"old-{host}.onnx"})
+        if path == "/model":
+            body = json.loads(request.content)
+            posts.append((host, body["file"]))
+            if host == "faces":
+                return httpx.Response(400, json={"detail": "9-tensor export required"})
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected {host}{path}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "broken.onnx"})
+    assert out["ok"] is False
+    assert "rolled back" in out["error"]
+    assert posts == [
+        ("persons", "yolox_s.onnx"),   # applied
+        ("faces", "broken.onnx"),      # refused
+        ("persons", "old-persons.onnx"),  # compensated
+    ]

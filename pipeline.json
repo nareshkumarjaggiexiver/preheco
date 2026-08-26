@@ -145,6 +145,31 @@
         },
         "calibration": null,
         "file": "face_detection_yunet_2023mar.onnx"
+      },
+      {
+        "id": "scrfd-2.5g",
+        "family": "scrfd",
+        "file": "scrfd_2.5g_kps.onnx",
+        "default": false,
+        "provides": [
+          "boxes",
+          "landmarks5"
+        ],
+        "device": [
+          "cpu",
+          "cuda",
+          "igpu"
+        ],
+        "grant": {
+          "spdx": "InsightFace-NC",
+          "commercial": "contact"
+        },
+        "provenance": {
+          "status": "gray",
+          "note": "InsightFace lineage — non-commercial weights; grant purchasable, provenance disclosed (doc 07)"
+        },
+        "calibration": null,
+        "note": "The strong face-detector alternative; restricted tier. The adapter (9-tensor *_kps decode) ships ahead of weights, like rtdetr did at persons — models-restricted.lock documents the fetch when a vendor conversation starts."
       }
     ],
     "embed": [
@@ -175,6 +200,35 @@
           "note": "the paper's 1:1 operating point plus bench-measured bands; venue calibration is the M3 gap"
         },
         "file": "face_recognition_sface_2021dec.onnx"
+      },
+      {
+        "id": "arcface-w600k-r50",
+        "family": "arcface",
+        "file": "arcface_w600k_r50.onnx",
+        "default": false,
+        "requires": [
+          "landmarks5"
+        ],
+        "provides": [
+          "embedding:arcface-512"
+        ],
+        "device": [
+          "cpu",
+          "cuda"
+        ],
+        "grant": {
+          "spdx": "InsightFace-NC",
+          "commercial": "contact"
+        },
+        "provenance": {
+          "status": "disputed",
+          "note": "WebFace600K lineage — the permanent face-stage disclosure (doc 07: not curable by purchase)"
+        },
+        "calibration": {
+          "status": "uncalibrated",
+          "note": "evaluation-only until eval/sweep.py writes it a pack from our labels; per-embedder staff store + HECO_EMBEDDING_DIM=512 travel with any deployment of it"
+        },
+        "note": "The generic-embedder path proven by the arcface family (own alignment, dim read from the graph). NOT hot-swappable by design — an embedder change is a deployment (doc 15 M3)."
       }
     ],
     "reid": [
