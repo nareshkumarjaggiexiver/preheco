@@ -1073,3 +1073,35 @@ def test_prefetch_changes_the_schedule_and_none_of_the_decisions():
     )
     assert overlapped.match_qualities == serial.match_qualities
     assert final_overlapped["state"] == final_serial["state"] == "ended"
+
+
+def test_the_accelerator_tier_is_stamped_from_the_persons_device_truth():
+    """A profile's fps means nothing without the tier it ran on — and the
+    tier comes from the persons service's ACTIVE provider list, never from
+    intention (accelerator EPs fall back to CPU silently)."""
+    fake = FakePipeline(n_frames=1)
+    original = fake.handler
+
+    def handler(request):
+        if request.url.host == "persons" and request.url.path == "/health":
+            return httpx.Response(200, json={
+                "ok": True, "model": "yolox_s.onnx", "version": "0",
+                "device": {"requested": "CUDA",
+                           "active": ["CUDAExecutionProvider", "CPUExecutionProvider"]},
+            })
+        return original(request)
+
+    fake.handler = handler
+    make_loop(fake).run()
+    assert fake.run_created["config"]["devices"] == {
+        "persons": {"requested": "CUDA",
+                    "active": ["CUDAExecutionProvider", "CPUExecutionProvider"]},
+    }
+
+
+def test_an_old_persons_build_stamps_no_devices_block_at_all():
+    """Absent means pre-devices build; {} would read as 'measured, nothing
+    found', which is a different claim."""
+    fake = FakePipeline(n_frames=1)  # the stock fake serves no device block
+    make_loop(fake).run()
+    assert "devices" not in fake.run_created["config"]

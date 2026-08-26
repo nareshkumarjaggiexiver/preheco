@@ -16,6 +16,8 @@ staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
 import importlib
 import json
 import logging
+import os
+import platform
 from pathlib import Path
 from typing import Literal
 
@@ -299,7 +301,45 @@ def health() -> dict:
         "version": VERSION,
         "build": BUILD_ID,
         "pipeline": _manifest(),
+        # HOST FACTS for the box inventory (doc 15 addendum, 2026-08-14):
+        # a profile is chosen for hardware, so the hardware must be
+        # inspectable where the planner already looks. Best-effort and
+        # container-honest: cores reflect this container's cpuset (its real
+        # capacity), memory is the machine's, the CPU model is read from
+        # /proc. GPU truth lives at the persons service's /health `device`
+        # block — the planner joins the two.
+        "host": _host_facts(),
     }
+
+
+def _host_facts() -> dict:
+    """CPU model, usable cores, memory and platform — cheap, cached, honest."""
+    global _HOST_FACTS
+    if _HOST_FACTS is None:
+        facts: dict = {"platform": platform.platform()}
+        try:
+            facts["cores"] = len(os.sched_getaffinity(0))
+        except AttributeError:  # not Linux
+            facts["cores"] = os.cpu_count()
+        try:
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    facts["cpu"] = line.split(":", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal"):
+                    facts["memGB"] = round(int(line.split()[1]) / 1024 / 1024, 1)
+                    break
+        except OSError:
+            pass
+        _HOST_FACTS = facts
+    return _HOST_FACTS
+
+
+_HOST_FACTS: dict | None = None
 
 
 @app.post("/runs")

@@ -249,6 +249,29 @@ def probe_models(client, settings: Settings) -> dict:
     return models
 
 
+def probe_devices(client, settings: Settings) -> dict:
+    """Per-stage accelerator truth, where a stage has one to tell.
+
+    Today only persons serves a ``device`` block (requested vs ACTIVE
+    providers — the honest pair, because accelerator EPs fall back to CPU
+    silently); the map grows as stages gain devices. Stamped into the run
+    config so the planner can say WHICH TIER a profile's numbers were
+    measured on (cpu / igpu / cuda) without trusting anybody's intention.
+    """
+    out: dict = {}
+    try:
+        reply = client.get(f"{settings.persons_url}/health", timeout=2.0).json()
+        device = reply.get("device")
+        if isinstance(device, dict):
+            out["persons"] = {
+                "requested": device.get("requested"),
+                "active": device.get("active"),
+            }
+    except Exception:  # noqa: BLE001 — facts are best-effort, the run is not
+        pass
+    return out
+
+
 def refuse_model_profile(
     profile: dict | None, manifest: dict | None, live: dict
 ) -> str | None:
@@ -1028,6 +1051,9 @@ class RunLoop:
                     "siteId": req.get("siteId"),
                     **self._gate_config(),
                     "models": (models_now := self._models_config()),
+                    # The accelerator tier the numbers were measured on —
+                    # absent means a pre-devices build, never "cpu".
+                    **({"devices": d} if (d := probe_devices(self.client, self.s)) else {}),
                     # The profile is the PROMISE, the models map the TRUTH —
                     # both stamped, because the gate that keeps them equal
                     # (refuse_model_profile) runs at POST time and the record
