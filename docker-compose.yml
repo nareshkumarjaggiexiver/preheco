@@ -83,6 +83,7 @@ services:
       # /health stays open for the healthcheck above. All unset = the LAN
       # door stays open, exactly as before this block existed.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -100,6 +101,7 @@ services:
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -144,6 +146,7 @@ services:
       HECO_TRACKER_MAX_AGE: ${HECO_TRACKER_MAX_AGE-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -159,6 +162,7 @@ services:
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -182,6 +186,7 @@ services:
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -224,6 +229,7 @@ services:
       HECO_MATCH_NEARMISS_CLOTHES: ${HECO_MATCH_NEARMISS_CLOTHES-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_URL: ${HECO_AUTH_URL-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
@@ -333,6 +339,7 @@ services:
       # runner's HECO_AUTH_URL above pulls double duty: minting its own
       # outbound tokens AND verifying its inbound callers.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
+      HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
       # Where the minted token is kept across restarts (see runner-state).
