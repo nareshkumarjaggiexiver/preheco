@@ -21,7 +21,7 @@ async def _downstream(scope, receive, send):
     await send({"type": "http.response.body", "body": b'{"ok": true}'})
 
 
-def call(gate, path="/detect", headers=None, scope_type="http"):
+def call(gate, path="/detect", headers=None, scope_type="http", method="GET"):
     """Drive the gate once; return (status, body, response_headers)."""
     sent = []
 
@@ -34,6 +34,7 @@ def call(gate, path="/detect", headers=None, scope_type="http"):
     scope = {
         "type": scope_type,
         "path": path,
+        "method": method,
         "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
     }
     asyncio.run(gate(scope, receive, send))
@@ -104,6 +105,54 @@ def test_a_worker_minted_token_is_accepted_via_the_pinned_jwks(kit):
     assert call(g, headers={"authorization": f"Bearer {good}"})[0] == 200
     expired = kit.mint(iss=ISS, exp_in=-3600)
     assert call(g, headers={"authorization": f"Bearer {expired}"})[0] == 401
+
+
+def test_a_report_token_cannot_reach_the_hot_swap(kit):
+    """The 2026-08 review's confused deputy: every box holds a
+    ``planner:report`` machine token, and without a scope check any of them
+    (a lost one included) could switch models on an armed install. The gate's
+    SCOPE_RULES table demands ``planner:operate`` on POST /models/apply —
+    403 with its own code, because the credential is real and the fix is a
+    registration, not a rotation."""
+    env = {
+        "HECO_REQUIRE_AUTH": "1",
+        "HECO_JWKS_JSON": json.dumps(kit.jwks),
+        "HECO_AUTH_ISSUER": ISS,
+    }
+    g = gate_with(env)
+    report = kit.mint(iss=ISS, extra_claims={"scope": "planner:report"})
+    auth = {"authorization": f"Bearer {report}"}
+
+    status, body, _ = call(g, path="/models/apply", method="POST", headers=auth)
+    assert status == 403
+    refusal = json.loads(body)
+    assert refusal["code"] == "scope"
+    assert "planner:operate" in refusal["detail"], "the sentence names the fix"
+
+    # The same report token keeps its day job everywhere else...
+    assert call(g, path="/runs", method="POST", headers=auth)[0] == 200
+    assert call(g, path="/models/apply", method="GET", headers=auth)[0] == 200, (
+        "the rule is (method, path) — reading models is reporting"
+    )
+    # ...and a token that carries the operate scope opens the door.
+    operate = kit.mint(iss=ISS, extra_claims={"scope": "planner:report planner:operate"})
+    status, _, _ = call(
+        g, path="/models/apply", method="POST",
+        headers={"authorization": f"Bearer {operate}"},
+    )
+    assert status == 200
+
+    # A scopeless token (pre-scope mints) is refused on the control path too:
+    # absence of rights is not rights.
+    bare = kit.mint(iss=ISS)
+    assert call(g, path="/models/apply", method="POST",
+                headers={"authorization": f"Bearer {bare}"})[0] == 403
+
+
+def test_scope_rules_are_dormant_while_unarmed(kit):
+    """Unarmed is unarmed: the scope table must not smuggle in enforcement."""
+    g = gate_with({})
+    assert call(g, path="/models/apply", method="POST")[0] == 200
 
 
 def test_an_env_change_rebuilds_the_verifier(kit):

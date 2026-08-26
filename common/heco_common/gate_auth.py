@@ -38,6 +38,18 @@ from .verify import JwksVerifier, TokenRefused
 #: Paths that never require a credential. Exact match.
 OPEN_PATHS = ("/health",)
 
+#: Control paths that demand MORE than a valid token: (method, path) → the
+#: scope the token must carry. Report paths stay open to the fleet's
+#: ``planner:report`` machine tokens — that is what they exist for — but a
+#: hot-swap is an operator's act, and the 2026-08 review showed the gap:
+#: with no scope check, ANY box's reporting credential (including a lost
+#: one, until its rotation) could switch models on an armed install. The
+#: table is consulted only when the gate is armed; unarmed boxes are open
+#: LAN exactly as before.
+SCOPE_RULES: dict[tuple[str, str], str] = {
+    ("POST", "/models/apply"): "planner:operate",
+}
+
 TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -48,6 +60,18 @@ def _refusal_body(reason: str) -> bytes:
         "detail": f"this pipeline service requires a bearer token ({reason}) — "
         "mint one from the auth service, or unset HECO_REQUIRE_AUTH to reopen the LAN",
         "code": "auth",
+    }).encode()
+
+
+def _scope_refusal_body(required: str) -> bytes:
+    # 403, not 401: the credential is real, its rights are not enough. The
+    # sentence names the exact scope so the fix is a registration, not an
+    # afternoon of guessing.
+    return json.dumps({
+        "detail": f"this path requires the {required} scope — the token was "
+        "accepted but carries only reporting rights; register the calling "
+        "application with the extra scope in heco-auth and mint a new token",
+        "code": "scope",
     }).encode()
 
 
@@ -96,15 +120,15 @@ class BearerGate:
         self._verifier, self._verifier_env = verifier, env
         return verifier
 
-    def _credential_ok(self, token: str) -> bool:
+    def _verified_claims(self, token: str) -> dict | None:
+        """The token's claims when it verifies, None when it does not."""
         verifier = self._current_verifier()
         if verifier is not None:
             try:
-                verifier.verify(token)
-                return True
+                return verifier.verify(token)
             except TokenRefused:
-                return False
-        return False
+                return None
+        return None
 
     # ----------------------------------------------------------------- ASGI
 
@@ -125,16 +149,26 @@ class BearerGate:
         if not token:
             await self._refuse(send, "no credential was sent")
             return
-        if not self._credential_ok(token):
+        claims = self._verified_claims(token)
+        if claims is None:
             await self._refuse(send, "the credential was refused")
+            return
+        required = SCOPE_RULES.get((scope.get("method", ""), scope.get("path", "")))
+        if required and required not in str(claims.get("scope", "")).split():
+            await self._refuse_scope(send, required)
             return
         await self.app(scope, receive, send)
 
     async def _refuse(self, send, reason: str) -> None:
-        body = _refusal_body(reason)
+        await self._answer(send, 401, _refusal_body(reason))
+
+    async def _refuse_scope(self, send, required: str) -> None:
+        await self._answer(send, 403, _scope_refusal_body(required))
+
+    async def _answer(self, send, status: int, body: bytes) -> None:
         await send({
             "type": "http.response.start",
-            "status": 401,
+            "status": status,
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode()),

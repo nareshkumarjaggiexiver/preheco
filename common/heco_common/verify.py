@@ -39,9 +39,14 @@ Checks, and why each exists:
     The runner, the planner and eval all present the same lab-wide credential
     to every internal surface; a per-service audience would triple the number
     of applications to rotate for no attacker this threat model contains.
-    ``scope`` is deliberately NOT enforced yet: every registered application
-    carries ``planner:report`` today, so a scope check would refuse nobody
-    and imply a policy that does not exist.
+    ``scope`` is not enforced HERE — verification answers "who is this",
+    and the claims (scope included) ride back to the caller. Authorization
+    lives one layer up: the bearer gate holds a per-path scope table
+    (gate_auth.SCOPE_RULES) so control surfaces like the runner's
+    ``POST /models/apply`` can demand ``planner:operate`` while the report
+    paths keep accepting the fleet's ``planner:report`` machine tokens.
+    The 2026-08 review showed why the split matters: without it, any box's
+    reporting credential could hot-swap models on an armed install.
 
 Only stdlib + ``cryptography`` (the Ed25519 primitive; hand-rolling
 signature verification is how auth modules become CVEs).
