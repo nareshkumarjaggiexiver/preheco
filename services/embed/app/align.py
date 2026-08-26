@@ -42,14 +42,27 @@ ARCFACE_TEMPLATE = np.array(
 #: The template's frame.
 TEMPLATE_SIZE = 112
 
+#: Landmark-variance floor (px^2) below which alignment is refused. A real
+#: gate-passing face (>= 56 px wide, inter-eye distance >= ~24 px) has
+#: landmark variance in the HUNDREDS of px^2, so this only catches the
+#: degenerate sentinels — an all-zeros "no landmarks" placeholder, five
+#: copy-pasted points — which would otherwise warp an arbitrary frame window
+#: (for all-zeros: the top-left corner) into a confident, matchable
+#: "face" embedding with nothing in any log.
+MIN_LANDMARK_VAR = 1.0
+
 
 def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """The 2x3 similarity matrix mapping src points onto dst (Umeyama).
+    """Solve the 2x3 similarity matrix mapping src points onto dst (Umeyama).
 
     Closed form: centre both point sets, take the SVD of the covariance,
     fix any reflection (a mirror is not a rotation — a reflected face is a
     different face), scale by the variance ratio. Deterministic for a given
     input, which is what makes alignment testable at all.
+
+    (Near-)coincident src points are a ValueError, not a fallback: a zero
+    covariance has no meaningful rotation and the old scale=1.0 branch
+    silently embedded whatever pixels sat under the landmark point.
     """
     src = np.asarray(src, dtype=np.float64)
     dst = np.asarray(dst, dtype=np.float64)
@@ -57,13 +70,17 @@ def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     dst_mean = dst.mean(axis=0)
     src_c = src - src_mean
     dst_c = dst - dst_mean
+    src_var = (src_c ** 2).sum() / len(src)
+    if src_var < MIN_LANDMARK_VAR:
+        raise ValueError(
+            "degenerate landmarks: five points (near-)coincident — cannot align"
+        )
     cov = dst_c.T @ src_c / len(src)
     u, s, vt = np.linalg.svd(cov)
     d = np.sign(np.linalg.det(u) * np.linalg.det(vt))
     diag = np.diag([1.0, d])
     rotation = u @ diag @ vt
-    src_var = (src_c ** 2).sum() / len(src)
-    scale = float(np.trace(np.diag(s) @ diag) / src_var) if src_var > 0 else 1.0
+    scale = float(np.trace(np.diag(s) @ diag) / src_var)
     matrix = np.empty((2, 3), dtype=np.float64)
     matrix[:, :2] = scale * rotation
     matrix[:, 2] = dst_mean - scale * rotation @ src_mean
@@ -71,7 +88,7 @@ def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
 
 
 def align_face(img: np.ndarray, landmarks) -> np.ndarray:
-    """The 112x112 aligned crop an ArcFace-lineage embedder consumes.
+    """Warp out the 112x112 aligned crop an ArcFace-lineage embedder consumes.
 
     `landmarks` are the contract's five [x, y] pairs in source pixels, in
     the contract order — the same five every face-detector family emits.

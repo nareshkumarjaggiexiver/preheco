@@ -116,6 +116,11 @@ services:
       # The service's writable STATE (the planner-applied model selection)
       # — deliberately separate from the read-only models mount: weights
       # stay immutable-by-mount, state stays durable across restarts.
+      # The dir ships in the repo (state/.gitkeep) so it exists OWNED BY THE
+      # CHECKOUT USER before the daemon can create it: a bind-mount source
+      # the daemon creates is root-owned, which 507s every planner apply
+      # wherever the container's uid is not host root (userns-remap,
+      # host-run services on a compose-touched checkout).
       - ./services/persons/state:/srv/services/persons/state
       - ./services/persons/models:/srv/services/persons/models:ro
 
@@ -161,6 +166,8 @@ services:
       # The service's writable STATE (the planner-applied model selection)
       # — deliberately separate from the read-only models mount: weights
       # stay immutable-by-mount, state stays durable across restarts.
+      # Shipped in the repo via state/.gitkeep — see the persons service
+      # for why the daemon must never be the one to create this dir.
       - ./services/faces/state:/srv/services/faces/state
       - ./services/faces/models:/srv/services/faces/models:ro
 

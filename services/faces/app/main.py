@@ -47,24 +47,63 @@ install_bearer_gate(app)
 _detector: FaceDetector | None = None
 _load_error: str | None = None
 _load_lock = threading.Lock()
+#: (mtime_ns, size) of the configured weight file at the FAILED attempt —
+#: the stat gate that keeps the error sticky per FILE STATE, not forever.
+_failed_stat: tuple | None = None
+#: Serialises persist+swap across concurrent POST /model requests, so the
+#: durable .selected and the serving detector cannot end up naming
+#: different models (see apply_model). The slow candidate build stays
+#: outside it on purpose.
+_apply_lock = threading.Lock()
 
 
 def _get_detector() -> FaceDetector | None:
-    """Load the configured family lazily so the app can boot (unhealthy)
-    without weights. Any load failure is caught (the persons review rule:
-    a truncated weight raises InvalidProtobuf, not FileNotFoundError, and
-    an exception escaping /health is a 500 per probe)."""
-    global _detector, _load_error
+    """Load the configured family lazily so the app can boot (unhealthy) without weights.
+
+    The persons review rules live here too (ported 2026-08-26):
+
+      * ANY load failure is caught, not just a missing file — a truncated
+        weight raises InvalidProtobuf, an exception escaping /health is a
+        500 per probe;
+      * the failure is sticky per FILE STATE, not per process: /health
+        keeps answering ok:false cheaply on the same broken file, but when
+        the weights CHANGE on disk (the bind-mount delivering them after a
+        raced `make models`, a re-fetch fixing a truncation) the next probe
+        retries — "ok is false until the weights are loadable" means what
+        it says, without a manual restart or a knowing POST /model;
+      * one lock: two concurrent first-probes must not both build a
+        multi-second session.
+    """
+    global _detector, _load_error, _failed_stat
     if _detector is not None:
         return _detector
     with _load_lock:
-        if _detector is None and _load_error is None:
-            try:
-                _detector = build_detector()
-            except Exception as exc:  # noqa: BLE001 — see the docstring
-                _load_error = f"{type(exc).__name__}: {exc}"
-                log.error("model load failed: %s", _load_error)
+        if _detector is not None:
+            return _detector
+        if _load_error is not None and _current_stat() == _failed_stat:
+            return None  # same broken file — stay cheap, stay unhealthy
+        # Stat BEFORE the attempt: a writer replacing the file DURING a
+        # failed load must invalidate the memo, not be masked by a
+        # post-failure stat of the new file (persons review finding).
+        attempt_stat = _current_stat()
+        try:
+            _detector = build_detector()
+            _load_error = None
+            _failed_stat = None
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            _load_error = f"{type(exc).__name__}: {exc}"
+            _failed_stat = attempt_stat
+            log.error("model load failed: %s", _load_error)
     return _detector
+
+
+def _current_stat() -> tuple | None:
+    """(mtime_ns, size) of the configured weight file, or None while absent."""
+    try:
+        st = MODEL_PATH.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 class WithinBox(BaseModel):
@@ -149,18 +188,26 @@ def _with_quality(face: dict, img: np.ndarray) -> dict:
 def health() -> dict:
     """Liveness + model identity; ok is false until the weights are loadable."""
     det = _get_detector()
-    return {
+    body = {
         "ok": det is not None,
         "model": det.model_name if det else MODEL_PATH.name,
         "version": __version__,
         # Family + device truth, same shape as persons: requested vs ACTIVE,
-        # because accelerator EPs fall back to CPU silently.
+        # because accelerator EPs fall back to CPU silently. scoreMin rides
+        # along because the families' scores are NOT commensurable — a
+        # golden-replay ledger must record which operating point made it.
         "device": {
             "requested": det.device_requested,
             "active": det.providers_active,
             "family": det.family,
+            "scoreMin": det.score_min,
         } if det else None,
     }
+    if det is None and _load_error:
+        # The cause, not just the fact: an operator staring at an unhealthy
+        # probe needs to know WHAT blocks the load without docker exec.
+        body["error"] = _load_error
+    return body
 
 
 class ApplyModelRequest(BaseModel):
@@ -178,7 +225,7 @@ def apply_model(req: ApplyModelRequest) -> dict:
     the bind-mounted models dir, bare filenames only, and this endpoint
     SELECTS among installed weights — it never fetches.
     """
-    global _detector, _load_error
+    global _detector, _load_error, _failed_stat
     name = req.file.strip()
     if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(status_code=400, detail="file must be a bare model filename")
@@ -193,13 +240,21 @@ def apply_model(req: ApplyModelRequest) -> dict:
         candidate = build_detector(path)
     except Exception as exc:  # noqa: BLE001 — the refusal IS the feature
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
-    try:
-        persist_selection(name)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
-    with _load_lock:
-        _detector = candidate
-        _load_error = None
+    # persist + swap are ONE critical section: two concurrent applies must
+    # not interleave so .selected names A while the process serves B — that
+    # half-state would flip the model on the next random restart with no
+    # log trail. The last _apply_lock holder wins BOTH the durable file and
+    # the pointer. The slow part (build_detector, above) stays outside; the
+    # 507 refusal still runs before anything moves.
+    with _apply_lock:
+        try:
+            persist_selection(name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        with _load_lock:
+            _detector = candidate
+            _load_error = None
+            _failed_stat = None
     return {
         "ok": True,
         "model": candidate.model_name,
@@ -207,6 +262,7 @@ def apply_model(req: ApplyModelRequest) -> dict:
         "device": {
             "requested": candidate.device_requested,
             "active": candidate.providers_active,
+            "scoreMin": candidate.score_min,
         },
     }
 
@@ -245,4 +301,12 @@ def detect(req: DetectRequest) -> dict:
         faces.sort(key=lambda f: f.get("conf", 0.0), reverse=True)
         faces = dedupe_boxes(faces, iou_thr=0.6, box_of=lambda f: f["box"])
     infer_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-    return {"faces": faces, "inferMs": infer_ms}
+    out = {"faces": faces, "inferMs": infer_ms}
+    if req.within is None and det.family == "scrfd":
+        # Additive field, whole-frame scrfd only: the letterbox downscale
+        # can leave the 56 px POC floor unresolvable in network pixels, so
+        # the caller must be able to tell "no faces present" from "faces
+        # this small were invisible" (the `within` crop path never
+        # downscales enough to care; YuNet runs at native resolution).
+        out["minResolvableFacePx"] = det.min_resolvable_face_px(w, h)
+    return out

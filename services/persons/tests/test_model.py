@@ -70,3 +70,55 @@ def test_persons_model_env_speaks_filenames_like_everything_else():
     assert _model_path("") == DEFAULT_MODEL
     assert _model_path("yolox_s.onnx") == DEFAULT_MODEL.parent / "yolox_s.onnx"
     assert _model_path("/tmp/exp/custom.onnx") == Path("/tmp/exp/custom.onnx")
+
+
+# ------------------------------------------------- selection durability
+
+def test_persist_selection_names_the_root_owned_dir_case(tmp_path, monkeypatch):
+    """The 507's sentence must send the operator to the REAL fix.
+
+    On default deployments the mount exists, so the old "mount it writable"
+    advice pointed at a fix already in place while the actual cause was
+    ownership: a state dir absent from the checkout is created root-owned by
+    the docker daemon, and a non-root container uid (userns-remap, host-run
+    service) cannot write it. The error now says so, and names pre-creation
+    with the right owner as the remedy.
+    """
+    import os
+
+    import pytest
+
+    from app import model as model_mod
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores permission bits; the write below would succeed")
+    state = tmp_path / "state"
+    state.mkdir()
+    state.chmod(0o500)  # exists, but this uid cannot write it — the root-owned shape
+    monkeypatch.setattr(model_mod, "STATE_DIR", state)
+    monkeypatch.setattr(model_mod, "SELECTED_FILE", state / "selected")
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            model_mod.persist_selection("yolox_s.onnx")
+    finally:
+        state.chmod(0o700)  # let tmp_path cleanup work
+    msg = str(exc.value)
+    assert "root-owned by the docker daemon" in msg
+    assert "pre-create services/persons/state" in msg
+    assert "deployment env" in msg
+
+
+def test_the_state_dir_ships_in_the_checkout():
+    """The bind-mount source must exist OWNED BY THE CHECKOUT USER before
+    the docker daemon can create it root-owned (and it must travel in
+    tar-copy deploys): state/.gitkeep is that guarantee."""
+    from pathlib import Path
+
+    from app import model as model_mod
+
+    keep = Path(model_mod.__file__).resolve().parent.parent / "state" / ".gitkeep"
+    assert keep.is_file(), (
+        "services/persons/state/.gitkeep is missing — without it the first "
+        "`compose up` creates the state dir root-owned and every planner "
+        "apply 507s on non-root-uid setups"
+    )

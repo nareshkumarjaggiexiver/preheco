@@ -61,12 +61,20 @@ make run      # uvicorn on :7104
 
 ## API
 
-- `GET /health` → `{ok, model, version}`.
+- `GET /health` → `{ok, model, version, device: {requested, active, family,
+  scoreMin}}`; while unhealthy the body adds `error` naming what blocks the
+  load, and the load retries automatically once the weight file changes on
+  disk (stat-gated, the persons rule) — no restart needed after a raced
+  `make models`.
 - `POST /detect` `{imageB64, within?: [{x, y, w, h, ...}]}` →
   `{faces: [{box, landmarks: [5×[x, y]], conf, widthPx, quality, iedPx?,
   frontality?, sharpness?}], inferMs}`
   — frame coordinates; `within` boxes are clamped, degenerate/outside boxes
-  skipped; extra keys on `within` boxes (e.g. `conf`) are ignored.
+  skipped; extra keys on `within` boxes (e.g. `conf`) are ignored. On the
+  whole-frame path (no `within`) with the scrfd family the reply adds
+  `minResolvableFacePx`: the smallest source-pixel face the 640-letterbox
+  can still resolve, so `faces: []` on a big frame is never mistaken for
+  "no faces present".
 
 ## Test
 
@@ -82,8 +90,9 @@ gets measured on pilot footage.
 
 | env | default | meaning |
 | --- | --- | --- |
-| `FACES_SCORE_MIN` | `0.8` | YuNet score threshold |
-| `FACES_NMS_IOU` | `0.3` | YuNet NMS threshold |
+| `FACES_SCORE_MIN` | `0.8` | YuNet score threshold (the yunet knob ONLY — scrfd has its own below) |
+| `FACES_SCRFD_SCORE_MIN` | `0.5` | SCRFD score threshold (InsightFace's det_thresh calibration). The families' scores are not commensurable — running scrfd at YuNet's 0.8 silently guts its recall — so each family gets its own knob; the active value is served on `/health` as `device.scoreMin` |
+| `FACES_NMS_IOU` | `0.3` | NMS threshold (both families) |
 | `FACES_TOP_K` | `5000` | YuNet top-K before NMS |
 | `FACES_CANON_PX` | `80` | quality "ok" boundary (production canon) |
 | `FACES_FLOOR_PX` | `56` | POC embedding floor ("sub-canon" lower bound) |
