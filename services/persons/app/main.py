@@ -31,6 +31,15 @@ _load_error: str | None = None
 
 _load_lock = threading.Lock()
 _failed_stat: tuple | None = None  # (mtime_ns, size) of the file that failed
+#: Serializes the persist+swap tail of POST /model across requests. The
+#: load lock alone guarded only the pointer assignment, so two in-flight
+#: applies could persist in one order and swap in the other — .selected
+#: naming model A while the process serves model B, and the next restart
+#: silently flipping the detector with no apply anywhere in the record
+#: (review finding, 2026-08-26). A separate lock rather than widening
+#: _load_lock: the candidate BUILD stays outside both, deliberately — a
+#: 40 s session build must not block /health's cheap load-state reads.
+_apply_lock = threading.Lock()
 
 
 def _get_detector() -> PersonDetector | None:
@@ -159,14 +168,21 @@ def apply_model(req: ApplyModelRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
     # Durability FIRST: an apply that cannot be persisted is refused before
     # anything moves — applied-until-a-random-restart is the banned half-state.
-    try:
-        persist_selection(name)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
-    with _load_lock:
-        _detector = candidate
-        _load_error = None
-        _failed_stat = None
+    # And persist+swap are ONE critical section under _apply_lock, so each
+    # completed apply leaves .selected naming the detector it is serving:
+    # concurrent applies become well-defined last-writer-wins instead of the
+    # persist order and the swap order landing independently. The 507 path is
+    # unchanged — persist still runs first and can refuse before anything
+    # moves, and the `with` releases the lock when it raises.
+    with _apply_lock:
+        try:
+            persist_selection(name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        with _load_lock:
+            _detector = candidate
+            _load_error = None
+            _failed_stat = None
     return {
         "ok": True,
         "model": candidate.model_name,

@@ -1,0 +1,5 @@
+# Keeps services/persons/state in the checkout, owned by the checkout user.
+# Absent, the docker daemon creates the bind-mount source root-owned at the
+# first `compose up`, and persist_selection then 507s every planner apply
+# wherever the container's uid is not host root (userns-remap, host-run
+# services). The dir travels in tar-copy deploys for the same reason.

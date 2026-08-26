@@ -32,24 +32,57 @@ install_bearer_gate(app)
 _embedder: FaceEmbedder | None = None
 _load_error: str | None = None
 _load_lock = threading.Lock()
+_failed_stat: tuple | None = None  # (mtime_ns, size) of the file that failed
 
 
 def _get_embedder() -> FaceEmbedder | None:
-    """Load the configured family lazily so the app can boot (unhealthy)
-    without weights. Any failure is caught, not just a missing file — the
-    persons review rule: a truncated weight raises InvalidProtobuf, and an
-    exception escaping /health is a 500 per probe."""
-    global _embedder, _load_error
+    """Load the configured family lazily so the app can boot unhealthy without weights.
+
+    The persons review rules apply here too:
+
+      * ANY load failure is caught, not just a missing file — a truncated
+        weight raises InvalidProtobuf, and an exception escaping /health
+        turns the documented "boot unhealthy" contract into a 500 per probe;
+      * the failure is sticky per FILE STATE, not per process: /health keeps
+        answering ok:false cheaply, but when MODEL_PATH's bytes CHANGE on
+        disk (the bind-mount delivering weights after boot, a re-fetch
+        fixing a truncation) the next probe retries — "ok is false until
+        the weights are loadable" now means what it says. This matters MORE
+        here than in persons/faces: embed deliberately has no POST /model
+        (an embedder change is a deployment — see recognizer.py), so a
+        stat-gated retry is the ONLY recovery short of a manual restart;
+      * one lock: two concurrent first-probes must not both build a session.
+    """
+    global _embedder, _load_error, _failed_stat
     if _embedder is not None:
         return _embedder
     with _load_lock:
-        if _embedder is None and _load_error is None:
-            try:
-                _embedder = build_embedder()
-            except Exception as exc:  # noqa: BLE001 — see the docstring
-                _load_error = f"{type(exc).__name__}: {exc}"
-                log.error("model load failed: %s", _load_error)
+        if _embedder is not None:
+            return _embedder
+        if _load_error is not None and _current_stat() == _failed_stat:
+            return None  # same broken file — stay cheap, stay unhealthy
+        # Stat BEFORE the attempt: a writer replacing the file DURING a
+        # failed load must invalidate the memo, not be masked by a
+        # post-failure stat of the new file (persons review finding).
+        attempt_stat = _current_stat()
+        try:
+            _embedder = build_embedder()
+            _load_error = None
+            _failed_stat = None
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            _load_error = f"{type(exc).__name__}: {exc}"
+            _failed_stat = attempt_stat
+            log.error("model load failed: %s", _load_error)
     return _embedder
+
+
+def _current_stat() -> tuple | None:
+    """(mtime_ns, size) of the model file, or None while it is absent."""
+    try:
+        st = MODEL_PATH.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 class FaceIn(BaseModel):
@@ -75,6 +108,10 @@ def health() -> dict:
         "ok": emb is not None,
         "model": emb.model_name if emb else MODEL_PATH.name,
         "version": __version__,
+        # While unhealthy, say WHY: an operator staring at a red healthcheck
+        # needs the blocking error (missing file? truncated? bad dtype?)
+        # without docker exec — the deploy-integrity lesson.
+        "error": None if emb is not None else _load_error,
         # Family, device truth AND dimension: the runner cross-checks dim
         # against the deployment's HECO_EMBEDDING_DIM story, and the family
         # says which alignment produced these vectors.

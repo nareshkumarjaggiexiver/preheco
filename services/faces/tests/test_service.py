@@ -198,7 +198,9 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 def test_health_serves_family_and_device_truth():
     """The persons convention, now at faces: requested vs ACTIVE, plus which
     family answered — the yunet family honestly reports cv2, because OpenCV
-    ignores acceleration targets (measured on the iGPU bench)."""
+    ignores acceleration targets (measured on the iGPU bench). The active
+    scoreMin rides along: the families' scores are not commensurable, so a
+    golden-replay ledger must record which operating point produced it."""
     from fastapi.testclient import TestClient
 
     from app import main as m
@@ -207,6 +209,8 @@ def test_health_serves_family_and_device_truth():
     assert body["ok"] is True
     assert body["device"]["family"] == "yunet"
     assert body["device"]["active"] == ["cv2"]
+    assert body["device"]["scoreMin"] == 0.8  # FACES_SCORE_MIN, the yunet knob
+    assert "error" not in body, "the error field is for unhealthy answers only"
 
 
 def test_apply_model_refuses_traversal_and_uninstalled_files():
@@ -220,3 +224,183 @@ def test_apply_model_refuses_traversal_and_uninstalled_files():
     r = client.post("/model", json={"file": "scrfd_2.5g_kps.onnx"})
     assert r.status_code == 404
     assert "models-restricted" in r.json()["detail"]
+
+
+def _fake_family(name, family="scrfd", score_min=0.5):
+    """A stand-in detector carrying every attribute /health and /model serve."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        model_name=name,
+        family=family,
+        device_requested="CPU",
+        providers_active=["CPUExecutionProvider"] if family == "scrfd" else ["cv2"],
+        score_min=score_min,
+        detect=lambda img: [],
+        min_resolvable_face_px=lambda w, h: 96,
+    )
+
+
+def test_load_error_unsticks_when_the_weight_file_changes(monkeypatch, tmp_path):
+    """The persons stat-gated retry, ported: the first failure is cached per
+    FILE STATE, so /health stays cheap on the same broken file but heals on
+    the very next probe once the weights appear — no manual restart, no
+    knowing POST /model. The cause is served in the unhealthy body."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    weight = tmp_path / "w.onnx"  # absent at the first attempt
+    monkeypatch.setattr(m, "MODEL_PATH", weight)
+    monkeypatch.setattr(m, "_detector", None)
+    monkeypatch.setattr(m, "_load_error", None)
+    monkeypatch.setattr(m, "_failed_stat", None)
+    calls = []
+
+    def failing():
+        calls.append(1)
+        raise FileNotFoundError(f"{weight} missing")
+
+    monkeypatch.setattr(m, "build_detector", failing)
+    client = TestClient(m.app)
+
+    body = client.get("/health").json()
+    assert body["ok"] is False
+    assert "missing" in body["error"], "the unhealthy body names the blocker"
+    # Same broken state: the memo holds, no second multi-second build.
+    assert client.get("/health").json()["ok"] is False
+    assert len(calls) == 1
+
+    # The weights appear — the next probe retries and heals.
+    weight.write_bytes(b"weights")
+    monkeypatch.setattr(m, "build_detector", lambda: _fake_family("w.onnx", "yunet", 0.8))
+    body = client.get("/health").json()
+    assert body["ok"] is True
+    assert "error" not in body
+
+
+def test_whole_frame_scrfd_reply_carries_the_resolvable_floor(monkeypatch):
+    """Additive field on the whole-frame scrfd path only: `faces: []` on a
+    big letterboxed frame must not be readable as "no faces present"."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    monkeypatch.setattr(m, "_detector", _fake_family("scrfd_test_kps.onnx"))
+    client = TestClient(m.app)
+    frame = _b64(np.zeros((240, 320, 3), np.uint8))
+
+    whole = client.post("/detect", json={"imageB64": frame}).json()
+    assert whole["minResolvableFacePx"] == 96
+
+    # The `within` crop path never downscales enough to care — no field.
+    within = client.post(
+        "/detect",
+        json={"imageB64": frame, "within": [{"x": 0, "y": 0, "w": 100, "h": 100}]},
+    ).json()
+    assert "minResolvableFacePx" not in within
+    # The yunet family never carries it either — pinned by
+    # test_detect_contract_shape_blank_frame's exact key-set assertion.
+
+
+def test_apply_persists_and_swaps_under_one_lock(monkeypatch, tmp_path):
+    """persist + swap are one critical section: the durable .selected and
+    the serving detector must be written by the same lock holder."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    (tmp_path / "cand.onnx").write_bytes(b"x")
+    cand = _fake_family("cand.onnx")
+    monkeypatch.setattr(m, "DEFAULT_MODEL", tmp_path / "default.onnx")
+    monkeypatch.setattr(m, "build_detector", lambda p: cand)
+    seen = {}
+    monkeypatch.setattr(
+        m, "persist_selection", lambda name: seen.__setitem__("locked", m._apply_lock.locked())
+    )
+    monkeypatch.setattr(m, "_detector", None)
+
+    r = TestClient(m.app).post("/model", json={"file": "cand.onnx"})
+    assert r.status_code == 200
+    assert seen["locked"] is True, "persist runs INSIDE the apply lock"
+    assert m._detector is cand
+    assert r.json()["device"]["scoreMin"] == 0.5, "the reply records the operating point"
+
+
+def test_apply_refuses_with_507_when_persist_cannot_stick(monkeypatch, tmp_path):
+    """A selection that cannot be made durable is refused BEFORE the swap
+    (the .94 incident contract) — and the 507 path releases the lock."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    (tmp_path / "cand.onnx").write_bytes(b"x")
+    monkeypatch.setattr(m, "DEFAULT_MODEL", tmp_path / "default.onnx")
+    monkeypatch.setattr(m, "build_detector", lambda p: _fake_family("cand.onnx"))
+
+    def refuse(name):
+        raise RuntimeError("cannot persist the selection (EACCES)")
+
+    monkeypatch.setattr(m, "persist_selection", refuse)
+    before = object()
+    monkeypatch.setattr(m, "_detector", before)
+
+    r = TestClient(m.app).post("/model", json={"file": "cand.onnx"})
+    assert r.status_code == 507
+    assert m._detector is before, "a selection that cannot stick is not applied"
+    assert not m._apply_lock.locked(), "the refusal releases the apply lock"
+
+
+def test_concurrent_applies_cannot_interleave_persist_and_swap(monkeypatch, tmp_path):
+    """Two racing POST /model requests must serialise persist+swap, so the
+    last lock holder wins BOTH the durable file and the pointer — never
+    .selected naming A while the process serves B (the silent model flip
+    on the next restart)."""
+    import threading as th
+    import time as _time
+
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    for n in ("a.onnx", "b.onnx"):
+        (tmp_path / n).write_bytes(b"x")
+    dets = {n: _fake_family(n) for n in ("a.onnx", "b.onnx")}
+    monkeypatch.setattr(m, "DEFAULT_MODEL", tmp_path / "default.onnx")
+    monkeypatch.setattr(m, "build_detector", lambda p: dets[p.name])
+    monkeypatch.setattr(m, "_detector", None)
+
+    events: list[str] = []
+    release_a = th.Event()
+
+    def persist(name):
+        events.append(f"persist:{name}:enter")
+        if name == "a.onnx":
+            release_a.wait(timeout=5)
+        events.append(f"persist:{name}:exit")
+
+    monkeypatch.setattr(m, "persist_selection", persist)
+
+    def apply(name):
+        TestClient(m.app).post("/model", json={"file": name})
+
+    ta = th.Thread(target=apply, args=("a.onnx",))
+    tb = th.Thread(target=apply, args=("b.onnx",))
+    ta.start()
+    deadline = _time.time() + 5
+    while "persist:a.onnx:enter" not in events and _time.time() < deadline:
+        _time.sleep(0.005)
+    assert "persist:a.onnx:enter" in events, "A never reached persist"
+    tb.start()
+    _time.sleep(0.15)  # give B every chance to (wrongly) enter the section
+    assert "persist:b.onnx:enter" not in events, "B must wait out A's persist+swap"
+    release_a.set()
+    ta.join(timeout=5)
+    tb.join(timeout=5)
+    assert events == [
+        "persist:a.onnx:enter",
+        "persist:a.onnx:exit",
+        "persist:b.onnx:enter",
+        "persist:b.onnx:exit",
+    ]
+    assert m._detector is dets["b.onnx"], "the last persist and the last swap agree"

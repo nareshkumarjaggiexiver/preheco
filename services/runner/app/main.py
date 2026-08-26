@@ -7,6 +7,12 @@ Endpoints (CONTRACTS.md):
                            exclusionZones?:[{label, points:[[x,y],...]}]}
     GET  /runs/{runId}    -> live local status
     POST /runs/{runId}/stop
+    GET  /models          -> {models: {stage: name}} — the LIVE truth per stage
+    POST /models/apply    {stages: {persons?: file, faces?: file}}
+
+Swaps and runs exclude each other both ways (409): a run refuses to start
+while a model apply is in flight, and an apply refuses while any run's
+thread is alive — either order, the run's model stamp is the truth.
 
 ``mode`` defaults to ``count`` (the counting loop).  ``mode:'enrol'`` runs the
 staff-enrolment walk-through (CONTRACTS.md v1) and requires ``siteId`` +
@@ -27,7 +33,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from . import config
 from .loop import apply_models, refuse_model_profile
-from .runs import RunManager
+from .runs import ModelSwapInProgress, RunManager
 
 
 def _build_id() -> str:
@@ -356,7 +362,13 @@ def create_run(body: RunRequest) -> dict:
         # The run thread re-checks the profile against the models it STAMPS
         # (TOCTOU guard) and needs the same catalog this gate used.
         request["_manifest"] = _manifest()
-    run_id = manager.start(request)
+    try:
+        run_id = manager.start(request)
+    except ModelSwapInProgress as exc:
+        # /models/apply holds the box: a run started now would stamp models
+        # that change under it mid-flight. 409, not a wait — the swap can
+        # take a minute and the caller should see WHY the start refused.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"runId": run_id, "state": "starting"}
 
 
@@ -375,6 +387,22 @@ class ApplyModelsRequest(BaseModel):
     stages: dict[str, str] = Field(min_length=1)
 
 
+@app.get("/models")
+def live_models() -> dict:
+    """The LIVE model per stage, asked of each service's own /health.
+
+    The planner's honesty check: after an apply whose answer it never read
+    (a timeout, a dropped connection), the audit trail needs the box's real
+    state, not an inference from the last response that happened to arrive.
+    Same probe the run stamp and the POST /runs profile gate use
+    (loop.probe_models), so all three can never disagree about what "this
+    install runs" means — unreachable and unloaded stages keep the probe's
+    truthful strings rather than pretending to a filename. Auth rides the
+    standard inbound gate like every route here (/health alone stays open).
+    """
+    return {"models": manager.probe_live_models()}
+
+
 @app.post("/models/apply")
 def apply_models_route(body: ApplyModelsRequest) -> dict:
     """The planner's no-DevOps switch: hot-swap persons/faces to other
@@ -383,18 +411,33 @@ def apply_models_route(body: ApplyModelsRequest) -> dict:
     a swap under a running count would falsify that run's own stamp — and
     refused entirely for the embedder, which is a deployment, not a click.
     Auth rides the standard planner:operate gate.
+
+    The live-run veto is BIDIRECTIONAL and atomic: begin_swap claims the box
+    under the same lock POST /runs registers threads with, so a run cannot
+    start mid-swap (it 409s) and a swap cannot start mid-run (refused here,
+    naming the runs). A second concurrent apply gets its own 409 from
+    begin_swap — serialized by refusal, so the second operator sees the
+    collision instead of a silent last-writer-wins.
     """
-    live = manager.live_run_ids()
+    try:
+        live = manager.begin_swap()
+    except ModelSwapInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if live:
         raise HTTPException(
             status_code=409,
             detail=f"a live count keeps its models — stop {', '.join(live)} first",
         )
-    client = manager.probe_client()
+    # The window is claimed from here on: end_swap in finally, uncondition-
+    # ally, or one failed apply would leave the box refusing runs forever.
     try:
-        result = apply_models(client, manager.settings, body.stages)
+        client = manager.probe_client()
+        try:
+            result = apply_models(client, manager.settings, body.stages)
+        finally:
+            client.close()
     finally:
-        client.close()
+        manager.end_swap()
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error"))
     return result

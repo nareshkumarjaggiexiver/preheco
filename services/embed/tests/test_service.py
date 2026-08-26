@@ -107,6 +107,157 @@ def test_embed_rejects_malformed_landmarks():
     assert r.status_code == 400
 
 
+def _reset_loader(monkeypatch, app_main, path):
+    """Point the lazy loader at `path` with a clean slate (monkeypatch
+    restores the real globals afterwards, so the model-backed tests above
+    are untouched whichever order pytest runs them in)."""
+    monkeypatch.setattr(app_main, "MODEL_PATH", path)
+    monkeypatch.setattr(app_main, "_embedder", None)
+    monkeypatch.setattr(app_main, "_load_error", None)
+    monkeypatch.setattr(app_main, "_failed_stat", None)
+
+
+def test_health_reports_the_error_and_recovers_when_weights_appear(tmp_path, monkeypatch):
+    """The sticky-load-error fix (persons' stat-gated retry, ported):
+
+    * the first failed load is memoized — same file state, no retry storm;
+    * /health says WHY it is unhealthy (the `error` field), not just false;
+    * the moment the weights CHANGE on disk (`make models` finishing after
+      boot), the next probe retries and the service self-heals — critical
+      here because embed deliberately has no POST /model to clear the error.
+    """
+    import app.main as app_main
+
+    path = tmp_path / "model.onnx"
+    calls = []
+
+    class DummyEmbedder:
+        model_name = "model.onnx"
+        device_requested = "CPU"
+        providers_active = ["cv2"]
+        family = "sface"
+        dim = 128
+
+    def fake_build():
+        calls.append(1)
+        if not path.is_file():
+            raise FileNotFoundError(f"{path} missing — run `make models` in services/embed")
+        return DummyEmbedder()
+
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", fake_build)
+    client = TestClient(app_main.app)
+
+    first = client.get("/health").json()
+    assert first["ok"] is False
+    assert "FileNotFoundError" in first["error"]
+    assert len(calls) == 1
+
+    assert client.get("/health").json()["ok"] is False
+    assert len(calls) == 1, "same absent file — memoized, no load storm"
+
+    path.write_bytes(b"weights")  # `make models` delivers the file
+    third = client.get("/health").json()
+    assert third["ok"] is True
+    assert third["error"] is None
+    assert len(calls) == 2, "changed file state — exactly one retry"
+
+
+def test_a_replaced_broken_weight_is_retried_without_restart(tmp_path, monkeypatch):
+    """The truncation shape of the same fix: a broken file stays a cheap
+    ok:false until its (mtime, size) changes, then one retry loads it."""
+    import app.main as app_main
+
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"truncated")
+    calls = []
+
+    class DummyEmbedder:
+        model_name = "model.onnx"
+        device_requested = "CPU"
+        providers_active = ["cv2"]
+        family = "sface"
+        dim = 128
+
+    def fake_build():
+        calls.append(1)
+        if path.read_bytes() == b"truncated":
+            raise RuntimeError("[ONNXRuntimeError] INVALID_PROTOBUF")
+        return DummyEmbedder()
+
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", fake_build)
+    client = TestClient(app_main.app)
+
+    assert client.get("/health").json()["ok"] is False
+    assert client.get("/health").json()["ok"] is False
+    assert len(calls) == 1, "same broken bytes — no retry"
+
+    path.write_bytes(b"the full weights")  # re-fetch fixes the truncation
+    assert client.get("/health").json()["ok"] is True
+    assert len(calls) == 2
+
+
+def test_arcface_family_serves_the_contract_end_to_end(tmp_path, monkeypatch):
+    """POST /embed against a real (tiny) arcface graph: dim read from the
+    graph into /health, embeddings served, and the two landmark refusals the
+    review demanded — malformed nesting and degenerate points — both 400,
+    exactly like the sface path."""
+    from tiny_onnx import FLOAT, write_model
+
+    import app.main as app_main
+    from app.recognizer import ArcFaceEmbedder
+
+    path = write_model(tmp_path, "tiny_arcface_nchw.onnx", FLOAT, (1, 3, 112, 112))
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", lambda: ArcFaceEmbedder(path, "CPU"))
+    client = TestClient(app_main.app)
+
+    health = client.get("/health").json()
+    assert health["ok"] is True
+    assert health["device"]["family"] == "arcface"
+    assert health["device"]["dim"] == 3 * 112 * 112
+
+    ok = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [_face()]})
+    assert ok.status_code == 200
+    assert len(ok.json()["embeddings"][0]) == 3 * 112 * 112
+
+    nested = _face()
+    nested["landmarks"] = [[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]]
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [nested]})
+    assert r.status_code == 400
+    assert "five [x, y] pairs" in r.json()["detail"]
+
+    degenerate = _face()
+    degenerate["landmarks"] = [[0.0, 0.0]] * 5
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [degenerate]})
+    assert r.status_code == 400
+    assert "degenerate landmarks" in r.json()["detail"]
+
+
+def test_an_init_refused_model_is_unhealthy_with_the_reason(tmp_path, monkeypatch):
+    """An unsupported graph must be /health ok:false WITH the reason — never
+    ok:true followed by a 500 per /embed (the finding's failure shape). The
+    double-dtype fixture stands in for any init-refused export."""
+    from tiny_onnx import DOUBLE, write_model
+
+    import app.main as app_main
+
+    path = write_model(tmp_path, "tiny_arcface_double.onnx", DOUBLE, (1, 3, 112, 112))
+    _reset_loader(monkeypatch, app_main, path)
+    # The real factory: spec_for routes the name to the arcface family,
+    # whose init refuses the dtype.
+    from app.recognizer import build_embedder as real_build
+    monkeypatch.setattr(app_main, "build_embedder", lambda: real_build(path, "CPU"))
+    client = TestClient(app_main.app)
+
+    health = client.get("/health").json()
+    assert health["ok"] is False
+    assert "tensor(double)" in health["error"]
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": []})
+    assert r.status_code == 503, "unloadable model refuses requests, never 500s them"
+
+
 def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
     """HECO_REQUIRE_AUTH=1 turns the LAN door off (runbook step 8).
 

@@ -7,6 +7,11 @@ uvicorn==0.52.1
 pydantic==2.13.4
 numpy==2.5.1
 opencv-python-headless==5.0.0.93
+# The arcface family (recognizer.ArcFaceEmbedder) runs on ONNX Runtime.
+# Same pin as docker/base.Dockerfile and services/persons — without it the
+# family only exists inside docker: bare-metal runs pin ModuleNotFoundError
+# as the load error and `make test` can never exercise the code path.
+onnxruntime==1.28.0
 pytest==9.1.1
 httpx==0.28.1
 ruff==0.16.1
