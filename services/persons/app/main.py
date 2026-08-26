@@ -157,11 +157,16 @@ def apply_model(req: ApplyModelRequest) -> dict:
         candidate = PersonDetector(path, spec["input"], spec["family"])
     except Exception as exc:  # noqa: BLE001 — the refusal IS the feature
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    # Durability FIRST: an apply that cannot be persisted is refused before
+    # anything moves — applied-until-a-random-restart is the banned half-state.
+    try:
+        persist_selection(name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
     with _load_lock:
         _detector = candidate
         _load_error = None
         _failed_stat = None
-    persist_selection(name)
     return {
         "ok": True,
         "model": candidate.model_name,

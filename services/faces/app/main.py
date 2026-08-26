@@ -193,10 +193,13 @@ def apply_model(req: ApplyModelRequest) -> dict:
         candidate = build_detector(path)
     except Exception as exc:  # noqa: BLE001 — the refusal IS the feature
         raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    try:
+        persist_selection(name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
     with _load_lock:
         _detector = candidate
         _load_error = None
-    persist_selection(name)
     return {
         "ok": True,
         "model": candidate.model_name,

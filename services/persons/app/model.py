@@ -83,7 +83,13 @@ def _model_path(value: str | None) -> Path:
 #: default, deliberately — the file records the operator's LATEST intent
 #: through the planner, and the env is the box's standing configuration
 #: underneath it. /health's model field always tells the truth either way.
-SELECTED_FILE = DEFAULT_MODEL.parent / ".selected"
+#: State lives BESIDE the weights, not among them: the models mount is
+#: read-only by design (weights are immutable-by-mount; verify-models
+#: guards their content) — bitten live on the .94 first apply, where the
+#: swap succeeded and the durability write then 500'd the response. The
+#: state dir is its own small writable mount.
+STATE_DIR = DEFAULT_MODEL.parent.parent / "state"
+SELECTED_FILE = STATE_DIR / "selected"
 
 
 def selected_model() -> str | None:
@@ -101,10 +107,24 @@ def selected_model() -> str | None:
 
 
 def persist_selection(name: str) -> None:
-    """Record an applied selection atomically (tmp + rename)."""
-    tmp = SELECTED_FILE.with_suffix(".tmp")
-    tmp.write_text(name + "\n")
-    tmp.replace(SELECTED_FILE)
+    """Record an applied selection atomically (tmp + rename).
+
+    Raises with the operational sentence when the state dir is missing or
+    read-only — callers persist BEFORE swapping, so a selection that cannot
+    be made durable is REFUSED rather than applied-until-a-random-restart,
+    which is the half-state this feature exists to ban.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SELECTED_FILE.with_suffix(".tmp")
+        tmp.write_text(name + "\n")
+        tmp.replace(SELECTED_FILE)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot persist the selection ({exc}) — the service's state dir is "
+            "missing or read-only; mount services/<svc>/state writable (see "
+            "docker-compose.yml) or apply the change as deployment env"
+        ) from exc
 
 
 MODEL_PATH = _model_path(selected_model() or os.environ.get("PERSONS_MODEL"))
