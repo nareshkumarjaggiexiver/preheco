@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+from heco_common.ort import announce_device, providers_for
+
 from .postprocess import decode_predictions, select_persons, select_persons_rtdetr
 from .preprocess import letterbox, rtdetr_blob
 
@@ -53,23 +55,9 @@ def spec_for(model_path: Path) -> dict:
     return {"family": family, "input": 640 if family == "rtdetr" else 416}
 
 
-def providers_for(device: str) -> tuple[list[str], list[dict]]:
-    """ORT (providers, provider_options) for a HECO_DEVICE string.
-
-    CPU is always the last entry: a missing accelerator must degrade to a
-    working detector, not a dead service — but the degradation is LOGGED and
-    served from /health, never silent.
-    """
-    dev = (device or "CPU").upper()
-    if dev == "CPU":
-        return ["CPUExecutionProvider"], [{}]
-    if dev == "CUDA":
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"], [{}, {}]
-    # Anything else is an OpenVINO device string: GPU (iGPU), NPU, ...
-    return (
-        ["OpenVINOExecutionProvider", "CPUExecutionProvider"],
-        [{"device_type": dev}, {}],
-    )
+# providers_for lives in heco_common.ort now — one table for every service
+# (faces and embed grew family layers of their own, and three hand-copied
+# provider tables is how one box's "CUDA" quietly means another's "CPU").
 
 
 # `or` rather than a default argument throughout: compose passthroughs render
@@ -88,7 +76,38 @@ def _model_path(value: str | None) -> Path:
     return Path(value) if "/" in value else DEFAULT_MODEL.parent / value
 
 
-MODEL_PATH = _model_path(os.environ.get("PERSONS_MODEL"))
+#: The planner-applied selection, persisted BESIDE the weights (the models
+#: dir is the bind mount, so it survives container restarts — that is the
+#: whole point: an operator applying a profile from the planner must not
+#: need a DevOps step to make it stick). Precedence: .selected > env >
+#: default, deliberately — the file records the operator's LATEST intent
+#: through the planner, and the env is the box's standing configuration
+#: underneath it. /health's model field always tells the truth either way.
+SELECTED_FILE = DEFAULT_MODEL.parent / ".selected"
+
+
+def selected_model() -> str | None:
+    """The persisted planner-applied model name, validated or None."""
+    try:
+        name = SELECTED_FILE.read_text().strip()
+    except OSError:
+        return None
+    # basename only, and the file must actually exist — a stale selection
+    # naming removed weights must not brick boot; it is ignored with the
+    # env/default taking over, and /health says what actually loaded.
+    if not name or "/" in name or not (DEFAULT_MODEL.parent / name).is_file():
+        return None
+    return name
+
+
+def persist_selection(name: str) -> None:
+    """Record an applied selection atomically (tmp + rename)."""
+    tmp = SELECTED_FILE.with_suffix(".tmp")
+    tmp.write_text(name + "\n")
+    tmp.replace(SELECTED_FILE)
+
+
+MODEL_PATH = _model_path(selected_model() or os.environ.get("PERSONS_MODEL"))
 _SPEC = spec_for(MODEL_PATH)
 # For models the SPECS table knows, the table is authoritative — a lingering
 # env var tuned for the previous model must not misconfigure the next one
@@ -164,13 +183,7 @@ class PersonDetector:
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        # The one line that keeps a benchmark honest: both ORT accelerator
-        # EPs fall back to CPU silently, so the ACTIVE list is stated at load
-        # (and served from /health) rather than trusted from the request.
-        sys.stderr.write(
-            f"[heco-device] persons requested={self.device_requested} "
-            f"active={self.providers_active}\n"
-        )
+        announce_device("persons", self.device_requested, self.providers_active)
         # THE GRAPH IS THE GROUND TRUTH. A static export knows its own input
         # size and arity; configuration that disagrees would load cleanly and
         # then fail every /detect while /health reported healthy. Reconcile

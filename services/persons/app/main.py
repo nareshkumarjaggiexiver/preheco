@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .codec import b64_to_bgr
-from .model import MODEL_PATH, PersonDetector
+from .model import DEFAULT_MODEL, MODEL_PATH, PersonDetector, persist_selection, spec_for
 
 log = logging.getLogger("persons")
 
@@ -81,6 +81,12 @@ def _current_stat() -> tuple | None:
         return None
 
 
+class ApplyModelRequest(BaseModel):
+    """Body of POST /model — which installed weights to run, by filename."""
+
+    file: str = Field(min_length=1, max_length=200)
+
+
 class DetectRequest(BaseModel):
     """POST /detect body: a base64 JPEG frame plus an optional threshold."""
 
@@ -119,3 +125,49 @@ def detect(req: DetectRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     boxes, infer_ms = det.detect(img, conf_min=req.confMin)
     return {"boxes": boxes, "inferMs": infer_ms}
+
+
+@app.post("/model")
+def apply_model(req: ApplyModelRequest) -> dict:
+    """Hot-swap the loaded model to another INSTALLED weight file.
+
+    The planner's no-DevOps path (doc 15 addendum): validate-before-swap —
+    the new session is fully constructed and graph-reconciled BEFORE the
+    global moves, so a bad request leaves the old model serving untouched;
+    the swap is atomic under the load lock; the selection persists in the
+    bind-mounted models dir so a container restart keeps it. Weights must
+    already be on the box (`make models` / models-restricted): this endpoint
+    selects among installed files, it does not fetch — a model download is
+    a provisioning step with its own verification, not a request handler.
+    Auth rides the standard inbound gate (armed boxes require a token).
+    """
+    global _detector, _load_error, _failed_stat
+    name = req.file.strip()
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="file must be a bare model filename")
+    path = DEFAULT_MODEL.parent / name
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"{name} is not installed on this box — fetch it with make models "
+            "(or models-restricted) and verify-models first",
+        )
+    spec = spec_for(path)
+    try:
+        candidate = PersonDetector(path, spec["input"], spec["family"])
+    except Exception as exc:  # noqa: BLE001 — the refusal IS the feature
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    with _load_lock:
+        _detector = candidate
+        _load_error = None
+        _failed_stat = None
+    persist_selection(name)
+    return {
+        "ok": True,
+        "model": candidate.model_name,
+        "family": candidate.family,
+        "device": {
+            "requested": candidate.device_requested,
+            "active": candidate.providers_active,
+        },
+    }
