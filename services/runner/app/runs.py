@@ -39,6 +39,16 @@ from .loop import (
 LIVE_STATES = frozenset({"starting", "running", "enrolling"})
 
 
+class ModelSwapInProgress(RuntimeError):
+    """The swap window and a run start collided; whoever came second gets this.
+
+    Raised by :meth:`RunManager.start` when /models/apply holds the window,
+    and by :meth:`RunManager.begin_swap` when another apply already does.
+    The route maps it to a 409 — non-blocking on purpose, so the second
+    caller SEES the collision instead of silently last-writer-winning.
+    """
+
+
 class RunManager:
     """Holds this runner process's live runs, and recently settled ones."""
 
@@ -59,6 +69,15 @@ class RunManager:
         # because the status dict has no settled-at field and adding one would
         # put a clock in the hot path for a housekeeping job's benefit.
         self._settled_at: dict[str, float] = {}
+        # True while /models/apply owns the box (begin_swap .. end_swap).
+        # Guarded by _lock, the SAME lock the run registry uses — that
+        # sharing is the mechanism: either a swap sees the registered live
+        # thread and refuses, or a run start sees the in-flight swap and
+        # refuses; no interleaving admits both, so a run's model stamp
+        # always executes in a swap-free window (review finding, 2026-08-26:
+        # the one-shot live_run_ids() read left a 60-94 s window in which a
+        # run could start mid-swap and stamp falsified models).
+        self._swapping = False
         self._lock = threading.Lock()
 
     def probe_client(self) -> "httpx.Client":
@@ -81,8 +100,44 @@ class RunManager:
         finally:
             client.close()
 
+    def begin_swap(self) -> list[str]:
+        """Claim the box for a model swap, or say why it cannot be claimed.
+
+        Returns the LIVE run ids when any run thread is alive — the caller
+        refuses with them (a swap under a running count would falsify that
+        run's own stamp).  Raises :class:`ModelSwapInProgress` when another
+        apply already holds the window: that refusal IS the concurrent-apply
+        serialization — the second operator gets a 409 naming the collision
+        rather than two applies interleaving per-service swaps into a model
+        combination neither of them asked for.  Returns ``[]`` when the
+        window is claimed; the caller MUST pair it with :meth:`end_swap`
+        (try/finally), or the box refuses runs forever.
+        """
+        with self._lock:
+            live = [rid for rid, t in self._threads.items() if t.is_alive()]
+            if live:
+                return live
+            if self._swapping:
+                raise ModelSwapInProgress(
+                    "a model apply is already in flight on this install — "
+                    "retry when it settles"
+                )
+            self._swapping = True
+            return []
+
+    def end_swap(self) -> None:
+        """Release the swap window claimed by :meth:`begin_swap`."""
+        with self._lock:
+            self._swapping = False
+
     def start(self, request: dict) -> str:
         """Spawn a RunLoop thread for a validated POST /runs body; returns runId.
+
+        Refuses with :class:`ModelSwapInProgress` while /models/apply holds
+        the swap window — checked inside the SAME locked block that registers
+        and starts the thread, so the check and the registration are one
+        atomic step against :meth:`begin_swap` (see its docstring for why the
+        shared lock is the whole point).
 
         THREE http clients, deliberately: the stage client keeps the generous
         timeout (a stage call is the product), the planner client a short one
@@ -125,21 +180,36 @@ class RunManager:
         )
         loop = RunLoop(run_id, request, settings, client, planner, is_live_run=self._is_live)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)
-        with self._lock:
-            self._runs[run_id] = loop
-            self._threads[run_id] = thread
-            # Started INSIDE the lock: a reaper reads liveness off the thread,
-            # and a registered-but-not-yet-started thread reports not-alive.
-            # The reaper takes this same lock, so it cannot observe that gap.
-            thread.start()
+        try:
+            with self._lock:
+                if self._swapping:
+                    raise ModelSwapInProgress(
+                        "a model swap is in progress — retry when it settles"
+                    )
+                self._runs[run_id] = loop
+                self._threads[run_id] = thread
+                # Started INSIDE the lock: a reaper reads liveness off the thread,
+                # and a registered-but-not-yet-started thread reports not-alive.
+                # The reaper takes this same lock, so it cannot observe that gap.
+                thread.start()
+        except ModelSwapInProgress:
+            # The loop never ran, so nothing will ever close its clients — do
+            # it here or every refused start leaks three sockets' keep-alives.
+            client.close()
+            planner_http.close()
+            report_http.close()
+            raise
         return run_id
 
     def live_run_ids(self) -> list[str]:
         """Runs whose threads are still counting — the hot-swap veto list.
 
         A model swap under a live count would falsify the run's own stamp
-        (taken at start) mid-flight; /models/apply refuses while this is
-        non-empty, naming the runs so the operator can stop them.
+        (taken at start) mid-flight. /models/apply no longer reads this
+        directly — :meth:`begin_swap` computes the same list under the lock
+        so the read and the window claim are one atomic step — but the
+        console's diagnostics still ask it, and the sentence naming the runs
+        to stop is built from it either way.
         """
         with self._lock:
             return [rid for rid, t in self._threads.items() if t.is_alive()]

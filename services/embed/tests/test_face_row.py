@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from app.face_row import face_to_row
+from app.face_row import face_to_row, validate_landmarks
 
 
 def _face():
@@ -46,3 +46,30 @@ def test_malformed_faces_raise(mutation):
     mutation(face)
     with pytest.raises(ValueError):
         face_to_row(face)
+
+
+def test_validate_landmarks_returns_the_pairs():
+    face = _face()
+    assert validate_landmarks(face) == face["landmarks"]
+
+
+@pytest.mark.parametrize(
+    "landmarks",
+    [
+        None,  # key present, wrong type
+        [[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]],  # 2x5 re-pairing
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],  # flat ten floats
+        [1.0, 2.0, 3.0, 4.0, 5.0],  # five bare floats (used to TypeError)
+        [[1.0, 2.0]] * 4,  # four points
+    ],
+)
+def test_validate_landmarks_refuses_every_wrong_nesting(landmarks):
+    """Any nesting totalling ten floats used to sail through the arcface
+    path's np.reshape; the shared guard refuses them all with one sentence."""
+    with pytest.raises(ValueError, match=r"five \[x, y\] pairs"):
+        validate_landmarks({"landmarks": landmarks})
+
+
+def test_validate_landmarks_missing_key_is_valueerror_not_keyerror():
+    with pytest.raises(ValueError, match=r"five \[x, y\] pairs"):
+        validate_landmarks({})

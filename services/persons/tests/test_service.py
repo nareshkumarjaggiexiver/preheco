@@ -143,3 +143,102 @@ def test_apply_model_hot_swaps_and_persists_and_refuses_garbage(tmp_path, monkey
     r = client.post("/model", json={"file": "not_installed.onnx"})
     assert r.status_code == 404
     assert "make models" in r.json()["detail"]
+
+
+class _FakeDetector:
+    """Stands in for PersonDetector where only identity fields matter."""
+
+    def __init__(self, path, input_size=416, family="yolox"):
+        self.model_name = Path(path).name
+        self.family = family
+        self.device_requested = "CPU"
+        self.providers_active = ["CPUExecutionProvider"]
+
+
+def _swap_fixture(tmp_path, monkeypatch, names=("a.onnx", "b.onnx")):
+    """Installed dummy weights + a fake detector build, module state restored.
+
+    monkeypatch.setattr records the ORIGINAL module globals, so whatever the
+    endpoint assigns to _detector/_load_error/_failed_stat during the test is
+    rolled back at teardown — the other tests keep seeing the real state.
+    """
+    from app import main as m
+
+    models = tmp_path / "models"
+    models.mkdir()
+    for name in names:
+        (models / name).write_bytes(b"weights")
+    monkeypatch.setattr(m, "DEFAULT_MODEL", models / "default.onnx")
+    monkeypatch.setattr(m, "PersonDetector", _FakeDetector)
+    monkeypatch.setattr(m, "_detector", None)
+    monkeypatch.setattr(m, "_load_error", None)
+    monkeypatch.setattr(m, "_failed_stat", None)
+    return m
+
+
+def test_concurrent_applies_keep_selected_and_serving_in_lockstep(tmp_path, monkeypatch):
+    """The persist+swap tail of POST /model is ONE critical section.
+
+    Regression for the 2026-08-26 review finding: with only the load lock
+    (which guarded just the pointer assignment), two in-flight applies could
+    persist in one order and swap in the other — .selected naming model A
+    while the process serves model B, and the next restart silently flipping
+    the detector. The proof here is direct: while apply A sits inside its
+    persist, apply B's persist must NOT run; once A finishes, B runs whole,
+    so the last persisted name and the serving detector agree.
+    """
+    import threading
+    import time
+
+    m = _swap_fixture(tmp_path, monkeypatch)
+
+    persists = []
+    a_in_persist = threading.Event()
+    release_a = threading.Event()
+
+    def fake_persist(name):
+        persists.append(name)
+        if name == "a.onnx":
+            a_in_persist.set()
+            assert release_a.wait(timeout=5), "the test must release A"
+
+    monkeypatch.setattr(m, "persist_selection", fake_persist)
+
+    statuses = {}
+
+    def apply(name):
+        # One TestClient per thread: each owns its own portal.
+        statuses[name] = TestClient(m.app).post("/model", json={"file": name}).status_code
+
+    ta = threading.Thread(target=apply, args=("a.onnx",))
+    ta.start()
+    assert a_in_persist.wait(timeout=5)
+    tb = threading.Thread(target=apply, args=("b.onnx",))
+    tb.start()
+    time.sleep(0.3)
+    assert persists == ["a.onnx"], "B must be blocked while A holds the apply lock"
+    release_a.set()
+    ta.join(timeout=5)
+    tb.join(timeout=5)
+    assert statuses == {"a.onnx": 200, "b.onnx": 200}
+    assert persists == ["a.onnx", "b.onnx"]
+    # The invariant the lock restores: last persist == last swap.
+    assert m._detector.model_name == persists[-1]
+
+
+def test_a_persist_refusal_is_507_and_leaves_the_old_model_serving(tmp_path, monkeypatch):
+    """Durability first, unchanged by the apply lock: a selection that
+    cannot stick is refused BEFORE the swap, so the serving detector — and
+    the next restart — keep the old model."""
+    m = _swap_fixture(tmp_path, monkeypatch)
+    incumbent = _FakeDetector("old.onnx")
+    monkeypatch.setattr(m, "_detector", incumbent)
+
+    def refuse_persist(name):
+        raise RuntimeError("cannot persist the selection (disk says no)")
+
+    monkeypatch.setattr(m, "persist_selection", refuse_persist)
+    r = TestClient(m.app).post("/model", json={"file": "a.onnx"})
+    assert r.status_code == 507
+    assert "cannot persist" in r.json()["detail"]
+    assert m._detector is incumbent, "the swap must not have happened"

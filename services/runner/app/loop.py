@@ -280,6 +280,29 @@ def probe_devices(client, settings: Settings) -> dict:
 SWAPPABLE_STAGES = ("persons", "faces")
 
 
+def _rollback(client, urls: dict, applied: list[str], before: dict) -> list[str]:
+    """Swap every already-applied stage BACK; returns the stages that failed.
+
+    Each rollback POST is guarded individually: a rollback that raises (the
+    service died between its apply and now) counts as a failure and must NOT
+    skip the remaining stages — one dead service otherwise freezes every
+    other stage in the half-applied state the compensation exists to ban.
+    The POST re-runs the target's full apply path, so the old ``.selected``
+    is re-persisted too: durability rolls back along with the serving model.
+    """
+    failures: list[str] = []
+    for done in applied:
+        try:
+            rb = client.post(f"{urls[done]}/model",
+                             content=json.dumps({"file": before[done]}),
+                             headers={"content-type": "application/json"}, timeout=30.0)
+            if rb.status_code >= 400:
+                failures.append(done)
+        except httpx.HTTPError:
+            failures.append(done)
+    return failures
+
+
 def apply_models(client, settings: Settings, stages: dict) -> dict:
     """Orchestrate hot-swaps across services, with ROLLBACK compensation.
 
@@ -290,6 +313,15 @@ def apply_models(client, settings: Settings, stages: dict) -> dict:
     fully on the new selection or fully on the old one, never half-way.
     A rollback that itself fails is reported loudly with the truth of what
     is now running; the caller (the planner) re-probes and shows it.
+
+    ALL THREE failure shapes compensate (review finding, 2026-08-26: only
+    the >=400 branch did, so an unreachable or timing-out second stage left
+    the first swapped while the error claimed otherwise): a stage REFUSING,
+    a stage's health probe UNREACHABLE, and the apply POST itself RAISING.
+    The last one gets the most careful wording, because an HTTP client
+    giving up does not cancel the server's work — a timed-out session build
+    usually FINISHES its swap seconds later, so the honest report is "may
+    have completed; re-probe", never "still on the old model".
     """
     urls = {"persons": settings.persons_url, "faces": settings.faces_url}
     unknown = [k for k in stages if k not in SWAPPABLE_STAGES]
@@ -313,18 +345,43 @@ def apply_models(client, settings: Settings, stages: dict) -> dict:
             reply = client.get(f"{url}/health", timeout=2.0).json()
             before[stage] = str(reply.get("model") or "")
         except Exception:  # noqa: BLE001
-            return {"ok": False, "error": f"the {stage} service is unreachable — nothing was changed"}
-        r = client.post(f"{url}/model", content=json.dumps({"file": stages[stage]}),
-                        headers={"content-type": "application/json"}, timeout=30.0)
+            if not applied:
+                # The one place "nothing was changed" is actually true.
+                return {"ok": False, "error":
+                        f"the {stage} service is unreachable — nothing was changed"}
+            failures = _rollback(client, urls, applied, before)
+            if failures:
+                return {"ok": False, "error": (
+                    f"the {stage} service is unreachable AND rolling back "
+                    f"{', '.join(failures)} failed — the box is in a mixed "
+                    "state; re-probe /health per service for the truth")}
+            return {"ok": False, "error": (
+                f"the {stage} service is unreachable — "
+                f"{', '.join(applied)} rolled back to the previous selection")}
+        try:
+            r = client.post(f"{url}/model", content=json.dumps({"file": stages[stage]}),
+                            headers={"content-type": "application/json"}, timeout=30.0)
+        except httpx.HTTPError as exc:
+            # Transport failure is NOT "still on the old model": the server
+            # keeps building after the client gives up, and a 35 s session
+            # build lands its swap 5 s after a 30 s timeout. Compensate what
+            # we KNOW was applied and say plainly what we cannot know.
+            failures = _rollback(client, urls, applied, before)
+            prefix = (f"{stage} did not answer its apply ({type(exc).__name__}) — "
+                      "its swap may still have completed server-side; ")
+            if failures:
+                return {"ok": False, "error": prefix + (
+                    f"AND rolling back {', '.join(failures)} failed — the box is "
+                    "in a mixed state; re-probe /health per service for the truth")}
+            if applied:
+                return {"ok": False, "error": prefix + (
+                    f"{', '.join(applied)} rolled back to the previous selection; "
+                    "re-probe /health per service for the truth")}
+            return {"ok": False, "error": prefix +
+                    "re-probe /health per service for the truth"}
         if r.status_code >= 400:
             # COMPENSATE: put every already-swapped stage back.
-            rollback_failures = []
-            for done in applied:
-                rb = client.post(f"{urls[done]}/model",
-                                 content=json.dumps({"file": before[done]}),
-                                 headers={"content-type": "application/json"}, timeout=30.0)
-                if rb.status_code >= 400:
-                    rollback_failures.append(done)
+            rollback_failures = _rollback(client, urls, applied, before)
             detail = _detail(r)
             if rollback_failures:
                 return {"ok": False, "error": (

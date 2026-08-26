@@ -31,11 +31,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 from heco_common.ort import announce_device, providers_for
 
-from .align import align_face
-from .face_row import face_to_row
+from .align import TEMPLATE_SIZE, align_face
+from .face_row import face_to_row, validate_landmarks
 
 #: Default model location — populated by `make models`, never committed.
 DEFAULT_MODEL = (
@@ -51,6 +50,7 @@ MODEL_SPECS = {
 
 
 def spec_for(model_path: Path) -> dict:
+    """Resolve the family/dim spec for a model file (unknown names infer arcface)."""
     known = MODEL_SPECS.get(model_path.name)
     if known:
         return dict(known)
@@ -67,7 +67,7 @@ DEVICE = os.environ.get("HECO_DEVICE") or "CPU"
 
 
 def build_embedder(model_path: Path | None = None, device: str | None = None):
-    """The family factory: one embed() contract, family chosen by the file."""
+    """Build the configured family — one embed() contract, family chosen by the file."""
     path = model_path or MODEL_PATH
     spec = spec_for(path)
     if spec["family"] == "arcface":
@@ -126,6 +126,13 @@ class ArcFaceEmbedder:
     family = "arcface"
 
     def __init__(self, model_path: Path, device: str | None = None):
+        """Build the ORT session and read dtype/layout/dim from the graph.
+
+        Raises (ValueError) on any graph embed() could never feed — wrong
+        input dtype, 1-channel input — because ORT only checks those at
+        run() time: accepted here, they would be a green /health and a 500
+        on every request.
+        """
         if not model_path.is_file():
             raise FileNotFoundError(
                 f"{model_path} missing — fetch it (restricted tier: make models-restricted) first"
@@ -142,11 +149,47 @@ class ArcFaceEmbedder:
         announce_device("embed", self.device_requested, self.providers_active)
         inp = self._session.get_inputs()[0]
         self._input_name = inp.name
+        # The graph's input DTYPE read from the graph, like the layout below:
+        # ORT checks dtype at run() time, not at session build, so a float16
+        # export accepted here without this check would be green /health and
+        # a 500 on every POST /embed — the healthy-but-dead shape the deploy
+        # integrity guards exist to ban. Refusing at init instead rides the
+        # lazy loader out as /health ok:false with the reason.
+        itype = inp.type
+        if itype == "tensor(float16)":
+            self._np_dtype = np.float16
+        elif itype == "tensor(float)":
+            self._np_dtype = np.float32
+        else:
+            raise ValueError(
+                f"{model_path.name} declares input dtype {itype} — this family feeds "
+                "tensor(float) or tensor(float16); re-export the model with a float input"
+            )
         # NCHW vs NHWC read from the graph, not guessed from the filename:
         # both layouts exist in the wild and a silent transpose error embeds
         # noise that COSINES happily compare.
         shape = list(inp.shape)
         self._nchw = len(shape) == 4 and shape[1] in (1, 3)
+        # A 1-channel graph builds a session fine but can never accept the
+        # 3-channel RGB blob embed() feeds — same green-health/always-500
+        # trap as the dtype hole, refused the same way. Both layouts get the
+        # channel check, and static spatial dims must match the aligned crop
+        # (ORT checks dimensions at run() time, not session creation, so a
+        # 224x224 export would pass init and then 500 every request).
+        channels = shape[1] if self._nchw else (shape[3] if len(shape) == 4 else None)
+        if isinstance(channels, int) and channels != 3:
+            raise ValueError(
+                f"{model_path.name} expects {channels}-channel input; embed feeds "
+                "3-channel RGB — deploy a 3-channel export"
+            )
+        spatial = shape[2:4] if self._nchw else shape[1:3]
+        static = [d for d in spatial if isinstance(d, int)]
+        if static and any(d != TEMPLATE_SIZE for d in static):
+            raise ValueError(
+                f"{model_path.name} declares a {'x'.join(str(d) for d in spatial)} input; "
+                f"alignment produces {TEMPLATE_SIZE}x{TEMPLATE_SIZE} crops — "
+                "deploy a matching export"
+            )
         out_shape = self._session.get_outputs()[0].shape
         self.dim = int(out_shape[-1]) if isinstance(out_shape[-1], int) else None
         self._lock = threading.Lock()
@@ -157,9 +200,17 @@ class ArcFaceEmbedder:
         embeddings: list[list[float]] = []
         with self._lock:
             for face in faces:
-                aligned = align_face(img, face["landmarks"])
+                # Same landmark guard as the sface path (face_to_row):
+                # np.reshape would happily re-pair ANY nesting totalling ten
+                # floats into wrong (x, y) points and embed the garbage crop
+                # with 200 OK — malformed landmarks must be the same
+                # ValueError -> 400 on both families.
+                aligned = align_face(img, validate_landmarks(face))
                 rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
                 blob = (rgb.astype(np.float32) - 127.5) / 127.5
+                # Cast to the graph's declared dtype (validated at init):
+                # ORT refuses a float32 blob on a float16 graph at run().
+                blob = blob.astype(self._np_dtype, copy=False)
                 blob = blob.transpose(2, 0, 1)[None] if self._nchw else blob[None]
                 feat = self._session.run(
                     None, {self._input_name: np.ascontiguousarray(blob)}

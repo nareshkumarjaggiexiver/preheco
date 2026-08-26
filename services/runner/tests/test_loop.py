@@ -1182,3 +1182,129 @@ def test_a_refused_second_stage_rolls_the_first_back():
         ("faces", "broken.onnx"),      # refused
         ("persons", "old-persons.onnx"),  # compensated
     ]
+
+
+def test_an_unreachable_first_stage_truly_changed_nothing():
+    """'nothing was changed' survives ONLY where it is true: before any
+    stage has been applied."""
+    from app.loop import apply_models
+
+    def handler(request):
+        if request.url.path == "/health":
+            raise httpx.ConnectTimeout("persons down")
+        raise AssertionError(f"unexpected {request.url}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "scrfd.onnx"})
+    assert out["ok"] is False
+    assert "nothing was changed" in out["error"]
+
+
+def test_an_unreachable_second_stage_compensates_the_first():
+    """The compensation contract holds on the UNREACHABLE path too (review
+    finding, 2026-08-26: only the >=400 branch rolled back, so a faces
+    container mid-restart left persons permanently swapped while the error
+    claimed nothing was changed)."""
+    from app.loop import apply_models
+
+    posts = []
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if path == "/health":
+            if host == "faces":
+                raise httpx.ConnectTimeout("faces mid-restart")
+            return httpx.Response(200, json={"ok": True, "model": f"old-{host}.onnx"})
+        if path == "/model":
+            posts.append((host, json.loads(request.content)["file"]))
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected {host}{path}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "scrfd.onnx"})
+    assert out["ok"] is False
+    assert "nothing was changed" not in out["error"], "persons DID change"
+    assert "rolled back to the previous selection" in out["error"]
+    assert posts == [
+        ("persons", "yolox_s.onnx"),      # applied
+        ("persons", "old-persons.onnx"),  # compensated
+    ]
+
+
+def test_a_transport_exception_from_the_apply_post_returns_and_compensates():
+    """A raising POST /model must not escape apply_models (it used to 500
+    the route with no rollback), and because a client timeout does not
+    cancel server-side work, the error must send the caller to /health
+    rather than claim the stage is still on the old model."""
+    from app.loop import apply_models
+
+    posts = []
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"ok": True, "model": f"old-{host}.onnx"})
+        if path == "/model":
+            posts.append((host, json.loads(request.content)["file"]))
+            if host == "faces":
+                raise httpx.ReadTimeout("cold build outlived the client budget")
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected {host}{path}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "scrfd_10g.onnx"})
+    assert out["ok"] is False
+    assert "may still have completed" in out["error"]
+    assert "re-probe /health" in out["error"]
+    assert posts == [
+        ("persons", "yolox_s.onnx"),      # applied
+        ("faces", "scrfd_10g.onnx"),      # timed out client-side
+        ("persons", "old-persons.onnx"),  # compensated anyway
+    ]
+
+
+def test_a_raising_rollback_post_does_not_skip_the_remaining_rollbacks():
+    """One dead service must cost ONE rollback, not all of them: the helper
+    guards each POST so a raising rollback is counted as failed and the
+    loop moves on to the next stage."""
+    from app.loop import _rollback
+
+    attempts = []
+
+    def handler(request):
+        host = request.url.host
+        attempts.append(host)
+        if host == "persons":
+            raise httpx.ConnectError("persons died after its apply")
+        return httpx.Response(200, json={"ok": True})
+
+    urls = {"persons": "http://persons:7102", "faces": "http://faces:7104"}
+    before = {"persons": "old-persons.onnx", "faces": "old-faces.onnx"}
+    failures = _rollback(_apply_client(handler), urls, ["persons", "faces"], before)
+    assert attempts == ["persons", "faces"], "faces must still be attempted"
+    assert failures == ["persons"]
+
+
+def test_a_failed_rollback_on_the_unreachable_path_reports_the_mixed_state():
+    """Worst case: the second stage is unreachable AND the first stage's
+    rollback fails — the only honest sentence is the mixed-state one."""
+    from app.loop import apply_models
+
+    def handler(request):
+        host, path = request.url.host, request.url.path
+        if path == "/health":
+            if host == "faces":
+                raise httpx.ConnectTimeout("faces down")
+            return httpx.Response(200, json={"ok": True, "model": f"old-{host}.onnx"})
+        if path == "/model":
+            body = json.loads(request.content)
+            if body["file"] == "old-persons.onnx":  # the rollback attempt
+                raise httpx.ConnectError("persons died too")
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected {host}{path}")
+
+    out = apply_models(_apply_client(handler), _apply_settings(),
+                       {"persons": "yolox_s.onnx", "faces": "scrfd.onnx"})
+    assert out["ok"] is False
+    assert "mixed" in out["error"]
+    assert "re-probe /health" in out["error"]

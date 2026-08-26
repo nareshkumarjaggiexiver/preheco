@@ -120,10 +120,19 @@ def persist_selection(name: str) -> None:
         tmp.write_text(name + "\n")
         tmp.replace(SELECTED_FILE)
     except OSError as exc:
+        # Name the OWNERSHIP case too: on default deployments the mount
+        # exists, so "mount it writable" sent operators to a fix that was
+        # already in place while the real cause was uid mismatch — a state
+        # dir absent from the checkout is created root-owned by the docker
+        # daemon at first `compose up`, and under userns-remap (or a
+        # host-run service on a compose-touched checkout) the service's uid
+        # cannot write it (review finding, 2026-08-26).
         raise RuntimeError(
             f"cannot persist the selection ({exc}) — the service's state dir is "
-            "missing or read-only; mount services/<svc>/state writable (see "
-            "docker-compose.yml) or apply the change as deployment env"
+            "missing, read-only, or not writable by this service's uid; "
+            "pre-create services/persons/state on the host with the right owner "
+            "(a missing dir is created root-owned by the docker daemon) or "
+            "apply the change as deployment env"
         ) from exc
 
 

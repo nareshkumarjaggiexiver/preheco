@@ -81,12 +81,21 @@ def nms(xyxy: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
     return keep
 
 
-def select_faces(outputs: list, input_hw, ratio: float, score_min: float,
-                 nms_iou: float, img_w: int, img_h: int) -> list[dict]:
+def select_faces(outputs: list, input_hw, scale: tuple[float, float], score_min: float,
+                 nms_iou: float) -> list[dict]:
     """The nine SCRFD tensors into contract face dicts, in source pixels.
 
-    `ratio` undoes the letterbox (same convention as the persons YOLOX
-    path); boxes and landmarks clamp into the source frame; output shape is
+    `scale` is the ACHIEVED per-axis letterbox scale (sx, sy) = (rw/w,
+    rh/h) — what the canvas actually holds after the integer-truncated
+    resize, not the nominal ratio, because whenever the frame does not
+    divide the input cleanly the truncation shifts every coordinate toward
+    the origin (up to ~4 px at 4MP frame edges — letterbox arithmetic that
+    would read as model disagreement in a golden diff).
+
+    Coordinates are UNCLAMPED source pixels, exactly like the YuNet rows: a
+    face straddling a crop edge keeps its extrapolated box, which is the
+    truer width the 56/80 px floors are calibrated against (the crop edge
+    is an artifact of the person box, not of the face). Output shape is
     IDENTICAL to the YuNet path — box, five landmarks in the same order,
     conf — so the quality gate and the embed alignment downstream cannot
     tell the families apart, which is the whole contract.
@@ -102,11 +111,14 @@ def select_faces(outputs: list, input_hw, ratio: float, score_min: float,
             all_lm.append(lm[mask])
     if not all_scores:
         return []
+    sx, sy = scale
     scores = np.concatenate(all_scores)
-    xyxy = np.concatenate(all_xyxy) / ratio
-    lm = np.concatenate(all_lm) / ratio
-    xyxy[:, 0::2] = xyxy[:, 0::2].clip(0, img_w)
-    xyxy[:, 1::2] = xyxy[:, 1::2].clip(0, img_h)
+    xyxy = np.concatenate(all_xyxy)
+    xyxy[:, 0::2] /= sx
+    xyxy[:, 1::2] /= sy
+    lm = np.concatenate(all_lm)
+    lm[..., 0] /= sx
+    lm[..., 1] /= sy
     keep = nms(xyxy, scores, nms_iou)
     return [
         {
