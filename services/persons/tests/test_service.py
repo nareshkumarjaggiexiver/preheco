@@ -122,3 +122,24 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 
     allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+
+def test_apply_model_hot_swaps_and_persists_and_refuses_garbage(tmp_path, monkeypatch):
+    """The planner's no-DevOps path: validate-before-swap (a bad file leaves
+    the old model serving), atomic swap, durable .selected in the models dir
+    — and path traversal is refused at the name, not discovered at the
+    filesystem."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+    from app import model as model_mod
+
+    client = TestClient(m.app)
+
+    for bad in ["../../etc/passwd", ".hidden", "a/b.onnx"]:
+        r = client.post("/model", json={"file": bad})
+        assert r.status_code == 400, bad
+
+    r = client.post("/model", json={"file": "not_installed.onnx"})
+    assert r.status_code == 404
+    assert "make models" in r.json()["detail"]

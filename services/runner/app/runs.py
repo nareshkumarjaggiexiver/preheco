@@ -61,6 +61,14 @@ class RunManager:
         self._settled_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    def probe_client(self) -> "httpx.Client":
+        """A short-lived credentialed client for probe/apply orchestration.
+
+        The caller closes it. Same identity a run would use, so the swap
+        passes an armed sibling gate exactly when a run would.
+        """
+        return httpx.Client(timeout=30.0, **auth_for(self.settings, self.token_provider))
+
     def probe_live_models(self) -> dict:
         """The live model per stage, for the POST /runs profile gate.
 
@@ -125,6 +133,16 @@ class RunManager:
             # The reaper takes this same lock, so it cannot observe that gap.
             thread.start()
         return run_id
+
+    def live_run_ids(self) -> list[str]:
+        """Runs whose threads are still counting — the hot-swap veto list.
+
+        A model swap under a live count would falsify the run's own stamp
+        (taken at start) mid-flight; /models/apply refuses while this is
+        non-empty, naming the runs so the operator can stop them.
+        """
+        with self._lock:
+            return [rid for rid, t in self._threads.items() if t.is_alive()]
 
     def reap(self, now: float | None = None) -> list[str]:
         """Evict runs that settled more than ``run_retention_s`` ago.

@@ -14,6 +14,7 @@ from — see :func:`_with_quality`.
 """
 
 import logging
+import threading
 import time
 
 import numpy as np
@@ -24,7 +25,13 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .codec import b64_to_bgr
-from .detector import MODEL_PATH, FaceDetector
+from .detector import (
+    DEFAULT_MODEL,
+    MODEL_PATH,
+    FaceDetector,
+    build_detector,
+    persist_selection,
+)
 from .mapping import clamp_box, offset_face
 from .quality import classify_width, crop_sharpness, eye_span_ratio, landmarks_plausible
 
@@ -39,17 +46,24 @@ install_bearer_gate(app)
 
 _detector: FaceDetector | None = None
 _load_error: str | None = None
+_load_lock = threading.Lock()
 
 
 def _get_detector() -> FaceDetector | None:
-    """Load YuNet lazily so the app can boot (unhealthy) without weights."""
+    """Load the configured family lazily so the app can boot (unhealthy)
+    without weights. Any load failure is caught (the persons review rule:
+    a truncated weight raises InvalidProtobuf, not FileNotFoundError, and
+    an exception escaping /health is a 500 per probe)."""
     global _detector, _load_error
-    if _detector is None and _load_error is None:
-        try:
-            _detector = FaceDetector()
-        except FileNotFoundError as exc:
-            _load_error = str(exc)
-            log.error("model load failed: %s", exc)
+    if _detector is not None:
+        return _detector
+    with _load_lock:
+        if _detector is None and _load_error is None:
+            try:
+                _detector = build_detector()
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                _load_error = f"{type(exc).__name__}: {exc}"
+                log.error("model load failed: %s", _load_error)
     return _detector
 
 
@@ -139,6 +153,58 @@ def health() -> dict:
         "ok": det is not None,
         "model": det.model_name if det else MODEL_PATH.name,
         "version": __version__,
+        # Family + device truth, same shape as persons: requested vs ACTIVE,
+        # because accelerator EPs fall back to CPU silently.
+        "device": {
+            "requested": det.device_requested,
+            "active": det.providers_active,
+            "family": det.family,
+        } if det else None,
+    }
+
+
+class ApplyModelRequest(BaseModel):
+    """Body of POST /model — which installed weights to run, by filename."""
+
+    file: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/model")
+def apply_model(req: ApplyModelRequest) -> dict:
+    """Hot-swap the loaded face detector to another INSTALLED weight file.
+
+    Same contract as persons /model (the planner's no-DevOps path):
+    validate-before-swap, atomic under the load lock, durable .selected in
+    the bind-mounted models dir, bare filenames only, and this endpoint
+    SELECTS among installed weights — it never fetches.
+    """
+    global _detector, _load_error
+    name = req.file.strip()
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="file must be a bare model filename")
+    path = DEFAULT_MODEL.parent / name
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"{name} is not installed on this box — fetch it (make models / "
+            "models-restricted) and verify-models first",
+        )
+    try:
+        candidate = build_detector(path)
+    except Exception as exc:  # noqa: BLE001 — the refusal IS the feature
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+    with _load_lock:
+        _detector = candidate
+        _load_error = None
+    persist_selection(name)
+    return {
+        "ok": True,
+        "model": candidate.model_name,
+        "family": candidate.family,
+        "device": {
+            "requested": candidate.device_requested,
+            "active": candidate.providers_active,
+        },
     }
 
 

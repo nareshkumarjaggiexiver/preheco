@@ -193,3 +193,30 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 
     allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+
+def test_health_serves_family_and_device_truth():
+    """The persons convention, now at faces: requested vs ACTIVE, plus which
+    family answered — the yunet family honestly reports cv2, because OpenCV
+    ignores acceleration targets (measured on the iGPU bench)."""
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    body = TestClient(m.app).get("/health").json()
+    assert body["ok"] is True
+    assert body["device"]["family"] == "yunet"
+    assert body["device"]["active"] == ["cv2"]
+
+
+def test_apply_model_refuses_traversal_and_uninstalled_files():
+    from fastapi.testclient import TestClient
+
+    from app import main as m
+
+    client = TestClient(m.app)
+    for bad in ["../x.onnx", ".selected", "a/b.onnx"]:
+        assert client.post("/model", json={"file": bad}).status_code == 400, bad
+    r = client.post("/model", json={"file": "scrfd_2.5g_kps.onnx"})
+    assert r.status_code == 404
+    assert "models-restricted" in r.json()["detail"]
