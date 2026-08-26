@@ -155,6 +155,22 @@ def test_scope_rules_are_dormant_while_unarmed(kit):
     assert call(g, path="/models/apply", method="POST")[0] == 200
 
 
+def test_an_empty_enforce_passthrough_still_enforces(kit):
+    """Compose passthroughs deliver "" when the host env is unset — the
+    repo's empty-string trap. Empty must mean the default (enforce), never a
+    silent fail-open of a security rule."""
+    env = {
+        "HECO_REQUIRE_AUTH": "1",
+        "HECO_SCOPE_ENFORCE": "",
+        "HECO_JWKS_JSON": json.dumps(kit.jwks),
+        "HECO_AUTH_ISSUER": ISS,
+    }
+    g = gate_with(env)
+    report = kit.mint(iss=ISS, extra_claims={"scope": "planner:report"})
+    assert call(g, path="/models/apply", method="POST",
+                headers={"authorization": f"Bearer {report}"})[0] == 403
+
+
 def test_the_scope_bridge_suspends_only_the_table_never_the_gate(kit):
     """HECO_SCOPE_ENFORCE=0 is the one-box bridge for arming before the
     planner holds an operate credential: the report token passes the control

@@ -105,7 +105,10 @@ class BearerGate:
     def _scopes_enforced(self) -> bool:
         # Default ON: only the literal opt-out suspends the table (see the
         # SCOPE_RULES comment for the one legitimate reason it exists).
-        return self._environ.get("HECO_SCOPE_ENFORCE", "1").strip().lower() in TRUTHY
+        # `or`, not a dict default: compose passthroughs deliver "" when the
+        # host env is unset, and an empty string silently disabling a
+        # security rule is this repo's documented trap.
+        return (self._environ.get("HECO_SCOPE_ENFORCE") or "1").strip().lower() in TRUTHY
 
     def _current_verifier(self) -> JwksVerifier | None:
         env = (
