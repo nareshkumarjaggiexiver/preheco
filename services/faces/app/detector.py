@@ -54,7 +54,13 @@ def spec_for(model_path: Path) -> dict:
 #: Planner-applied selection, persisted beside the weights (bind-mounted, so
 #: it survives restarts). Precedence: .selected > env > default — the file
 #: is the operator's LATEST intent through the planner; same rule as persons.
-SELECTED_FILE = DEFAULT_MODEL.parent / ".selected"
+#: State lives BESIDE the weights, not among them: the models mount is
+#: read-only by design (weights are immutable-by-mount; verify-models
+#: guards their content) — bitten live on the .94 first apply, where the
+#: swap succeeded and the durability write then 500'd the response. The
+#: state dir is its own small writable mount.
+STATE_DIR = DEFAULT_MODEL.parent.parent / "state"
+SELECTED_FILE = STATE_DIR / "selected"
 
 
 def selected_model() -> str | None:
@@ -68,9 +74,20 @@ def selected_model() -> str | None:
 
 
 def persist_selection(name: str) -> None:
-    tmp = SELECTED_FILE.with_suffix(".tmp")
-    tmp.write_text(name + "\n")
-    tmp.replace(SELECTED_FILE)
+    """Record an applied selection atomically; refuse when not durable —
+    persist runs BEFORE the swap, so a selection that cannot stick is
+    refused rather than applied-until-a-random-restart (same contract as
+    persons; the .94 first apply is the incident)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SELECTED_FILE.with_suffix(".tmp")
+        tmp.write_text(name + "\n")
+        tmp.replace(SELECTED_FILE)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot persist the selection ({exc}) — mount services/<svc>/state "
+            "writable (see docker-compose.yml) or apply as deployment env"
+        ) from exc
 
 
 def _model_path(value: str | None) -> Path:

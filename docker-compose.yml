@@ -113,6 +113,10 @@ services:
       PERSONS_INPUT_SIZE: ${PERSONS_INPUT_SIZE-}
       PERSONS_FAMILY: ${PERSONS_FAMILY-}
     volumes:
+      # The service's writable STATE (the planner-applied model selection)
+      # — deliberately separate from the read-only models mount: weights
+      # stay immutable-by-mount, state stays durable across restarts.
+      - ./services/persons/state:/srv/services/persons/state
       - ./services/persons/models:/srv/services/persons/models:ro
 
   tracker:
@@ -154,6 +158,10 @@ services:
       HECO_AUTH_ISSUER: ${HECO_AUTH_ISSUER-}
       HECO_JWKS_JSON: ${HECO_JWKS_JSON-}
     volumes:
+      # The service's writable STATE (the planner-applied model selection)
+      # — deliberately separate from the read-only models mount: weights
+      # stay immutable-by-mount, state stays durable across restarts.
+      - ./services/faces/state:/srv/services/faces/state
       - ./services/faces/models:/srv/services/faces/models:ro
 
   embed:
