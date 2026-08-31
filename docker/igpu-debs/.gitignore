@@ -1,0 +1,3 @@
+# The Intel legacy runtime .debs (~146MB) are fetched, never committed —
+# SHA256SUMS is the repo's pin, and the build refuses debs that don't match.
+*.deb
