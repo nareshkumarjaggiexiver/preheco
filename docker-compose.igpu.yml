@@ -1,0 +1,38 @@
+# iGPU overlay — the Intel accelerator arm for a box with a usable /dev/dri
+# (the ThinkCentre UHD 620s are the proving ground). Repo-owned, replacing
+# the 2026-08-12 box-local file, so the arm survives its box the way the
+# CUDA overlay does.
+#
+#   docker compose -f docker-compose.yml build persons
+#   docker build -f docker/persons-igpu.Dockerfile --build-arg BASE=heco-persons \
+#     -t heco-persons:igpu .
+#   HECO_DEVICE=GPU HECO_RENDER_GID=$(getent group render | cut -d: -f3) \
+#     docker compose -f docker-compose.yml -f docker-compose.igpu.yml \
+#     up -d --force-recreate persons
+#
+# Only `persons` is overlaid: faces and embed ride OpenCV, whose current
+# build blocks their OpenCL path — the 2026-08 bench measured the whole win
+# (~+40%) from moving persons alone, because the offload hands its four CPU
+# cores back to everything else.
+#
+# Rollback is total: `docker compose -f docker-compose.yml up -d` puts the
+# untouched CPU image back; nothing to un-patch.
+services:
+  persons:
+    image: heco-persons:igpu
+    devices:
+      - /dev/dri:/dev/dri
+    # The HOST's render group gid, REQUIRED on purpose: without it
+    # /dev/dri/renderD128 is present but unopenable, OpenCL reports zero
+    # platforms, and every "GPU" number is silently a CPU number. It differs
+    # per box (`getent group render | cut -d: -f3`), so a baked default
+    # would be exactly the silent-CPU trap; refusing to start names the fix
+    # instead.
+    group_add:
+      - "${HECO_RENDER_GID:?set to the host's render group gid — getent group render}"
+    environment:
+      # OpenVINO compiles Gen9.5 kernels on first inference — seconds of
+      # work a cache turns into a one-time cost; without it every container
+      # restart pays again and short benchmarks read far slower than steady
+      # state.
+      OV_GPU_CACHE_PATH: /tmp/ov_cache
