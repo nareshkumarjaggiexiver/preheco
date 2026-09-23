@@ -28,3 +28,6 @@ data/
 .vscode/
 *.swp
 .DS_Store
+
+# Native (non-docker) run logs — see scripts/run-native-cuda.sh
+.native-logs/
