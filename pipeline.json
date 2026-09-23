@@ -170,6 +170,31 @@
         },
         "calibration": null,
         "note": "The strong face-detector alternative; restricted tier. The adapter (9-tensor *_kps decode) ships ahead of weights, like rtdetr did at persons — models-restricted.lock documents the fetch when a vendor conversation starts."
+      },
+      {
+        "id": "scrfd-10g",
+        "family": "scrfd",
+        "file": "scrfd_10g_kps.onnx",
+        "default": false,
+        "provides": [
+          "boxes",
+          "landmarks5"
+        ],
+        "device": [
+          "cpu",
+          "cuda",
+          "igpu"
+        ],
+        "grant": {
+          "spdx": "InsightFace-NC",
+          "commercial": "contact"
+        },
+        "provenance": {
+          "status": "gray",
+          "note": "InsightFace lineage — non-commercial weights; grant purchasable, provenance disclosed (doc 07)"
+        },
+        "calibration": null,
+        "note": "The 10G arm of the same family — ~4x 2.5g's compute, same 9-tensor *_kps decode, and detector.py's MODEL_SPECS already knew the filename. Declared because the CUDA box RUNS it: an install whose live model is undeclared refuses every profile naming it, which is the model gate doing its job and also the one way to make a working stack unlaunchable. Its home is a GPU — on a CPU box it is the wrong end of the family."
       }
     ],
     "embed": [
