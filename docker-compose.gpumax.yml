@@ -1,0 +1,74 @@
+# GPU-max overlay — every stage that CAN use the GPU does.
+#
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-persons -t heco-persons:cuda .
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-faces   -t heco-faces:cuda   .
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-embed   -t heco-embed:cuda   .
+#   HECO_CPUSET= \
+#   HECO_DEVICE=CUDA \
+#   PERSONS_MODEL=yolox_s.onnx \
+#   FACES_MODEL=scrfd_10g_kps.onnx \
+#   EMBED_MODEL=arcface_w600k_r50.onnx HECO_EMBEDDING_DIM=512 HECO_EMBEDDER_ID=arcface-w600k-r50 \
+#   docker compose -f docker-compose.yml -f docker-compose.gpumax.yml up -d
+#
+# WHY THIS EXISTS, AND HOW IT DIFFERS FROM docker-compose.cuda.yml. The CUDA
+# overlay accelerates `persons` ALONE, and deliberately: the measured verdict
+# was per-stage, and YuNet and SFace ride cv2.FaceDetectorYN /
+# cv2.FaceRecognizerSF, which ignore an acceleration target entirely. That
+# verdict is about those two MODELS, not about the stages. Swap the model and
+# the stage changes hands: the `scrfd` family in faces and the `arcface`
+# family in embed are generic onnxruntime paths that read HECO_DEVICE like
+# persons always has (services/faces/app/detector.py, embed/app/recognizer.py).
+# So this overlay is the cuda one plus the two stages that only become
+# GPU-capable once their model is not an OpenCV one.
+#
+# THE MODELS ARE THE RESTRICTED TIER. SCRFD and ArcFace carry InsightFace
+# non-commercial terms and ArcFace's WebFace600K provenance is the one doc 07
+# calls not curable by purchase. models-restricted.lock pins them for
+# EVALUATION; nothing here is admissible for a billable event without the
+# procurement record M4 defines. This overlay is a bench instrument.
+#
+# EMBEDDINGS ARE NOT COMPATIBLE ACROSS THIS SWITCH. ArcFace is 512-d where
+# SFace is 128-d, so a gallery or staff store written by one is meaningless to
+# the other — HECO_EMBEDDING_DIM and HECO_EMBEDDER_ID travel together, and a
+# staff store enrolled under SFace must be re-enrolled. The match threshold
+# goes with them: 0.363 is SFace's operating point and says nothing about
+# ArcFace's, so HECO_MATCH_THRESHOLD is uncalibrated here until eval/sweep.py
+# writes a pack from labelled footage. Expect the count to be WRONG in an
+# interesting direction until it does, and read it as a signal, not a result.
+#
+# PASS HECO_CPUSET= (empty). The shared anchor pins every service to the even
+# CPUs of a 64-thread dual-socket T440, a list that runs to cpu 62. On any
+# smaller box docker refuses the container outright — the pinning is an
+# optimisation for one machine and a hard failure everywhere else.
+#
+# Rollback is total: drop the -f and the CPU stack returns untouched.
+services:
+  persons:
+    image: heco-persons:cuda
+    gpus: all
+
+  faces:
+    image: heco-faces:cuda
+    gpus: all
+    environment:
+      # NEITHER of these reaches faces from the base compose — it was written
+      # when this stage could only ever be cv2/CPU, so there was nothing for a
+      # device knob to do. Without them the container runs SCRFD on the CPU
+      # and /health says so, which is the device truth earning its keep again.
+      HECO_DEVICE: ${HECO_DEVICE-}
+      FACES_MODEL: ${FACES_MODEL-}
+
+  embed:
+    image: heco-embed:cuda
+    gpus: all
+    environment:
+      HECO_DEVICE: ${HECO_DEVICE-}
+      EMBED_MODEL: ${EMBED_MODEL-}
+      HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
+      HECO_EMBEDDER_ID: ${HECO_EMBEDDER_ID-}
+
+  match:
+    environment:
+      # The gallery dimension follows the embedder. Left at SFace's 128 while
+      # embed emits 512, every write is a shape error at the first face.
+      HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
