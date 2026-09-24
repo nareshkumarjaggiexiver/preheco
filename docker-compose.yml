@@ -70,7 +70,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: ingest, PORT: "7101" }
-    image: heco-ingest
+    image: heco-ingest:${HECO_IMAGE_TAG:-latest}
     ports: ["7101:7101"]
     environment:
       # Cap the longest edge before frames enter the pipeline. Empty = the
@@ -96,7 +96,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: persons, PORT: "7102" }
-    image: heco-persons
+    image: heco-persons:${HECO_IMAGE_TAG:-latest}
     ports: ["7102:7102"]
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
@@ -132,7 +132,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: tracker, PORT: "7103" }
-    image: heco-tracker
+    image: heco-tracker:${HECO_IMAGE_TAG:-latest}
     ports: ["7103:7103"]
     environment:
       # Frames a track may coast unmatched before it is dropped. Default 30
@@ -157,7 +157,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: faces, PORT: "7104" }
-    image: heco-faces
+    image: heco-faces:${HECO_IMAGE_TAG:-latest}
     ports: ["7104:7104"]
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
@@ -181,7 +181,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: embed, PORT: "7105" }
-    image: heco-embed
+    image: heco-embed:${HECO_IMAGE_TAG:-latest}
     ports: ["7105:7105"]
     environment:
       # Inbound auth gate — see the ingest service for the whole story.
@@ -210,7 +210,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: match, PORT: "7106" }
-    image: heco-match
+    image: heco-match:${HECO_IMAGE_TAG:-latest}
     ports: ["7106:7106"]
     volumes:
       - match-data:/srv/services/match/data   # per-run galleries survive restarts
@@ -289,7 +289,7 @@ services:
       context: .
       dockerfile: docker/service.Dockerfile
       args: { SERVICE: runner, PORT: "7100" }
-    image: heco-runner
+    image: heco-runner:${HECO_IMAGE_TAG:-latest}
     ports: ["7100:7100"]
     environment:
       # The quality gate. Every floor defaults to TODAY'S BEHAVIOUR when
