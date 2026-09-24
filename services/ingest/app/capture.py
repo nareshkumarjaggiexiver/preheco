@@ -16,9 +16,20 @@ Sources:
 * **rtsp url** — TCP transport by default (INGEST_RTSP_TCP), because UDP
   RTP loss under event-venue WiFi shreds H.264/H.265 frames. Read failures
   trigger release + reopen with a 1 s pause, forever, until stopped.
+
+Levers (app.config): with every lever off the worker runs the loop below
+exactly as it always has. Arm one — the motion gate or the live buffer — and
+it runs ``_run_levered`` instead: every frame is retrieved (the gate needs its
+pixels), gated (app.motion), published into a :class:`~app.frames.FrameStore`
+or counted as skipped, and GET /frame takes frames out of that store with
+``take()``. Every frame decoded is accounted for:
+``captured == skipped + published`` and
+``published == served + dropped + pending``.
 """
 
+import itertools
 import os
+import sys
 import threading
 import time
 
@@ -26,6 +37,15 @@ import cv2
 import numpy as np
 from heco_common.config import env_bool, env_float, env_int
 from heco_common.logs import safe
+from heco_common.ort import announce_device
+
+from .config import Levers
+from .ffmpeg_source import DecoderError, FfmpegSource
+from .frames import FrameStore, Item, RawFrame, Served
+from .motion import MotionGate, small_luma
+
+#: INGEST_BUFFER_MB is in MiB.
+_MB = 1024 * 1024
 
 
 class CaptureError(RuntimeError):
@@ -38,13 +58,28 @@ class CaptureWorker(threading.Thread):
     The capture is opened synchronously in ``__init__`` so POST /open can
     report an unopenable source immediately; the thread then only reads.
     Stop with ``stop()`` — sets an event, joins, and releases the capture.
+    With a lever armed the slot is a :class:`~app.frames.FrameStore` and
+    consumers call ``take()`` (``latest()`` delegates to it).
     """
 
+    #: Distinguishes workers across /open calls: seq restarts at 1 for every
+    #: new source, so (generation, seq) is what names one frame.
+    _generations = itertools.count(1)
+
     def __init__(
-        self, source: str, is_file: bool, loop: bool = False, lockstep: bool = False
+        self,
+        source: str,
+        is_file: bool,
+        loop: bool = False,
+        lockstep: bool = False,
+        levers: Levers | None = None,
     ) -> None:
-        """Open the source (raises CaptureError on failure) and prep the slot."""
+        """Open the source (raises CaptureError on failure) and prep the slot.
+
+        ``levers`` None means all off — today's worker, byte for byte.
+        """
         super().__init__(name="ingest-capture", daemon=True)
+        self.generation = next(CaptureWorker._generations)
         self.source = source
         self.is_file = is_file
         self.loop = loop
@@ -70,8 +105,45 @@ class CaptureWorker(threading.Thread):
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
         self._latest: tuple[int, int, np.ndarray] | None = None  # (seq, tMs, frame)
+        # The file's own FPS, probed once and shared by pacing and the gate.
+        self._fps: float | None = None
         self._pace_s = self._pacing_interval() if is_file else 0.0
-        self._cap = self._open()
+        self.levers = levers if levers is not None else Levers()
+        # L6 DEVICE TRUTH, served from /health: what was asked for, what
+        # actually decodes, and why not when they differ.
+        self.decoder = {"requested": self.levers.decoder, "active": "cpu", "error": None}
+        self._ff: FfmpegSource | None = None
+        if self.levers.decoder != "cpu":
+            self._ff = self._start_decoder()
+        # LEVER MODE — see _run_levered. Decided once, here: a worker never
+        # switches loops mid-stream. A hardware decoder that fell back to cpu
+        # with no other lever armed IS today's worker, so it runs today's loop.
+        self.levered = (
+            self.levers.motion_gate or self.levers.buffer_s > 0 or self._ff is not None
+        )
+        self._gate = (
+            MotionGate(
+                self.levers.motion_min_frac,
+                self.levers.motion_pixel_thr,
+                self.levers.motion_keepalive_s,
+            )
+            if self.levers.motion_gate
+            else None
+        )
+        # Lockstep never queues: the reader waits for each published frame to
+        # be taken, so the slot is the whole buffer and nothing is dropped.
+        self._store = FrameStore(
+            0.0 if self.lockstep else self.levers.buffer_s, self.levers.buffer_mb * _MB
+        )
+        self._last_item: Item | None = None  # the frame most recently served
+        self._exhausted = False  # file read to its end; frames may still wait
+        self._counts = {
+            "captured": 0, "published": 0, "skipped": 0,
+            "dropped": 0, "served": 0, "backlogMax": 0,
+        }
+        if self.levered and is_file:
+            self._probe_fps()  # the gate's footage clock needs it even unpaced
+        self._cap = self._open() if self._ff is None else None
 
     # ------------------------------------------------------------- public
 
@@ -86,6 +158,9 @@ class CaptureWorker(threading.Thread):
         on waking is to take that same lock, and holding it while we wake them
         would hand them a lock they immediately have to queue for.
         """
+        if self.levered:
+            served = self.take()
+            return None if served is None else (served.seq, served.t_ms, served.image)
         with self._lock:
             was_unread, self._unread = self._unread, False
             latest = self._latest
@@ -93,16 +168,90 @@ class CaptureWorker(threading.Thread):
             self._taken_evt.set()
         return latest
 
+    def take(self) -> Served | None:
+        """LEVER MODE: the oldest unread frame, or the last one again.
+
+        A fresh frame leaves the store (and wakes a lockstep reader); with
+        nothing unread the last frame served is repeated, so a poller sees the
+        same ``seq`` and waits — exactly what the newest-frame slot did.
+
+        ``ended`` is decided HERE, under the same lock as the take, and never
+        rides on a fresh frame: the runner treats ``ended`` as "no frame" and
+        stops, so a frame handed out with ``ended`` set would be the last one
+        of the file thrown away. It is set only once the file is exhausted AND
+        nothing published is left unread.
+        """
+        with self._lock:
+            item = self._store.take()
+            fresh = item is not None
+            if fresh:
+                self._last_item = item
+                self._counts["served"] += 1
+            else:
+                item = self._last_item
+            backlog = self._store.pending()
+            if not fresh and self._exhausted and backlog == 0:
+                self.ended = True
+            counts = dict(self._counts)
+        if fresh:
+            self._taken_evt.set()
+        if item is None:
+            return None
+        return Served(
+            seq=item.seq,
+            t_ms=item.t_ms,
+            image=item.frame.bgr(self._fit),
+            ended=self.ended and not fresh,
+            motion=item.motion,
+            backlog=backlog,
+            captured=counts["captured"],
+            # Absent is not zero: with the gate off nothing was measured, and
+            # a 0 would read as "the gate ran and found motion everywhere".
+            skipped=counts["skipped"] if self._gate is not None else None,
+            dropped=counts["dropped"],
+        )
+
+    def describe(self) -> dict:
+        """This worker's lever settings and counters, for GET /health."""
+        with self._lock:
+            counts = dict(self._counts)
+            pending, nbytes = self._store.pending(), self._store.bytes
+        out = {
+            "levered": self.levered,
+            "isFile": self.is_file,
+            "lockstep": self.lockstep,
+            "knobs": self.levers.knobs(),
+            "decoder": dict(self.decoder),
+            "counters": None,
+        }
+        if self.levered:
+            out["counters"] = {
+                **counts,
+                "skipped": counts["skipped"] if self._gate is not None else None,
+                "pending": pending,
+                "bufferBytes": nbytes,
+                "exhausted": self._exhausted,
+            }
+        return out
+
     def stop(self, join_timeout_s: float = 5.0) -> None:
         """Signal the thread, wait for it, and release the capture."""
         self._stop_evt.set()
+        ff = self._ff
+        if ff is not None:
+            ff.interrupt()  # a read blocked on the pipe returns now
         if self.is_alive():
             self.join(timeout=join_timeout_s)
+        elif ff is not None:
+            ff.close()  # never started, or already finished: reap it here
 
     # ------------------------------------------------------------ thready
 
     def run(self) -> None:
         """Read loop: newest frame wins the slot; files pace and loop."""
+        if self.levered:
+            self._run_levered()
+            return
         t0 = time.monotonic()
         seq = 0
         try:
@@ -187,6 +336,160 @@ class CaptureWorker(threading.Thread):
         finally:
             self._cap.release()
 
+    def _run_levered(self) -> None:
+        """LEVER MODE read loop: decode, gate, publish or skip — every frame.
+
+        Differences from the loop above, each on purpose:
+
+        * **Every frame is retrieved.** The gate has to look at a frame to
+          skip it, and a buffered frame has to exist to be queued. On the cv2
+          decoder that is the BGR conversion the loop above avoids for unread
+          frames (~35 ms CPU per 4K frame on the laptop); the ffmpeg decoders
+          (INGEST_DECODER, L6) hand the gate a free Y plane instead.
+        * **Newest wins the unbuffered slot.** The frame is already retrieved,
+          so the unread one it replaces is simply older; the overwrite is
+          counted in ``dropped``.
+        * **Pacing keeps a deadline** instead of sleeping a fixed interval
+          after each frame, so decode time is not added on top of the frame
+          period and a paced clip really plays at its native rate.
+        """
+        t0 = time.monotonic()
+        due = t0
+        seq = 0
+        try:
+            while not self._stop_evt.is_set():
+                if self.lockstep and self._pending():
+                    # Same wait as the loop above: re-check under the lock, and
+                    # wake at least once a second so stop() is honoured.
+                    self._taken_evt.clear()
+                    if self._pending():
+                        self._taken_evt.wait(timeout=1.0)
+                    continue
+                frame = self._next_raw()
+                if frame is None:
+                    if self._stop_evt.is_set():
+                        return
+                    if self.is_file and self._ff is not None and not self._ff.clean_eof:
+                        # A decoder that DIED is not the end of the file, and
+                        # saying `ended` would settle an incomplete count as a
+                        # complete one. Stop producing instead: the runner sees
+                        # a stall and fails the run with its gallery kept.
+                        self.decoder["error"] = (
+                            f"decoder exited {self._ff.returncode} mid-file: {self._ff.tail()}"
+                        )
+                        sys.stderr.write(f"[heco-device] ingest {self.decoder['error']}\n")
+                        return
+                    if self.is_file and self.loop and self._ff is None:
+                        # (an ffmpeg decoder loops the file itself: -stream_loop)
+                        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    if self.is_file:
+                        with self._lock:
+                            self._exhausted = True
+                        return
+                    # Live stream hiccup: release, breathe, reopen — as above.
+                    self._release_source()
+                    if self._stop_evt.wait(1.0):
+                        return
+                    try:
+                        self._reopen_source()
+                    except CaptureError:
+                        continue
+                    if self._gate is not None:
+                        self._gate.reset()  # a new stream: compare with nothing old
+                    continue
+                seq += 1
+                self._admit(seq, t0, frame)
+                if self._pace_s:
+                    due += self._pace_s
+                    delay = due - time.monotonic()
+                    if delay > 0 and self._stop_evt.wait(delay):
+                        return
+        finally:
+            self._release_source()
+
+    def _next_raw(self) -> RawFrame | None:
+        """Decode the next frame, or None at EOF / on a read failure."""
+        if self._ff is not None:
+            return self._ff.read()
+        ok, frame = self._cap.read()
+        return RawFrame.from_bgr(self._fit(frame)) if ok else None
+
+    def _start_decoder(self) -> FfmpegSource | None:
+        """Start the requested subprocess decoder, or fall back to cpu LOUDLY.
+
+        A decoder that cannot start must not take the camera down with it: the
+        cv2 path is today's and still works. But it must never be silent
+        either — a "hardware decode" benchmark that quietly ran on the CPU is
+        exactly the dishonesty the device truth exists to catch — so the
+        fallback is announced on stderr and served from /health ``device``.
+        """
+        requested = self.levers.decoder
+        try:
+            ff = self._new_ffmpeg()
+        except DecoderError as exc:
+            self.decoder["error"] = str(exc)
+            announce_device("ingest", requested, ["cpu"])
+            sys.stderr.write(f"[heco-device] ingest decoder fell back to cpu: {exc}\n")
+            return None
+        self.decoder["active"] = requested
+        announce_device("ingest", requested, [requested])
+        return ff
+
+    def _new_ffmpeg(self) -> FfmpegSource:
+        return FfmpegSource(
+            self.source,
+            self.levers.decoder,
+            loop=self.is_file and self.loop,
+            rtsp_tcp=env_bool("INGEST_RTSP_TCP", True),
+            abort=self._stop_evt,
+        )
+
+    def _release_source(self) -> None:
+        if self._ff is not None:
+            self._ff.close()
+        elif self._cap is not None:
+            self._cap.release()
+
+    def _reopen_source(self) -> None:
+        """Reconnect a live source on the decoder it was running (CaptureError on failure).
+
+        A camera that drops is a camera problem, not a decoder one, so the
+        reconnect never switches decoders mid-run.
+        """
+        if self._ff is None:
+            self._cap = self._open()
+            return
+        try:
+            self._ff = self._new_ffmpeg()
+        except DecoderError as exc:
+            raise CaptureError(str(exc)) from exc
+
+    def _admit(self, seq: int, t0: float, frame: RawFrame) -> None:
+        """Gate one decoded frame, then publish it into the store or skip it."""
+        now = time.monotonic()
+        t_ms = int((now - t0) * 1000)
+        # Footage time for a file — frame number over its FPS, so the gate's
+        # keepalive means "a frame per second OF FOOTAGE" whether the run is
+        # paced, lockstep or flat out. Wall time for a camera.
+        clock_s = seq / (self._fps or 25.0) if self.is_file else now - t0
+        publish, motion = True, None
+        if self._gate is not None:
+            publish, motion = self._gate.decide(small_luma(frame.luma_source()), clock_s)
+        with self._lock:
+            self._counts["captured"] += 1
+            if not publish:
+                self._counts["skipped"] += 1
+                return
+            self._counts["published"] += 1
+            self._counts["dropped"] += self._store.put(Item(seq, t_ms, clock_s, frame, motion))
+            self._counts["backlogMax"] = max(self._counts["backlogMax"], self._store.pending())
+
+    def _pending(self) -> int:
+        """Published frames not yet taken (lever mode)."""
+        with self._lock:
+            return self._store.pending()
+
     def _slot_unread(self) -> bool:
         """Is the slot still holding a frame nobody has taken?"""
         with self._lock:
@@ -250,9 +553,13 @@ class CaptureWorker(threading.Thread):
         pace = env_float("INGEST_FILE_PACE", 1.0)
         if pace <= 0:
             return 0.0
-        probe = cv2.VideoCapture(self.source)
-        fps = probe.get(cv2.CAP_PROP_FPS) if probe.isOpened() else 0.0
-        probe.release()
-        if not fps or fps <= 0:
-            fps = 25.0
-        return 1.0 / (fps * pace)
+        return 1.0 / (self._probe_fps() * pace)
+
+    def _probe_fps(self) -> float:
+        """The file's own FPS (fallback 25), probed once with a throwaway capture."""
+        if self._fps is None:
+            probe = cv2.VideoCapture(self.source)
+            fps = probe.get(cv2.CAP_PROP_FPS) if probe.isOpened() else 0.0
+            probe.release()
+            self._fps = fps if fps and fps > 0 else 25.0
+        return self._fps

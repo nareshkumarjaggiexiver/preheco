@@ -8,8 +8,10 @@ Endpoints (CONTRACTS.md):
   slot, one owner" below.
 * ``POST /close`` {owner?, force?} — release the slot at end of run.
 * ``GET /frame``  → {tMs, imageB64, w, h, seq, ended} — the LATEST frame only
-  (drop-not-queue; see app.capture for the policy).
-* ``GET /health`` → {ok, model, version, owner}.
+  (drop-not-queue; see app.capture for the policy). With a lever armed
+  (app.config) it is the OLDEST UNREAD frame instead, dequeued, and the body
+  also carries {motion, backlog, skipped, dropped, captured}.
+* ``GET /health`` → {ok, model, version, owner, knobs, capture}.
 
 One slot, one owner
 -------------------
@@ -36,14 +38,32 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
+import cv2
 from fastapi import FastAPI, HTTPException
 from heco_common.config import env_int
 from heco_common.gate_auth import install_bearer_gate
 from heco_common.imaging import encode_jpeg_b64
 from heco_common.schemas import CloseSource, Frame, Health, OpenSource
+from pydantic import Field
 
 from . import __version__
 from .capture import CaptureError, CaptureWorker
+from .config import cv_threads_from_env, levers_from_env
+
+
+class OpenIngest(OpenSource):
+    """POST /open body: the shared OpenSource plus this run's lever overrides.
+
+    Both default to None, which means "whatever the service's env says"
+    (app.config) — so a runner that sends neither gets exactly the worker it
+    always got. Declared here rather than on the shared model because only
+    ingest reads them; the runner forwards its ``source`` dict verbatim.
+    """
+
+    #: Override INGEST_MOTION_GATE for this run.
+    motionGate: bool | None = None
+    #: Override INGEST_BUFFER_S for this run (0 = the newest-frame slot).
+    bufferS: float | None = Field(default=None, ge=0)
 
 
 class _State:
@@ -80,7 +100,10 @@ state = _State()
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Ensure the capture thread and device are released on shutdown."""
+    """Size OpenCV's pool (INGEST_CV_THREADS) and release capture on shutdown."""
+    threads = cv_threads_from_env()
+    if threads is not None:
+        cv2.setNumThreads(threads)
     yield
     state.swap(None)
 
@@ -94,7 +117,7 @@ install_bearer_gate(app)
 
 
 @app.post("/open")
-def open_source(body: OpenSource) -> dict:
+def open_source(body: OpenIngest) -> dict:
     """Open an RTSP url or a video file, claiming the exclusive capture slot.
 
     409 when a different, still-live owner holds the slot — the error names
@@ -103,6 +126,12 @@ def open_source(body: OpenSource) -> dict:
     """
     if body.path is not None and not os.path.exists(body.path):
         raise HTTPException(status_code=400, detail=f"no such file: {body.path}")
+    try:
+        levers = levers_from_env(motion_gate=body.motionGate, buffer_s=body.bufferS)
+    except ValueError as exc:
+        # A malformed knob in the SERVICE's env, not in the request: refuse
+        # loudly with the variable's name rather than guess a default.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     with state.lock:
         holder = state.owner
         if (
@@ -126,7 +155,8 @@ def open_source(body: OpenSource) -> dict:
         )
         try:
             worker = CaptureWorker(
-                source=source, is_file=is_file, loop=body.loop, lockstep=body.lockstep
+                source=source, is_file=is_file, loop=body.loop, lockstep=body.lockstep,
+                levers=levers,
             )
         except CaptureError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -156,16 +186,65 @@ def close_source(body: CloseSource) -> dict:
     return {"ok": True, "released": True, "owner": holder}
 
 
-@app.get("/frame")
+#: The last JPEG handed out, keyed by (worker generation, seq, quality).
+_jpeg_lock = threading.Lock()
+_jpeg_last: tuple[tuple[int, int, int], str] | None = None
+
+
+def _jpeg_once(worker: CaptureWorker, seq: int, img, quality: int) -> str:
+    """Encode a frame once, however many times it is asked for.
+
+    The runner polls /frame every source_poll_s (20 ms) while it waits for
+    the next seq, and every one of those polls returned the SAME frame, freshly
+    encoded — 14-21 ms of JPEG per poll on a 4K frame. The output for a given
+    frame is identical, so encoding it again is pure waste, and the motion
+    gate makes that waiting common: a still scene is one frame a second.
+
+    Keyed by the worker's generation as well as seq, because seq restarts at 1
+    on every /open: seq alone would hand a new run the old run's first frame.
+    """
+    global _jpeg_last
+    key = (worker.generation, seq, quality)
+    with _jpeg_lock:
+        if _jpeg_last is not None and _jpeg_last[0] == key:
+            return _jpeg_last[1]
+    b64 = encode_jpeg_b64(img, quality=quality)
+    with _jpeg_lock:
+        _jpeg_last = (key, b64)
+    return b64
+
+
+# exclude_unset: a field is on the wire only when this handler SET it. With
+# every lever off that is exactly the six fields /frame has always carried —
+# byte for byte, so nothing downstream can tell the levers exist — and in
+# lever mode an unmeasured value still travels as an explicit null.
+@app.get("/frame", response_model_exclude_unset=True)
 def get_frame() -> Frame:
     """Return the latest captured frame as base64 JPEG.
 
     409: no source open. 503: source open but no frame decoded yet (a live
     RTSP source can take a moment) — callers should retry shortly.
+
+    Lever mode (a gate or buffer armed): the OLDEST unread frame, taken out
+    of the store, plus the counters the runner carries into the run's notes.
     """
     worker = state.worker
     if worker is None:
         raise HTTPException(status_code=409, detail="no source open — POST /open first")
+    if worker.levered:
+        served = worker.take()
+        if served is None:
+            raise HTTPException(status_code=503, detail="no frame captured yet — retry")
+        h, w = served.image.shape[:2]
+        return Frame(
+            tMs=served.t_ms,
+            imageB64=_jpeg_once(
+                worker, served.seq, served.image, env_int("INGEST_JPEG_QUALITY", 85)
+            ),
+            w=w, h=h, seq=served.seq, ended=served.ended,
+            motion=served.motion, backlog=served.backlog, skipped=served.skipped,
+            dropped=served.dropped, captured=served.captured,
+        )
     latest = worker.latest()
     if latest is None:
         raise HTTPException(status_code=503, detail="no frame captured yet — retry")
@@ -177,7 +256,7 @@ def get_frame() -> Frame:
     # a live stream forever and only sets ended for a finished file), and until
     # now it kept that to itself.
     return Frame(
-        tMs=t_ms, imageB64=encode_jpeg_b64(img, quality=quality),
+        tMs=t_ms, imageB64=_jpeg_once(worker, seq, img, quality),
         w=w, h=h, seq=seq, ended=bool(getattr(worker, "ended", False)),
     )
 
@@ -188,8 +267,37 @@ def health() -> dict:
 
     ``owner`` is included so an operator can see which run holds the camera
     without guessing from a 409.
+
+    ``knobs`` is what the NEXT /open will get from the env (a run may still
+    override motionGate/bufferS); a malformed knob turns ``ok`` false, so the
+    compose healthcheck refuses the stack instead of letting it count with a
+    default nobody chose. ``capture`` is the open worker's own settings and
+    counters (null when nothing is open; counters null outside lever mode).
+
+    ``device`` is the decoder truth, the same shape the model services serve:
+    ``requested`` (INGEST_DECODER) against ``active`` (what the open worker
+    actually decodes with — null while nothing is open) and ``error``, the
+    reason when a hardware decoder fell back to cpu.
     """
-    return {
+    body = {
         **Health(ok=True, model="opencv-videocapture", version=__version__).model_dump(),
         "owner": state.owner,
     }
+    requested = None
+    try:
+        knobs = levers_from_env().knobs()
+        knobs["cvThreads"] = cv_threads_from_env()
+        body["knobs"], requested = knobs, knobs["decoder"]
+    except ValueError as exc:
+        body["ok"] = False
+        body["knobs"] = {"error": str(exc)}
+    # What the pool actually is, whoever set it.
+    body["cvThreadsActive"] = cv2.getNumThreads()
+    worker = state.worker
+    body["capture"] = worker.describe() if worker is not None else None
+    body["device"] = (
+        dict(worker.decoder)
+        if worker is not None
+        else {"requested": requested, "active": None, "error": None}
+    )
+    return body
