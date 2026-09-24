@@ -35,7 +35,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import (
+    announce_device,
+    is_trt,
+    providers_for,
+    trt_batch_profile,
+)
 
 #: The default weight location — beside the embedder's, gitignored, never
 #: committed (InsightFace weights are restricted-tier: see the README).
@@ -149,8 +154,13 @@ class AttributeModel:
     /health attrError with the reason.
     """
 
-    def __init__(self, model_path: Path, device: str | None = None):
-        """Build the session and read dtype/layout/dims from the graph."""
+    def __init__(self, model_path: Path, device: str | None = None, batch: bool = False,
+                 batch_max: int = 16):
+        """Build the session and read dtype/layout/dims from the graph.
+
+        `batch` (the embedder's EMBED_BATCH) lets predict_many answer a whole
+        request in one run when the graph's batch dimension is dynamic.
+        """
         if not model_path.is_file():
             raise FileNotFoundError(
                 f"{model_path} missing — place InsightFace genderage.onnx there or set "
@@ -175,7 +185,8 @@ class AttributeModel:
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("embed-attributes", self.device_requested, self.providers_active)
+        if not is_trt(device):
+            announce_device("embed-attributes", self.device_requested, self.providers_active)
         inp = self._session.get_inputs()[0]
         self._input_name = inp.name
         itype = inp.type
@@ -209,6 +220,26 @@ class AttributeModel:
                 f"{model_path.name} answers {out_shape[-1]} values per face; a genderage "
                 f"graph answers {OUTPUT_DIM} ([F logit, M logit, age/100])"
             )
+        self.batch_max = int(batch_max)
+        self.batch_active = bool(batch) and not isinstance(shape[0], int)
+        sample = (3, INPUT_SIZE, INPUT_SIZE) if self._nchw else (INPUT_SIZE, INPUT_SIZE, 3)
+        if is_trt(device) and self.batch_active and (
+            "TensorrtExecutionProvider" in self.providers_active
+        ):
+            # Same reason as the embedder: an explicit 1..max profile, or
+            # every new batch size rebuilds the engine inside a request.
+            providers, provider_options = providers_for(
+                device, trt_batch_profile(inp.name, sample, self.batch_max))
+            self._session = ort.InferenceSession(
+                str(model_path), options, providers=providers, provider_options=provider_options
+            )
+            self.providers_active = list(self._session.get_providers())
+        if is_trt(device):
+            # Build (or load) the TensorRT engine at load, not in a request —
+            # and read the truth after it (a failed build drops ORT to CUDA).
+            self._session.run(None, {self._input_name: np.zeros((1, *sample), self._np_dtype)})
+            self.providers_active = list(self._session.get_providers())
+            announce_device("embed-attributes", self.device_requested, self.providers_active)
 
     def blob(self, img: np.ndarray, box) -> np.ndarray:
         """Build the exact tensor fed to the graph: RGB, 0..255, graph dtype and layout."""
@@ -222,10 +253,27 @@ class AttributeModel:
         pred = self._session.run(None, {self._input_name: self.blob(img, box)})[0]
         return postprocess(pred)
 
+    def predict_many(self, img: np.ndarray, boxes: list) -> list[dict]:
+        """predict() for every box, in order — one run per batch_max when batching.
 
-def build_attributes(model_path: Path | None = None, device: str | None = None) -> AttributeModel:
+        Every crop (and every box validation) happens before the first run,
+        so a malformed box is the same ValueError it is in predict().
+        """
+        if not self.batch_active:
+            return [self.predict(img, box) for box in boxes]
+        blobs = [self.blob(img, box) for box in boxes]
+        out: list[dict] = []
+        for start in range(0, len(blobs), self.batch_max):
+            batch = np.concatenate(blobs[start:start + self.batch_max], axis=0)
+            preds = self._session.run(None, {self._input_name: batch})[0]
+            out.extend(postprocess(row) for row in np.asarray(preds))
+        return out
+
+
+def build_attributes(model_path: Path | None = None, device: str | None = None,
+                     batch: bool = False, batch_max: int = 16) -> AttributeModel:
     """Build the attribute model at `model_path` (default: the env-resolved one)."""
     path = model_path or ATTR_MODEL_PATH
     if path is None:
         raise ValueError("attribute model is switched off (EMBED_ATTR_MODEL=off)")
-    return AttributeModel(path, device)
+    return AttributeModel(path, device, batch, batch_max)
