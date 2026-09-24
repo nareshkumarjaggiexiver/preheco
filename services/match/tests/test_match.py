@@ -1184,7 +1184,7 @@ def test_review_on_an_empty_or_unknown_run_is_an_empty_queue(client):
         "excluded": {
             "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0,
         },
-        "setAside": [], "setAsideDropped": 0,
+        "setAside": [], "setAsideDropped": 0, "keptByLight": 0,
     }
 
 

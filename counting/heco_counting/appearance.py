@@ -739,9 +739,15 @@ BEARD_DARK_REL_V = 0.4
 BEARD_PALE_REL_S = 0.5
 #: ...and a pale pixel is WHITE from this fraction of its brightness up.
 BEARD_WHITE_REL_V = 0.9
-#: The nose tip at or below the mouth line: the head is fully down (or the
-#: landmarks are not a face) and the chin is out of sight.
-BEARD_MAX_NOSE_DROP = 1.0
+#: The nose tip this far or further from the eye line toward the mouth line
+#: (0 = at the eyes, 1 = at the mouth): the head is too far down for the
+#: chin window to hold the chin. Was 1.0 (only a fully bowed head); against
+#: eye labels on run f0bfc5 (38 identities, 803 reads) reads naming a
+#: conflicting class were 0-1.2% below a drop of 0.85 and 6.9% from 0.85 to
+#: 1.0 — a shaven man read "white" on both his steepest close-ups (the white
+#: collar in the window), a girl "grey" — and a duplicate is usually minted
+#: on exactly that head-down view. 0.8 drops that bin (~4% of reads).
+BEARD_MAX_NOSE_DROP = 0.8
 
 
 def _eyes(landmarks) -> tuple[float, float] | None:
@@ -996,3 +1002,65 @@ def beard_descriptor(
         float((pale & ~white).sum()) / n,
         float(white.sum()) / n,
     ]
+
+
+# ----------------------------------------------------------------- the light
+#
+# A fourth reading for the review queue, and the only one that is evidence
+# about the LIGHT rather than the person: the face's own skin colour.  A
+# duplicate is minted exactly when a face fails to match, and a change of
+# light is one cause — so the pair the queue most needs to show is the one
+# whose clothes, turban and beard were read under two different lights.
+# Replayed on run f0bfc5's crops (34 single-person identities split at their
+# time median, the late half under a per-channel shift): a +/-8% shift set
+# one genuine duplicate aside (a white shirt, cross 0.99 -> 0.28; a white
+# beard read "none"), +/-15% two or three, a stage wash seven or eight; the
+# frame's white balance (HECO_APPEARANCE_WB) cures a WHOLE-frame cast and
+# cannot see a light on one person (a spotlight, a videographer's lamp).
+# Skin moves with the light that falls on it: the same splits read the
+# cheek's median log(R/G), log(B/G) apart by 0.020 (median; p90 0.048)
+# under one light, and by 0.048-0.10 under a +/-8% shift, 0.11-0.23 under
+# +/-15%, 0.25-0.95 under the washes.  The match service holds a colour
+# set-aside back when two identities' skin readings disagree by more than
+# its tolerance (HECO_REVIEW_LIGHT_TOL).
+
+#: The skin reading's wire length: [log(R/G), log(B/G)] of the cheek window.
+SKIN_DIM = 2
+#: A cheek pixel is read when its brightest channel is at least this (a
+#: ratio of two small numbers is noise)...
+SKIN_V_MIN = 40
+#: ...its dimmest at least this (log of ~0)...
+SKIN_CHANNEL_MIN = 8
+#: ...and at most V_MAX (clipped).  Fewer usable pixels: not measured.
+SKIN_MIN_PX = 20
+
+
+def skin_tone(
+    image_bgr: np.ndarray,
+    landmarks,
+    gains: tuple[float, float, float] | None = None,
+) -> list[float] | None:
+    """``[log(R/G), log(B/G)]`` — the medians over the cheek window — or None.
+
+    The window is the beard reading's reference skin (:func:`cheek_region`,
+    under the eyes down to the nose tip), read under ``gains`` when given,
+    as every other colour reading is.  Log ratios because a light that
+    scales the three channels moves them by the same amount whatever the
+    skin, so a shift between two readings is the light's, in the units the
+    tolerance is set in.  None without eye and nose landmarks or with fewer
+    than SKIN_MIN_PX usable pixels — absent is not zero.
+    """
+    img_h, img_w = image_bgr.shape[:2]
+    win = cheek_region(landmarks, img_w, img_h)
+    if win is None:
+        return None
+    crop = image_bgr[win[2]:win[3], win[0]:win[1]]
+    if gains is not None:
+        crop = apply_gains(crop, gains)
+    px = crop.reshape(-1, 3).astype(np.float64)
+    top, low = px.max(axis=1), px.min(axis=1)
+    usable = (top <= V_MAX) & (top >= SKIN_V_MIN) & (low >= SKIN_CHANNEL_MIN)
+    if int(usable.sum()) < SKIN_MIN_PX:
+        return None
+    b, g, r = px[usable, 0], px[usable, 1], px[usable, 2]
+    return [float(np.median(np.log(r / g))), float(np.median(np.log(b / g)))]

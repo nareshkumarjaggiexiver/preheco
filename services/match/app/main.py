@@ -7,7 +7,7 @@ Endpoints:
     GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?, appearance?,
-                  attributes?, featNorm?, body?, head?, beard?}
+                  attributes?, featNorm?, body?, head?, beard?, skin?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
             templateN, templateAdded, appearanceSim, appearanceVetoed, templateId,
             nearMiss: {key, cosine, appearanceSim, basis} | null}
@@ -15,7 +15,8 @@ Endpoints:
         -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
             considered, returned, dropped,
             excluded: {gender, age, stature, clothes, head, beard},
-            setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped}
+            setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped,
+            keptByLight}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -35,6 +36,7 @@ carries it stays visible and tracked upstream.
 
 import asyncio
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -44,7 +46,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config, gallery, staff
-from .appearance import APPEARANCE_DIMS, BEARD_DIM, HEAD_DIM
+from .appearance import APPEARANCE_DIMS, BEARD_DIM, HEAD_DIM, SKIN_DIM
 from .store import EmbedderMismatchError, close_all_stores
 
 
@@ -70,7 +72,12 @@ def _env_s(name: str, default: float) -> float:
 #: 0.14.0 (same night): /match accepts optional `head` (40 floats) and
 #: `beard` (4), logged on the body row; the review adds why.head / why.beard
 #: and head / beard set-asides.  Additive only.
-VERSION = "0.14.0"
+#: 0.15.0 (2026-09-25): /match accepts optional `skin` (2 floats, the face's
+#: cheek log chromaticity) logged on the body row; the review HOLDS BACK a
+#: clothes / head / beard set-aside when the pair's skin says the light
+#: differed (HECO_REVIEW_LIGHT_TOL, why.light, keptByLight); none against a
+#: pale beard sets nothing aside unless HECO_REVIEW_BEARD_PALE.  Additive.
+VERSION = "0.15.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -208,7 +215,10 @@ class MatchRequest(BaseModel):
     reserved, summing to 1) and ``beard`` (exactly 4: skin, dark, grey,
     white fractions of the chin) are the runner's readings of this face
     (``heco_counting.appearance``), logged on the body row for the review
-    queue alone; a wrong length is a 422 naming the contract.
+    queue alone; a wrong length is a 422 naming the contract.  ``skin``
+    (0.15.0: exactly 2 finite numbers, the cheek's median log(R/G) and
+    log(B/G)) is the LIGHT that face was read under, logged beside them: the
+    review holds a colour set-aside back when two identities' skin differs.
     """
 
     runId: str
@@ -226,6 +236,19 @@ class MatchRequest(BaseModel):
     body: PersonBox | None = None
     head: list[float] | None = None
     beard: list[float] | None = None
+    skin: list[float] | None = None
+
+    @field_validator("skin")
+    @classmethod
+    def _skin_is_2_log_ratios(cls, v: list[float] | None) -> list[float] | None:
+        """A skin reading is [log(R/G), log(B/G)] — two finite numbers — or absent."""
+        if v is not None and (
+            len(v) != SKIN_DIM or any(not math.isfinite(x) or abs(x) > 10.0 for x in v)
+        ):
+            raise ValueError(
+                f"skin must be exactly 2 finite log ratios (log R/G, log B/G); got {v!r}"
+            )
+        return v
 
     @field_validator("head")
     @classmethod
@@ -418,6 +441,8 @@ def health() -> dict:
         "reviewClothesSelfMin": config.review_clothes_self_min(),
         "reviewHeadClash": config.review_head_clash(),
         "reviewBeardMinN": config.review_beard_min_n(),
+        "reviewBeardPale": config.review_beard_pale(),
+        "reviewLightTol": config.review_light_tol(),
     }
 
 
@@ -516,6 +541,7 @@ def match(body: MatchRequest) -> dict:
             body=None if body.body is None else body.body.model_dump(),
             head=body.head,
             beard=body.beard,
+            skin=body.skin,
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -707,6 +733,8 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             clothes_self_min=config.review_clothes_self_min(),
             head_clash=config.review_head_clash(),
             beard_min_n=config.review_beard_min_n(),
+            beard_pale=config.review_beard_pale(),
+            light_tol=config.review_light_tol(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e

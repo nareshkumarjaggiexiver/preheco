@@ -329,6 +329,15 @@ services:
       # none-vs-beard or dark-vs-white sets a pair aside; default 3, 0 = off.
       HECO_REVIEW_HEAD_CLASH: ${HECO_REVIEW_HEAD_CLASH-}
       HECO_REVIEW_BEARD_MIN_N: ${HECO_REVIEW_BEARD_MIN_N-}
+      # BEARD_PALE (0.15.0): none against a grey or white beard sets a pair
+      # aside only when 1 - an 8% warm light read a white beard as none.
+      # LIGHT_TOL (0.15.0): a clothes/head/beard set-aside is HELD BACK (the
+      # pair stays asked, why.light.held says so) when the two identities'
+      # face-skin readings differ by more than this - they were read under
+      # different light. f0bfc5 replay: one light 0.020 (p90 0.048), every
+      # false set-aside 0.08+; 0.07 held all of them. Default 0.07, 0 = off.
+      HECO_REVIEW_BEARD_PALE: ${HECO_REVIEW_BEARD_PALE-}
+      HECO_REVIEW_LIGHT_TOL: ${HECO_REVIEW_LIGHT_TOL-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
