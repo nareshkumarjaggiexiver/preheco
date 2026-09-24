@@ -500,6 +500,11 @@ services:
       # verifications: the crop path's re-verify saving, and the cadence's
       # "settled" window. 0 (default) = verify every frame.
       HECO_FACE_REVERIFY_INTERVAL_S: ${HECO_FACE_REVERIFY_INTERVAL_S-}
+      # How long a live source may stand still before the run settles as
+      # failed (source-stalled); runner default 45 s. demo-up.sh sets 600:
+      # the 2026-09-25 live test lost its camera for ~2 minutes and 45 s
+      # ended the run while ingest was still reconnecting.
+      HECO_SOURCE_STALL_S: ${HECO_SOURCE_STALL_S-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
