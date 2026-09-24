@@ -1054,6 +1054,18 @@ class RunLoop:
             # interval up needs to see what it bought and, beside it, that
             # `unique` did not move.
             "faceSearchesSkipped": 0,
+            # INGEST'S OWN ACCOUNT of the frames it did NOT hand this loop
+            # (the motion gate and the bounded live buffer: INGEST_MOTION_GATE,
+            # INGEST_BUFFER_S), as the frame wire reports them — cumulative
+            # frames decoded, withheld for want of motion, and discarded
+            # (buffer full, or a live frame overwritten before anybody read
+            # it), plus the deepest the live buffer ever got behind this loop.
+            # None until a frame carries them: an older ingest measures none
+            # of this, and absent is not zero (see _note_ingest).
+            "framesCaptured": None,
+            "framesSkippedNoMotion": None,
+            "framesDroppedLive": None,
+            "ingestBacklogMax": None,
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -1147,6 +1159,7 @@ class RunLoop:
                 continue
             r.raise_for_status()
             body = r.json()
+            self._note_ingest(body)
             if body.get("ended") or not body.get("imageB64"):
                 self._end_reason = "source-ended"
                 return None
@@ -1155,12 +1168,95 @@ class RunLoop:
                 self._last_seq = seq
                 waited = 0.0 if wait_start is None else time.monotonic() - wait_start
                 self.board.observe("ingest", "frameWaitMs", waited * 1000.0)
+                self._observe_ingest_frame(body)
                 return body
             if wait_start is None:
                 wait_start = time.monotonic()
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
+
+    #: Frame wire field -> the status counter that carries it (lever L1).
+    #: CUMULATIVE on the wire, so the latest report is the run's figure.
+    _INGEST_COUNTERS = (
+        ("captured", "framesCaptured"),
+        ("skipped", "framesSkippedNoMotion"),
+        ("dropped", "framesDroppedLive"),
+    )
+
+    def _note_ingest(self, body) -> None:
+        """Carry ingest's account of the frames it did not hand this loop.
+
+        WHY THE RUN MUST SAY IT.  With the motion gate on, ingest publishes
+        only frames in which something moved (plus a keepalive at least every
+        INGEST_MOTION_KEEPALIVE_S); with the live buffer on it queues up to
+        INGEST_BUFFER_S of frames and discards past its cap.  Both buy speed
+        by not looking at frames, and a frame nobody looks at is the one way
+        this pipeline can miss a guest without any stage ever seeing them.
+        So the numbers land in the run's status, results and notes: frames
+        decoded, frames withheld for no motion, frames thrown away, and how
+        far behind the loop fell.
+
+        Read on EVERY answer — a repeated frame, and the closing ``ended``
+        one, which is where a file's final totals arrive.  A value that is
+        not a non-negative integer is not a measurement and is ignored; an
+        absent one leaves the counter None (absent is not zero).  Called from
+        the fetching thread (the prefetcher's, when it is on), so it writes
+        under ``_lock`` like every other counter.
+        """
+        if not isinstance(body, dict):
+            return
+        upd = {
+            key: v
+            for wire, key in self._INGEST_COUNTERS
+            if _count(v := body.get(wire))
+        }
+        backlog = body.get("backlog")
+        if not upd and not _count(backlog):
+            return
+        with self._lock:
+            self._status.update(upd)
+            if _count(backlog):
+                deepest = self._status.get("ingestBacklogMax")
+                self._status["ingestBacklogMax"] = (
+                    backlog if deepest is None else max(deepest, backlog)
+                )
+
+    def _observe_ingest_frame(self, body: dict) -> None:
+        """Chart the per-frame half of L1 on the ingest board.
+
+        ``motion`` (the fraction of the small luma image that changed; null
+        when the gate is off) and ``backlog`` (frames queued behind this one)
+        are the two readings an engineer needs beside the throughput: whether
+        the gate's threshold is where the room's motion actually sits, and
+        whether the loop is keeping up or merely draining a queue.  Observed
+        only when measured, once per frame handed over.
+        """
+        motion = body.get("motion")
+        if isinstance(motion, int | float) and not isinstance(motion, bool) and motion == motion:
+            self.board.observe("ingest", "motion", float(motion))
+        backlog = body.get("backlog")
+        if _count(backlog):
+            self.board.observe("ingest", "backlog", float(backlog))
+
+    def _lever_counters(self, st: dict) -> dict:
+        """The throughput levers' own counters, for the notes and the results.
+
+        Only what was MEASURED: the ingest counters appear when ingest
+        reported them.  An absent key means "not measured" — the planner's
+        results door refuses a null (every value must be a finite number),
+        and a zero would claim a measurement nobody made.  With every lever
+        off and an older ingest this is empty, and the run row is exactly
+        what it has always been.
+        """
+        out: dict = {}
+        for key in (
+            "framesCaptured", "framesSkippedNoMotion", "framesDroppedLive",
+            "ingestBacklogMax",
+        ):
+            if st.get(key) is not None:
+                out[key] = st[key]
+        return out
 
     def _next_frame_prefetched(self) -> dict | None:
         """_next_frame, overlapped: hand back the frame fetched DURING the
@@ -1458,6 +1554,7 @@ class RunLoop:
         self._close_golden()
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
+        levers = self._lever_counters(st)
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
@@ -1520,7 +1617,10 @@ class RunLoop:
             f"nearMissMints={st['nearMissMints']} "
             f"galleryOverlaps={st['galleryOverlaps']} "
             f"excludedByZone={st['excludedByZone']} "
-            f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
+            # The levers' counters, when measured (see _lever_counters): what
+            # ingest withheld and discarded, beside what the loop counted.
+            + "".join(f"{k}={v} " for k, v in levers.items())
+            + "(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. A run that stopped because the camera
         # vanished must not present itself as a complete count, so it settles
@@ -1553,6 +1653,7 @@ class RunLoop:
             "nearMissMints": st["nearMissMints"],
             "galleryOverlaps": st["galleryOverlaps"],
             "excludedByZone": st["excludedByZone"],
+            **levers,
         }
         try:
             self.planner.end_run(
@@ -4521,6 +4622,11 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+
+
+def _count(v) -> bool:
+    """Whether ``v`` is a count: a non-negative int (a JSON bool is not one)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def _fmt(x) -> str:
