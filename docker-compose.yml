@@ -270,13 +270,27 @@ services:
       HECO_REVIEW_STATURE_GAP: ${HECO_REVIEW_STATURE_GAP-}
       HECO_REVIEW_STATURE_MIN_N: ${HECO_REVIEW_STATURE_MIN_N-}
       HECO_STATURE_ADULT_M: ${HECO_STATURE_ADULT_M-}
-      # Clothing set-aside (v3 torsos): the best cross agreement under which a
-      # pair is set aside when both people's own reads are plentiful (MIN_N,
-      # from 2+ seconds) and self-consistent (SELF_MIN). Defaults 0.35 / 3 /
-      # 0.6, measured on the Sharon re-run c84098; CLASH=0 turns it off.
+      # CLOTHING SET-ASIDE (0.13.0). A pair is set aside when each identity's
+      # own v3 torso reads (body log - its templates' in a pre-0.13.0 gallery -
+      # >= MIN_N over 2 s) agree at >= SELF_MIN and the best cross reading is
+      # still < CLASH. Defaults 0.35 / 3 / 0.6. c84098 (templates): a person
+      # against themselves never under 0.52, the operator's different-people
+      # pairs 0.10-0.25. f0bfc5 (body log): own reads 0.90 median, one person
+      # split in time 0.77-0.97, different people 0.10-0.97 (white shirts
+      # agree); 0.35 set aside #3/#6/#7/#23 and no same-person split.
+      # CLASH=0 turns it off.
       HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
       HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
       HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
+      # HEAD AND BEARD SET-ASIDES (0.14.0), read per sighting beside the torso.
+      # HEAD_CLASH: two HEADWEAR identities (turban against turban; a covered
+      # head is never set against a bare one - dupattas and rumals come and
+      # go in one wedding) whose best cross head reading is under it. f0bfc5:
+      # maroon vs peach turban 0.36, one person split in time 0.83-0.99;
+      # default 0.45, 0 = off. BEARD_MIN_N: reads each side needs before
+      # none-vs-beard or dark-vs-white sets a pair aside; default 3, 0 = off.
+      HECO_REVIEW_HEAD_CLASH: ${HECO_REVIEW_HEAD_CLASH-}
+      HECO_REVIEW_BEARD_MIN_N: ${HECO_REVIEW_BEARD_MIN_N-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -387,6 +401,13 @@ services:
       # and can be read out with `docker cp`.
       HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
       HECO_FACES_WHOLE_FRAME: ${HECO_FACES_WHOLE_FRAME-}
+      # WHITE BALANCE for the colour descriptors (0|1, default 0 = off). On,
+      # each frame's illuminant is estimated once (shades-of-grey, ~2.4 ms
+      # at 4K) and torso colour is read under neutral light. Run f0bfc5's
+      # camera AWB already held the warm hall neutral (gains within 2%), so
+      # it changed nothing there; a venue with coloured stage light is where
+      # to try it. Reported on runner /health as knobs.appearanceWb.
+      HECO_APPEARANCE_WB: ${HECO_APPEARANCE_WB-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

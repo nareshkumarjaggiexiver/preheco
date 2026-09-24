@@ -451,6 +451,20 @@ class Settings:
     # arming, because the gate is the pipeline's only irreversible discard.
     quality_min_feat_norm: float = 0.0
 
+    # APPEARANCE WHITE BALANCE (heco_counting.appearance.frame_gains).  Off
+    # by default.  On: each decoded frame's illuminant is estimated once
+    # (shades-of-grey, p = 6, on every 8th pixel, ~2.4 ms at 4K) and the
+    # torso descriptor reads its band under neutral light.  Proven on
+    # synthetic casts (four garments under red / blue / amber light agree
+    # with their neutral read at 0.83-0.99 balanced; raw, 0.00-0.995 and
+    # three of the twelve not measurable at all).  Measured on
+    # run f0bfc5 it changes nothing: the camera's own AWB already holds the
+    # warm hall at gains 1.006 / 0.985 / 1.009 (B/G/R median, every frame
+    # within 2%), and within-identity (median 0.90 -> 0.90) and cross-pair
+    # separation did not move — so it stays off until a venue with coloured
+    # light measures otherwise.
+    appearance_wb: bool = False
+
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
@@ -546,4 +560,5 @@ def from_env() -> Settings:
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
         enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
+        appearance_wb=env_bool("HECO_APPEARANCE_WB", s.appearance_wb),
     )

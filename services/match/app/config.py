@@ -320,6 +320,58 @@ DEFAULT_REVIEW_STATURE_GAP = 0.2
 # not.  Under this an identity's stature is null — not measured, never 0.
 DEFAULT_REVIEW_STATURE_MIN_N = 8
 
+# Clothing: the torso descriptor RANKS the queue, and since 2026-09-24
+# (night) it may also set a pair aside — on both identities' own testimony.
+# Each identity needs at least CLOTHES_MIN_N v3 torso reads in its body log
+# (its templates', in a gallery written before match 0.13.0), spanning two
+# seconds, whose median pairwise intersection is at least CLOTHES_SELF_MIN
+# (its clothing reads as ONE garment); then the pair is set aside when the
+# best intersection any read of one reaches against any read of the other is
+# under CLOTHES_CLASH.  Measured twice that night.  Run c84098 (the Sharon
+# re-run, v3 torsos on its templates): 60 identities' own reads split into
+# an early and a late half — a person against themselves, exactly what a
+# missed duplicate is — scored a best cross of at least 0.52 (p5 0.71,
+# median 0.93), while the operator's different-people pairs read 0.10 (man
+# / woman), 0.13, 0.15, 0.16, 0.24 (red / orange turban) and 0.25.  Run
+# f0bfc5 (body log, 45 identities of the queue's first 32 pairs): own reads
+# agree at a median 0.90 (p10 0.70; the two identities under 0.6 were each
+# two people merged), one person split across a gap of seconds to minutes
+# still agreed at a best cross of 0.77 to 0.97 (nine splits).  The queue's
+# different-people pairs spread 0.10-0.97: two white shirts agree, so
+# clothing can only speak for pairs dressed differently — 11 of the 32 sat
+# under 0.43, and of those the four whose identities both had the reads are
+# set aside at 0.35: #3 (blue shirt vs cream suit, 0.10), #6 (0.16), #7
+# (0.13), #23 (0.26); no same-person split came within 0.42 of it.
+# CLOTHES_CLASH 0 turns the signal off.
+DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
+DEFAULT_REVIEW_CLOTHES_MIN_N = 3
+DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
+
+# Head: turban and hair colour above the eyes, per sighting in the body log,
+# under the clothing rule's own-testimony bar (three reads over two seconds
+# agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
+# at least half chromatic — gallery._HEAD_WEAR_MIN says why a covered head
+# is never set against a bare one); set aside when the best cross reading is
+# under HEAD_CLASH.  Run f0bfc5, 45 identities of the queue's first 32 pairs:
+# own head reads agree at a median 0.87 (min 0.63), one person split across
+# a time gap at 0.83-0.99 (9 splits), pair #1 — maroon turban against peach
+# — at 0.36; blue turban against black hair (#18) 0.37 and pink turban
+# against black hair (#15) 0.41 are headwear against hair and stay asked.
+# 0.45 sits 0.09 over #1 and 0.38 under the closest same-person split.
+# HEAD_CLASH 0 turns the signal off.
+DEFAULT_REVIEW_HEAD_CLASH = 0.45
+
+# Beard: none / dark / grey / white per identity, from its body-log reads
+# (the class two thirds of its reads name, the unsure reads counting
+# against it).  A pair is set aside when both identities have at least
+# BEARD_MIN_N reads over two seconds and their classes cannot be one face:
+# none against any beard, dark against white — grey is never set against
+# either.  Run f0bfc5: pair #1 reads dark against white and is set aside;
+# of nine same-person splits none was; the seven full beards' median reads
+# are 0.47-0.75 dark against 0.03-0.48 for 21 shaven or moustached men.
+# BEARD_MIN_N 0 turns the signal off.
+DEFAULT_REVIEW_BEARD_MIN_N = 3
+
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
 # it is the anchor for every stature estimate and the planner's default
@@ -370,38 +422,35 @@ def review_stature_min_n() -> int:
     return max(1, int(_env_f("HECO_REVIEW_STATURE_MIN_N", DEFAULT_REVIEW_STATURE_MIN_N)))
 
 
-#: The clothing set-aside (2026-09-24 night), measured on run c84098 — the
-#: Sharon wedding re-run whose gallery holds v3 torsos for 69 identities.
-#: Splitting each of 60 identities' own reads into an early and a late half
-#: and scoring the halves against each other (a person against themselves,
-#: exactly what a missed duplicate is) gave a best cross agreement of at least
-#: 0.52 (p5 0.71, median 0.93); the operator's different-people pairs read
-#: 0.10 (man / woman), 0.13, 0.15, 0.16, 0.24 (red / orange turban) and 0.25.
-#: 0.35 sits 0.17 under the worst same-person split.
-DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
-#: Reads each identity needs, from at least two different seconds, and how
-#: much they must agree with each other: a person whose own clothing reads
-#: scatter (lighting, a shawl on and off, a crowded torso) is not evidence.
-DEFAULT_REVIEW_CLOTHES_MIN_N = 3
-DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
-
-
 def review_clothes_clash() -> float:
-    """Best cross torso agreement under which a pair is set aside
-    (env HECO_REVIEW_CLOTHES_CLASH; 0 = off)."""
+    """Best cross-torso intersection under which a pair whose identities each
+    wear ONE garment is set aside (env HECO_REVIEW_CLOTHES_CLASH; 0 = off)."""
     return _env_f("HECO_REVIEW_CLOTHES_CLASH", DEFAULT_REVIEW_CLOTHES_CLASH)
 
 
 def review_clothes_min_n() -> int:
-    """v3 torso reads each identity needs before its clothing can set a pair
-    aside (env HECO_REVIEW_CLOTHES_MIN_N).  Clamped to at least 2."""
+    """v3 torso reads each identity needs before its clothing counts
+    (env HECO_REVIEW_CLOTHES_MIN_N).  Clamped to at least 2: one read has no
+    self-agreement to trust."""
     return max(2, int(_env_f("HECO_REVIEW_CLOTHES_MIN_N", DEFAULT_REVIEW_CLOTHES_MIN_N)))
 
 
 def review_clothes_self_min() -> float:
-    """How much an identity's own torso reads must agree (median pairwise)
-    before they count (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
+    """Median pairwise intersection an identity's own torso reads must reach
+    (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
     return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
+
+
+def review_head_clash() -> float:
+    """Best cross head intersection under which a pair whose identities each
+    read ONE head is set aside (env HECO_REVIEW_HEAD_CLASH; 0 = off)."""
+    return _env_f("HECO_REVIEW_HEAD_CLASH", DEFAULT_REVIEW_HEAD_CLASH)
+
+
+def review_beard_min_n() -> int:
+    """Beard reads each identity needs before its class may set a pair aside
+    (env HECO_REVIEW_BEARD_MIN_N; 0 = off)."""
+    return max(0, int(_env_f("HECO_REVIEW_BEARD_MIN_N", DEFAULT_REVIEW_BEARD_MIN_N)))
 
 
 def adult_height_m() -> float:

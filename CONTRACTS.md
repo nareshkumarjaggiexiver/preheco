@@ -1685,3 +1685,151 @@ Match before runner, per tree: a 0.11.0 match refuses the 64-float
 descriptor (the runner degrades to "torso not measured" and counts
 `appearanceRefused`); a new match accepts a 48-float runner.
 
+## v4 addition — the review queue sets aside on clothes (match 0.13.0, 2026-09-24 night)
+
+The user's ask: "cosine for cloths is not good; keep cloth colour, pattern
+style and compare". Clothing keeps ranking the queue and may now also set a
+pair aside — on BOTH identities' own testimony.
+
+- Storage: `body_sightings` gains nullable **`appearance BLOB`** (migrated
+  in place by ADD COLUMN): the torso descriptor of that /match call, logged
+  on the call's body row. The review reads an identity's torsos from here —
+  every sighting — not from its (at most five) templates; a same-frame
+  `bodyId` retraction takes the torso with the row. A call without a usable
+  `body` logs no row (it had no person box, so it had no torso either). An
+  identity with NO torso in its body log (every identity of a gallery
+  written before 0.13.0) is read from its templates instead — never both,
+  since a template's torso is also on its sighting's body row. On run
+  c84098's templates the 2 s span sets aside 3 pairs where main's first cut
+  (e3ed159, two distinct write seconds) set aside 6; the other three
+  identities' template reads sat inside 0.85–1.94 s, one walk.
+- `POST /review/duplicates`: `excluded` gains **`clothes`**. A pair is set
+  aside when each identity has ≥ `HECO_REVIEW_CLOTHES_MIN_N` (3, clamped ≥ 2)
+  **v3** torso reads spanning ≥ 2 s of write time, whose median pairwise
+  intersection is ≥ `HECO_REVIEW_CLOTHES_SELF_MIN` (0.6), and the best
+  intersection of any read of one with any read of the other is <
+  `HECO_REVIEW_CLOTHES_CLASH` (0.35; 0 = off — `why.clothes` still reports
+  the reads). v2 (48-float) rows never count; at most 24 reads per identity,
+  spread evenly over its time on camera. Checked after gender, age and
+  stature, so a pair is still counted under exactly one reason.
+- Set aside writes nothing — no `cannot_link`, no merge; the operator's
+  `/merge` of the pair still works. `/health` reports
+  `reviewClothesClash`, `reviewClothesMinN`, `reviewClothesSelfMin`.
+- Measured on run f0bfc5 (45 identities of the first 32 pairs, ≤ 24 reads
+  each, re-read offline from the video): own reads agree at a median 0.90
+  (p10 0.70; the two identities under 0.6 were each two people merged); one
+  person split across a time gap agrees at a best cross of 0.77–0.97 (9
+  splits); the queue's different-people pairs anywhere from 0.10 to 0.97
+  (two white shirts agree). 0.35 sets aside #3, #6, #7, #23 and no split.
+
+### setAside and why.clothes (match 0.13.0)
+
+- `POST /review/duplicates` reply gains **`setAside: [{a, b, cosine,
+  clothes, why, reasons: [...]}]`** — every pair any signal set aside
+  (gender, age and stature included), ranked like `pairs` (face cosine
+  desc, clothes the tiebreak), at most `limit`; **`setAsideDropped`** counts
+  the set-aside pairs past `limit`. `reasons` lists EVERY
+  signal that spoke, in check order `gender, age, stature, clothes`;
+  `excluded` counts the pair once, under `reasons[0]`, so
+  `sum(excluded)` is the number of pairs set aside. Exclusion only removes
+  a pair from the ranked queue: it never writes `cannot_link` and never
+  merges, and `/merge` on a set-aside pair works as on any other.
+- Every row (`pairs` and `setAside`) gains **`why.clothes: {selfA, selfB,
+  cross, nA, nB}`** — v3 torso reads from the body log only: each side's
+  median pairwise self-agreement (null under two reads), the best cross
+  intersection (null when either side has none), each side's read count
+  (0 when none). Reported whether or not `HECO_REVIEW_CLOTHES_CLASH` is on.
+  The row's top-level `clothes` keeps its meaning (best intersection over
+  the identities' TEMPLATE descriptors, the ranking tiebreak).
+
+### Lighting — white balance for the colour descriptors (counting + runner)
+
+- `heco_counting.appearance.frame_gains(image_bgr) -> (gb, gg, gr) | None`:
+  shades-of-grey (p = 6) on every 8th pixel each way (~2.4 ms at 4K),
+  ignoring samples whose brightest channel is < 16 or any channel ≥ 250;
+  gains are the illuminant's inverse normalised to average 1, clamped to
+  [0.5, 2]; None under 1,000 usable samples. `torso_descriptor(...,
+  gains=None)` applies them to the band before the skin window and the
+  colour bins; the lit mask and the pattern parts keep reading the pixels
+  as delivered. `gains=None` is the descriptor as before, byte for byte.
+- Runner env **`HECO_APPEARANCE_WB`** (0|1, default 0): estimate once per
+  decoded frame and pass to every descriptor read off it (`wbMs` timed on
+  the count stage). `GET {runner}/health` gains **`knobs:
+  {appearanceWb}`**.
+- Default OFF, on a measurement: run f0bfc5's camera AWB already holds the
+  warm hall neutral (gains 1.006 / 0.985 / 1.009 B/G/R median, every frame
+  within 2%), and balancing moved no clothing number that matters (within
+  median 0.90 → 0.90, same-person split minimum 0.77 → 0.79, and raw and
+  balanced set aside the same pairs at every clash from 0.25 to 0.45).
+  Synthetic casts (red, blue, amber on four garments) are where it earns
+  its keep: colour part vs the neutral read 0.83–0.99 balanced against
+  0.00–0.995 raw with three of twelve not measurable at all — a grey-blue
+  garment under a warm cast sits wholly inside the skin window — and every
+  one measurable again balanced.
+
+### Head and beard (counting + runner + match 0.14.0)
+
+Run f0bfc5's pair #1 — a maroon turban and black beard against a peach
+turban and white beard — was the queue's first question, and the torso
+could not settle it (a white shirt against a pink check agreed at 0.42 in
+some pair of reads).
+
+- `heco_counting.appearance.head_descriptor(image_bgr, face_box, landmarks,
+  gains=None, person_box=None) -> 40 floats | None`. Region: from 0.6 face
+  heights above the face box's top — or the person box's top less 0.05 face
+  heights, when that is lower (above it is wall) — down to the eye line
+  less 0.15 IED; the box ± 0.15 of its width; clamped to the image. Lit
+  (not blown) pixels vote, skin-window pixels at a quarter weight: chroma
+  (max − min channel) ≥ 20 into bins 0..23 (24 SOFT hue bins of 15°, that
+  WRAP at red), the rest into 24..26 (soft brightness: black, grey,
+  white); 27..39 reserved zeros; sums to 1. Deviations from the drafted
+  contract, each measured: chroma not saturation (black hair read S 40–93,
+  chroma 4–5); skin at a quarter weight, not masked (the peach turban sits
+  wholly inside the skin window); no shadow floor (black hair is V 13–22).
+  None without two eye landmarks, for a window under 8 px or under 60 lit
+  pixels.
+- `beard_descriptor(image_bgr, face_box, landmarks, gains=None) ->
+  [skinFrac, darkFrac, greyFrac, whiteFrac] | None`. Region: nose tip to
+  the face box's bottom, the mouth corners ± 0.25 IED. Each pixel judged
+  against the same face's cheek band (eye line + 0.25 IED to the nose tip):
+  DARK under 0.4 of its median brightness; else PALE under half its median
+  saturation — WHITE from 0.9 of its brightness, GREY below; else SKIN.
+  None with the nose tip at or below the mouth line, a window under 6 px or
+  40 lit pixels, or cheeks under 20 pixels or darker than 20.
+- Runner: for every kept face with landmarks on a decoded frame, `POST
+  /match` gains **`head`** and **`beard`** (each only when measured; the
+  same-frame re-ask carries them too). Timed as `headBeardMs`.
+- Match 0.14.0: `MatchRequest` accepts `head` (exactly 40 floats) and
+  `beard` (exactly 4 in 0..1) — any other shape is a 422; `body_sightings`
+  gains nullable **`head BLOB, beard BLOB`** (ADD COLUMN; legacy rows read
+  null) logged on the call's body row. The review adds, on every row,
+  **`why.head: {a, b, sim, selfA, selfB, nA, nB}`** (`a`/`b` the dominant
+  colour of each identity's mean head reading — red, orange, yellow, green,
+  blue, purple, pink, black, grey, white, or null; never brown) and
+  **`why.beard: {a, b, nA, nB}`** (`none | dark | grey | white | null`),
+  and `excluded` gains **`head`** and **`beard`** (check order gender, age,
+  stature, clothes, head, beard).
+  - head: both identities ≥ 3 head reads over ≥ 2 s with median pairwise
+    self-agreement ≥ 0.6, BOTH heads headwear (mean chromatic share ≥ 0.5),
+    and best cross < **`HECO_REVIEW_HEAD_CLASH`** (0.45; 0 = off). A
+    covered head is never set against a bare one: a dupatta over the hair
+    for the ceremony, a rumal for the Gurdwara — one guest's head is both
+    within one wedding.
+  - beard: both identities ≥ **`HECO_REVIEW_BEARD_MIN_N`** (3; 0 = off)
+    reads over ≥ 2 s; class = the one two thirds of the reads name (a read:
+    dark ≥ 0.5 → dark; pale ≥ 0.5 with dark < 0.25 → white or grey; dark ≤
+    0.2 with skin ≥ 0.7 → none; else unsure); set aside for none against
+    any beard, or dark against white.
+  - `/health` gains `reviewHeadClash`, `reviewBeardMinN`.
+- Measured on f0bfc5 (45 identities, 1,092 head and 1,078 beard reads): own
+  head reads agree at a median 0.87 (min 0.63); nine same-person splits at
+  0.83–0.99 head and no beard clash; #1 reads head red/orange at 0.36 and
+  beard dark/white and is set aside on both. White balance changes none of
+  it.
+- Rollout, either order: a match ≤ 0.13.0 ignores `head`/`beard` (unknown
+  fields are dropped by its request model, not refused) and the review
+  simply has no head or beard evidence; a runner from before this sends
+  neither and every `why.head`/`why.beard` reads null with zero
+  exclusions. The torso has been on every `/match` since v3, so the
+  clothing set-aside needs only the new match.
+
