@@ -87,6 +87,11 @@ services:
       INGEST_MOTION_KEEPALIVE_S: ${INGEST_MOTION_KEEPALIVE_S-}
       INGEST_BUFFER_S: ${INGEST_BUFFER_S-}
       INGEST_BUFFER_MB: ${INGEST_BUFFER_MB-}
+      # L6 — cpu (empty) | nvdec | vaapi | ffmpeg. The hardware decoders need
+      # the ffmpeg image and the devices from docker-compose.hwdec.yml; asked
+      # for without them, the worker falls back to cpu and /health `device`
+      # says so.
+      INGEST_DECODER: ${INGEST_DECODER-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.

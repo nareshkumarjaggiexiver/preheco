@@ -29,6 +29,7 @@ or counted as skipped, and GET /frame takes frames out of that store with
 
 import itertools
 import os
+import sys
 import threading
 import time
 
@@ -36,8 +37,10 @@ import cv2
 import numpy as np
 from heco_common.config import env_bool, env_float, env_int
 from heco_common.logs import safe
+from heco_common.ort import announce_device
 
 from .config import Levers
+from .ffmpeg_source import DecoderError, FfmpegSource
 from .frames import FrameStore, Item, RawFrame, Served
 from .motion import MotionGate, small_luma
 
@@ -106,9 +109,18 @@ class CaptureWorker(threading.Thread):
         self._fps: float | None = None
         self._pace_s = self._pacing_interval() if is_file else 0.0
         self.levers = levers if levers is not None else Levers()
+        # L6 DEVICE TRUTH, served from /health: what was asked for, what
+        # actually decodes, and why not when they differ.
+        self.decoder = {"requested": self.levers.decoder, "active": "cpu", "error": None}
+        self._ff: FfmpegSource | None = None
+        if self.levers.decoder != "cpu":
+            self._ff = self._start_decoder()
         # LEVER MODE — see _run_levered. Decided once, here: a worker never
-        # switches loops mid-stream.
-        self.levered = self.levers.armed
+        # switches loops mid-stream. A hardware decoder that fell back to cpu
+        # with no other lever armed IS today's worker, so it runs today's loop.
+        self.levered = (
+            self.levers.motion_gate or self.levers.buffer_s > 0 or self._ff is not None
+        )
         self._gate = (
             MotionGate(
                 self.levers.motion_min_frac,
@@ -131,7 +143,7 @@ class CaptureWorker(threading.Thread):
         }
         if self.levered and is_file:
             self._probe_fps()  # the gate's footage clock needs it even unpaced
-        self._cap = self._open()
+        self._cap = self._open() if self._ff is None else None
 
     # ------------------------------------------------------------- public
 
@@ -209,6 +221,7 @@ class CaptureWorker(threading.Thread):
             "isFile": self.is_file,
             "lockstep": self.lockstep,
             "knobs": self.levers.knobs(),
+            "decoder": dict(self.decoder),
             "counters": None,
         }
         if self.levered:
@@ -224,8 +237,13 @@ class CaptureWorker(threading.Thread):
     def stop(self, join_timeout_s: float = 5.0) -> None:
         """Signal the thread, wait for it, and release the capture."""
         self._stop_evt.set()
+        ff = self._ff
+        if ff is not None:
+            ff.interrupt()  # a read blocked on the pipe returns now
         if self.is_alive():
             self.join(timeout=join_timeout_s)
+        elif ff is not None:
+            ff.close()  # never started, or already finished: reap it here
 
     # ------------------------------------------------------------ thready
 
@@ -351,7 +369,18 @@ class CaptureWorker(threading.Thread):
                 if frame is None:
                     if self._stop_evt.is_set():
                         return
-                    if self.is_file and self.loop:
+                    if self.is_file and self._ff is not None and not self._ff.clean_eof:
+                        # A decoder that DIED is not the end of the file, and
+                        # saying `ended` would settle an incomplete count as a
+                        # complete one. Stop producing instead: the runner sees
+                        # a stall and fails the run with its gallery kept.
+                        self.decoder["error"] = (
+                            f"decoder exited {self._ff.returncode} mid-file: {self._ff.tail()}"
+                        )
+                        sys.stderr.write(f"[heco-device] ingest {self.decoder['error']}\n")
+                        return
+                    if self.is_file and self.loop and self._ff is None:
+                        # (an ffmpeg decoder loops the file itself: -stream_loop)
                         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     if self.is_file:
@@ -359,11 +388,11 @@ class CaptureWorker(threading.Thread):
                             self._exhausted = True
                         return
                     # Live stream hiccup: release, breathe, reopen — as above.
-                    self._cap.release()
+                    self._release_source()
                     if self._stop_evt.wait(1.0):
                         return
                     try:
-                        self._cap = self._open()
+                        self._reopen_source()
                     except CaptureError:
                         continue
                     if self._gate is not None:
@@ -377,12 +406,64 @@ class CaptureWorker(threading.Thread):
                     if delay > 0 and self._stop_evt.wait(delay):
                         return
         finally:
-            self._cap.release()
+            self._release_source()
 
     def _next_raw(self) -> RawFrame | None:
         """Decode the next frame, or None at EOF / on a read failure."""
+        if self._ff is not None:
+            return self._ff.read()
         ok, frame = self._cap.read()
         return RawFrame.from_bgr(self._fit(frame)) if ok else None
+
+    def _start_decoder(self) -> FfmpegSource | None:
+        """Start the requested subprocess decoder, or fall back to cpu LOUDLY.
+
+        A decoder that cannot start must not take the camera down with it: the
+        cv2 path is today's and still works. But it must never be silent
+        either — a "hardware decode" benchmark that quietly ran on the CPU is
+        exactly the dishonesty the device truth exists to catch — so the
+        fallback is announced on stderr and served from /health ``device``.
+        """
+        requested = self.levers.decoder
+        try:
+            ff = self._new_ffmpeg()
+        except DecoderError as exc:
+            self.decoder["error"] = str(exc)
+            announce_device("ingest", requested, ["cpu"])
+            sys.stderr.write(f"[heco-device] ingest decoder fell back to cpu: {exc}\n")
+            return None
+        self.decoder["active"] = requested
+        announce_device("ingest", requested, [requested])
+        return ff
+
+    def _new_ffmpeg(self) -> FfmpegSource:
+        return FfmpegSource(
+            self.source,
+            self.levers.decoder,
+            loop=self.is_file and self.loop,
+            rtsp_tcp=env_bool("INGEST_RTSP_TCP", True),
+            abort=self._stop_evt,
+        )
+
+    def _release_source(self) -> None:
+        if self._ff is not None:
+            self._ff.close()
+        elif self._cap is not None:
+            self._cap.release()
+
+    def _reopen_source(self) -> None:
+        """Reconnect a live source on the decoder it was running (CaptureError on failure).
+
+        A camera that drops is a camera problem, not a decoder one, so the
+        reconnect never switches decoders mid-run.
+        """
+        if self._ff is None:
+            self._cap = self._open()
+            return
+        try:
+            self._ff = self._new_ffmpeg()
+        except DecoderError as exc:
+            raise CaptureError(str(exc)) from exc
 
     def _admit(self, seq: int, t0: float, frame: RawFrame) -> None:
         """Gate one decoded frame, then publish it into the store or skip it."""

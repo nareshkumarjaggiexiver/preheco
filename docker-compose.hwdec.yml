@@ -1,0 +1,42 @@
+# Hardware-decode overlay for ingest (L6) — NVDEC on the .94 RTX 4060 under
+# WSL2 + native docker-ce, and VA-API on its UHD 770 where Mesa's d3d12 driver
+# initialises. Repo-owned, like the CUDA and iGPU overlays.
+#
+#   docker build -f docker/ingest-hwdec.Dockerfile --build-arg BASE=heco-ingest \
+#     -t heco-ingest:hwdec .
+#   INGEST_DECODER=nvdec docker compose -f docker-compose.yml \
+#     -f docker-compose.hwdec.yml up -d --force-recreate ingest
+#
+# The overlay only makes the hardware REACHABLE; INGEST_DECODER (passed through
+# by the base compose) chooses to use it. Unset, this is today's cv2 ingest in
+# a bigger image. A decoder that cannot start falls back to cpu and says so on
+# /health `device` and in the log — check it after every recreate.
+#
+# WSL2-SPECIFIC, all of it measured on the .94 box (2026-09-24):
+#   * NVDEC loads only with /usr/lib/wsl mounted and on LD_LIBRARY_PATH AND the
+#     `video` driver capability; without the mount, ffmpeg says "Cannot load
+#     libnvcuvid.so.1" even though CUDA itself works.
+#   * VA-API needs /dev/dxg (the WSL GPU paravirtualisation device), a DRM
+#     node for libva to open (/dev/dri exists only while the vgem module is
+#     loaded — persisted on the box via /etc/modules-load.d/vgem.conf), and
+#     the d3d12 driver pointed at the Intel adapter.
+# On a native Linux host drop the /usr/lib/wsl mount, LD_LIBRARY_PATH and
+# /dev/dxg: the NVIDIA container toolkit injects libnvcuvid itself once the
+# `video` capability is requested.
+#
+# Rollback is total: `docker compose -f docker-compose.yml up -d ingest`.
+services:
+  ingest:
+    image: heco-ingest:${HECO_HWDEC_TAG:-hwdec}
+    build: !reset null
+    gpus: all
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      LIBVA_DRIVER_NAME: d3d12
+      MESA_D3D12_DEFAULT_ADAPTER_NAME: Intel
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+    devices:
+      - /dev/dxg:/dev/dxg
+      - /dev/dri:/dev/dri

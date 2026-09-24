@@ -20,13 +20,21 @@ L1 — motion gate + bounded live buffer:
   that many seconds of published frames in a FIFO instead of dropping them.
 * ``INGEST_BUFFER_MB`` (default 2048) — hard memory cap on that FIFO.
 
+L6 — hardware decode:
+
+* ``INGEST_DECODER`` = ``cpu`` (default: today's cv2.VideoCapture) |
+  ``nvdec`` | ``vaapi`` | ``ffmpeg``. The last three decode in an ffmpeg
+  subprocess to NV12 (app.ffmpeg_source); ``ffmpeg`` is SOFTWARE decode down
+  the same pipe — the cheap gate for a box without a usable GPU, and the path
+  the test-suite can run anywhere an ffmpeg binary exists. A decoder that
+  cannot start falls back to ``cpu`` loudly (stderr and /health ``device``).
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from heco_common.config import env_bool, env_float, env_int
+from heco_common.config import env_bool, env_float, env_int, env_str
 
 #: Every env var this module reads. The test-suite checks each one is passed
 #: through docker-compose.yml, because a knob with no passthrough looks set
@@ -38,7 +46,11 @@ ENV_KNOBS = (
     "INGEST_MOTION_KEEPALIVE_S",
     "INGEST_BUFFER_S",
     "INGEST_BUFFER_MB",
+    "INGEST_DECODER",
 )
+
+#: The accepted INGEST_DECODER values; ``cpu`` is today's path.
+DECODERS = ("cpu", "nvdec", "vaapi", "ffmpeg")
 
 
 @dataclass(frozen=True)
@@ -55,11 +67,12 @@ class Levers:
     motion_keepalive_s: float = 1.0
     buffer_s: float = 0.0
     buffer_mb: int = 2048
+    decoder: str = "cpu"
 
     @property
     def armed(self) -> bool:
         """True when any lever leaves today's capture loop."""
-        return self.motion_gate or self.buffer_s > 0
+        return self.motion_gate or self.buffer_s > 0 or self.decoder != "cpu"
 
     def knobs(self) -> dict:
         """The /health ``knobs`` block — camelCase, like every wire field."""
@@ -71,6 +84,7 @@ class Levers:
             "motionKeepaliveS": d["motion_keepalive_s"],
             "bufferS": d["buffer_s"],
             "bufferMb": d["buffer_mb"],
+            "decoder": d["decoder"],
         }
 
 
@@ -88,6 +102,8 @@ def levers_from_env(
     pixel_thr = env_float("INGEST_MOTION_PIXEL_THR", 0.08)
     keepalive = env_float("INGEST_MOTION_KEEPALIVE_S", 1.0)
     cap_mb = env_int("INGEST_BUFFER_MB", 2048)
+    # "" is unset (compose renders an unchosen knob as the empty string).
+    decoder = (env_str("INGEST_DECODER", "") or "cpu").strip().lower()
     if not 0.0 <= min_frac <= 1.0:
         raise ValueError(f"INGEST_MOTION_MIN_FRAC must be in [0, 1], got {min_frac}")
     if pixel_thr <= 0:
@@ -98,6 +114,8 @@ def levers_from_env(
         raise ValueError(f"INGEST_BUFFER_S (or bufferS) must be >= 0, got {buf}")
     if cap_mb < 1:
         raise ValueError(f"INGEST_BUFFER_MB must be >= 1, got {cap_mb}")
+    if decoder not in DECODERS:
+        raise ValueError(f"INGEST_DECODER must be one of {'|'.join(DECODERS)}, got {decoder!r}")
     return Levers(
         motion_gate=gate,
         motion_min_frac=min_frac,
@@ -105,4 +123,5 @@ def levers_from_env(
         motion_keepalive_s=keepalive,
         buffer_s=buf,
         buffer_mb=cap_mb,
+        decoder=decoder,
     )
