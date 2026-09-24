@@ -236,6 +236,41 @@ def test_a_covered_head_is_never_set_against_a_bare_one(client, ticking):
     assert (wh["a"], wh["b"]) == (("red", "black") if me == "A" else ("black", "red"))
 
 
+def worn(bins: dict[int, float], wear: float) -> list[float]:
+    """A head descriptor as a 2026-09-25 runner sends it: histogram, then the
+    headwear share (skin left out) in slot 27 and its flag in slot 28."""
+    v = head(bins)
+    v[27], v[28] = wear, 1.0
+    return v
+
+
+def test_a_bald_scalp_is_bare_however_chromatic_its_skin(client, ticking):
+    """f0bfc5's p00062, balding: his head histogram read 0.91 chromatic (his
+    skin's orange) and the rule took him for headwear, set against real
+    turbans at 0.21-0.26 — a balding guest in a safa for the baraat, set
+    aside against himself bare-headed. Skin left out, his share is 0.03:
+    bare, and a covered head is never set against a bare one."""
+    kh = seen(client, hub(), heads=[worn({1: 0.9, 24: 0.1}, 0.03)] * 3)
+    seen(client, spoke(1), heads=[worn({11: 0.85, 24: 0.15}, 0.8)] * 3)  # blue turban
+    got = review(client)
+    assert got["excluded"]["head"] == 0 and len(got["pairs"]) == 1
+    wh = got["pairs"][0]["why"]["head"]
+    me, other = side(got["pairs"][0], kh)
+    assert wh["wear" + me] == pytest.approx(0.03) and wh["wear" + other] == pytest.approx(0.8)
+    assert wh["sim"] < config.DEFAULT_REVIEW_HEAD_CLASH, "the colours still disagree"
+
+
+def test_two_turbans_measured_skin_free_are_still_set_aside(client, ticking):
+    """Blue against maroon, both well over the skin-free floor: set aside, as
+    before; the flag and the share never count as histogram agreement."""
+    seen(client, hub(), heads=[worn({11: 0.9, 24: 0.1}, 0.8)] * 3)
+    seen(client, spoke(1), heads=[worn({22: 0.6, 23: 0.3, 24: 0.1}, 0.7)] * 3)
+    got = review(client)
+    assert got["excluded"]["head"] == 1
+    (row,) = got["setAside"]
+    assert row["why"]["head"]["sim"] == pytest.approx(0.1), "bins 0..26 only"
+
+
 def test_head_clash_zero_is_off(client, ticking, monkeypatch):
     """Off: the pair is back in the queue and why.head is still shown."""
     seen(client, hub(), heads=[RED_HEAD] * 3)

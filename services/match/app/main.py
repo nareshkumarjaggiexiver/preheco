@@ -80,7 +80,10 @@ def _env_s(name: str, default: float) -> float:
 #: 0.15.1 (2026-09-25): a pair whose identities BOTH have 8+ torso reads is
 #: set aside on clothing under 0.55, not 0.35 (HECO_REVIEW_CLOTHES_WELL_SEEN_N
 #: / _CLASH; /health reviewClothesWellSeenN / reviewClothesWellSeenClash).
-VERSION = "0.15.1"
+#: 0.15.2 (2026-09-25): head slots 27/28 carry the headwear share (chromatic
+#: pixels outside the skin window) and its flag; heads are compared on bins
+#: 0..26 only, and a bald scalp is no longer headwear.  Wire shape unchanged.
+VERSION = "0.15.2"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -214,8 +217,9 @@ class MatchRequest(BaseModel):
     They feed only the duplicate review queue's ``why`` and its exclusions.
     Each is optional and ``null`` means not measured.
 
-    ``head`` (exactly 40 floats: 24 soft hue bins, 3 brightness bins, 13
-    reserved, summing to 1) and ``beard`` (exactly 4: skin, dark, grey,
+    ``head`` (exactly 40 floats: 24 soft hue bins and 3 brightness bins
+    summing to 1, then the headwear share and its flag, 11 reserved) and
+    ``beard`` (exactly 4: skin, dark, grey,
     white fractions of the chin) are the runner's readings of this face
     (``heco_counting.appearance``), logged on the body row for the review
     queue alone; a wrong length is a 422 naming the contract.  ``skin``
@@ -259,8 +263,8 @@ class MatchRequest(BaseModel):
         """A head descriptor is 40 floats or absent; anything else is a wire bug."""
         if v is not None and len(v) != HEAD_DIM:
             raise ValueError(
-                "head must be exactly 40 floats (24 hue + 3 brightness + 13"
-                f" reserved, summing to 1); got {len(v)}"
+                "head must be exactly 40 floats (24 hue + 3 brightness summing to 1,"
+                f" the headwear share and its flag, 11 reserved); got {len(v)}"
             )
         return v
 
