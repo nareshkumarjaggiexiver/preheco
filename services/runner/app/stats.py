@@ -85,6 +85,8 @@ class StatsBoard:
         """Start with every contract stage present but empty."""
         self.stages: dict[str, StageStats] = {s: StageStats() for s in STAGES}
         self._lock = threading.Lock()
+        #: stage -> (window start, the stage's frames then); see observe_window_rate.
+        self._windows: dict[str, tuple[float, int]] = {}
 
     def frame(self, stage: str) -> None:
         """Count one processed frame for a stage."""
@@ -95,6 +97,36 @@ class StatsBoard:
         """Record one metric observation under a stage."""
         with self._lock:
             self.stages[stage].observe(name, value)
+
+    def observe_window_rate(
+        self, stage: str, now: float, window_s: float, name: str = "windowFps"
+    ) -> float | None:
+        """Every ``window_s``, observe ``stage``'s frames per second over the window just closed.
+
+        A stage's ``fps`` is frames over the time since the run started, a
+        MEAN with no history: the 2026-09-25 live test read ~7 fps for a run
+        whose loop processed 13-14.6 fps for as long as the camera sent,
+        because the camera was off the network for part of it. Observed as a
+        metric, the windows reach the planner as {count, min, mean, max} with
+        no new wire field, so the console can show the slow patch or the
+        outage (a window with no frames observes 0) beside the mean.
+
+        The first call only opens a window; a call before ``window_s`` has
+        passed observes nothing. Returns the rate observed, else None.
+        """
+        with self._lock:
+            st = self.stages[stage]
+            opened = self._windows.get(stage)
+            if opened is None:
+                self._windows[stage] = (now, st.frames)
+                return None
+            t0, f0 = opened
+            if now - t0 < window_s:
+                return None
+            rate = (st.frames - f0) / (now - t0)
+            st.observe(name, rate)
+            self._windows[stage] = (now, st.frames)
+            return rate
 
     def snapshot(self, elapsed_s: float) -> list[dict]:
         """Return planner stats bodies for every stage with activity.

@@ -126,6 +126,14 @@ export HECO_REVIEW_LIGHT_TOL=${HECO_REVIEW_LIGHT_TOL:-0}
 # takes the decode off the CPU (4K H.265 from a CP Plus camera is the heavy
 # case) and falls back to cpu, loudly, if the GPU decoder cannot open.
 # INGEST_LIVE_TIMEOUT_S=10 reopens a live camera that goes silent (~13 s).
+# HECO_SOURCE_STALL_S=600 keeps a live run open through a camera outage of up
+# to ten minutes (runner default 45 s). The 2026-09-25 live test on the
+# Sharon CP Plus camera ran at 14.6 fps (89% of camera frames) until the
+# camera dropped off the network for about two minutes; ingest kept
+# reconnecting, but at 45 s the runner settled the run as failed
+# (source-stalled), and a restarted run is a new guest list. The console's
+# silence alarm still shows at 30 s; a genuinely dead camera fails the run
+# after ten minutes, or the operator stops it.
 #
 # HECO_DEMO_LEVERS=0 turns every default below off (the pre-ladder stack);
 # any one can still be set or overridden on the command line.
@@ -138,6 +146,7 @@ if [ "${HECO_DEMO_LEVERS:-1}" = 1 ]; then
   export INGEST_DECODER=${INGEST_DECODER:-nvdec}
   export INGEST_CV_THREADS=${INGEST_CV_THREADS:-1}
   export INGEST_LIVE_TIMEOUT_S=${INGEST_LIVE_TIMEOUT_S:-10}
+  export HECO_SOURCE_STALL_S=${HECO_SOURCE_STALL_S:-600}
 fi
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
@@ -184,7 +193,7 @@ knobs() {
        HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL -- "$@"
   show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
        HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
-       HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S -- "$@"
+       HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S HECO_SOURCE_STALL_S -- "$@"
   show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
        INGEST_MOTION_KEEPALIVE_S INGEST_BUFFER_S INGEST_BUFFER_MB INGEST_DECODER \
        INGEST_CV_THREADS INGEST_LIVE_TIMEOUT_S -- "$@"
@@ -253,7 +262,8 @@ PY
   echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
   echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
   echo '    levers: this script turns ON TRT 1 · FACES_SCRFD_INPUT 1472x832 · PIPELINE_OVERLAP 1 · PARALLEL_DETECT 1 ·'
-  echo '    HWDEC 1 + INGEST_DECODER nvdec + INGEST_CV_THREADS 1 · INGEST_LIVE_TIMEOUT_S 10 (HECO_DEMO_LEVERS=0: all off);'
+  echo '    HWDEC 1 + INGEST_DECODER nvdec + INGEST_CV_THREADS 1 · INGEST_LIVE_TIMEOUT_S 10 · SOURCE_STALL_S 600 (runner default 45)'
+  echo '    (HECO_DEMO_LEVERS=0: all off);'
   echo '    the services default each lever OFF: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
   echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
