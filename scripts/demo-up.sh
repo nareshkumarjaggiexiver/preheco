@@ -37,11 +37,36 @@
 #                           it, which is why the default now lives HERE and not
 #                           only in a shell history.
 #
-# THE REVIEW EXCLUSIONS (gender, age, stature) and the track-presence split
-# are NOT exported here: their defaults live in the services (match config.py,
-# runner config.py) and are on out of the box. `status` prints what the running
-# containers actually hold, so an operator can see a knob that was set — or
-# one that was not — without reading a compose file.
+# THE REVIEW EXCLUSIONS (gender, age, stature, clothes, head, beard) and the
+# track-presence split are NOT exported here: their defaults live in the
+# services (match config.py, runner config.py) and are on out of the box.
+# `status` prints what the running containers actually hold, so an operator
+# can see a knob that was set — or one that was not — without reading a
+# compose file.
+#
+# THE THROUGHPUT LEVERS (docs/LEVERS-2026-09-25.md) are OFF unless the caller
+# sets them: nothing below exports one, and compose passes an unset knob
+# through as the service's default, which for every lever is off. Set them on
+# the command line, per camera if they should differ:
+#
+#   HECO_PIPELINE_OVERLAP=1 HECO_PARALLEL_DETECT=1 ./scripts/demo-up.sh a
+#   HECO_FACE_CADENCE=1 HECO_FACE_REVERIFY_INTERVAL_S=2.5 ./scripts/demo-up.sh b
+#   HECO_HWDEC=1 INGEST_DECODER=nvdec INGEST_CV_THREADS=1 ./scripts/demo-up.sh both
+#   HECO_TRT=1 FACES_SCRFD_INPUT=1472x832 ./scripts/demo-up.sh both
+#
+# Two levers need an overlay as well as a variable; these two switches append
+# it (and are off by default like the rest):
+#
+#   HECO_TRT=1     docker-compose.trt.yml, LAST: persons/faces/embed on
+#                  TensorRT fp16. The :cuda images must carry TensorRT
+#                  (scripts/build-images.sh since lever/models), and each model's
+#                  first start builds its engine: YOLOX-s ~157 s, SCRFD ~34 s,
+#                  ArcFace ~35 s, genderage ~20 s — warm them before a count.
+#   HECO_HWDEC=1   docker-compose.hwdec.yml: the ffmpeg ingest image
+#                  (heco-ingest:${HECO_HWDEC_TAG:-hwdec}, built by hand from
+#                  docker/ingest-hwdec.Dockerfile) and the WSL GPU wiring, for
+#                  INGEST_DECODER=nvdec. Without it a hardware decoder falls
+#                  back to cpu, loudly — `status` shows which one ran.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -67,37 +92,52 @@ export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
 B=("${A[@]}" -f docker-compose.camB.yml)
+# The lever overlays, appended to both stacks and after camB: TensorRT's header
+# asks to be layered last, over everything that names the model services.
+EXTRA=()
+if [ "${HECO_HWDEC:-0}" = 1 ]; then EXTRA+=(-f docker-compose.hwdec.yml); fi
+if [ "${HECO_TRT:-0}" = 1 ]; then EXTRA+=(-f docker-compose.trt.yml); fi
+if [ ${#EXTRA[@]} -gt 0 ]; then A+=("${EXTRA[@]}"); B+=("${EXTRA[@]}"); fi
+case "${INGEST_DECODER:-cpu}" in
+  cpu|'') ;;
+  *) [ "${HECO_HWDEC:-0}" = 1 ] || echo "note: INGEST_DECODER=${INGEST_DECODER} without HECO_HWDEC=1 runs the plain ingest image, which has no ffmpeg — it will fall back to cpu (status shows it)" >&2 ;;
+esac
 
 # The knobs a RUNNING stack holds, read out of its containers and not out of
 # this shell: `status` runs the same exports `up` does, so the shell would
 # say HECO_REVIEW_FLOOR=0.28 about a stack that was started last week at
-# 0.15. Empty means the service's own default (listed once, below).
+# 0.15. Empty (·) means the service's own default (listed once, below).
+show() {
+  local name=$1 svc=$2; shift 2
+  local vars=() env k v
+  while [ "$1" != -- ]; do vars+=("$1"); shift; done
+  shift
+  printf '  camera %s  %-7s ' "$name" "$svc:"
+  if env=$(docker compose "$@" exec -T "$svc" printenv 2>/dev/null); then
+    for k in "${vars[@]}"; do
+      v=$(printf '%s\n' "$env" | sed -n "s/^$k=//p")
+      printf '%s=%s ' "${k#HECO_}" "${v:-·}"
+    done
+    echo
+  else
+    echo "($svc not up)"
+  fi
+}
+
 knobs() {
   local name=$1; shift
-  local env k v
-  printf '  camera %s  match:  ' "$name"
-  if env=$(docker compose "$@" exec -T match printenv 2>/dev/null); then
-    for k in HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
-             HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
-             HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
-             HECO_REVIEW_CLOTHES_SELF_MIN; do
-      v=$(printf '%s\n' "$env" | sed -n "s/^$k=//p")
-      printf '%s=%s ' "${k#HECO_}" "${v:-·}"
-    done
-    echo
-  else
-    echo '(match not up)'
-  fi
-  printf '  camera %s  runner: ' "$name"
-  if env=$(docker compose "$@" exec -T runner printenv 2>/dev/null); then
-    for k in HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM; do
-      v=$(printf '%s\n' "$env" | sed -n "s/^$k=//p")
-      printf '%s=%s ' "${k#HECO_}" "${v:-·}"
-    done
-    echo
-  else
-    echo '(runner not up)'
-  fi
+  show "$name" match HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
+       HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
+       HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
+       HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N -- "$@"
+  show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM \
+       HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
+       HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S -- "$@"
+  show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
+       INGEST_MOTION_KEEPALIVE_S INGEST_BUFFER_S INGEST_BUFFER_MB INGEST_DECODER \
+       INGEST_CV_THREADS -- "$@"
+  show "$name" faces HECO_DEVICE FACES_MODEL FACES_SCRFD_INPUT HECO_TRT_CACHE -- "$@"
+  show "$name" embed HECO_DEVICE EMBED_BATCH HECO_TRT_CACHE -- "$@"
 }
 
 status() {
@@ -108,7 +148,7 @@ status() {
     echo
   done
   echo '--- device truth (requested vs ACTIVE; CPU here means the GPU is not being used) ---'
-  for p in 7102 7104 7105 7202 7204 7205; do
+  for p in 7101 7102 7104 7105 7201 7202 7204 7205; do
     PORT=$p python3 - <<'PY' 2>/dev/null
 import json, os, urllib.request
 port = os.environ["PORT"]
@@ -117,10 +157,22 @@ try:
 except Exception:
     raise SystemExit
 dev = d.get("device") or {}
+if port.endswith("01"):
+    # INGEST's device block is the DECODER (L6): requested vs what the open
+    # capture decodes with (null until a source is open), and why not.
+    err = f"   <-- FELL BACK: {dev['error']}" if dev.get("error") else ""
+    print(f"  :{port} ingest decoder {dev.get('requested')} -> {dev.get('active')}{err}")
+    raise SystemExit
 active = (dev.get("active") or ["?"])[0]
-flag = "" if active.startswith("CUDA") or dev.get("requested") in (None, "CPU") else "   <-- NOT ON THE GPU"
+requested = str(dev.get("requested"))
+on_gpu = active.startswith(("CUDA", "Tensorrt"))
+flag = "" if on_gpu or requested in ("None", "CPU") else "   <-- NOT ON THE GPU"
+if requested.upper() in ("TRT", "TENSORRT") and not active.startswith("Tensorrt"):
+    flag += "   <-- TensorRT requested, not running"
 print(f"  :{port} {d.get('model','?'):34s} ok={str(d.get('ok')):5s} "
-      f"{dev.get('requested')} -> {active}{flag}")
+      f"{requested} -> {active}{flag}")
+if dev.get("trt"):
+    print(f"        tensorrt: {dev['trt']}")
 # The attribute head is the embed service's second model and its own truth:
 # absent, every review pair reads "not measured" for gender and age and the
 # gender/age exclusions never fire. Say so here rather than in a queue.
@@ -131,13 +183,17 @@ if port.endswith("05"):
         print(f"        attribute model: {d['attrModel'] or 'NONE — gender/age will read not measured'}")
 PY
   done
-  echo '--- review + presence knobs as the containers hold them (· = the service default) ---'
+  echo '--- review, presence and lever knobs as the containers hold them (· = the service default) ---'
   knobs A "${A[@]}"
   knobs B -p heco-pipeline-b "${B[@]}"
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
   echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
-  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 ·'
+  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · HEAD_CLASH 0.45 · BEARD_MIN_N 3 ·'
   echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script). 0 turns a signal off.'
+  echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
+  echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
+  echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
+  echo '    EMBED_BATCH 0 · FACES_SCRFD_INPUT 640 · TensorRT only with HECO_TRT=1 (device truth above).'
 }
 
 case "${1:-both}" in
