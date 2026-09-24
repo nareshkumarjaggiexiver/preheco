@@ -436,7 +436,8 @@ def test_open_overrides_win_over_the_env(client, synthetic, monkeypatch):
 def test_health_shows_the_knobs_and_the_open_workers_counters(client, synthetic, monkeypatch):
     """Every knob is visible on /health; a malformed one turns ok false."""
     body = client.get("/health").json()
-    assert body["knobs"] == Levers().knobs() and body["capture"] is None
+    assert body["knobs"] == {**Levers().knobs(), "cvThreads": None}
+    assert body["capture"] is None
     synthetic(lambda i: textured(), n_frames=None, fps=10.0, period_s=0.01)
     client.post("/open", json={"url": "rtsp://cam/1", "motionGate": True})
     cap = client.get("/health").json()["capture"]
@@ -494,3 +495,27 @@ def test_a_polled_frame_is_encoded_once_and_served_identically(client, synthetic
             break
         time.sleep(0.005)
     assert second.json()["seq"] == 1 and calls == [10, 99], "a new source reused the old JPEG"
+
+
+def test_cv_threads_is_left_alone_unless_set(monkeypatch):
+    """INGEST_CV_THREADS unset (or empty) never touches OpenCV's pool; set, it
+    sizes it once at startup and /health shows both the knob and the truth."""
+    import cv2
+    from app.main import app
+    from fastapi.testclient import TestClient
+
+    calls = []
+    monkeypatch.setattr(cv2, "setNumThreads", calls.append)
+    for unset in (None, ""):
+        if unset is None:
+            monkeypatch.delenv("INGEST_CV_THREADS", raising=False)
+        else:
+            monkeypatch.setenv("INGEST_CV_THREADS", unset)
+        with TestClient(app) as c:
+            assert c.get("/health").json()["knobs"]["cvThreads"] is None
+        assert calls == [], "an unset knob must leave today's pool exactly as it was"
+    monkeypatch.setenv("INGEST_CV_THREADS", "1")
+    with TestClient(app) as c:
+        body = c.get("/health").json()
+    assert calls == [1] and body["knobs"]["cvThreads"] == 1
+    assert isinstance(body["cvThreadsActive"], int)

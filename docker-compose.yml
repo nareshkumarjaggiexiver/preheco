@@ -92,6 +92,10 @@ services:
       # for without them, the worker falls back to cpu and /health `device`
       # says so.
       INGEST_DECODER: ${INGEST_DECODER-}
+      # OpenCV's pool size, process-wide. Empty = OpenCV's default (a thread
+      # per core). 1 cut the NVDEC + gate path from 45.4 to 30.1 ms of CPU per
+      # 4K frame on the .94 box — see app/config.py cv_threads_from_env.
+      INGEST_CV_THREADS: ${INGEST_CV_THREADS-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.

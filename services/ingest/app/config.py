@@ -28,6 +28,12 @@ L6 — hardware decode:
   the same pipe — the cheap gate for a box without a usable GPU, and the path
   the test-suite can run anywhere an ffmpeg binary exists. A decoder that
   cannot start falls back to ``cpu`` loudly (stderr and /health ``device``).
+
+Process-wide:
+
+* ``INGEST_CV_THREADS`` (default unset = OpenCV's own choice, one per core)
+  — size of OpenCV's thread pool, applied once at startup. See
+  :func:`cv_threads_from_env` for the measurement.
 """
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ ENV_KNOBS = (
     "INGEST_BUFFER_S",
     "INGEST_BUFFER_MB",
     "INGEST_DECODER",
+    "INGEST_CV_THREADS",
 )
 
 #: The accepted INGEST_DECODER values; ``cpu`` is today's path.
@@ -125,3 +132,22 @@ def levers_from_env(
         buffer_mb=cap_mb,
         decoder=decoder,
     )
+
+
+def cv_threads_from_env() -> int | None:
+    """INGEST_CV_THREADS: OpenCV's pool size, or None to leave OpenCV's default.
+
+    Measured on the .94 box (28 threads), NVDEC + motion gate, 4K at 15 fps:
+    45.4 ms of CPU per captured frame with OpenCV's default pool, 30.1 ms with
+    one thread, at the same frame rate and the same GET /frame latency (p50
+    23.4 vs 23.5 ms). The per-frame work here (a 4K resize for the gate, an
+    NV12 to BGR conversion per served frame) is a few milliseconds, and a
+    28-way parallel_for spends more waking and spinning its workers than it
+    saves. Unset keeps today's pool exactly; OpenCV's own
+    OPENCV_FOR_THREADS_NUM is not passed through instead because compose
+    delivers an unset knob as "", which OpenCV does not read as unset.
+    """
+    n = env_int("INGEST_CV_THREADS", 0)
+    if n < 0:
+        raise ValueError(f"INGEST_CV_THREADS must be >= 0, got {n}")
+    return n or None
