@@ -40,6 +40,13 @@ services:
     environment: *frames
     volumes: ["frames:/frames:ro"]
 
+  runner:
+    # The runner mounts nothing — it never touches a frame's pixels. It only
+    # needs the switch that lets it stop asking ingest for a JPEG, and it
+    # proves the stages can read refs before using it.
+    environment:
+      HECO_FRAMES_REF_ONLY: ${HECO_FRAMES_REF_ONLY-}
+
 volumes:
   frames:
     driver: local

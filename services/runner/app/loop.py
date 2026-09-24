@@ -1006,7 +1006,12 @@ class RunLoop:
                 continue
             r.raise_for_status()
             body = r.json()
-            if body.get("ended") or not body.get("imageB64"):
+            # "No pixels" means ended — but a ref-only frame legitimately
+            # carries NO imageB64, and reading that as end-of-source ended
+            # every ref-only run at frame zero with no error anywhere
+            # (measured live, 2026-09-24: 0 frames, state ended, err None).
+            # A frame is empty only when BOTH carriers are.
+            if body.get("ended") or not (body.get("imageB64") or body.get("frameRef")):
                 self._end_reason = "source-ended"
                 return None
             seq = body.get("seq")
@@ -1037,14 +1042,30 @@ class RunLoop:
         """
         if not self.s.frames_ref_only:
             return False
-        try:
-            r = self.client.get(f"{self.s.ingest_url}/frame")
-            frame = r.json() if r.content else {}
-        except Exception:
-            return False
-        ref = (frame or {}).get("frameRef")
+        # WAIT FOR A FRAME TO EXIST. The probe runs immediately after the
+        # source is opened, and a source that has not decoded its first frame
+        # yet answers 503 — which is not "no shared transport", it is "not
+        # yet". Reading that as a refusal silently kept the JPEGs on a stack
+        # that was configured correctly and writing refs the whole time
+        # (measured live, 2026-09-24). A live RTSP source can take a second or
+        # two to produce its first frame, so this waits about that long.
+        ref = None
+        for _ in range(20):
+            try:
+                r = self.client.get(f"{self.s.ingest_url}/frame")
+                frame = r.json() if r.content else {}
+            except Exception:
+                frame = {}
+            ref = (frame or {}).get("frameRef")
+            if ref:
+                break
+            if self._stop.wait(0.1):
+                return False
         if not ref:
-            self.log.info("ref-only: ingest offered no frameRef — keeping JPEG frames")
+            self.log.info(
+                "ref-only: ingest offered no frameRef in 2 s — keeping JPEG frames "
+                "(is HECO_FRAMES_DIR mounted on ingest?)"
+            )
             return False
         probes = (
             (f"{self.s.persons_url}/detect", {"imageB64": "", "frameRef": ref}),
@@ -1056,12 +1077,12 @@ class RunLoop:
                 self._post(url, payload)
             except Exception as exc:
                 self.log.info(
-                    "ref-only: %s cannot read %s (%s) — keeping JPEG frames for this run",
-                    url, ref, str(exc)[:120],
+                    f"ref-only: {url} cannot read {ref} ({str(exc)[:120]}) — "
+                    "keeping JPEG frames for this run"
                 )
                 return False
         self.log.info(
-            "ref-only: every stage read %s — dropping the JPEG encode for this run", ref
+            f"ref-only: every stage read {ref} — dropping the JPEG encode for this run"
         )
         return True
 
