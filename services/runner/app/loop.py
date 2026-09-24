@@ -5206,6 +5206,9 @@ class RunLoop:
         never the count.
         """
         try:
+            # count.windowFps: the processing rate per ~5 s window, so the
+            # console can show min / mean / max beside the run's mean fps.
+            self.board.observe_window_rate("count", time.monotonic(), WINDOW_FPS_S)
             for body in self.board.snapshot(elapsed_s):
                 self.planner.post_stats(
                     body["stage"], frames=body["frames"], fps=body["fps"], metrics=body["metrics"]
@@ -5255,6 +5258,12 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+
+
+#: The window behind count.windowFps (StatsBoard.observe_window_rate): at
+#: 15 fps one frame is 1.3% of it, and a camera silent for ten seconds still
+#: reads as a zero window.
+WINDOW_FPS_S = 5.0
 
 
 def _frame_clock(frame: dict) -> float | None:
