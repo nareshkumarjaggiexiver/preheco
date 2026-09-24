@@ -26,6 +26,9 @@ export HECO_EMBEDDING_DIM=512
 export HECO_EMBEDDER_ID=arcface-w600k-r50
 export HECO_MATCH_NEARMISS_FLOOR=0
 export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
+# The measured feature-norm floor, same as demo-up.sh: on the Sharon re-run
+# it removes exactly p00047 (a half face behind a pillar) and no real guest.
+export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # THIS TREE'S IMAGES. Main's stacks run heco-*:latest / :cuda; this candidate
 # runs :shm / :shmcuda, so building one tree can never swap the other's code
