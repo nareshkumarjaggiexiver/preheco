@@ -1687,16 +1687,15 @@ class RunLoop:
         )
 
     def _cadence_bodies(self, persons: dict | None, frame: dict) -> list:
-        """The person boxes a detect-worker ruling must see: the TRACKABLE ones.
+        """The person boxes a whole-frame cadence ruling must see.
 
-        A box inside a detections-mode zone never forms a track, so it can
-        never be settled, and a face inside it is excluded anyway — leaving
-        it in would keep the search running for a wall TV all night.  The
-        zones' own rule on COPIES, with a silent observer: the worker books
-        nothing; the loop thread does the counting when the frame's turn comes.
+        Every box whose face could still be counted
+        (:func:`heco_counting.zones.cadence_bodies`): a box a detections zone
+        drops holds the search open unless its head point is inside a zone
+        too — a guest in front of a wall TV zone is still searched, the TV
+        itself is not.  Pure, on the worker thread: nothing is booked here.
         """
-        boxes = [dict(b) for b in (persons or {}).get("boxes", [])]
-        return zones.apply_detection_zones(boxes, frame, self.zones, _SILENT)
+        return zones.cadence_bodies((persons or {}).get("boxes", []), frame, self.zones)
 
     def _last_face_search(self) -> float | None:
         """Frame time of the last face search that ran (None before the first)."""
@@ -2387,7 +2386,7 @@ class RunLoop:
         if s.face_cadence:
             self._cadence_tracks = tracks  # what "settled" is judged on next
 
-        faces_out = self._search_faces(frame, trackable, tracks, det)
+        faces_out = self._search_faces(frame, trackable, tracks, det, boxes)
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
@@ -2822,9 +2821,15 @@ class RunLoop:
         self._count_stage()
 
     def _search_faces(
-        self, frame: dict, trackable: list, tracks: list, det: _Detections | None
+        self, frame: dict, trackable: list, tracks: list, det: _Detections | None,
+        boxes: list | None = None,
     ) -> dict:
         """This frame's face search, booked on the face-detect stage.
+
+        ``boxes`` (every person box of the frame, zone-dropped ones included)
+        is what a whole-frame or region cadence ruling looks at — a zoned
+        body whose face is still countable holds the search open; the crop
+        path can only find faces in ``trackable`` and rules on those.
 
         Searched by the detect worker already when the search needed no
         tracks (``det.face_decided``: the whole frame, or the operator's
@@ -2838,9 +2843,10 @@ class RunLoop:
             if det.region_unplaced:
                 self._bump("faceRegionUnplaced")
             if det.face_skipped:
-                return self._skip_face_search(
-                    len(face_search.bodies_in(trackable, self._region_px(frame)))
-                )
+                return self._skip_face_search(len(face_search.bodies_in(
+                    self._cadence_bodies({"boxes": boxes or []}, frame),
+                    self._region_px(frame),
+                )))
             reply = self._take_detected(
                 det.faces, det.faces_ms, det.faces_error, "face-detect", "faceDetectMs"
             )
@@ -2882,7 +2888,10 @@ class RunLoop:
         # only the bodies it touches can hold the search open.
         if s.face_cadence:
             now_s = self._now()
-            bodies = face_search.bodies_in(trackable, region)
+            searchable = trackable
+            if boxes is not None and (region is not None or s.faces_whole_frame):
+                searchable = self._cadence_bodies({"boxes": boxes}, frame)
+            bodies = face_search.bodies_in(searchable, region)
             due = self._cadence_due(bodies, self._cadence_snapshot(), now_s)
             if due is None:
                 return self._skip_face_search(len(bodies))
@@ -2902,8 +2911,16 @@ class RunLoop:
         # configuration (whole frame, interval armed) a live 4K profile runs.
         if region is not None:
             within = [region]  # one crop, at the frame's native resolution
-        else:
-            within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
+        elif s.faces_whole_frame:
+            within = None
+        elif not s.face_cadence:
+            within = self._reverify_within(within, tracks)
+        # ...and under the cadence (L4) the gate does not apply: a cadence
+        # pass is a FULL pass.  Its saving is the frames it skips; filtered
+        # here as well, the max-gap search of a still, settled room went out
+        # with within=[] — searched nobody — and still reset the gap clock
+        # (verified: one guest, gap 0.25 s, interval 2 s, searched at 0, 1, 4
+        # and 25 of 30 frames while seven "searches" were empty).
         reply = self._timed(
             "face-detect", "faceDetectMs", partial(self._post_faces, frame, within)
         )
@@ -5371,22 +5388,6 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
-
-
-class _SilentObserver:
-    """A CountingObserver that books nothing — for rulings made off the loop thread."""
-
-    def bump(self, key: str, by: int = 1) -> None:
-        """Discard a counter bump."""
-
-    def observe(self, stage: str, metric: str, value: float) -> None:
-        """Discard a metric observation."""
-
-    def event(self, text: str) -> None:
-        """Discard a ledger event."""
-
-
-_SILENT = _SilentObserver()
 
 
 def _frame_clock(frame: dict) -> float | None:

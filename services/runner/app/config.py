@@ -156,8 +156,9 @@ class Settings:
     # every person box is covered one to one (IoU >= 0.5) by a SETTLED track —
     # one holding an identity lock whose last comfortable face match is
     # younger than face_reverify_interval_s — and less than
-    # face_cadence_max_gap_s of footage has passed since the last search that
-    # ran (heco_counting.face_search).  A newcomer, a stale lock, an
+    # face_cadence_max_gap_s of frame time (tMs: footage on a live camera,
+    # processing time on a lockstep replay) has passed since the last search
+    # that ran (heco_counting.face_search).  A newcomer, a stale lock, an
     # unconfirmed body, an empty frame: all searched, every frame.
     #
     # WHY.  The whole-frame SCRFD search is the largest single cost of the 4K

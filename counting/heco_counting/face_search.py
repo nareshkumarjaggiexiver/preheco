@@ -16,9 +16,11 @@ skipped only when ALL of these hold:
   — a track that holds an identity lock whose last comfortable face match
   is younger than faceReverifyIntervalS.  One to one, so two people standing
   inside one settled box are not both "covered" by it;
-* less than ``max_gap_s`` of FOOTAGE time has passed since the last search
+* less than ``max_gap_s`` of frame time has passed since the last search
   that actually ran, so even a room of settled guests is looked at again at
-  least that often.
+  least that often.  Frame time is the frame's tMs, ingest's clock since
+  /open: footage time on a live camera, PROCESSING time on a lockstep file
+  replay — a replay faster than real time skips more footage per gap.
 
 Anything else — a newcomer, a guest whose lock has gone stale, a body the
 tracker has not confirmed, no clock to measure the gap by — searches.  The
@@ -78,7 +80,7 @@ def search_due(
     find a face in), ``settled`` the output of :func:`settled_tracks`.  The
     reasons are for the ledger and for tests: ``no-clock`` (the frame carries
     no time, so no gap can be measured), ``first`` (nothing searched yet),
-    ``gap`` (``max_gap_s`` of footage since the last search, or the clock
+    ``gap`` (``max_gap_s`` of frame time since the last search, or the clock
     went backwards), ``no-bodies``, ``unsettled``.
     """
     if now_s is None:

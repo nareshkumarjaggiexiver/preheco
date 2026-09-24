@@ -3,6 +3,7 @@
 from heco_counting.zones import (
     apply_detection_zones,
     apply_face_zones,
+    cadence_bodies,
     mark_person_zones,
 )
 
@@ -138,3 +139,36 @@ def test_mark_person_zones_LABELS_and_never_filters():
     assert boxes[0].get("inZone") is True
     assert "inZone" not in boxes[1]
     assert len(boxes) == 2, "labelling must never shorten the list"
+
+
+# ------------------------------------------------------ the cadence's bodies
+
+_FRAME = {"w": 160, "h": 120}
+_BODY = {"x": 100, "y": 20, "w": 60, "h": 100}  # centre (130, 70), head (130, 35)
+_TV_UNDER = {"mode": "detections",
+             "points": [[0.70, 0.50], [0.95, 0.50], [0.95, 0.90], [0.70, 0.90]]}
+_TV_OVER = {"mode": "detections",
+            "points": [[0.60, 0.10], [0.99, 0.10], [0.99, 0.95], [0.60, 0.95]]}
+_FACES_OVER_HEAD = {"mode": "faces",
+                    "points": [[0.70, 0.20], [0.95, 0.20], [0.95, 0.40], [0.70, 0.40]]}
+
+
+def test_cadence_bodies_keep_a_zoned_body_whose_face_can_still_count():
+    """Dropped by a detections zone at its body centre, kept for the cadence
+    while its head point is outside every zone — its face still counts."""
+    assert cadence_bodies([_BODY], _FRAME, [_TV_UNDER]) == [_BODY]
+    assert apply_detection_zones([dict(_BODY)], _FRAME, [_TV_UNDER], Obs()) == []
+
+
+def test_cadence_bodies_drop_a_body_whose_head_is_zoned_too():
+    """A wall TV (body and head in the zone), or a head under a faces zone:
+    no face on it can count, so it must not hold the search open."""
+    assert cadence_bodies([_BODY], _FRAME, [_TV_OVER]) == []
+    assert cadence_bodies([_BODY], _FRAME, [_TV_UNDER, _FACES_OVER_HEAD]) == []
+
+
+def test_cadence_bodies_without_detections_zones_or_a_size_are_every_box():
+    """No detections zone: nothing dropped; no frame size: nothing dropped."""
+    assert cadence_bodies([_BODY], _FRAME, [_FACES_OVER_HEAD]) == [_BODY]
+    assert cadence_bodies([_BODY], {}, [_TV_OVER]) == [_BODY]
+    assert cadence_bodies([], _FRAME, [_TV_OVER]) == []
