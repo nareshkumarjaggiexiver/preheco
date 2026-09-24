@@ -4501,9 +4501,11 @@ class RunLoop:
         planner only keeps one when a match-stage frame arrives
         (server/index.js: ``if (stage === 'match') captureKeyframe(...)``, and
         that function reads the match tap payload to know who is in it). So a
-        keyframe costs exactly two calls — the match payload and the match
-        frame — where a full round costs ten, plus four annotated 4K renders
-        nobody is waiting for.
+        keyframe costs four calls — this frame's ingest and person payloads
+        (small JSON, so the moment carries ITS time and head count, not the
+        last full round's), the match payload and the match frame — where a
+        full round costs ten, plus four annotated 4K renders nobody is waiting
+        for.
 
         THE FAILURE THIS FIXES, which is the one the forced queue exists to
         prevent, reintroduced in a new shape. Charging a mint a full round
@@ -4537,6 +4539,14 @@ class RunLoop:
             retired=retired,
             co_present=co_present,
         )
+        # The frame's own ingest and person payloads go FIRST: two small JSON
+        # posts, no picture. Without them the planner's tick for this moment
+        # held the last full round's ingest and person taps — another frame's
+        # time, sequence number and head count beside this frame's names — so
+        # "what each stage held" at a mint described two different frames.
+        for stage in ("ingest", "person-detect"):
+            if payloads.get(stage) is not None:
+                self.planner.post_tap(stage, payloads[stage])
         match_payload = payloads.get("match")
         if match_payload is not None:
             self._shed_match_payload(match_payload)
