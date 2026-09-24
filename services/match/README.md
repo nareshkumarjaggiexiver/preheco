@@ -405,9 +405,11 @@ classes — the one two thirds of the reads name — cannot be one face: none
 against a dark beard, dark against white (grey is never set against either;
 none against grey or white only with `HECO_REVIEW_BEARD_PALE=1` — an 8%
 warm light read a white beard as none).
-`why.head` = `{a, b, sim, selfA, selfB, nA, nB}` (`a`/`b` the dominant
-colour: red, orange, yellow, green, blue, purple, pink, black, grey,
-white — never brown; a bald scalp reads orange), `why.beard` = `{a, b, nA,
+`why.head` = `{a, b, sim, selfA, selfB, nA, nB, wearA, wearB}` (`a`/`b` the
+dominant colour: red, orange, yellow, green, blue, purple, pink, black, grey,
+white — never brown; a bald scalp reads orange; `wear*` the headwear share
+with skin left out, 0.15.2 — a bald scalp is bare there, 0.03 against the
+turbans' 0.51-0.82, and headwear is 0.3 of it), `why.beard` = `{a, b, nA,
 nB}`. On f0bfc5 pair #1 — maroon turban and black beard against peach
 turban and white beard — reads head `red`/`orange` at 0.36 and beard
 `dark`/`white` and is set aside on both; nine same-person splits read head

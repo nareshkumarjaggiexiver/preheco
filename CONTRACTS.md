@@ -1877,6 +1877,32 @@ on one person.
   the guard's cost (two thirds of the true colour set-asides asked again)
   buys nothing where the light does not change.
 
+### The headwear share (counting + runner + match 0.15.2, 2026-09-25)
+
+The head rule sets a pair aside only when BOTH heads are headwear — a covered
+head is never set against a bare one — and "headwear" was the histogram's
+chromatic share. A bald or balding scalp is chromatic too (its skin): f0bfc5's
+p00062 read 0.91 and, once his reads spanned two seconds, was set against the
+run's blue, maroon and pink turbans at 0.21-0.26 — a balding guest in a safa
+for the baraat, set aside against himself bare-headed later.
+
+- `head_descriptor` slot **27** = the share of the head window's lit pixels
+  that are chromatic AND outside the skin window; slot **28** = 1.0 (27 was
+  measured; zeros from an older runner); 29..39 reserved. Bins 0..26 still
+  sum to 1 and are the only part heads are COMPARED on (an intersection over
+  the flag would read any two heads as agreeing).
+- Match 0.15.2: the rule takes the identity's mean slot-27 share where
+  measured, headwear at **0.3**, else the old chromatic share at 0.5.
+  `why.head` gains `wearA`, `wearB` (null when unmeasured).
+- Measured on f0bfc5's 45 identities: every bald, balding or haired head
+  0.01-0.11 (p00062 0.03); the blue, maroon and pink turbans 0.51-0.82; the
+  peach turban 0.09 — skin-toned cloth sits inside the skin window, reads
+  bare and is asked, never set aside, on its head (pair #1 keeps its beard
+  reason).
+- Rollout: match first. A match before 0.15.2 compares all 40 floats, so a
+  new runner's flag inflates every head similarity past any clash — no head
+  set-aside, the safe direction, until match is updated.
+
 ### The well-seen clothing tier (match 0.15.1, 2026-09-25)
 
 The clothing rule's best cross is charitable on purpose: one agreeing pair
