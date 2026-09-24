@@ -456,7 +456,8 @@ def test_every_knob_reaches_the_container():
     because the container never received them.
     """
     compose = (REPO / "docker-compose.yml").read_text()
-    for name in ENV_KNOBS:
+    older = ("INGEST_MAX_WIDTH", "INGEST_RTSP_TCP", "INGEST_FILE_PACE", "INGEST_JPEG_QUALITY")
+    for name in (*ENV_KNOBS, *older):
         assert f"{name}: ${{{name}-}}" in compose, f"{name} has no compose passthrough"
 
 
