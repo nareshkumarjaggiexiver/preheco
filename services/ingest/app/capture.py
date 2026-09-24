@@ -124,7 +124,9 @@ class CaptureWorker(threading.Thread):
         self._ff: FfmpegSource | None = None
         if self.levers.decoder != "cpu":
             self._ff = self._start_decoder()
-        self._start_error = self.decoder["error"]
+        # The start-up fallback reason (a hardware decoder that fell back to
+        # cpu) survives a reconnect: _note_up restores it, never clears it.
+        self._start_error: str | None = self.decoder["error"]
         # LEVER MODE — see _run_levered. Decided once, here: a worker never
         # switches loops mid-stream. A hardware decoder that fell back to cpu
         # with no other lever armed IS today's worker, so it runs today's loop.
@@ -157,9 +159,6 @@ class CaptureWorker(threading.Thread):
         # with that knob set, so OFF keeps today's /health exactly.
         self._live = {"stalls": 0, "reconnects": 0, "reconnectFailures": 0}
         self._down_since_fail = 0  # failed reopenings since the source was last up
-        # The start-up fallback reason (a hardware decoder that fell back to
-        # cpu) survives a reconnect: _note_up restores it, never clears it.
-        self._start_error: str | None = None
         if self.levered and is_file:
             self._probe_fps()  # the gate's footage clock needs it even unpaced
         self._cap = self._open() if self._ff is None else None
