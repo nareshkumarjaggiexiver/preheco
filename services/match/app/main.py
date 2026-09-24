@@ -376,6 +376,9 @@ def health() -> dict:
         "reviewStatureGap": config.review_stature_gap(),
         "reviewStatureMinN": config.review_stature_min_n(),
         "adultM": config.adult_height_m(),
+        "reviewClothesClash": config.review_clothes_clash(),
+        "reviewClothesMinN": config.review_clothes_min_n(),
+        "reviewClothesSelfMin": config.review_clothes_self_min(),
     }
 
 
@@ -614,7 +617,10 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
     So the machine stops guessing and hands over a short, ordered list.  Pairs
     the gallery already knows are different — a recorded `cannot_link`, from
     co-presence or from the operator's own false-match click — never appear.
-    Clothing orders the queue; it is not allowed to remove anyone from it.
+    Clothing orders the queue, and since the v3 torso a CLEAR clash — both
+    people's own reads plentiful and self-consistent, and still disagreeing —
+    sets a pair aside (reply ``setAside``), where the operator can still see
+    and merge it.
 
     Since 2026-09-24 each pair also carries ``why`` — both identities' sex
     (with confidence), median age and stature ratio, null wherever nothing
@@ -648,6 +654,9 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             stature_gap=config.review_stature_gap(),
             stature_min_n=config.review_stature_min_n(),
             adult_m=config.adult_height_m(),
+            clothes_clash=config.review_clothes_clash(),
+            clothes_min_n=config.review_clothes_min_n(),
+            clothes_self_min=config.review_clothes_self_min(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
