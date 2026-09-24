@@ -1499,13 +1499,17 @@ class RunLoop:
         self._frame_clock_s: float | None = t_ms / 1000.0
         s, board, samples = self.s, self.board, self.samples
         image_b64 = frame["imageB64"]
+        # Ride the shared transport when ingest offered one. Sent beside
+        # imageB64, never instead of it: the stages fall back per-request, so
+        # a retired frame or an un-mounted consumer costs a decode, not a run.
+        frame_ref = frame.get("frameRef")
         site_id = self.request.get("siteId")
 
         # person-detect
         persons = self._timed(
             "person-detect",
             "personDetectMs",
-            lambda: self._post(f"{s.persons_url}/detect", {"imageB64": image_b64}),
+            lambda: self._post(f"{s.persons_url}/detect", {"imageB64": image_b64, "frameRef": frame_ref}),
         )
         board.frame("person-detect")
         boxes = persons.get("boxes", [])
@@ -1570,7 +1574,7 @@ class RunLoop:
             "face-detect",
             "faceDetectMs",
             lambda: self._post(
-                f"{s.faces_url}/detect", {"imageB64": image_b64, "within": within}
+                f"{s.faces_url}/detect", {"imageB64": image_b64, "frameRef": frame_ref, "within": within}
             ),
         )
         board.frame("face-detect")
@@ -1633,7 +1637,7 @@ class RunLoop:
             "embed",
             "embedMs",
             lambda: self._post(
-                f"{s.embed_url}/embed", {"imageB64": image_b64, "faces": kept}
+                f"{s.embed_url}/embed", {"imageB64": image_b64, "frameRef": frame_ref, "faces": kept}
             ),
         )
         board.frame("embed")
@@ -3764,12 +3768,13 @@ class RunLoop:
                 break
             frames += 1
             image_b64 = frame["imageB64"]
+            frame_ref = frame.get("frameRef")
             boxes = self._post(
-                f"{self.s.persons_url}/detect", {"imageB64": image_b64}
+                f"{self.s.persons_url}/detect", {"imageB64": image_b64, "frameRef": frame_ref}
             ).get("boxes", [])
             faces = self._post(
                 f"{self.s.faces_url}/detect",
-                {"imageB64": image_b64, "within": boxes or None},
+                {"imageB64": image_b64, "frameRef": frame_ref, "within": boxes or None},
             ).get("faces", [])
             # The SAME gate as counting: a template captured from a face the
             # count would have discarded is a template that will not match.
@@ -3781,7 +3786,7 @@ class RunLoop:
                 continue
             faces_seen += 1
             embeddings = self._post(
-                f"{self.s.embed_url}/embed", {"imageB64": image_b64, "faces": kept}
+                f"{self.s.embed_url}/embed", {"imageB64": image_b64, "frameRef": frame_ref, "faces": kept}
             ).get("embeddings", [])
             for face, emb in zip(kept, embeddings, strict=False):
                 captured.append((enrol_score(face), emb))
