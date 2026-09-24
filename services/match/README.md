@@ -31,12 +31,13 @@ evidence (project hard rule: measure first).
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{ok, model, version, threshold, canonPx, template policy, appearanceClash, nearMissFloor, nearMissWeakFloor, nearMissClothes}` |
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
-| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss: {key, cosine, appearanceSim, basis} \| null}` |
+| POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?, attributes?, featNorm?, body?, head?, beard?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss: {key, cosine, appearanceSim, basis} \| null}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
 | POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
+| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes, head, beard}, setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
 | POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
 | POST | `/gallery/sweep` | `{maxAgeS?}` | `{swept:[runId], maxAgeS}` — retention backstop |
 
@@ -348,6 +349,68 @@ which is visible and an operator can merge; a wrong fold **under**-counts
 silently and nobody ever sees it. Fixed mirrors and screens are handled by
 exclusion zones; a hand-held phone is not, and that is the residual.
 
+## The review queue's set-asides
+
+`POST /review/duplicates` ranks identity pairs whose face cosine sits in
+`[HECO_REVIEW_FLOOR .. threshold)` for a human to look at. It never merges
+and never writes; a pair the evidence says cannot be one person is **set
+aside** instead of asked about, and counted in `excluded` so a quiet queue
+is never mistaken for a silenced one. Every signal needs its evidence on
+BOTH sides — one measured identity against an unmeasured one is one
+opinion, not a disagreement.
+
+**Every set-aside pair stays inspectable.** `setAside` lists them —
+`{a, b, cosine, clothes, why, reasons}`, ranked like the queue, at most
+`limit` — with every signal that spoke in `reasons`; `excluded` counts each
+pair once, under the first. An operator who disagrees merges the pair with
+the ordinary `/merge`: setting aside writes no `cannot_link` and merges
+nothing.
+
+**Clothing (0.13.0).** Each identity's torso reads come from its **body
+log** — every sighting's v3 descriptor, not the five a template cap keeps
+(on run f0bfc5 those sat inside two seconds for 20 of 44 identities). An
+identity with no torso in its body log — every identity of a gallery
+written before 0.13.0 — is read from its templates instead, never both
+(run c84098's templates: 3 pairs set aside where counting distinct write
+seconds set aside 6; the other three identities' reads sat inside 0.85-1.94
+s, one walk).
+A pair is set aside when each identity has at least
+`HECO_REVIEW_CLOTHES_MIN_N` reads spanning two seconds whose median pairwise
+intersection is at least `HECO_REVIEW_CLOTHES_SELF_MIN` (it wears ONE
+garment), and the best intersection any read of one reaches against any
+read of the other is under `HECO_REVIEW_CLOTHES_CLASH`. v2 (48-float) rows
+never count; at most 24 reads per identity are compared, spread over its
+time on camera. Measured on f0bfc5 (45 identities of the first 32 pairs):
+own reads agree at a median 0.90 (p10 0.70), one person split across a
+time gap still agrees at a best cross of 0.77–0.97, and the queue's
+different-people pairs anywhere from 0.10 to 0.97 (two white shirts agree:
+clothing only speaks for pairs dressed differently) — the default 0.35
+sets aside #3, #6, #7 and #23 and none of the nine same-person splits.
+`why.clothes` = `{selfA, selfB, cross, nA, nB}` on every row, queue or
+set aside, whether or not the rule is on: each side's median
+self-agreement (null under two reads), the best cross (null when a side
+has no read) and each side's read count.
+
+**Head and beard (0.14.0).** `/match` takes the runner's `head` (40 floats:
+24 soft wrapping hue bins, black/grey/white, 13 reserved) and `beard`
+(`[skin, dark, grey, white]` fractions of the chin, judged against the
+same face's cheeks); both are logged on the body row. The head sets a pair
+aside under the clothing rule's own-testimony bar (three reads over two
+seconds agreeing at 0.6) when BOTH heads are headwear (at least half
+chromatic) and the best cross is under `HECO_REVIEW_HEAD_CLASH` — a
+covered head is never set against a bare one, because a dupatta or a rumal
+comes and goes within one wedding. The beard sets a pair aside when both
+identities have `HECO_REVIEW_BEARD_MIN_N` reads over two seconds and their
+classes — the one two thirds of the reads name — cannot be one face: none
+against any beard, dark against white (grey is never set against either).
+`why.head` = `{a, b, sim, selfA, selfB, nA, nB}` (`a`/`b` the dominant
+colour: red, orange, yellow, green, blue, purple, pink, black, grey,
+white — never brown; a bald scalp reads orange), `why.beard` = `{a, b, nA,
+nB}`. On f0bfc5 pair #1 — maroon turban and black beard against peach
+turban and white beard — reads head `red`/`orange` at 0.36 and beard
+`dark`/`white` and is set aside on both; nine same-person splits read head
+0.83–0.99 and no beard clash.
+
 ## Run
 
 ```sh
@@ -407,6 +470,11 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_MATCH_NEARMISS_FLOOR` | `0.29` | Floor of the FACE near-miss band on a mint: best cosine in `[floor .. threshold)` earns `nearMiss` with `basis: "face"` (operator suggestion, never a merge — impostors measured face 0.377 / clothes 0.503). Just below the measured same-person misses (0.294/0.308/0.346/0.361). **0 disables both bands** (the weak band lives under this floor); empty string means unset. |
 | `HECO_MATCH_NEARMISS_WEAK_FLOOR` | `0.15` | Floor of the WEAK (clothing) band: cosine in `[weak floor .. near-miss floor)` **plus** clothing at or above the bar below earns `nearMiss` with `basis: "clothing"`. Exists because bench 6e1a5d measured one person splitting at face 0.212/clothing 0.797 and face 0.228/clothing 0.875 — both invisible to the face band. **0 disables the weak band only**; empty string means unset. |
 | `HECO_MATCH_NEARMISS_CLOTHES` | `0.78` | Torso-intersection bar the weak band requires. **0.033 above the worst measured impostor clothing reading (0.747, two genuinely different men)** — a hair, not a margin, which is why this band only ever suggests. Expect wrong suggestions at venues with uniforms or a dress code; turn the band off there via the weak floor. Empty string means unset. |
+| `HECO_REVIEW_CLOTHES_CLASH` | `0.35` | Best cross-identity torso intersection under which a pair whose identities each wear one garment is set aside from the review queue. **0 disables clothing set-asides**; `why.clothes` still reports the reads. |
+| `HECO_REVIEW_CLOTHES_MIN_N` | `3` | v3 torso reads (spanning two seconds) each identity needs before its clothing counts; clamped to at least 2. |
+| `HECO_REVIEW_HEAD_CLASH` | `0.45` | Best cross head intersection under which two HEADWEAR identities (both heads at least half chromatic) that each read one head are set aside. **0 disables head set-asides.** |
+| `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-beard or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
+| `HECO_REVIEW_CLOTHES_SELF_MIN` | `0.6` | Median pairwise intersection an identity's own torso reads must reach — an identity whose reads disagree (two people merged, a band on a pillar) has no clothing to compare. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
 operator-supervised walk-through, never from a crossing, and staff flows

@@ -27,11 +27,25 @@ import itertools
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from .appearance import best_intersection, intersection
+from .appearance import (
+    BEARD_DIM,
+    HEAD_DIM,
+    HEAD_H_BINS,
+    TORSO_DIM,
+    beard_class,
+    beards_differ,
+    best_cross,
+    best_intersection,
+    head_label,
+    intersection,
+    self_agreement,
+    spread,
+)
 from .store import Neighbour, VectorStore, as_unit, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -424,6 +438,11 @@ def match(
     attributes: dict | None = None,
     feat_norm: float | None = None,
     body: dict | None = None,
+    # The sighting's head descriptor (40 floats) and beard reading (4),
+    # logged on the body row beside the torso; None = not measured.  Their
+    # one reader is the review queue.
+    head: list[float] | None = None,
+    beard: list[float] | None = None,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -586,7 +605,7 @@ def match(
                 # measurement that killed the quality rule here.
                 store.prune_redundant(hit.key, templates_per_person)
                 overlap = _overlap_after_write(store, hit.key, embedding, appearance, threshold)
-            body_id = _log_body(store, hit.key, body, quality)
+            body_id = _log_body(store, hit.key, body, quality, appearance, head, beard)
             return MatchResult(
                 hit.key,
                 False,
@@ -605,7 +624,7 @@ def match(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p",
             appearance=appearance, attributes=attributes, feat_norm=feat_norm,
         )
-        body_id = _log_body(store, key, body, quality)
+        body_id = _log_body(store, key, body, quality, appearance, head, beard)
         # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
         # BEFORE this mint wrote anything — and against the near-missed
         # identity's already-stored descriptors, the same before-the-write
@@ -633,7 +652,13 @@ def match(
 
 
 def _log_body(
-    store: VectorStore, key: str, body: dict | None, face_w: float | None
+    store: VectorStore,
+    key: str,
+    body: dict | None,
+    face_w: float | None,
+    appearance: list[float] | None = None,
+    head: list[float] | None = None,
+    beard: list[float] | None = None,
 ) -> int | None:
     """Append the sighting's person box to ``key``'s body log; its rowid.
 
@@ -644,6 +669,13 @@ def _log_body(
     logging field.  ``face_w`` is the call's ``quality`` (face box width px),
     stored beside the box so the stature reader can see a head-and-shoulders
     crop for what it is; a non-positive one is stored as unknown.
+    ``appearance`` (the torso descriptor), ``head`` and ``beard`` (None when
+    unmeasured) are logged on the same row: they are the review queue's
+    per-sighting evidence.  A torso needs the person box this row records,
+    so a call without a usable body had no torso to log either; its head
+    and beard readings are not logged — a face outside every person box is
+    rare (1 of run f0bfc5's 2,809 guest verdicts) and the row has nothing
+    else to hang them on.
     """
     if not body:
         return None
@@ -655,7 +687,9 @@ def _log_body(
     if h <= 0 or w <= 0 or frame_h <= 0:
         return None
     fw = float(face_w) if face_w is not None and float(face_w) > 0 else None
-    return store.add_body_sighting(key, h, w, y_bottom, frame_h, fw)
+    return store.add_body_sighting(
+        key, h, w, y_bottom, frame_h, fw, appearance=appearance, head=head, beard=beard
+    )
 
 
 def _overlap_after_write(
@@ -1043,56 +1077,17 @@ def stature_ratios(sightings: list, min_n: int) -> dict[str, float]:
     }
 
 
-#: Torso descriptor length the clothing set-aside reads: v3 only.  A v2
-#: (48-float) read is a different histogram — comparing across generations is
-#: None by contract, and it is never evidence here.
-_CLOTHES_V3 = 64
-
-
-def identity_clothes(rows: list[tuple[str, np.ndarray]]) -> dict:
-    """One identity's v3 torso reads: how many, how consistent, over how long.
-
-    ``self`` is the median pairwise intersection among the identity's own v3
-    reads — how much this person's clothing agrees with itself across their
-    sightings — or None under two reads.  ``moments`` counts distinct write
-    seconds: five reads from one second of one crossing agree trivially and
-    prove nothing, the same reasoning as the stature reader's two-moment bar.
-    """
-    v3 = [(t, v) for t, v in rows if v.size == _CLOTHES_V3]
-    vecs = [v for _, v in v3]
-    pairwise = [float(np.minimum(a, b).sum()) for a, b in itertools.combinations(vecs, 2)]
-    return {
-        "n": len(vecs),
-        "self": float(np.median(pairwise)) if pairwise else None,
-        "moments": len({str(t)[:19] for t, _ in v3 if t}),
-        "vecs": vecs,
-    }
-
-
-def _clothes_clash(ca: dict, cb: dict, cross: float | None,
-                   clash: float, min_n: int, self_min: float) -> bool:
-    """True when BOTH identities' clothing reads are plentiful and
-    self-consistent and the best agreement between them is still under
-    ``clash``.  Every condition must hold on both sides: one consistent
-    reader against one scattered or thin one is one opinion, not a clash."""
-    if clash <= 0 or cross is None:
-        return False
-    for c in (ca, cb):
-        if c["n"] < min_n or c["moments"] < 2 or c["self"] is None or c["self"] < self_min:
-            return False
-    return cross < clash
-
-
-def _exclusion(
+def _side_reasons(
     gender: dict, age: dict, stature: dict,
     gender_min_p: float, age_child_max: float, age_adult_min: float, stature_gap: float,
-) -> str | None:
-    """Which side signal, if any, says this pair cannot be one person.
+) -> list[str]:
+    """Which of sex, age and stature say this pair cannot be one person.
 
-    Checked in the order gender, age, stature, and the first to speak names
-    the exclusion — a pair is counted under one reason, never three.  Every
-    signal has an off switch at zero, and every signal needs its evidence on
-    BOTH sides: one measured identity and one unmeasured is not a
+    Every one that speaks, in the order gender, age, stature; the review
+    COUNTS a pair under the first reason only (``excluded`` sums to the
+    pairs set aside) and lists them all in ``setAside[].reasons``.  Every
+    signal has an off switch at zero, and every signal needs its evidence
+    on BOTH sides: one measured identity and one unmeasured is not a
     disagreement, it is one opinion, and absent is not zero.
 
     * gender — both confident at or above ``gender_min_p`` and different.
@@ -1104,6 +1099,7 @@ def _exclusion(
       budget and a pair straddling it is still asked about.
     * stature — both ratios measured and ``|a-b| >= stature_gap``.
     """
+    reasons: list[str] = []
     ga, gb, pa, pb = gender["a"], gender["b"], gender["pA"], gender["pB"]
     if (
         gender_min_p > 0
@@ -1112,7 +1108,7 @@ def _exclusion(
         and pa >= gender_min_p and pb >= gender_min_p
         and ga != gb
     ):
-        return "gender"
+        reasons.append("gender")
     aa, ab = age["a"], age["b"]
     if (
         age_child_max > 0 and age_adult_min > 0
@@ -1122,11 +1118,208 @@ def _exclusion(
             or (ab <= age_child_max and aa >= age_adult_min)
         )
     ):
-        return "age"
+        reasons.append("age")
     sa, sb = stature["a"], stature["b"]
     if stature_gap > 0 and sa is not None and sb is not None and abs(sa - sb) >= stature_gap:
-        return "stature"
-    return None
+        reasons.append("stature")
+    return reasons
+
+
+#: The clothing rule's floor in TIME: an identity's torso reads must span at
+#: least this many seconds (first to last write) before its self-agreement
+#: means anything.  Three reads from three consecutive frames are one pose
+#: under one light, read three times; run f0bfc5's identities were on camera
+#: for 1-5 s a walk, so two seconds is the most the rule can ask and still
+#: measure most of them.
+_CLOTHES_MIN_SPAN_S = 2.0
+
+
+def _seconds(created_at: str | None) -> float | None:
+    """A row's write time as epoch seconds; None when it has none."""
+    if not created_at:
+        return None
+    try:
+        return datetime.fromisoformat(created_at).timestamp()
+    except ValueError:
+        return None
+
+
+@dataclass
+class IdentityReads:
+    """One identity's appearance reads of one kind, ready to compare.
+
+    ``vectors`` are the reads spread over the identity's time on camera
+    (:func:`app.appearance.spread`); ``n`` counts every read the log held,
+    ``span_s`` is first-to-last write time (0.0 with fewer than two timed
+    reads) and ``agreement`` the median pairwise intersection of
+    ``vectors`` (None under two).
+    """
+
+    vectors: list[np.ndarray]
+    n: int
+    span_s: float
+    agreement: float | None
+
+
+def identity_reads(rows: list[tuple[float | None, np.ndarray]]) -> IdentityReads:
+    """Build :class:`IdentityReads` from ``(time_s, vector)`` rows in any order."""
+    ordered = sorted(rows, key=lambda r: (r[0] is None, r[0] or 0.0))
+    times = [t for t, _ in ordered if t is not None]
+    vectors = [v for _, v in spread(ordered)]
+    return IdentityReads(
+        vectors=vectors,
+        n=len(ordered),
+        span_s=(max(times) - min(times)) if len(times) >= 2 else 0.0,
+        agreement=self_agreement(vectors),
+    )
+
+
+def torso_reads(
+    evidence: list, templates: dict[str, list[tuple[str, np.ndarray]]] | None = None
+) -> dict[str, IdentityReads]:
+    """Each identity's v3 torso reads from the body log; v2 rows never count.
+
+    A 48-float (v2) descriptor is a different partition over a different
+    crop — the chin-down band whose skin and hair made a yellow top agree
+    with a green dress at 0.72 — so it is not clothing evidence here, and
+    an identity with only v2 rows is simply absent.
+
+    ``templates`` (key -> its templates' ``(created_at, torso)`` rows) is
+    the fallback for an identity whose body log holds no v3 torso: until
+    match 0.13.0 torsos were written on templates only, and run c84098's
+    gallery — where the template reads set aside six pairs, all different
+    people — has nothing else.  An identity with body-log reads never mixes
+    its templates in: a template's torso is also on the body row of the
+    sighting that wrote it, and counting it twice would inflate ``n``.
+    """
+    by_key: dict[str, list] = {}
+    for row in evidence:
+        vec = row.appearance
+        if vec is None or vec.size != TORSO_DIM:
+            continue
+        by_key.setdefault(row.key, []).append((_seconds(row.created_at), vec))
+    for key, rows in (templates or {}).items():
+        if key in by_key:
+            continue
+        v3 = [(_seconds(ts), vec) for ts, vec in rows if vec.size == TORSO_DIM]
+        if v3:
+            by_key[key] = v3
+    return {k: identity_reads(v) for k, v in by_key.items()}
+
+
+def _reads_of(evidence: list, field: str, dim: int) -> dict[str, IdentityReads]:
+    """Each identity's reads of one body-log column of length ``dim``."""
+    by_key: dict[str, list] = {}
+    for row in evidence:
+        vec = getattr(row, field)
+        if vec is None or vec.size != dim:
+            continue
+        by_key.setdefault(row.key, []).append((_seconds(row.created_at), vec))
+    return {k: identity_reads(v) for k, v in by_key.items()}
+
+
+def head_reads(evidence: list) -> dict[str, IdentityReads]:
+    """Each identity's head descriptors (40 floats) from the body log."""
+    return _reads_of(evidence, "head", HEAD_DIM)
+
+
+def beard_reads(evidence: list) -> dict[str, IdentityReads]:
+    """Each identity's beard readings (4 floats) from the body log."""
+    return _reads_of(evidence, "beard", BEARD_DIM)
+
+
+#: The head rule's own-testimony bar, as the clothing rule's defaults: three
+#: reads over two seconds whose median pairwise intersection is 0.6.  Run
+#: f0bfc5: every one of the 45 identities' own head reads agreed at 0.63 or
+#: more (median 0.87), so the bar only ever refuses an identity whose reads
+#: disagree — a merged pair, or a head half out of frame.
+_HEAD_MIN_N = 3
+_HEAD_SELF_MIN = 0.6
+#: ...and BOTH heads must be HEADWEAR: at least this share of each identity's
+#: mean head reading chromatic (hue bins 0..23).  On run f0bfc5 the four
+#: turbans read 0.68-0.87, every head of black, grey or white hair 0.03-0.38.
+#: Why the rule never sets a covered head against a bare one: at a Punjabi
+#: wedding the same guest's head is covered and uncovered within the night —
+#: a dupatta drawn over the hair for the ceremony, a rumal or patka for the
+#: Gurdwara — so "pink turban against black hair" (#15, head cross 0.41) is
+#: exactly what one person minted twice can look like.  A bald scalp reads
+#: as its skin colour (0.91 chromatic) and counts as headwear here: the
+#: residual, a bald man with a rumal on in one identity only, is rare.
+_HEAD_WEAR_MIN = 0.5
+
+
+def headwear_share(reads: IdentityReads | None) -> float | None:
+    """The chromatic share of an identity's mean head reading, or None."""
+    if reads is None or not reads.vectors:
+        return None
+    return float(np.mean([float(v[:HEAD_H_BINS].sum()) for v in reads.vectors]))
+
+
+def head_apart(
+    ha: IdentityReads | None, hb: IdentityReads | None, sim: float | None, clash: float
+) -> bool:
+    """Do two identities' headwear — turban against turban — say two people?
+
+    Both identities must read one head (:data:`_HEAD_MIN_N` reads over
+    _CLOTHES_MIN_SPAN_S agreeing at :data:`_HEAD_SELF_MIN`), both heads must
+    be headwear (:data:`_HEAD_WEAR_MIN`), and the best reading of one
+    against any of the other must stay under ``clash``.  ``clash <= 0`` is
+    off.
+    """
+    for r in (ha, hb):
+        share = headwear_share(r)
+        if share is None or share < _HEAD_WEAR_MIN:
+            return False
+    return clothes_apart(ha, hb, sim, clash, _HEAD_MIN_N, _HEAD_SELF_MIN)
+
+
+def beards_apart(
+    ba: IdentityReads | None, bb: IdentityReads | None, min_n: int
+) -> tuple[str | None, str | None, bool]:
+    """Both identities' beard classes, and whether they cannot be one face.
+
+    A class (:func:`app.appearance.beard_class`) is shown whenever an
+    identity has reads; it may set a pair aside only when BOTH identities
+    have at least ``min_n`` reads spanning _CLOTHES_MIN_SPAN_S and their
+    confident classes differ as one face cannot (none against any beard,
+    dark against white).  ``min_n <= 0`` is off.
+    """
+    ca = None if ba is None else beard_class(ba.vectors)
+    cb = None if bb is None else beard_class(bb.vectors)
+    if min_n <= 0 or ba is None or bb is None:
+        return ca, cb, False
+    for r in (ba, bb):
+        if r.n < min_n or r.span_s < _CLOTHES_MIN_SPAN_S:
+            return ca, cb, False
+    return ca, cb, beards_differ(ca, cb)
+
+
+def clothes_apart(
+    ra: IdentityReads | None,
+    rb: IdentityReads | None,
+    cross: float | None,
+    clash: float,
+    min_n: int,
+    self_min: float,
+) -> bool:
+    """Do two identities' clothes say they are two people?
+
+    Only when EACH identity's own torso reads agree with each other —
+    at least ``min_n`` reads spanning _CLOTHES_MIN_SPAN_S, median pairwise
+    intersection at or above ``self_min`` — and the best any read of one
+    manages against any read of the other is still under ``clash``.  The
+    self-agreement is what makes the cross meaningful: an identity whose
+    own reads disagree (a merged pair of two people, a band that kept
+    catching a pillar) has no clothing to compare.  ``clash <= 0`` is off.
+    """
+    if clash <= 0 or cross is None or ra is None or rb is None:
+        return False
+    for r in (ra, rb):
+        if r.n < min_n or r.span_s < _CLOTHES_MIN_SPAN_S:
+            return False
+        if r.agreement is None or r.agreement < self_min:
+            return False
+    return cross < clash
 
 
 def review_duplicates(
@@ -1144,6 +1337,8 @@ def review_duplicates(
     clothes_clash: float = 0.0,
     clothes_min_n: int = 3,
     clothes_self_min: float = 0.6,
+    head_clash: float = 0.0,
+    beard_min_n: int = 0,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1172,14 +1367,26 @@ def review_duplicates(
       needed; below the floor they are not similar in any measurable sense.
     * **Clothing RANKS — and, since the v3 torso, may SET ASIDE a clear
       clash.** The 0.587-against-0.538 bench above was the v2 histogram,
-      whose band started under the chin and read mostly skin; there a
-      clothing bar was a coin toss.  v3 reads the cloth: on the Sharon
-      re-run (c84098) a person against themselves (early reads vs late)
-      never scored under 0.52, while the operator's different-people pairs
-      scored 0.10-0.25.  So a pair is set aside when BOTH identities have
-      >= ``clothes_min_n`` v3 reads from >= 2 seconds agreeing with
-      themselves >= ``clothes_self_min``, and their best cross agreement is
-      under ``clothes_clash``.  Everything short of that still only ranks;
+      whose band started under the chin and read mostly skin, and it was ONE
+      descriptor against one; there a clothing bar was a coin toss.  v3
+      reads the cloth, and the rule asks for agreement WITHIN each identity
+      first and a clash second: a pair is set aside only when BOTH
+      identities have >= ``clothes_min_n`` v3 torso reads spanning two
+      seconds that agree with each other at ``clothes_self_min``, and the
+      best cross reading is still under ``clothes_clash``
+      (:func:`clothes_apart`).  The reads are the BODY LOG's — every
+      sighting's torso, not the five a template cap keeps — and a gallery
+      written before the body log carried them falls back to its templates'
+      (:func:`torso_reads`).  Measured twice the same night: on the Sharon
+      re-run c84098 (templates) a person against themselves (early reads vs
+      late) never scored under 0.52 while the operator's different-people
+      pairs scored 0.10-0.25; on run f0bfc5 (45 identities of the queue's
+      first 32 pairs, <= 24 body-log reads each) own reads agree at a median
+      0.90 (p10 0.70), the same person split across a gap of seconds to
+      minutes at a best cross of 0.77-0.97, and the queue's different-people
+      pairs anywhere from 0.10 to 0.97 (two white shirts agree) — the
+      default 0.35 sets aside #3, #6, #7 and #23 and none of the nine
+      same-person splits.  Everything short of that still only ranks;
       unmeasured torsos still appear, because absent is not zero.  A v2
       (48-d) torso against a v3 (64-d) one is not comparable and reads as
       unmeasured, not as 0.
@@ -1193,9 +1400,17 @@ def review_duplicates(
       measured; absent is not zero) — and the reply's ``excluded`` counts
       say how many pairs each signal set aside, so a queue that was quieted
       is never mistaken for one that was quiet.  The rules and their off
-      switches are in :func:`_exclusion`; the knobs in :mod:`app.config`.
+      switches are in :func:`_side_reasons`; the knobs in :mod:`app.config`.
       Nothing set aside is written anywhere — not to ``cannot_link``, which
       remains a human's or co-presence's word — and nothing is merged.
+
+    * **Head and beard may set a pair aside (2026-09-24, night)** — read per
+      sighting beside the torso: the head descriptor (turban or hair colour)
+      under the same own-testimony rule as clothing at ``head_clash``
+      (:func:`head_apart`), and the beard class — none, dark, grey or white
+      — when both identities are confident and one face could not show both
+      (:func:`beards_apart`).  Run f0bfc5's #1, a maroon turban and black
+      beard against a peach turban and white beard, is what they exist for.
 
     Stature is metres-free on the wire by design: ``stature.a``/``b`` are
     ratios against the run's own perspective fit (1.0 = an average standing
@@ -1203,24 +1418,49 @@ def review_duplicates(
     metres for a human to read (``aM``/``bM`` carry that product ready-made),
     and the exclusion gap is on the ratio, so the anchor never moves it.
 
+    EVERY PAIR SET ASIDE STAYS INSPECTABLE.  ``setAside`` lists them —
+    ``{a, b, cosine, clothes, why, reasons}``, ranked like the queue and
+    capped at ``limit`` — with every signal that spoke in ``reasons`` (the
+    pair is counted in ``excluded`` under the first).  An operator who
+    disagrees with the machine can read the evidence and merge the pair with
+    the ordinary /merge: nothing here wrote a cannot_link or a merge.
+
+    ``why.clothes`` is ``{selfA, selfB, cross, nA, nB}`` over the v3 torso
+    reads of each identity's body log (its templates' in a gallery written
+    before match 0.13.0): each side's median self-agreement
+    (null under two reads), the best cross intersection (null when either
+    side has none) and how many reads each side had — reported whether or
+    not the clothing rule is on.  ``why.head`` is ``{a, b, sim, selfA,
+    selfB, nA, nB}`` — ``a``/``b`` each side's dominant colour
+    (:func:`app.appearance.head_label`), ``sim`` the best cross — and
+    ``why.beard`` ``{a, b, nA, nB}`` with each side's class; null wherever
+    a side has no read.
+
     Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
-    "excluded": {"gender": g, "age": a, "stature": s}}``.  ``dropped`` is
-    stated rather than swallowed: a truncated queue that looks complete is
-    how a real duplicate goes unreviewed.
+    "excluded": {"gender": g, "age": a, "stature": s, "clothes": c,
+    "head": h, "beard": b}, "setAside": [...], "setAsideDropped": s}``.
+    ``dropped`` (and ``setAsideDropped``, the set-aside pairs past
+    ``limit``) is stated rather than swallowed: a truncated queue that looks
+    complete is how a real duplicate goes unreviewed.
+
+    The store's lock — the one every /match of the run waits on — is held
+    only to READ: the appearance evidence is compared after it is released
+    (a 41,000-row body log took 0.7 s to compare; the live loop's /match
+    must not wait on an operator's click).
     """
     store = open_store(db_path(data_dir, run_id))
-    excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
-    set_aside: list[dict] = []
+    excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0}
     with store.reading():
         keys = store.keys()
         vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
         apps = {k: store.appearances_for(k) for k in keys}
-        dress = {k: identity_clothes(store.appearance_rows_for(k)) for k in keys}
+        tpl_torsos = {k: store.appearance_rows_for(k) for k in keys}
         attrs = {k: store.attributes_for(k) for k in keys}
         genders = {k: identity_gender(attrs[k]) for k in keys}
         ages = {k: identity_age(attrs[k]) for k in keys}
         statures = stature_ratios(store.body_sightings(), stature_min_n)
-        candidates, considered = [], 0
+        evidence = store.sighting_evidence()
+        in_band, considered = [], 0
         for a, b in itertools.combinations(keys, 2):
             considered += 1
             if store.cannot_link(a, b):
@@ -1234,48 +1474,69 @@ def review_duplicates(
                 s for s in (intersection(p, q) for p in apps[a] for q in apps[b])
                 if s is not None
             ]
-            clothes = max(scores) if scores else None
-            sa, sb = statures.get(a), statures.get(b)
-            why = {
-                "gender": {
-                    "a": genders[a][0], "b": genders[b][0],
-                    "pA": genders[a][1], "pB": genders[b][1],
-                },
-                "age": {"a": ages[a], "b": ages[b]},
-                "stature": {
-                    "a": sa, "b": sb, "adultM": adult_m,
-                    "aM": None if sa is None else sa * adult_m,
-                    "bM": None if sb is None else sb * adult_m,
-                },
-            }
-            da, db_ = dress[a], dress[b]
-            cross = max(
-                (float(np.minimum(x, y).sum()) for x in da["vecs"] for y in db_["vecs"]),
-                default=None,
-            )
-            why["clothes"] = {
-                "selfA": da["self"], "selfB": db_["self"], "cross": cross,
-                "nA": da["n"], "nB": db_["n"],
-            }
-            reasons = []
-            reason = _exclusion(
-                why["gender"], why["age"], why["stature"],
-                gender_min_p, age_child_max, age_adult_min, stature_gap,
-            )
-            if reason is not None:
-                reasons.append(reason)
-            if _clothes_clash(da, db_, cross, clothes_clash, clothes_min_n, clothes_self_min):
-                reasons.append("clothes")
-            row = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
-            if reasons:
-                # Counted once, under the first reading that ruled it out, so
-                # the counts sum to the pairs set aside; every reason rides
-                # the row.  Set aside is NOT a merge and NOT a cannot_link:
-                # the row stays in setAside for the operator to overrule.
-                excluded[reasons[0]] += 1
-                set_aside.append({**row, "reasons": reasons})
-                continue
-            candidates.append(row)
+            in_band.append((a, b, cosine, max(scores) if scores else None))
+
+    torsos = torso_reads(evidence, tpl_torsos)
+    heads = head_reads(evidence)
+    beards = beard_reads(evidence)
+    candidates, set_aside = [], []
+    for a, b, cosine, clothes in in_band:
+        sa, sb = statures.get(a), statures.get(b)
+        ta, tb = torsos.get(a), torsos.get(b)
+        cross = None if ta is None or tb is None else best_cross(ta.vectors, tb.vectors)
+        ha, hb = heads.get(a), heads.get(b)
+        head_sim = None if ha is None or hb is None else best_cross(ha.vectors, hb.vectors)
+        ba, bb = beards.get(a), beards.get(b)
+        beard_a, beard_b, beard_differ = beards_apart(ba, bb, beard_min_n)
+        why = {
+            "gender": {
+                "a": genders[a][0], "b": genders[b][0],
+                "pA": genders[a][1], "pB": genders[b][1],
+            },
+            "age": {"a": ages[a], "b": ages[b]},
+            "stature": {
+                "a": sa, "b": sb, "adultM": adult_m,
+                "aM": None if sa is None else sa * adult_m,
+                "bM": None if sb is None else sb * adult_m,
+            },
+            "clothes": {
+                "selfA": None if ta is None else ta.agreement,
+                "selfB": None if tb is None else tb.agreement,
+                "cross": cross,
+                "nA": 0 if ta is None else ta.n,
+                "nB": 0 if tb is None else tb.n,
+            },
+            "head": {
+                "a": None if ha is None else head_label(ha.vectors),
+                "b": None if hb is None else head_label(hb.vectors),
+                "sim": head_sim,
+                "selfA": None if ha is None else ha.agreement,
+                "selfB": None if hb is None else hb.agreement,
+                "nA": 0 if ha is None else ha.n,
+                "nB": 0 if hb is None else hb.n,
+            },
+            "beard": {
+                "a": beard_a, "b": beard_b,
+                "nA": 0 if ba is None else ba.n,
+                "nB": 0 if bb is None else bb.n,
+            },
+        }
+        reasons = _side_reasons(
+            why["gender"], why["age"], why["stature"],
+            gender_min_p, age_child_max, age_adult_min, stature_gap,
+        )
+        if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
+            reasons.append("clothes")
+        if head_apart(ha, hb, head_sim, head_clash):
+            reasons.append("head")
+        if beard_differ:
+            reasons.append("beard")
+        entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
+        if reasons:
+            excluded[reasons[0]] += 1
+            set_aside.append({**entry, "reasons": reasons})
+            continue
+        candidates.append(entry)
 
     # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
     # measurement. The clothes-first order was built for run 0f5c6d, where
