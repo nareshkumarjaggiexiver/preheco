@@ -1819,4 +1819,10 @@ some pair of reads).
   0.83–0.99 head and no beard clash; #1 reads head red/orange at 0.36 and
   beard dark/white and is set aside on both. White balance changes none of
   it.
+- Rollout, either order: a match ≤ 0.13.0 ignores `head`/`beard` (unknown
+  fields are dropped by its request model, not refused) and the review
+  simply has no head or beard evidence; a runner from before this sends
+  neither and every `why.head`/`why.beard` reads null with zero
+  exclusions. The torso has been on every `/match` since v3, so the
+  clothing set-aside needs only the new match.
 
