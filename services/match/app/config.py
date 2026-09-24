@@ -340,6 +340,31 @@ DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
 DEFAULT_REVIEW_CLOTHES_MIN_N = 3
 DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
 
+# Head: turban and hair colour above the eyes, per sighting in the body log,
+# under the clothing rule's own-testimony bar (three reads over two seconds
+# agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
+# at least half chromatic — gallery._HEAD_WEAR_MIN says why a covered head
+# is never set against a bare one); set aside when the best cross reading is
+# under HEAD_CLASH.  Run f0bfc5, 45 identities of the queue's first 32 pairs:
+# own head reads agree at a median 0.87 (min 0.63), one person split across
+# a time gap at 0.83-0.99 (9 splits), pair #1 — maroon turban against peach
+# — at 0.36; blue turban against black hair (#18) 0.37 and pink turban
+# against black hair (#15) 0.41 are headwear against hair and stay asked.
+# 0.45 sits 0.09 over #1 and 0.38 under the closest same-person split.
+# HEAD_CLASH 0 turns the signal off.
+DEFAULT_REVIEW_HEAD_CLASH = 0.45
+
+# Beard: none / dark / grey / white per identity, from its body-log reads
+# (the class two thirds of its reads name, the unsure reads counting
+# against it).  A pair is set aside when both identities have at least
+# BEARD_MIN_N reads over two seconds and their classes cannot be one face:
+# none against any beard, dark against white — grey is never set against
+# either.  Run f0bfc5: pair #1 reads dark against white and is set aside;
+# of nine same-person splits none was; the seven full beards' median reads
+# are 0.47-0.75 dark against 0.03-0.48 for 21 shaven or moustached men.
+# BEARD_MIN_N 0 turns the signal off.
+DEFAULT_REVIEW_BEARD_MIN_N = 3
+
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
 # it is the anchor for every stature estimate and the planner's default
@@ -407,6 +432,18 @@ def review_clothes_self_min() -> float:
     """Median pairwise intersection an identity's own torso reads must reach
     (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
     return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
+
+
+def review_head_clash() -> float:
+    """Best cross head intersection under which a pair whose identities each
+    read ONE head is set aside (env HECO_REVIEW_HEAD_CLASH; 0 = off)."""
+    return _env_f("HECO_REVIEW_HEAD_CLASH", DEFAULT_REVIEW_HEAD_CLASH)
+
+
+def review_beard_min_n() -> int:
+    """Beard reads each identity needs before its class may set a pair aside
+    (env HECO_REVIEW_BEARD_MIN_N; 0 = off)."""
+    return max(0, int(_env_f("HECO_REVIEW_BEARD_MIN_N", DEFAULT_REVIEW_BEARD_MIN_N)))
 
 
 def adult_height_m() -> float:

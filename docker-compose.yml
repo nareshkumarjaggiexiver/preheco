@@ -279,6 +279,15 @@ services:
       HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
       HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
       HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
+      # HEAD AND BEARD SET-ASIDES (0.14.0), read per sighting beside the torso.
+      # HEAD_CLASH: two HEADWEAR identities (turban against turban; a covered
+      # head is never set against a bare one - dupattas and rumals come and
+      # go in one wedding) whose best cross head reading is under it. f0bfc5:
+      # maroon vs peach turban 0.36, one person split in time 0.83-0.99;
+      # default 0.45, 0 = off. BEARD_MIN_N: reads each side needs before
+      # none-vs-beard or dark-vs-white sets a pair aside; default 3, 0 = off.
+      HECO_REVIEW_HEAD_CLASH: ${HECO_REVIEW_HEAD_CLASH-}
+      HECO_REVIEW_BEARD_MIN_N: ${HECO_REVIEW_BEARD_MIN_N-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}

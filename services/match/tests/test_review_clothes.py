@@ -79,6 +79,11 @@ BLUE = torso({24: 1.0})
 RED_BLUE = torso({0: 1.0, 24: 1.0})
 
 
+def excluded(**counts) -> dict:
+    """The reply's ``excluded`` block: every signal at zero but those named."""
+    return {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, **counts}
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     """TestClient with gallery data redirected to a temp directory."""
@@ -246,7 +251,7 @@ def test_clash_zero_is_off_and_the_evidence_is_still_shown(client, ticking, monk
 
     monkeypatch.setenv("HECO_REVIEW_CLOTHES_CLASH", "0")
     off = review(client)
-    assert off["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert off["excluded"] == excluded()
     assert off["setAside"] == []
     assert in_queue(off, kh, ks)
     (pair,) = off["pairs"]
@@ -309,7 +314,7 @@ def test_side_signals_land_in_set_aside_with_every_reason_that_spoke(client, tic
         }).json()
         ks = res["personKey"]
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded(age=1)
     (row,) = got["setAside"]
     assert {row["a"], row["b"]} == {kh, ks}
     assert row["reasons"] == ["age", "clothes"]

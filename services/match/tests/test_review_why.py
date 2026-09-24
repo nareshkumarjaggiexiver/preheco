@@ -68,6 +68,11 @@ def spoke(i: int, cosine: float = 0.30) -> np.ndarray:
     return cosine * _e(0) + math.sqrt(1.0 - cosine * cosine) * _e(i)
 
 
+def excluded(**counts) -> dict:
+    """The reply's ``excluded`` block: every signal at zero but those named."""
+    return {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, **counts}
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     """TestClient with gallery data redirected to a temp directory."""
@@ -491,7 +496,7 @@ def test_gender_exclusion_needs_both_sides_confident_and_a_null_never_excludes(c
     got = review(client)
     by = pairs_of(got)
     assert frozenset((kh, k_sure)) not in by, "both confident, different: set aside"
-    assert got["excluded"] == {"gender": 1, "age": 0, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded(gender=1)
     assert got["considered"] == 6, "still examined — the count beyond the queue is not hidden"
 
     unsure = by[frozenset((kh, k_unsure))]["why"]
@@ -523,7 +528,7 @@ def test_a_lone_confident_read_on_either_side_still_asks(client, tmp_path):
     settle(tmp_path, "r", kh, hub(), "M", SURE_P, 41.0)
     ks = match(client, "r", spoke(1), attrs("F", 0.95, 43.0))["personKey"]
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded()
     (p,) = got["pairs"]
     assert {p["a"], p["b"]} == {kh, ks}
     lone = p["why"]["gender"]["pB"] if p["b"] == ks else p["why"]["gender"]["pA"]
@@ -540,7 +545,7 @@ def test_age_exclusion_is_child_against_adult_and_the_dead_zone_still_asks(clien
     by = pairs_of(got)
     assert frozenset((kh, k_child)) not in by
     assert frozenset((kh, k_teen)) in by
-    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded(age=1)
 
 
 def test_stature_exclusion_sets_aside_a_child_sized_body_against_an_adult(client, ticking):
@@ -554,7 +559,7 @@ def test_stature_exclusion_sets_aside_a_child_sized_body_against_an_adult(client
 
     got = review(client)
     assert got["pairs"] == []
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 1, "clothes": 0}
+    assert got["excluded"] == excluded(stature=1)
 
     # Turn the signal off: the pair is back, and its `why` carries the ratios
     # AND the metres a human reads (ratio × the 1.75 m anchor).
@@ -591,7 +596,7 @@ def test_stature_is_null_under_min_n_and_null_never_excludes(client, ticking):
     hub_side, spoke_side = ("a", "b") if p["a"] == kh else ("b", "a")
     assert st[hub_side] == pytest.approx(1.0, abs=0.05)
     assert st[spoke_side] is None, "under HECO_REVIEW_STATURE_MIN_N: not measured"
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded()
 
 
 def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, tmp_path):
@@ -605,7 +610,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
     _write_v2_gallery(path, [("p00001", hub()), ("p00002", spoke(1)), ("p00003", spoke(2))])
 
     got = review(client, run="legacy")
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded()
     assert len(got["pairs"]) == 2, "both in-band pairs are still asked about"
     for p in got["pairs"]:
         assert p["why"] == {
@@ -615,6 +620,11 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
                 "a": None, "b": None, "adultM": pytest.approx(1.75), "aM": None, "bM": None,
             },
             "clothes": {"selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0},
+            "head": {
+                "a": None, "b": None, "sim": None, "selfA": None, "selfB": None,
+                "nA": 0, "nB": 0,
+            },
+            "beard": {"a": None, "b": None, "nA": 0, "nB": 0},
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
     assert got["setAside"] == []
@@ -673,11 +683,11 @@ def test_every_exclusion_knob_at_zero_is_its_off_switch(client, monkeypatch, tmp
 
     monkeypatch.setenv("HECO_REVIEW_GENDER_MIN_P", "0")
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}, "then age"
+    assert got["excluded"] == excluded(age=1), "then age"
 
     monkeypatch.setenv("HECO_REVIEW_AGE_CHILD_MAX", "0")
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert got["excluded"] == excluded()
     assert frozenset((kh, ks)) in pairs_of(got), "nothing left to set it aside"
 
 
