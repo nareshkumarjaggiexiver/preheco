@@ -227,6 +227,15 @@ services:
       # WEAK_FLOOR=0 disables the weak band entirely.
       HECO_MATCH_NEARMISS_WEAK_FLOOR: ${HECO_MATCH_NEARMISS_WEAK_FLOOR-}
       HECO_MATCH_NEARMISS_CLOTHES: ${HECO_MATCH_NEARMISS_CLOTHES-}
+      # The duplicate-REVIEW band's floor, and a DIFFERENT question from the
+      # near-miss floor above — config.py says so explicitly, because they
+      # once shared a value and the documented off switch for one silently
+      # emptied the other. Left unplumbed it could not be set at all: on an
+      # ArcFace install the SFace-derived 0.15 default queued 20 of 78
+      # identity pairs — 26% of every possible pairing — and an operator
+      # reading that queue saw children paired with adults and turbaned men
+      # with women, none of which the gallery was actually merging.
+      HECO_REVIEW_FLOOR: ${HECO_REVIEW_FLOOR-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
