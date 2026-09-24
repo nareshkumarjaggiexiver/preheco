@@ -1420,9 +1420,14 @@ def review_duplicates(
 
     Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
     "excluded": {"gender": g, "age": a, "stature": s, "clothes": c,
-    "head": h, "beard": b}, "setAside": [...]}``.  ``dropped`` is stated rather than swallowed: a
-    truncated queue that looks complete is how a real duplicate goes
-    unreviewed.
+    "head": h, "beard": b}, "setAside": [...]}``.  ``dropped`` is stated
+    rather than swallowed: a truncated queue that looks complete is how a
+    real duplicate goes unreviewed.
+
+    The store's lock — the one every /match of the run waits on — is held
+    only to READ: the appearance evidence is compared after it is released
+    (a 41,000-row body log took 0.7 s to compare; the live loop's /match
+    must not wait on an operator's click).
     """
     store = open_store(db_path(data_dir, run_id))
     excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0}
@@ -1435,10 +1440,7 @@ def review_duplicates(
         ages = {k: identity_age(attrs[k]) for k in keys}
         statures = stature_ratios(store.body_sightings(), stature_min_n)
         evidence = store.sighting_evidence()
-        torsos = torso_reads(evidence)
-        heads = head_reads(evidence)
-        beards = beard_reads(evidence)
-        candidates, set_aside, considered = [], [], 0
+        in_band, considered = [], 0
         for a, b in itertools.combinations(keys, 2):
             considered += 1
             if store.cannot_link(a, b):
@@ -1452,63 +1454,69 @@ def review_duplicates(
                 s for s in (intersection(p, q) for p in apps[a] for q in apps[b])
                 if s is not None
             ]
-            clothes = max(scores) if scores else None
-            sa, sb = statures.get(a), statures.get(b)
-            ta, tb = torsos.get(a), torsos.get(b)
-            cross = None if ta is None or tb is None else best_cross(ta.vectors, tb.vectors)
-            ha, hb = heads.get(a), heads.get(b)
-            head_sim = None if ha is None or hb is None else best_cross(ha.vectors, hb.vectors)
-            ba, bb = beards.get(a), beards.get(b)
-            beard_a, beard_b, beard_differ = beards_apart(ba, bb, beard_min_n)
-            why = {
-                "gender": {
-                    "a": genders[a][0], "b": genders[b][0],
-                    "pA": genders[a][1], "pB": genders[b][1],
-                },
-                "age": {"a": ages[a], "b": ages[b]},
-                "stature": {
-                    "a": sa, "b": sb, "adultM": adult_m,
-                    "aM": None if sa is None else sa * adult_m,
-                    "bM": None if sb is None else sb * adult_m,
-                },
-                "clothes": {
-                    "selfA": None if ta is None else ta.agreement,
-                    "selfB": None if tb is None else tb.agreement,
-                    "cross": cross,
-                    "nA": 0 if ta is None else ta.n,
-                    "nB": 0 if tb is None else tb.n,
-                },
-                "head": {
-                    "a": None if ha is None else head_label(ha.vectors),
-                    "b": None if hb is None else head_label(hb.vectors),
-                    "sim": head_sim,
-                    "selfA": None if ha is None else ha.agreement,
-                    "selfB": None if hb is None else hb.agreement,
-                    "nA": 0 if ha is None else ha.n,
-                    "nB": 0 if hb is None else hb.n,
-                },
-                "beard": {
-                    "a": beard_a, "b": beard_b,
-                    "nA": 0 if ba is None else ba.n,
-                    "nB": 0 if bb is None else bb.n,
-                },
-            }
-            reasons = _side_reasons(
-                why["gender"], why["age"], why["stature"],
-                gender_min_p, age_child_max, age_adult_min, stature_gap,
-            )
-            if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
-                reasons.append("clothes")
-            if head_apart(ha, hb, head_sim, head_clash):
-                reasons.append("head")
-            if beard_differ:
-                reasons.append("beard")
-            entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
-            if reasons:
-                excluded[reasons[0]] += 1
-                set_aside.append({**entry, "reasons": reasons})
-                continue
-            candidates.append(entry)
+            in_band.append((a, b, cosine, max(scores) if scores else None))
+
+    torsos = torso_reads(evidence)
+    heads = head_reads(evidence)
+    beards = beard_reads(evidence)
+    candidates, set_aside = [], []
+    for a, b, cosine, clothes in in_band:
+        sa, sb = statures.get(a), statures.get(b)
+        ta, tb = torsos.get(a), torsos.get(b)
+        cross = None if ta is None or tb is None else best_cross(ta.vectors, tb.vectors)
+        ha, hb = heads.get(a), heads.get(b)
+        head_sim = None if ha is None or hb is None else best_cross(ha.vectors, hb.vectors)
+        ba, bb = beards.get(a), beards.get(b)
+        beard_a, beard_b, beard_differ = beards_apart(ba, bb, beard_min_n)
+        why = {
+            "gender": {
+                "a": genders[a][0], "b": genders[b][0],
+                "pA": genders[a][1], "pB": genders[b][1],
+            },
+            "age": {"a": ages[a], "b": ages[b]},
+            "stature": {
+                "a": sa, "b": sb, "adultM": adult_m,
+                "aM": None if sa is None else sa * adult_m,
+                "bM": None if sb is None else sb * adult_m,
+            },
+            "clothes": {
+                "selfA": None if ta is None else ta.agreement,
+                "selfB": None if tb is None else tb.agreement,
+                "cross": cross,
+                "nA": 0 if ta is None else ta.n,
+                "nB": 0 if tb is None else tb.n,
+            },
+            "head": {
+                "a": None if ha is None else head_label(ha.vectors),
+                "b": None if hb is None else head_label(hb.vectors),
+                "sim": head_sim,
+                "selfA": None if ha is None else ha.agreement,
+                "selfB": None if hb is None else hb.agreement,
+                "nA": 0 if ha is None else ha.n,
+                "nB": 0 if hb is None else hb.n,
+            },
+            "beard": {
+                "a": beard_a, "b": beard_b,
+                "nA": 0 if ba is None else ba.n,
+                "nB": 0 if bb is None else bb.n,
+            },
+        }
+        reasons = _side_reasons(
+            why["gender"], why["age"], why["stature"],
+            gender_min_p, age_child_max, age_adult_min, stature_gap,
+        )
+        if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
+            reasons.append("clothes")
+        if head_apart(ha, hb, head_sim, head_clash):
+            reasons.append("head")
+        if beard_differ:
+            reasons.append("beard")
+        entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
+        if reasons:
+            excluded[reasons[0]] += 1
+            set_aside.append({**entry, "reasons": reasons})
+            continue
+        candidates.append(entry)
 
     # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
     # measurement. The clothes-first order was built for run 0f5c6d, where
