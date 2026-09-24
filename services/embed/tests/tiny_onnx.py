@@ -58,10 +58,16 @@ def _string(field: int, text: str) -> bytes:
     return _blob(field, text.encode())
 
 
-def _value_info(name: str, elem_type: int, dims: tuple[int, ...]) -> bytes:
+def _dim(d) -> bytes:
+    """TensorShapeProto.Dimension: dim_value(1) for an int, dim_param(2) for a
+    name — a str dim is SYMBOLIC (a dynamic batch, like the real arcface's)."""
+    return _blob(1, _string(2, d) if isinstance(d, str) else _int(1, d))
+
+
+def _value_info(name: str, elem_type: int, dims: tuple) -> bytes:
     """ValueInfoProto: name(1) + TypeProto(2){tensor_type(1){elem_type(1),
-    shape(2){dim(1){dim_value(1)}...}}} — all dims static ints."""
-    shape = b"".join(_blob(1, _int(1, d)) for d in dims)  # TensorShapeProto
+    shape(2){dim(1){dim_value(1) | dim_param(2)}...}}}."""
+    shape = b"".join(_dim(d) for d in dims)  # TensorShapeProto
     tensor = _int(1, elem_type) + _blob(2, shape)  # TypeProto.Tensor
     return _string(1, name) + _blob(2, _blob(1, tensor))
 
@@ -70,7 +76,7 @@ def flatten_model(elem_type: int, input_shape: tuple[int, ...]) -> bytes:
     """A ModelProto: Flatten(x) -> y, x of `input_shape`, y (batch, rest)."""
     n = 1
     for d in input_shape[1:]:
-        n *= d
+        n *= d  # only the batch dim may be symbolic
     node = (
         _string(1, "x") + _string(2, "y")  # input, output
         + _string(3, "flatten") + _string(4, "Flatten")  # name, op_type
