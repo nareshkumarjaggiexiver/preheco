@@ -58,8 +58,9 @@
 # it (and are off by default like the rest):
 #
 #   HECO_TRT=1     docker-compose.trt.yml, LAST: persons/faces/embed on
-#                  TensorRT fp16. The :cuda images must carry TensorRT
-#                  (scripts/build-images.sh since lever/models), and each model's
+#                  TensorRT fp16. The :cuda images must carry TensorRT —
+#                  build them with HECO_TRT=1 ./scripts/build-images.sh; a plain
+#                  build leaves it out (f1b2f07) — and each model's
 #                  first start builds its engine: YOLOX-s ~157 s, SCRFD ~34 s,
 #                  ArcFace ~35 s, genderage ~20 s — warm them before a count.
 #   HECO_HWDEC=1   docker-compose.hwdec.yml: the ffmpeg ingest image

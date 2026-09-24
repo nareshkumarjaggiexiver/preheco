@@ -17,8 +17,13 @@ TRT (alias TENSORRT) is the fp16 arm: TensorRT first, then CUDA, then CPU.
 Measured 2026-09-24 on the 4060, eight real 4K frames of the Sharon bench
 clip, session.run median fp32 CUDA -> fp16 TensorRT: YOLOX-s 640 7.1 ->
 3.3 ms, SCRFD-10G 1472x832 20.0 -> 5.4 ms, ArcFace-R50 23.3 -> 8.6 ms per
-5.5-face frame; parity: person boxes IoU >= 0.995, face boxes IoU >= 0.991
-with landmarks within 0.22 px, ArcFace cosine >= 0.9999, no gender flips.
+5.5-face frame. Parity, re-measured on 40 frames through the services' own
+classes: no person or face gained or lost at score 0.5 or 0.7 (268 persons,
+243 faces), confidence within 0.005, no gender flips, age within 0.17 y;
+person IoU p1 0.987 (min 0.93: a 110x341 partial person), face IoU min
+0.987, landmarks within 0.30 px, ArcFace cosine min 0.9997 (0.9999 for
+faces >= 56 px), feature norm within 1.1% (p99 0.40%). The tails are small
+or half-hidden subjects.
 
 Nodes TensorRT cannot take fall to CUDA, and a TensorRT that will not load
 at all (libnvinfer missing, a wrong soname) drops the session to CUDA+CPU —
