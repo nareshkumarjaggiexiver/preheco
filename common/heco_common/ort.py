@@ -27,7 +27,8 @@ same honesty rule as every other fallback. A TensorRT that loads but cannot
 BUILD an engine fails later, inside the first run(), where ORT rebuilds the
 session on CUDA without raising — so every service reads its device truth
 after its first (warm-up) run, not after construction. Engines are built
-once per model, input shape and GPU and kept under HECO_TRT_CACHE: 35-160 s
+once per model CONTENT, input shape and GPU and kept under HECO_TRT_CACHE,
+in a directory named by the weights' own hash (:func:`model_key`): 35-160 s
 cold, under 1 s from the cache (docker-compose.trt.yml keeps it on a volume
 and gives the healthcheck the start period a cold build needs).
 """
@@ -35,6 +36,7 @@ and gives the healthcheck the start period a cold build needs).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import sys
 
@@ -61,8 +63,47 @@ def trt_cache_dir() -> str:
     return os.environ.get(TRT_CACHE_ENV) or DEFAULT_TRT_CACHE
 
 
-def trt_options(cache_dir: str | None = None) -> dict:
+#: Hex digits of the weights' sha256 that name an engine directory: 48 bits,
+#: for the handful of weights one cache volume ever holds.
+MODEL_KEY_CHARS = 12
+
+
+def model_key(model: bytes | bytearray | str | os.PathLike) -> str:
+    """The first MODEL_KEY_CHARS hex digits of the sha256 of a model's BYTES.
+
+    ``model`` is the graph ORT is handed: bytes as they are, a path read
+    (in 1 MiB chunks — ArcFace-R50 is 166 MB).
+
+    WHY THE ENGINE CACHE NEEDS IT. ORT's TensorRT EP names a cached engine
+    by a hash of the GRAPH — nodes, shapes and, for a model loaded from a
+    path, its file name — never of the weights. Measured 2026-09-25 on the
+    4060 (ORT 1.30.0, TensorRT 10.16.1): a SCRFD-10G copy with one bias
+    shifted by +2.0 (8 bytes; its stride-8 score mean 0.0096 -> 0.0643 on
+    CUDA) "built" in 0.08 s against the original's 32.9 s and returned the
+    ORIGINAL's scores (0.00962 both), under the very engine hash the faces
+    service had cached; a persons or embed weight re-fetched in place under
+    its old name did the same. So engines live in a directory named by the
+    content (:func:`trt_options`): a new weight is a new engine, whatever
+    it is called.
+    """
+    digest = hashlib.sha256()
+    if isinstance(model, bytes | bytearray | memoryview):
+        digest.update(model)
+    else:
+        with open(model, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()[:MODEL_KEY_CHARS]
+
+
+def trt_options(cache_dir: str | None = None, model=None) -> dict:
     """TensorrtExecutionProvider options: fp16, engine + timing cache, 2 GiB.
+
+    ``model`` (the bytes or path ORT is handed) puts the ENGINES under
+    ``<cache>/<model_key(model)>`` — see :func:`model_key` for the stale
+    engine that keying on anything else served. The timing cache stays at
+    ``<cache>``: it holds per-layer kernel timings for this GPU and TensorRT
+    version, valid for any weights, and sharing it only speeds a rebuild.
 
     The cache directory is created here, best-effort: the EP creates only
     the LAST path component and a session whose TensorRT EP throws falls
@@ -71,14 +112,15 @@ def trt_options(cache_dir: str | None = None) -> dict:
     Values are strings because that is what ORT hands the EP either way.
     """
     cache = cache_dir or trt_cache_dir()
+    engines = cache if model is None else os.path.join(cache, model_key(model))
     # A failure here is not ours to report: the EP's own error (and /health's
     # active list) will say so.
     with contextlib.suppress(OSError):
-        os.makedirs(cache, exist_ok=True)
+        os.makedirs(engines, exist_ok=True)
     return {
         "trt_fp16_enable": "True",
         "trt_engine_cache_enable": "True",
-        "trt_engine_cache_path": cache,
+        "trt_engine_cache_path": engines,
         "trt_timing_cache_enable": "True",
         "trt_timing_cache_path": cache,
         "trt_max_workspace_size": str(TRT_WORKSPACE_BYTES),
@@ -102,7 +144,7 @@ def trt_batch_profile(input_name: str, sample: tuple[int, ...], max_batch: int) 
 
 
 def providers_for(
-    device: str | None, trt_extra: dict | None = None
+    device: str | None, trt_extra: dict | None = None, model=None
 ) -> tuple[list[str], list[dict]]:
     """ORT (providers, provider_options) for a HECO_DEVICE string.
 
@@ -110,7 +152,9 @@ def providers_for(
     CUDA → CUDA with CPU fallback; TRT/TENSORRT → TensorRT fp16, then CUDA,
     then CPU; anything else is handed to OpenVINO as a device string
     (GPU = iGPU, NPU, …). `trt_extra` adds TensorRT options (a batch
-    profile) and is ignored on every other device.
+    profile) and `model` (the bytes or path the session loads) keys the
+    engine directory on the weights (:func:`model_key`); both are ignored —
+    `model` never even read — on every other device.
     """
     dev = (device or "CPU").upper()
     if dev == "CPU":
@@ -120,7 +164,7 @@ def providers_for(
     if dev in _TRT_NAMES:
         return (
             ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
-            [{**trt_options(), **(trt_extra or {})}, {}, {}],
+            [{**trt_options(model=model), **(trt_extra or {})}, {}, {}],
         )
     return (
         ["OpenVINOExecutionProvider", "CPUExecutionProvider"],

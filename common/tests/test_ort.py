@@ -60,6 +60,52 @@ def test_an_uncreatable_cache_dir_does_not_raise(tmp_path):
     assert opts["trt_engine_cache_path"] == str(blocker / "sub")
 
 
+def test_model_key_is_the_content_not_the_name(tmp_path):
+    """Bytes and a path with those bytes key alike; one byte apart (the
+    shifted-bias SCRFD that ran the original's engine) keys apart."""
+    raw = bytes(range(256)) * 64
+    path = tmp_path / "scrfd_10g_kps.onnx"
+    path.write_bytes(raw)
+    key = ort.model_key(raw)
+    assert len(key) == ort.MODEL_KEY_CHARS and int(key, 16) >= 0
+    assert ort.model_key(path) == key == ort.model_key(str(path))
+    shifted = bytearray(raw)
+    shifted[1000] ^= 0x01
+    assert ort.model_key(bytes(shifted)) != key
+
+
+def test_trt_engines_live_under_the_weights_hash(tmp_path, monkeypatch):
+    """Same file NAME, different weights (an in-place re-fetch, or the same
+    architecture swapped in): different engine directories, so neither can
+    be served the other's engine. The timing cache stays shared — it holds
+    kernel timings for this GPU, valid for any weights."""
+    monkeypatch.setenv("HECO_TRT_CACHE", str(tmp_path / "cache"))
+    old, new = tmp_path / "a" / "yolox_s.onnx", tmp_path / "b" / "yolox_s.onnx"
+    for p, payload in ((old, b"weights-v1"), (new, b"weights-v2")):
+        p.parent.mkdir()
+        p.write_bytes(payload)
+    opts_old = ort.providers_for("TRT", model=old)[1][0]
+    opts_new = ort.providers_for("TRT", model=new)[1][0]
+    assert opts_old["trt_engine_cache_path"] == str(
+        tmp_path / "cache" / ort.model_key(b"weights-v1"))
+    assert opts_new["trt_engine_cache_path"] != opts_old["trt_engine_cache_path"]
+    assert opts_old["trt_timing_cache_path"] == opts_new["trt_timing_cache_path"] == str(
+        tmp_path / "cache")
+    assert (tmp_path / "cache" / ort.model_key(b"weights-v2")).is_dir()
+    # A batch profile rides beside the keyed cache, not instead of it.
+    both = ort.providers_for("TRT", {"trt_profile_min_shapes": "x:1x3"}, model=old)[1][0]
+    assert both["trt_engine_cache_path"] == opts_old["trt_engine_cache_path"]
+    assert both["trt_profile_min_shapes"] == "x:1x3"
+
+
+def test_off_trt_the_model_is_never_read(tmp_path):
+    """OFF is today: CPU, CUDA and OpenVINO ignore `model` without opening it
+    (a path that does not exist would raise if anything read it)."""
+    ghost = tmp_path / "missing.onnx"
+    for dev in ("CPU", None, "CUDA", "GPU"):
+        assert ort.providers_for(dev, model=ghost) == ort.providers_for(dev)
+
+
 def test_is_trt():
     """TRT and TENSORRT, any case; nothing else."""
     assert ort.is_trt("TRT") and ort.is_trt("tensorrt")

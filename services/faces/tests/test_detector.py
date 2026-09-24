@@ -231,3 +231,31 @@ def test_trt_loads_the_dims_renamed_graph_and_other_devices_the_file(fake_ort, m
     monkeypatch.setattr(d, "distinct_input_dims", lambda raw: None)
     d.ScrfdDetector(fake_ort["weight"], 640, "TRT")
     assert seen[-1] == str(fake_ort["weight"]), "nothing to rename: the file, as ever"
+
+
+def test_trt_engine_dir_is_keyed_on_the_graph_handed_to_ort(fake_ort, monkeypatch, tmp_path):
+    """Loaded from BYTES, the EP's own engine name carries no file name: any
+    same-architecture weight ran the cached engine (a bias shifted by +2.0
+    answered the original's scores). The engine directory is the hash of
+    exactly what ORT gets, so two weights under one name build apart."""
+    from heco_common.ort import model_key
+
+    monkeypatch.setenv("HECO_TRT_CACHE", str(tmp_path / "cache"))
+    seen = []
+    mod = sys.modules["onnxruntime"]
+    monkeypatch.setattr(mod, "InferenceSession", lambda model, providers, provider_options: (
+        seen.append((model, provider_options[0])) or fake_ort["session"]))
+    monkeypatch.setattr(d, "distinct_input_dims", lambda raw: b"renamed:" + raw)
+    other = tmp_path / "other" / fake_ort["weight"].name
+    other.parent.mkdir()
+    other.write_bytes(b"same-architecture-other-weights")
+    d.ScrfdDetector(fake_ort["weight"], 640, "TRT")
+    d.ScrfdDetector(other, 640, "TRT")
+    (m1, o1), (m2, o2) = seen
+    assert o1["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(m1))
+    assert o2["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(m2))
+    assert o1["trt_engine_cache_path"] != o2["trt_engine_cache_path"]
+    # Nothing to rename: the path is loaded and its bytes are what key it.
+    monkeypatch.setattr(d, "distinct_input_dims", lambda raw: None)
+    d.ScrfdDetector(other, 640, "TRT")
+    assert seen[-1][1]["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(other))
