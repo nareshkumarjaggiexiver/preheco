@@ -380,6 +380,15 @@ services:
       # and can be read out with `docker cp`.
       HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
       HECO_FACES_WHOLE_FRAME: ${HECO_FACES_WHOLE_FRAME-}
+      # STAGE OVERLAP (lever L3; 1 = on, default off). One worker thread
+      # fetches frame k+1 and runs its detection (persons, and the face search
+      # when it needs no tracks: HECO_FACES_WHOLE_FRAME) while the loop decides
+      # frame k — track, gate, embed, match, verdicts — so the stateless half
+      # of the ~200 ms/frame 4K chain hides behind the stateful half. At most
+      # one frame ahead; every decision stays on the loop thread in frame
+      # order. Off is the loop exactly as it ran (pinned call for call).
+      # GET /health `knobs` shows what the container actually resolved.
+      HECO_PIPELINE_OVERLAP: ${HECO_PIPELINE_OVERLAP-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

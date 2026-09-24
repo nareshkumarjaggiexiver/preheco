@@ -193,6 +193,26 @@ class Settings:
     #: returns the NEXT seq whenever it is asked), so golden diffs hold.
     frame_prefetch: bool = True
 
+    # STAGE OVERLAP (lever L3, HECO_PIPELINE_OVERLAP).  Off by default, and
+    # off is the loop exactly as it has always run (pinned call for call:
+    # tests/test_call_sequence_pinned.py).
+    #
+    # THE MEASUREMENT.  One 4K camera through the CUDA box, whole-frame
+    # SCRFD-10G at 1472x832: ~200 ms a frame with every stage SERIAL in this
+    # loop, while the camera delivers a frame every 67 ms.  Persons and faces
+    # are the stateless half of that chain — each is a pure function of the
+    # frame — and everything else (the tracker, the gallery, the locks,
+    # co-presence, the ledger, the taps) is state that must be touched in
+    # frame order.  So ONE worker thread fetches frame k+1 and runs its
+    # detection (persons, then the face search when it needs no tracks: the
+    # whole frame) while this thread runs frame k's track -> gate -> embed ->
+    # match -> verdict pass.  At most one frame ahead; every piece of state
+    # stays on this thread; a stage failure in the worker is carried back and
+    # raised here, at the very point the inline call would have raised it.
+    # A crop search still waits for its frame's tracks, so on the crop path
+    # only persons moves to the worker.
+    pipeline_overlap: bool = False
+
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
     # keyframe is uploaded promptly, long enough that an empty scene does not
@@ -542,8 +562,22 @@ def from_env() -> Settings:
         golden_path=os.environ.get("HECO_GOLDEN_PATH") or s.golden_path,
         golden_embeddings=os.environ.get("HECO_GOLDEN_EMBEDDINGS", "") == "1",
         frame_prefetch=os.environ.get("HECO_FRAME_PREFETCH", "1") != "0",
+        pipeline_overlap=env_bool("HECO_PIPELINE_OVERLAP", s.pipeline_overlap),
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
         enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
     )
+
+
+def knobs(s: Settings) -> dict:
+    """The throughput levers as this process resolved them, for GET /health.
+
+    Keyed by the variable an operator sets, so "is it on?" is answered
+    against the very name in the .env.  The failure this exists for is a
+    knob that LOOKED set and changed nothing: three knobs in this repo once
+    had no compose passthrough, and nothing anywhere said so.
+    """
+    return {
+        "HECO_PIPELINE_OVERLAP": s.pipeline_overlap,
+    }

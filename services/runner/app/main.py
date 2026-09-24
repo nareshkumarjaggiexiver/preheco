@@ -320,6 +320,10 @@ def health() -> dict:
         # /proc. GPU truth lives at the persons service's /health `device`
         # block — the planner joins the two.
         "host": _host_facts(),
+        # THE THROUGHPUT LEVERS as this process resolved them from its env
+        # (app.config.knobs) — the one place to check a lever is really on,
+        # because a knob with no compose passthrough looks set and does nothing.
+        "knobs": config.knobs(manager.settings),
     }
 
 
