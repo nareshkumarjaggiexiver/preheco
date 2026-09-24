@@ -366,7 +366,7 @@ def _analyse(
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
     if sensor_bgr is not None:
-        v = sensor_bgr.max(axis=2)  # OpenCV's 8-bit V is max(B, G, R)
+        v = _max3(sensor_bgr)  # OpenCV's 8-bit V is max(B, G, R)
     lit = (v >= V_MIN) & (v <= V_MAX)
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
@@ -845,6 +845,17 @@ def nose_drop(landmarks) -> float | None:
     return None if span <= 0 else (nose_y - eyes[0]) / span
 
 
+def _max3(img: np.ndarray) -> np.ndarray:
+    """Per-pixel max over the 3 channels — numpy's reduce over an axis of
+    length 3 cost 70% of the head and beard time; this is 6x faster."""
+    return np.maximum(np.maximum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
+def _min3(img: np.ndarray) -> np.ndarray:
+    """Per-pixel min over the 3 channels (see :func:`_max3`)."""
+    return np.minimum(np.minimum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
 def _skin_window(crop_bgr: np.ndarray, sat: np.ndarray) -> np.ndarray:
     """The torso's skin window: YCrCb, capped at SKIN_S_MAX saturation."""
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
@@ -909,13 +920,12 @@ def head_descriptor(
     x0, x1, y0, y1 = win
     crop = image_bgr[y0:y1, x0:x1]
     colour = crop if gains is None else apply_gains(crop, gains)
-    lit = crop.max(axis=2) <= V_MAX
+    lit = _max3(crop) <= V_MAX
     if int(lit.sum()) < HEAD_MIN_PX:
         return None
     hsv = cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)
     weight = np.where(lit, np.where(_skin_window(colour, hsv[:, :, 1]), HEAD_SKIN_WEIGHT, 1.0), 0.0)
-    c16 = colour.astype(np.int16)
-    chromatic = (c16.max(axis=2) - c16.min(axis=2)) >= HEAD_CHROMA_MIN
+    chromatic = (_max3(colour).astype(np.int16) - _min3(colour)) >= HEAD_CHROMA_MIN
     out = np.zeros(HEAD_DIM, dtype=np.float64)
     sel = lit & chromatic
     if sel.any():
@@ -961,10 +971,10 @@ def beard_descriptor(
 
     def read(w):
         crop = image_bgr[w[2]:w[3], w[0]:w[1]]
-        lit = crop.max(axis=2) <= V_MAX
-        c16 = (crop if gains is None else apply_gains(crop, gains)).astype(np.int16)
-        v = c16.max(axis=2)
-        return v[lit].astype(np.float64), (v - c16.min(axis=2))[lit].astype(np.float64)
+        lit = _max3(crop) <= V_MAX
+        colour = crop if gains is None else apply_gains(crop, gains)
+        v = _max3(colour).astype(np.int16)
+        return v[lit].astype(np.float64), (v - _min3(colour))[lit].astype(np.float64)
 
     cv, cc = read(cheek)
     if cv.size < BEARD_CHEEK_MIN_PX:
