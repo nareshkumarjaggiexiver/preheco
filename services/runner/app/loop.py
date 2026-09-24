@@ -762,6 +762,9 @@ class RunLoop:
         # exit path, failures included, can drain its worker BEFORE any
         # per-run state downstream is released.
         self._frames_in = None
+        # The second detector thread HECO_PARALLEL_DETECT issues faces on,
+        # created on first use and shut down with the frame source.
+        self._face_pool_ex: concurrent.futures.ThreadPoolExecutor | None = None
         # The single-slot frame prefetcher (see _next_frame_prefetched).
         self._prefetch: concurrent.futures.Future | None = None
         self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(
@@ -1401,23 +1404,41 @@ class RunLoop:
         return frame, self._detect(frame)
 
     def _detect(self, frame: dict) -> _Detections:
-        """This frame's detector calls, OFF the loop thread.
+        """This frame's detector calls, made without touching loop state.
 
         Persons always; the face search too when it needs no tracks — the
         whole frame.  A crop search is built from THIS frame's tracks, and
         the tracker is stateful, so it waits for the loop thread exactly as
-        before.  Touches no loop state: it POSTs, clocks, and hands back
-        replies (or the exception a call raised) for :meth:`_pipeline_step`
-        to account in frame order.
+        before.  With HECO_PARALLEL_DETECT the two are issued side by side
+        (faces on a second thread) rather than one after the other.  Runs on
+        the detect worker under the overlap, or inline for parallel-only; it
+        POSTs, clocks, and hands back replies (or the exception a call
+        raised) for :meth:`_pipeline_step` to account in frame order.
         """
         image_b64 = frame["imageB64"]
         det = _Detections()
+        whole = self.s.faces_whole_frame
+        faces_side = None
+        if whole and self.s.parallel_detect:
+            faces_side = self._face_pool().submit(
+                _clocked, partial(self._post_faces, image_b64, None)
+            )
         try:
             det.persons, det.persons_ms = _clocked(partial(self._post_persons, image_b64))
         except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
             det.persons_error = e
+        if faces_side is not None:
+            # Always collected, even behind a persons failure: no call of this
+            # frame may be left running once the frame is handed over.
+            det.face_decided = True
+            try:
+                det.faces, det.faces_ms = faces_side.result()
+            except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+                det.faces_error = e
             return det
-        if self.s.faces_whole_frame:
+        if det.persons_error is not None:
+            return det  # inline order: a frame whose persons failed searches no faces
+        if whole:
             det.face_decided = True
             try:
                 det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, None))
@@ -1425,11 +1446,40 @@ class RunLoop:
                 det.faces_error = e
         return det
 
+    def _face_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The parallel detector's second thread, created on first use.
+
+        Only ever asked for by whichever single thread runs :meth:`_detect`
+        for this run (the worker, or the loop for parallel-only), so the
+        lazy creation cannot race.
+        """
+        if self._face_pool_ex is None:
+            self._face_pool_ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-detect"
+            )
+        return self._face_pool_ex
+
+    def _detects_inline(self) -> bool:
+        """Whether a serial run still issues its detectors side by side.
+
+        HECO_PARALLEL_DETECT without the overlap: the loop thread itself
+        makes the calls the detect worker would have — persons here, faces
+        on the second thread — and only where the face search needs no
+        tracks.
+        """
+        return (
+            self.s.parallel_detect and not self.s.pipeline_overlap
+            and self.s.faces_whole_frame
+        )
+
     def _drain_frames(self) -> None:
-        """Close the frame source — and join its detect worker — at most once."""
+        """Close the frame source and join its detector threads, at most once."""
         frames_in, self._frames_in = self._frames_in, None
         if frames_in is not None:
             frames_in.close()
+        pool, self._face_pool_ex = self._face_pool_ex, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def _post_persons(self, image_b64: str) -> dict:
         """POST one frame to persons /detect (inline or from the detect worker)."""
@@ -1467,6 +1517,8 @@ class RunLoop:
         levers: dict = {}
         if self.s.pipeline_overlap:
             levers["pipelineOverlap"] = True
+        if self.s.parallel_detect:
+            levers["parallelDetect"] = True
         return {"levers": levers} if levers else {}
 
     def _open_source(self) -> None:
@@ -1969,6 +2021,10 @@ class RunLoop:
         site_id = self.request.get("siteId")
 
         # person-detect
+        if det is None and self._detects_inline():
+            # HECO_PARALLEL_DETECT on a serial run: the detector calls the
+            # worker would make, issued side by side from here.
+            det = self._detect(frame)
         if det is None:
             persons = self._timed(
                 "person-detect", "personDetectMs", partial(self._post_persons, image_b64)

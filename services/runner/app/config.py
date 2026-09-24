@@ -212,6 +212,16 @@ class Settings:
     # A crop search still waits for its frame's tracks, so on the crop path
     # only persons moves to the worker.
     pipeline_overlap: bool = False
+    # PARALLEL DETECT (lever L3, HECO_PARALLEL_DETECT).  Off by default.  With
+    # the whole-frame face search, persons and faces /detect for the SAME
+    # frame are issued side by side instead of one after the other — neither
+    # needs the other's answer.  Measured persons latency through its HTTP
+    # service is 31-43 ms against 8.6 ms of model time, so most of what this
+    # hides is transport, not GPU (two concurrent SCRFD inferences measured
+    # 1.05x: the GPU is already saturated by one).  Works with or without the
+    # overlap; on the crop path it does nothing, because a crop search needs
+    # this frame's tracks first.
+    parallel_detect: bool = False
 
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
@@ -563,6 +573,7 @@ def from_env() -> Settings:
         golden_embeddings=os.environ.get("HECO_GOLDEN_EMBEDDINGS", "") == "1",
         frame_prefetch=os.environ.get("HECO_FRAME_PREFETCH", "1") != "0",
         pipeline_overlap=env_bool("HECO_PIPELINE_OVERLAP", s.pipeline_overlap),
+        parallel_detect=env_bool("HECO_PARALLEL_DETECT", s.parallel_detect),
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
@@ -580,4 +591,5 @@ def knobs(s: Settings) -> dict:
     """
     return {
         "HECO_PIPELINE_OVERLAP": s.pipeline_overlap,
+        "HECO_PARALLEL_DETECT": s.parallel_detect,
     }
