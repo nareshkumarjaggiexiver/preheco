@@ -16,10 +16,10 @@ There is no DNN here: `/health` reports `model: "opencv-videocapture"`.
 
 | method | path | body / response |
 | ------ | ---- | --------------- |
-| POST | `/open` | `{url \| path, loop, owner?, takeover?}` — exactly one source; CLAIMS the capture slot |
+| POST | `/open` | `{url \| path, loop, isFile?, lockstep?, owner?, takeover?, motionGate?, bufferS?}` — exactly one source; CLAIMS the capture slot |
 | POST | `/close` | `{owner?, force?}` — release the slot; owner-checked, idempotent |
-| GET | `/frame` | `{tMs, imageB64, w, h, seq}` — 409 nothing open, 503 not ready yet |
-| GET | `/health` | `{ok, model, version, owner}` |
+| GET | `/frame` | `{tMs, imageB64, w, h, seq, ended}` — 409 nothing open, 503 not ready yet; with a lever armed also `{motion, backlog, skipped, dropped, captured}` |
+| GET | `/health` | `{ok, model, version, owner, knobs, capture}` |
 
 `tMs` is milliseconds since the source was opened (monotonic clock).
 
@@ -97,3 +97,57 @@ ms. About **112 ms a frame**, against a 629 ms measured budget.
 > camera's sub-streams are D1 (704x576) and CIF (352x288) — both below the face
 > floor. The served frame reports its true `w`/`h`, so the quality gate and the
 > taps measure what was actually analysed.
+
+
+## Levers (L1): the motion gate and the bounded live buffer
+
+Both are OFF by default, and OFF runs the capture loop above untouched: the
+same grab-not-retrieve, the same pacing, and a `/frame` body of exactly the
+six fields it has always had (the tests pin all three). Arm them in the env,
+or per run with `/open`'s `motionGate` / `bufferS` (null = the env's value):
+
+| env | default | meaning |
+| --- | --- | --- |
+| `INGEST_MOTION_GATE` | `0` | Publish a frame only when something in it moved, or when the keepalive is due. |
+| `INGEST_MOTION_MIN_FRAC` | `0.002` | Fraction of the ~1/8-scale luma pixels that must change to count as motion (~260 px of a 480x270 image). |
+| `INGEST_MOTION_PIXEL_THR` | `0.08` | How far one small pixel must move, in units of the frame's own luma std. |
+| `INGEST_MOTION_KEEPALIVE_S` | `1.0` | The longest a still scene goes unpublished. Footage seconds for a file, wall seconds for a camera. |
+| `INGEST_BUFFER_S` | `0` | `0` = the newest-frame slot. `> 0` = a FIFO of up to that many seconds of published frames. |
+| `INGEST_BUFFER_MB` | `2048` | Hard cap on the FIFO's pixels (MiB), oldest dropped first. |
+
+**The gate** (app/motion.py) compares each frame's small luma with the last
+PUBLISHED frame's, after normalising each by its own mean and std. A global
+exposure step or a DJ flash is therefore not motion, while anything local (a
+guest, a sweeping spotlight) is. Comparing against the last *published* frame
+rather than the previous one means a slow walker builds up change until he is
+published, where a frame-to-frame gate could skip him until the keepalive.
+Every doubt resolves toward processing: the first frame, and the first after
+a reconnect, are always published.
+
+**The buffer** holds published frames instead of letting the newest overwrite
+them, for live sources and paced files (a paced file is the bench's stand-in
+for a camera). Lockstep never queues: the reader waits for each published
+frame to be taken, so nothing is ever dropped. With a lever armed:
+
+* `GET /frame` returns and DEQUEUES the oldest unread frame. With nothing
+  unread it repeats the last one (same `seq`), so a poller waits as before.
+  **Only the run's own loop may poll it**: a second poller takes frames the
+  run then never sees.
+* `seq` stays the capture number, so a gap between two served frames is
+  exactly the frames skipped or dropped between them.
+* `ended` is true only once the file is exhausted AND nothing published is
+  left unread, and it never rides on a fresh frame (the runner reads `ended`
+  as "no frame").
+* Counters on every frame, cumulative and never decreasing: `captured`
+  (decoded), `skipped` (not published, no motion; null with the gate off),
+  `dropped` (published and discarded unread), and `backlog` (queued behind this
+  frame). `motion` is this frame's changed fraction (null when not measured).
+  Every decoded frame is accounted for:
+  `captured = skipped + published = skipped + served + dropped + pending`.
+  GET /health `capture.counters` shows the same numbers plus `backlogMax` and
+  `bufferBytes`.
+
+**The cost on the cv2 decoder.** The gate has to look at a frame to skip it,
+so in lever mode every frame is retrieved, which is the BGR conversion the
+default loop avoids for frames nobody reads. On the laptop that is 37 ms (grab
+only) against 72 ms (read) per 4K frame, single loop.

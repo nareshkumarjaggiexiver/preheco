@@ -77,6 +77,16 @@ services:
       # camera's own size, which is the default. Face pixels scale with it —
       # see services/ingest/README.md for the numbers before choosing.
       INGEST_MAX_WIDTH: ${INGEST_MAX_WIDTH-}
+      # L1 — the motion gate and the bounded live buffer (README "Levers").
+      # All empty = off = today's newest-frame slot, byte for byte; a run may
+      # still arm them per-run with /open's motionGate / bufferS. GET /health
+      # shows what the container actually received under `knobs`.
+      INGEST_MOTION_GATE: ${INGEST_MOTION_GATE-}
+      INGEST_MOTION_MIN_FRAC: ${INGEST_MOTION_MIN_FRAC-}
+      INGEST_MOTION_PIXEL_THR: ${INGEST_MOTION_PIXEL_THR-}
+      INGEST_MOTION_KEEPALIVE_S: ${INGEST_MOTION_KEEPALIVE_S-}
+      INGEST_BUFFER_S: ${INGEST_BUFFER_S-}
+      INGEST_BUFFER_MB: ${INGEST_BUFFER_MB-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.
