@@ -11,6 +11,10 @@ rules. `./scripts/demo-up.sh status` on the box shows every one of them.
       idles at 210–495 MHz between frames and every stage runs several times
       slower.
 - [ ] Box, laptop, camera, stand, LAN switch and cables packed.
+- [ ] **A PoE switch with enough power for the camera.** At night the
+      camera's infrared light switches on and draws more power; on an
+      underpowered port the camera's light blinks on and off and it drops
+      off the network every minute or so (the Sharon test, 2026-09-25).
 
 ## 2. Power-up order
 
@@ -48,6 +52,11 @@ change.
   second camera.
 - Watch: processed fps against the camera's fps, dropped frames, and on the
   box `./scripts/demo-up.sh status` for TensorRT and the `nvdec` decoder.
+- The run's processing fps reads `avg · min · max`. avg is over the whole
+  run; min and max are the slowest and fastest 5-second window. A min of 0
+  means the camera sent nothing for at least 5 seconds; max is what the
+  pipeline does when it is fed. If avg is low but max is near the camera's
+  fps, the camera or network is the problem, not the box.
 - A camera that drops out is reopened as soon as it answers again (checked
   every 10 seconds), and the run stays open through an outage of up to ten
   minutes. The console's silence alarm shows after 30 seconds. After ten
