@@ -703,6 +703,7 @@ class _Detections:
     persons_error: BaseException | None = None
     face_decided: bool = False
     face_skipped: bool = False
+    region_unplaced: bool = False
     faces: dict | None = None
     faces_ms: float = 0.0
     faces_error: BaseException | None = None
@@ -816,6 +817,15 @@ class RunLoop:
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
+        # FACE SEARCH REGION (L7): the operator's rectangle, normalised 0..1
+        # (validated at the API edge, app.main.FaceRegion), or None.  Faces are
+        # searched only inside it; persons and the tracker still see the frame.
+        # Count runs only: an enrolment walk-through keeps its own search.
+        self._face_region: dict | None = (
+            dict(request["faceRegion"])
+            if request.get("faceRegion") and request.get("mode", "count") == "count"
+            else None
+        )
         # TRACK-HEAL bookkeeping: track_id -> LIST of {key, cosine, at}, one
         # per NEW identity (isNew=true) the track minted inside the heal
         # window.  A list because a blurred crossing can mint twice in a
@@ -1117,6 +1127,11 @@ class RunLoop:
             # it is visible.  None when the cadence is off: nothing was
             # decided, so nothing was measured.
             "faceDetectSkippedSettled": 0 if settings.face_cadence else None,
+            # FACE SEARCH REGION (L7): frames the region could not be placed on
+            # because they carried no pixel size — searched as if no region
+            # were set (the error toward looking), and counted here.  None
+            # when the run has no region.
+            "faceRegionUnplaced": 0 if self._face_region else None,
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -1311,7 +1326,7 @@ class RunLoop:
         out: dict = {}
         for key in (
             "framesCaptured", "framesSkippedNoMotion", "framesDroppedLive",
-            "ingestBacklogMax", "faceDetectSkippedSettled",
+            "ingestBacklogMax", "faceDetectSkippedSettled", "faceRegionUnplaced",
         ):
             if st.get(key) is not None:
                 out[key] = st[key]
@@ -1442,7 +1457,12 @@ class RunLoop:
         """
         image_b64 = frame["imageB64"]
         det = _Detections()
-        whole = self.s.faces_whole_frame
+        # The search needs no tracks when it is the whole frame or the
+        # operator's region (L7) — the region wins, whatever the switch says.
+        region = self._region_px(frame) if self._face_region else None
+        det.region_unplaced = self._face_region is not None and region is None
+        within = [region] if region is not None else None
+        whole = region is not None or self.s.faces_whole_frame
         cadence = whole and self.s.face_cadence
         now_s = _frame_clock(frame)
         faces_side = None
@@ -1450,7 +1470,7 @@ class RunLoop:
             cadence and self._cadence_may_skip(snapshot, now_s)
         ):
             faces_side = self._face_pool().submit(
-                _clocked, partial(self._post_faces, image_b64, None)
+                _clocked, partial(self._post_faces, image_b64, within)
             )
             if cadence:
                 self._note_face_search(now_s)
@@ -1472,16 +1492,31 @@ class RunLoop:
         if whole:
             det.face_decided = True
             if cadence:
-                bodies = self._cadence_bodies(det.persons, frame)
+                bodies = face_search.bodies_in(self._cadence_bodies(det.persons, frame), region)
                 if self._cadence_due(bodies, snapshot, now_s) is None:
                     det.face_skipped = True
                     return det
                 self._note_face_search(now_s)
             try:
-                det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, None))
+                det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, within))
             except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
                 det.faces_error = e
         return det
+
+    def _region_px(self, frame: dict) -> dict | None:
+        """The face search region in this frame's pixels, or None if unplaceable.
+
+        The frame's own size first (ingest states it beside the picture), the
+        first frame's JPEG header as the fallback — the same order the body
+        rider uses.  Pure: the caller counts an unplaceable region, on the
+        loop thread.
+        """
+        dims = self._native_dims
+        return face_search.region_px(
+            self._face_region,
+            frame.get("w") or (dims[0] if dims else None),
+            frame.get("h") or (dims[1] if dims else None),
+        )
 
     # ------------------------------------------------ face-search cadence (L4)
 
@@ -1579,7 +1614,7 @@ class RunLoop:
         """
         return (
             self.s.parallel_detect and not self.s.pipeline_overlap
-            and self.s.faces_whole_frame
+            and (self.s.faces_whole_frame or self._face_region is not None)
         )
 
     def _drain_frames(self) -> None:
@@ -1635,7 +1670,12 @@ class RunLoop:
                 # The settledness window it ran against (0 = skips nothing).
                 "reverifyIntervalS": float(self.s.face_reverify_interval_s),
             }
-        return {"levers": levers} if levers else {}
+        out: dict = {"levers": levers} if levers else {}
+        if self._face_region is not None:
+            # WHERE faces were looked for is part of what the number means:
+            # a guest who never entered the region was never searched for.
+            out["faceRegion"] = dict(self._face_region)
+        return out
 
     def _open_source(self) -> None:
         """Claim ingest's exclusive capture slot for this run.
@@ -2187,7 +2227,7 @@ class RunLoop:
         if s.face_cadence:
             self._cadence_tracks = tracks  # what "settled" is judged on next
 
-        faces_out = self._search_faces(image_b64, trackable, tracks, det)
+        faces_out = self._search_faces(image_b64, frame, trackable, tracks, det)
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
@@ -2576,20 +2616,26 @@ class RunLoop:
         self._count_stage()
 
     def _search_faces(
-        self, image_b64: str, trackable: list, tracks: list, det: _Detections | None
+        self, image_b64: str, frame: dict, trackable: list, tracks: list,
+        det: _Detections | None,
     ) -> dict:
         """This frame's face search, booked on the face-detect stage.
 
         Searched by the detect worker already when the search needed no
-        tracks (``det.face_decided``: the whole frame) — then only its reply
-        and wall time are booked here, in frame order.  Otherwise searched
-        here, after the tracker, from this frame's person and track boxes, as
-        it always has been.
+        tracks (``det.face_decided``: the whole frame, or the operator's
+        region) — then only its reply and wall time are booked here, in frame
+        order.  Otherwise searched here, after the tracker: inside the region
+        when one is set (L7), else the whole frame or this frame's person and
+        track boxes, as it always has been.
         """
         s = self.s
         if det is not None and det.face_decided:
+            if det.region_unplaced:
+                self._bump("faceRegionUnplaced")
             if det.face_skipped:
-                return self._skip_face_search(len(trackable))
+                return self._skip_face_search(
+                    len(face_search.bodies_in(trackable, self._region_px(frame)))
+                )
             reply = self._take_detected(
                 det.faces, det.faces_ms, det.faces_error, "face-detect", "faceDetectMs"
             )
@@ -2616,14 +2662,25 @@ class RunLoop:
         within = dedupe_boxes(
             list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
         )
+        # FACE SEARCH REGION (L7): the operator's rectangle replaces whatever
+        # the search would otherwise have been.  A frame with no pixel size
+        # cannot place it and is searched as if no region were set — the
+        # error toward looking — and counted.
+        region = None
+        if self._face_region is not None:
+            region = self._region_px(frame)
+            if region is None:
+                self._bump("faceRegionUnplaced")
         # FACE-SEARCH CADENCE (L4): ruled on here, from THIS frame's tracks,
         # before the re-verify gate stamps anything — a skipped frame searched
-        # nobody, so no track may be marked as verified by it.
+        # nobody, so no track may be marked as verified by it.  With a region,
+        # only the bodies it touches can hold the search open.
         if s.face_cadence:
             now_s = self._now()
-            due = self._cadence_due(trackable, self._cadence_snapshot(), now_s)
+            bodies = face_search.bodies_in(trackable, region)
+            due = self._cadence_due(bodies, self._cadence_snapshot(), now_s)
             if due is None:
-                return self._skip_face_search(len(trackable))
+                return self._skip_face_search(len(bodies))
             self._note_face_search(now_s)
         # RE-VERIFY GATE: skip the crops belonging to tracks that have already
         # resolved to an identity and were verified recently.  Off by default.
@@ -2638,7 +2695,10 @@ class RunLoop:
         # faceSearchesSkipped while the whole frame was searched regardless —
         # a saving the status claimed and the GPU never saw, in exactly the
         # configuration (whole frame, interval armed) a live 4K profile runs.
-        within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
+        if region is not None:
+            within = [region]  # one crop, at the frame's native resolution
+        else:
+            within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
         reply = self._timed(
             "face-detect", "faceDetectMs", partial(self._post_faces, image_b64, within)
         )

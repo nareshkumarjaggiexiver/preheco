@@ -25,7 +25,7 @@ import logging
 import os
 import platform
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
@@ -173,6 +173,49 @@ class ExclusionZone(BaseModel):
         return self
 
 
+class FaceRegion(BaseModel):
+    """Where to search for faces: one rectangle, normalised 0..1 to the frame (L7).
+
+    WHY.  On a 4K overview camera the whole-frame face search letterboxes
+    3840x2160 into SCRFD's 1472x832 input — a 0.383 downscale, so a 56 px
+    face reaches the network at ~21 px.  The faces that count are at the
+    entrance, not across the hall.  Searching only the entrance region at
+    the frame's native resolution puts a 1920x1080 region through the same
+    input at 0.767 — twice the pixels on every face — for the same one
+    inference.  Persons and the tracker still see the whole frame, so
+    co-presence and track presence are unchanged; only WHERE faces are
+    looked for moves, and faces outside the region are never counted, which
+    is the operator's choice to make where they draw it.
+
+    Validated strictly at this edge, like the zones: inside the frame, and
+    at least 5% of it on each side — smaller is a mis-drawn rectangle, and a
+    region that silently holds no face counts nobody.
+    """
+
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+    w: float = Field(gt=0, le=1)
+    h: float = Field(gt=0, le=1)
+
+    #: Smallest side, as a fraction of the frame.
+    MIN_SIDE: ClassVar[float] = 0.05
+
+    @model_validator(mode="after")
+    def _inside_the_frame_and_drawable(self) -> "FaceRegion":
+        if self.x + self.w > 1.0 + 1e-6 or self.y + self.h > 1.0 + 1e-6:
+            raise ValueError(
+                "faceRegion must lie inside the frame (x + w <= 1 and y + h <= 1), "
+                f"got x={self.x} w={self.w} y={self.y} h={self.h}"
+            )
+        if self.w < self.MIN_SIDE or self.h < self.MIN_SIDE:
+            raise ValueError(
+                f"faceRegion must cover at least {self.MIN_SIDE:.0%} of the frame on "
+                f"each side (got w={self.w}, h={self.h}) — smaller is a mis-drawn "
+                "rectangle, and a region that holds no face counts nobody"
+            )
+        return self
+
+
 class QualityProfile(BaseModel):
     """Per-run overrides for the composite quality gate.
 
@@ -250,6 +293,10 @@ class RunRequest(BaseModel):
     exclusionZones: list[ExclusionZone] | None = None
     #: Per-run quality-gate overrides (see :class:`QualityProfile`).
     quality: QualityProfile | None = None
+    #: Search for faces only inside this rectangle (see :class:`FaceRegion`);
+    #: None searches as the runner is configured.  Count runs only — an
+    #: enrolment walk-through keeps its own search.
+    faceRegion: FaceRegion | None = None
     #: Engineering-station bench mode: post the RAW frame for EVERY processed
     #: frame (not just the sampled tap rounds), so the console can scrub the
     #: run frame by frame. Costs one LAN upload per frame — a deliberate,

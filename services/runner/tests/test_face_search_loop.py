@@ -263,3 +263,125 @@ def test_the_cadence_off_measures_nothing():
     assert "faceDetectSkippedSettled" not in fake.run_ended["results"]
     assert "faceDetectSkippedSettled" not in fake.run_ended["notes"]
     assert "levers" not in fake.run_created["config"]
+
+
+# ------------------------------------------------ the face search region (L7)
+
+#: The central half of the 160x120 scene: 40..120 x 30..90 in pixels.
+REGION = {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
+REGION_PX = {"x": 40, "y": 30, "w": 80, "h": 60}
+
+
+def region_run(**kw) -> dict:
+    """The request body of a count run with the region set."""
+    return {**RUN, "faceRegion": dict(REGION), **kw}
+
+
+@pytest.mark.parametrize("whole_frame", [False, True])
+def test_the_region_is_searched_as_one_native_crop_whatever_the_switch(whole_frame):
+    """within = [the region in pixels], every frame; persons still see it all."""
+    fake = Searches(settling_frames(4), SETTLING)
+    final = make_loop(
+        fake, region_run(), faces_whole_frame=whole_frame, frame_prefetch=False,
+    ).run()
+    assert [b["within"] for b in fake.face_bodies] == [[REGION_PX]] * 4
+    assert final["faceRegionUnplaced"] == 0
+    assert final["unique"] == 1
+    assert fake.run_created["config"]["faceRegion"] == REGION
+    assert fake.run_ended["results"]["faceRegionUnplaced"] == 0
+    assert "faceRegionUnplaced=0 " in fake.run_ended["notes"]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_the_detect_worker_searches_the_region_and_reasons_the_same(parallel):
+    """Overlap: the region needs no tracks, so the worker searches it."""
+    runs = []
+    for overlap in (False, True):
+        fake = Searches(settling_frames(5), SETTLING)
+        final = make_loop(
+            fake, region_run(), pipeline_overlap=overlap, parallel_detect=parallel,
+            frame_prefetch=False,
+        ).run()
+        runs.append(([b["within"] for b in fake.face_bodies], final["unique"],
+                     final["matches"], final["faceRegionUnplaced"]))
+    assert runs[0] == runs[1] == ([[REGION_PX]] * 5, 1, 5, 0)
+
+
+class Sizeless(Searches):
+    """Frames that state no pixel size (and carry no decodable JPEG)."""
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Strip w/h from every frame ingest serves."""
+        out = super().handler(request)
+        if request.url.host == "ingest" and request.url.path == "/frame":
+            body = json.loads(out.content)
+            body.pop("w", None)
+            body.pop("h", None)
+            return httpx.Response(200, json=body)
+        return out
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_a_frame_with_no_size_is_searched_as_without_a_region_and_counted(overlap):
+    """The region cannot be placed: look anyway (crops, here), and say so."""
+    fake = Sizeless(settling_frames(3), SETTLING)
+    final = make_loop(
+        fake, region_run(), pipeline_overlap=overlap, frame_prefetch=False,
+    ).run()
+    assert final["faceRegionUnplaced"] == 3, "once per frame, never twice"
+    assert all(isinstance(b["within"], list) and b["within"] != [REGION_PX]
+               for b in fake.face_bodies), "the crop search, as configured"
+    assert final["unique"] == 1
+
+
+def test_a_body_outside_the_region_does_not_hold_the_cadence_open():
+    """A guest across the hall is never searched for by a doorway region.
+
+    B stands wholly outside the region and never settles.  Without a region
+    she keeps every frame searched; with one she is not the search's
+    business, and the settled guest inside it lets the cadence skip.
+    """
+    from tests.test_loop_v1 import scripted_verdict
+
+    far = {"x": 130, "y": 20, "w": 25, "h": 60}   # right of x=120: outside
+    frames = [{"boxes": [A, far], "faces": [FA]} for _ in range(7)]
+    script = [scripted_verdict("p00001", True, None)] + [
+        scripted_verdict("p00001", False, 0.8) for _ in range(10)
+    ]
+    inside = dict(REGION, x=0.0, w=0.75)          # 0..120: holds A, not `far`
+    skipped = {}
+    for request in (RUN, {**RUN, "faceRegion": inside}):
+        fake = Searches(frames, list(script))
+        final = make_loop(
+            fake, request, faces_whole_frame=True, frame_prefetch=False, **CADENCE,
+        ).run()
+        skipped["region" if "faceRegion" in request else "none"] = (
+            final["faceDetectSkippedSettled"]
+        )
+    assert skipped["none"] == 0, "an unsettled body anywhere keeps the search running"
+    assert skipped["region"] > 0, "outside the region, she cannot"
+
+
+def test_malformed_regions_are_refused_with_a_readable_422():
+    """Outside the frame, pixels for fractions, or a sliver: refused at the edge."""
+    from app.main import app as runner_app
+    from fastapi.testclient import TestClient
+
+    client = TestClient(runner_app)
+    base = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    for region, needle in (
+        ({"x": 0.8, "y": 0.1, "w": 0.4, "h": 0.5}, "inside the frame"),
+        ({"x": 10, "y": 10, "w": 800, "h": 600}, "faceRegion"),
+        ({"x": 0.1, "y": 0.1, "w": 0.01, "h": 0.5}, "at least 5%"),
+        ({"x": -0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "faceRegion"),
+    ):
+        r = client.post("/runs", json={**base, "faceRegion": region})
+        assert r.status_code == 422, region
+        assert needle in r.text, (region, r.text[:300])
+
+
+def test_the_manifest_declares_the_region():
+    """The console forwards a region only to a pipeline that says it takes one."""
+    from app import main
+
+    assert main._manifest()["capabilities"]["faceRegion"] is True

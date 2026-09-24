@@ -138,3 +138,50 @@ def covered(bodies: list[dict], boxes: list[dict], iou_min: float = SETTLED_IOU)
         return False
 
     return all(claim(i, set()) for i in range(len(bodies)))
+
+
+# ------------------------------------------------ the face search region (L7)
+
+
+def region_px(region: dict | None, w, h) -> dict | None:
+    """A normalised region ({x, y, w, h} in 0..1) as whole pixels on a w x h frame.
+
+    Clamped to the frame.  None when there is no region, no frame size to
+    scale it by, or nothing of it left after clamping — and None means the
+    caller cannot place it, never "search nothing".
+    """
+    if not region or not w or not h:
+        return None
+    try:
+        fw, fh = int(w), int(h)
+        x0 = max(0, round(float(region["x"]) * fw))
+        y0 = max(0, round(float(region["y"]) * fh))
+        x1 = min(fw, round((float(region["x"]) + float(region["w"])) * fw))
+        y1 = min(fh, round((float(region["y"]) + float(region["h"])) * fh))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return None
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def bodies_in(boxes: list[dict], region: dict | None) -> list[dict]:
+    """The person boxes a region-only face search could find a face in.
+
+    Every box when there is no region; otherwise the boxes that overlap the
+    region at all.  A body wholly outside it cannot yield a face from a
+    search that never looks there, so it must not hold the cadence open —
+    or a region drawn over one doorway would be searched every frame for as
+    long as anyone stood anywhere else in the hall.
+    """
+    if region is None:
+        return list(boxes)
+    rx0, ry0 = float(region["x"]), float(region["y"])
+    rx1, ry1 = rx0 + float(region["w"]), ry0 + float(region["h"])
+    out = []
+    for b in boxes:
+        x0, y0 = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+        x1, y1 = x0 + float(b.get("w", 0.0)), y0 + float(b.get("h", 0.0))
+        if min(x1, rx1) > max(x0, rx0) and min(y1, ry1) > max(y0, ry0):
+            out.append(b)
+    return out
