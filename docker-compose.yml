@@ -201,6 +201,14 @@ services:
       # models/genderage.onnx when that file is mounted and OFF when it is
       # not — an absent model reports attributes as null, never as a guess.
       EMBED_ATTR_MODEL: ${EMBED_ATTR_MODEL-}
+      # EMBED_BATCH=1: all of a request's faces through ONE session.run
+      # (arcface family, dynamic-batch graphs; the attribute pass too)
+      # instead of one run per face. Measured on the 4060, 5.5 faces per
+      # 4K frame: embed 23.3 -> 11.6 ms and attributes 6.1 -> 1.7 ms per
+      # frame on CUDA (8.6 -> 3.7 and 2.9 -> 0.9 on TRT), cosine to the
+      # per-face vectors >= 0.999999. Unset = off = today's per-face loop.
+      # /health knobs.batch shows it as asked AND as the graph allows.
+      EMBED_BATCH: ${EMBED_BATCH-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 

@@ -24,10 +24,18 @@ families expose a raw vector: cv2's SFace `feature` is unnormalised too
 well.
 
 The optional ATTRIBUTE PASS (attributes.py — gender + age) runs in the same
-loop under the same lock, one extra session run per face: at the < 10
-faces a frame this service sees, batching would buy nothing and the lock
-already serialises the embedder, so a second lock would only add a place
-to deadlock.
+loop under the same lock, one extra session run per face; the lock already
+serialises the embedder, so a second lock would only add a place to
+deadlock.
+
+BATCHING (EMBED_BATCH=1, default off). With whole-frame SCRFD on a 4K
+wedding frame a request carries several faces at once, and per-face runs
+pay the launch and host<->device copies once per face. On an arcface graph
+with a DYNAMIC batch dimension the switch runs a request's faces through
+one session.run (chunks of BATCH_MAX), and the attribute pass likewise;
+order is preserved and every list stays index-parallel. A static-batch
+graph cannot, so it keeps the per-face loop and /health says so
+(knobs.batch.active false). Off, the loop below is today's, byte for byte.
 
 DELIBERATELY NO HOT-SWAP HERE. persons and faces gained POST /model; embed
 did not, and it must not: an embedder change renames the per-site staff
@@ -78,6 +86,12 @@ def spec_for(model_path: Path) -> dict:
 # night the passthrough shipped; review finding made flesh).
 MODEL_PATH = Path(os.environ.get("EMBED_MODEL") or str(DEFAULT_MODEL))
 DEVICE = os.environ.get("HECO_DEVICE") or "CPU"
+#: EMBED_BATCH=1: one session.run per request instead of one per face (see
+#: the module docstring). Anything but "1" is off — today's loop.
+BATCH = (os.environ.get("EMBED_BATCH") or "").strip() == "1"
+#: Faces per run when batching; a request with more runs in chunks. Also the
+#: TensorRT optimisation profile's ceiling, so a batch never forces a rebuild.
+BATCH_MAX = 16
 
 
 def build_embedder(model_path: Path | None = None, device: str | None = None):
@@ -100,9 +114,17 @@ class _Embedder:
 
     family = "unknown"
     _lock: threading.Lock
+    #: Batching as asked (EMBED_BATCH) and as it can actually run on this
+    #: graph. The cv2 sface family never batches.
+    batch_requested = False
+    batch_active = False
 
     def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
         raise NotImplementedError
+
+    def _features(self, img: np.ndarray, faces: list[dict]) -> list[np.ndarray]:
+        """Every face's raw vector, in order — batched families override."""
+        return [self._feature(img, face) for face in faces]
 
     def embed(self, img: np.ndarray, faces: list[dict]) -> tuple[list[list[float]], float]:
         """Align + embed every face; `(embeddings, align_ms)`, order preserved."""
@@ -127,6 +149,20 @@ class _Embedder:
         norms: list[float] = []
         attrs: list[dict | None] = []
         attr_s = 0.0
+        if self.batch_active and faces:
+            with self._lock:
+                for feat in self._features(img, faces):
+                    feat = np.asarray(feat).ravel()
+                    embeddings.append([float(v) for v in feat])
+                    norms.append(float(np.linalg.norm(feat.astype(np.float64))))
+                if attributes is not None:
+                    ta = time.perf_counter()
+                    attrs = attributes.predict_many(img, [face.get("box") for face in faces])
+                    attr_s = time.perf_counter() - ta
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            align_ms = round(total_ms - attr_s * 1000.0, 2)
+            attr_ms = round(attr_s * 1000.0, 2) if attributes is not None else None
+            return embeddings, norms, (attrs if attributes is not None else None), align_ms, attr_ms
         with self._lock:
             for face in faces:
                 feat = np.asarray(self._feature(img, face)).ravel()
@@ -179,7 +215,7 @@ class ArcFaceEmbedder(_Embedder):
 
     family = "arcface"
 
-    def __init__(self, model_path: Path, device: str | None = None):
+    def __init__(self, model_path: Path, device: str | None = None, batch: bool | None = None):
         """Build the ORT session and read dtype/layout/dim from the graph.
 
         Raises (ValueError) on any graph embed() could never feed — wrong
@@ -247,9 +283,19 @@ class ArcFaceEmbedder(_Embedder):
         out_shape = self._session.get_outputs()[0].shape
         self.dim = int(out_shape[-1]) if isinstance(out_shape[-1], int) else None
         self._lock = threading.Lock()
+        # Batching needs a DYNAMIC batch dimension; a static one (an int)
+        # keeps the per-face loop, and /health's knobs block says so.
+        self.batch_requested = BATCH if batch is None else bool(batch)
+        self.batch_active = self.batch_requested and not isinstance(shape[0], int)
 
     def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
         """Our alignment, the normalised RGB blob, one session run."""
+        return np.asarray(
+            self._session.run(None, {self._input_name: self._blob(img, face)})[0]
+        )
+
+    def _blob(self, img: np.ndarray, face: dict) -> np.ndarray:
+        """One face's (1, ...) input tensor: aligned, RGB, normalised, graph dtype."""
         # Same landmark guard as the sface path (face_to_row):
         # np.reshape would happily re-pair ANY nesting totalling ten
         # floats into wrong (x, y) points and embed the garbage crop
@@ -262,6 +308,20 @@ class ArcFaceEmbedder(_Embedder):
         # ORT refuses a float32 blob on a float16 graph at run().
         blob = blob.astype(self._np_dtype, copy=False)
         blob = blob.transpose(2, 0, 1)[None] if self._nchw else blob[None]
-        return np.asarray(
-            self._session.run(None, {self._input_name: np.ascontiguousarray(blob)})[0]
-        )
+        return np.ascontiguousarray(blob)
+
+    def _features(self, img: np.ndarray, faces: list[dict]) -> list[np.ndarray]:
+        """All faces through as few runs as BATCH_MAX allows, order preserved.
+
+        Every blob is built (and every landmark validated) BEFORE the first
+        run, so a malformed face is the same ValueError -> 400 it always was.
+        """
+        if not self.batch_active:
+            return super()._features(img, faces)
+        blobs = [self._blob(img, face) for face in faces]
+        out: list[np.ndarray] = []
+        for start in range(0, len(blobs), BATCH_MAX):
+            batch = np.concatenate(blobs[start:start + BATCH_MAX], axis=0)
+            rows = np.asarray(self._session.run(None, {self._input_name: batch})[0])
+            out.extend(rows[i:i + 1] for i in range(rows.shape[0]))
+        return out

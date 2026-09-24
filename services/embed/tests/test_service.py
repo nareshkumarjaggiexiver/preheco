@@ -464,3 +464,16 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
 
     allowed = client.get("/gate-probe", headers={"Authorization": f"Bearer {token}"})
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
+
+
+def test_health_knobs_block_shows_embed_batch_as_asked_and_as_it_runs():
+    """EMBED_BATCH off by default; a request the graph cannot honour shows
+    requested true, active false — never a silent no-op."""
+    from types import SimpleNamespace
+
+    from app.main import _knobs
+
+    emb = SimpleNamespace(device_requested="CPU", family="sface", dim=128)
+    assert _knobs(emb) == {"batch": {"requested": False, "active": False, "max": 16}}
+    emb.batch_requested, emb.batch_active = True, False
+    assert _knobs(emb)["batch"] == {"requested": True, "active": False, "max": 16}
