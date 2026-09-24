@@ -122,3 +122,39 @@ def test_the_state_dir_ships_in_the_checkout():
         "`compose up` creates the state dir root-owned and every planner "
         "apply 507s on non-root-uid setups"
     )
+
+
+def test_health_device_block_is_todays_off_trt_and_honest_on_it():
+    """Off TRT the block keeps its three keys byte-for-byte; asked for TRT it
+    carries `trt` — null when TensorRT did not come up (the fallback shown,
+    never hidden), the EP's own read-back when it did."""
+    from types import SimpleNamespace
+
+    from app.main import _device_block
+
+    det = SimpleNamespace(device_requested="CUDA", family="yolox", trt=None,
+                          providers_active=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert _device_block(det) == {
+        "requested": "CUDA", "active": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "family": "yolox"}
+    det.device_requested = "TRT"
+    assert _device_block(det)["trt"] is None
+    det.trt = {"fp16": True, "engineCache": "/srv/trt-cache/persons", "workspaceBytes": 1}
+    assert _device_block(det)["trt"]["fp16"] is True
+
+
+def test_a_cpu_detector_never_warms_up_or_reads_trt(monkeypatch):
+    """The TRT warm-up and read-back are TRT-only: a CPU load runs no extra
+    inference and carries trt=None (today's load, exactly)."""
+    import app.model as m
+
+    if not m.DEFAULT_MODEL.is_file():
+        import pytest
+
+        pytest.skip("yolox_nano.onnx missing")
+    calls = []
+    real = m.PersonDetector.detect
+    monkeypatch.setattr(m.PersonDetector, "detect",
+                        lambda self, *a, **k: calls.append(1) or real(self, *a, **k))
+    det = m.PersonDetector(m.DEFAULT_MODEL, 416, "yolox", "CPU")
+    assert calls == [] and det.trt is None

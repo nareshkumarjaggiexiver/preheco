@@ -26,7 +26,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import announce_device, is_trt, providers_for, trt_truth
 
 from . import scrfd
 
@@ -327,7 +327,11 @@ class ScrfdDetector:
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("faces", self.device_requested, self.providers_active)
+        #: TensorRT's own view of its options; None when it is not in the
+        #: session (set after the dry run below, see there).
+        self.trt = None
+        if not is_trt(device):
+            announce_device("faces", self.device_requested, self.providers_active)
         if len(self._session.get_outputs()) != 9:
             raise ValueError(
                 f"{model_path.name} has {len(self._session.get_outputs())} outputs — "
@@ -357,6 +361,14 @@ class ScrfdDetector:
             None, {self._input_name: np.zeros((1, 3, *self.input_size), np.float32)}
         )
         scrfd.select_faces(outputs, self.input_size, (1.0, 1.0), self.score_min, NMS_IOU)
+        if is_trt(device):
+            # The dry run is also where TensorRT builds (or loads) its
+            # engine — and where a failed build makes ORT silently rebuild
+            # the session on CUDA. The truth is read AFTER it, or /health
+            # would claim a TensorRT that is not running (measured: it did).
+            self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
+            announce_device("faces", self.device_requested, self.providers_active)
 
     def detect(self, img: np.ndarray) -> list[dict]:
         """Detect faces in a BGR image; returns contract face dicts (no quality)."""

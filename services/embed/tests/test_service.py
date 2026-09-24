@@ -466,14 +466,18 @@ def test_inbound_auth_gate_refuses_the_open_lan_when_armed(monkeypatch):
     assert allowed.status_code == 404, "a valid credential reaches the router itself"
 
 
-def test_health_knobs_block_shows_embed_batch_as_asked_and_as_it_runs():
-    """EMBED_BATCH off by default; a request the graph cannot honour shows
-    requested true, active false — never a silent no-op."""
+def test_health_device_and_knobs_blocks():
+    """device keeps its four keys off TRT (trt only rides a TRT request), and
+    knobs shows EMBED_BATCH as asked AND as it runs — off by default."""
     from types import SimpleNamespace
 
-    from app.main import _knobs
+    from app.main import _device_block, _knobs
 
-    emb = SimpleNamespace(device_requested="CPU", family="sface", dim=128)
+    emb = SimpleNamespace(device_requested="CUDA", family="arcface", dim=512, trt=None,
+                          providers_active=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert set(_device_block(emb)) == {"requested", "active", "family", "dim"}
+    emb.device_requested = "TENSORRT"
+    assert _device_block(emb)["trt"] is None
     assert _knobs(emb) == {"batch": {"requested": False, "active": False, "max": 16}}
     emb.batch_requested, emb.batch_active = True, False
     assert _knobs(emb)["batch"] == {"requested": True, "active": False, "max": 16}
