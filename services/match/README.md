@@ -45,8 +45,9 @@ against the pre-existing gallery (`null` on the very first face of a run).
 `galleryN` is the distinct-guest count after the call. `templateN` is how many
 views the matched identity now holds (`null` for a staff hit); `templateAdded`
 says whether this sighting became one of them. `appearance` is the sighting's
-optional torso descriptor (exactly 48 floats — see the tie-breaker section
-below; any other present length is a 422); `appearanceSim` is its best
+optional torso descriptor (exactly 48 floats — v2 — or 64 — v3, since
+0.12.0; see the tie-breaker section below; any other present length is a
+422, and a 48 against a 64 compares as `null`); `appearanceSim` is its best
 histogram intersection against the matched identity's stored descriptors
 (`null` for staff hits, new mints, or when either side lacks one) and
 `appearanceVetoed` says an enrolment was refused on a clash. `nearMiss` is
@@ -176,8 +177,11 @@ moved onto the `idx_vectors_key` index because the verdict now reports
 ## Torso appearance — the advisory tie-breaker (v1)
 
 **What it is.** The runner can attach a torso-appearance descriptor to a
-`/match` call: 48 floats, an L1-normalised 12×4 Hue×Saturation histogram of
-the torso crop (OpenCV HSV; V < 40 / V > 240 masked out as shadow/blowout).
+`/match` call: 48 floats (v2: 12×3 Hue×Saturation chromatic bins, 3
+brightness bins, 12 reserved) or 64 (v3, 2026-09-24: the same colour bins
+over a band below the neck weighted 0.9, LBP texture 0.07, edge density
+0.03, 12 reserved — see `counting/heco_counting/appearance.py`), L1-
+normalised; the crop masks shadow/blowout and down-weights skin.
 Clothing is constant within one event, so the descriptor is real evidence
 about whether two sightings seconds apart are the same body. Similarity is
 histogram intersection (0..1). This service computes nothing from pixels —
