@@ -46,10 +46,12 @@
 # can see a knob that was set — or one that was not — without reading a
 # compose file.
 #
-# THE THROUGHPUT LEVERS (docs/LEVERS-2026-09-25.md) are OFF unless the caller
-# sets them: nothing below exports one, and compose passes an unset knob
-# through as the service's default, which for every lever is off. Set them on
-# the command line, per camera if they should differ:
+# THE THROUGHPUT LEVERS (docs/LEVERS-2026-09-25.md): the measured demo set is
+# ON by default (THE DEMO LEVER SET, below, with the ladder that chose it);
+# HECO_DEMO_LEVERS=0 turns it off. The rest stay off unless the caller sets
+# them — compose passes an unset knob through as the service's default,
+# which for every lever is off. Set them on the command line, per camera if
+# they should differ:
 #
 #   HECO_PIPELINE_OVERLAP=1 HECO_PARALLEL_DETECT=1 ./scripts/demo-up.sh a
 #   HECO_FACE_CADENCE=1 HECO_FACE_REVERIFY_INTERVAL_S=2.5 ./scripts/demo-up.sh b
@@ -104,6 +106,39 @@ export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # fixed light", 2026-09-25), so the guard costs here and buys nothing. A
 # venue with stage washes or a videographer's lamp: HECO_REVIEW_LIGHT_TOL=0.07.
 export HECO_REVIEW_LIGHT_TOL=${HECO_REVIEW_LIGHT_TOL:-0}
+
+# THE DEMO LEVER SET — on by default since the 2026-09-25 ladder (camera A,
+# the 2-minute busiest Sharon clip paced LIVE at 15 fps, one lever more per
+# rung; frames processed of 1,815, unique guests):
+#
+#   r0 no levers                          901  50%   6.7 fps  11
+#   r1 + TensorRT fp16                   1094  60%   8.0 fps  11
+#   r2 + SCRFD input 1472x832             986  54%   7.3 fps  10
+#   r3 + overlap + parallel detect       1703  94%  12.2 fps  10
+#   r4 + face cadence (skipped nothing)  1598  88%  11.5 fps  10
+#   r5 + NVDEC decode                    1655  91%  12.5 fps  10
+#
+# Each stage still spends ~45-50 ms per frame, mostly decoding the JPEG it is
+# handed (TensorRT inference is 3-9 ms); overlapping persons and faces is
+# what moved the count from half the frames to nine in ten. The 1472x832
+# face input is kept for small far faces — its cost hides under the
+# overlap. Cadence skipped no frame on this footage and stays off. NVDEC
+# takes the decode off the CPU (4K H.265 from a CP Plus camera is the heavy
+# case) and falls back to cpu, loudly, if the GPU decoder cannot open.
+# INGEST_LIVE_TIMEOUT_S=10 reopens a live camera that goes silent (~13 s).
+#
+# HECO_DEMO_LEVERS=0 turns every default below off (the pre-ladder stack);
+# any one can still be set or overridden on the command line.
+if [ "${HECO_DEMO_LEVERS:-1}" = 1 ]; then
+  export HECO_TRT=${HECO_TRT:-1}
+  export FACES_SCRFD_INPUT=${FACES_SCRFD_INPUT:-1472x832}
+  export HECO_PIPELINE_OVERLAP=${HECO_PIPELINE_OVERLAP:-1}
+  export HECO_PARALLEL_DETECT=${HECO_PARALLEL_DETECT:-1}
+  export HECO_HWDEC=${HECO_HWDEC:-1}
+  export INGEST_DECODER=${INGEST_DECODER:-nvdec}
+  export INGEST_CV_THREADS=${INGEST_CV_THREADS:-1}
+  export INGEST_LIVE_TIMEOUT_S=${INGEST_LIVE_TIMEOUT_S:-10}
+fi
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
 B=("${A[@]}" -f docker-compose.camB.yml)
@@ -217,7 +252,9 @@ PY
   echo '    LIGHT_TOL 0.07 in the service (0 from this script: fixed chandelier light — the guard is off) ·'
   echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
   echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
-  echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
+  echo '    levers: this script turns ON TRT 1 · FACES_SCRFD_INPUT 1472x832 · PIPELINE_OVERLAP 1 · PARALLEL_DETECT 1 ·'
+  echo '    HWDEC 1 + INGEST_DECODER nvdec + INGEST_CV_THREADS 1 · INGEST_LIVE_TIMEOUT_S 10 (HECO_DEMO_LEVERS=0: all off);'
+  echo '    the services default each lever OFF: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
   echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
   echo '    INGEST_LIVE_TIMEOUT_S 0 (OpenCV 30 s / ffmpeg own timeouts; 10 recommended for live cameras) ·'
