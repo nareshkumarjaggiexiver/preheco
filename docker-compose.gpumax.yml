@@ -62,12 +62,12 @@
 # says so, which is the correct answer: they are not built from here.
 services:
   persons:
-    image: heco-persons:cuda
+    image: heco-persons:${HECO_CUDA_TAG:-cuda}
     build: !reset null
     gpus: all
 
   faces:
-    image: heco-faces:cuda
+    image: heco-faces:${HECO_CUDA_TAG:-cuda}
     build: !reset null
     gpus: all
     environment:
@@ -94,7 +94,7 @@ services:
       FACES_SCORE_MIN: ${FACES_SCORE_MIN-}
 
   embed:
-    image: heco-embed:cuda
+    image: heco-embed:${HECO_CUDA_TAG:-cuda}
     build: !reset null
     gpus: all
     environment:
