@@ -134,6 +134,43 @@ _SCRFD_SCORE_MIN_OVERRIDDEN = bool(os.environ.get("FACES_SCRFD_SCORE_MIN"))
 MIN_CROP_SIDE = 16
 
 
+def _parse_input_size(raw: str | None, fallback: int) -> int | tuple[int, int]:
+    """FACES_SCRFD_INPUT as a square ("640") or a frame-shaped pair ("1472x832").
+
+    WHY A RECTANGLE IS WORTH THE PARSER. The family letterboxes into its
+    input, so a 16:9 frame in a SQUARE canvas spends 44% of the pixels on
+    padding — and the padding is where the resolution for small faces went.
+    Measured on the 4060 with scrfd_10g: 1472x832 costs 20.5 ms and leaves a
+    67 px source face 25.7 net px; the square 640 that same frame would use
+    leaves it 11 and finds nothing, which is why the caller was cropping.
+
+    Both forms are validated to stride-32 multiples: the decode builds its
+    anchor grid as input // stride for strides 8/16/32, so a size that is not
+    a multiple silently drops the remainder row and shifts every box.
+    """
+    if not raw:
+        return fallback
+    text = raw.strip().lower().replace("*", "x")
+    try:
+        parts = [int(p) for p in text.split("x")]
+    except ValueError as exc:
+        raise ValueError(f"FACES_SCRFD_INPUT={raw!r} — want 640 or 1472x832") from exc
+    if len(parts) == 1:
+        parts = parts * 2
+    if len(parts) != 2 or any(p <= 0 or p % 32 for p in parts):
+        raise ValueError(
+            f"FACES_SCRFD_INPUT={raw!r} — both sides must be positive multiples of 32 "
+            "(the decode grids at strides 8/16/32)"
+        )
+    w, h = parts  # WxH as an operator writes it; the detector wants (h, w)
+    return (h, w)
+
+
+#: Operator override for the scrfd network input. Unset, MODEL_SPECS rules
+#: (640) and nothing changes.
+SCRFD_INPUT = os.environ.get("FACES_SCRFD_INPUT") or None
+
+
 def build_detector(model_path: Path | None = None, device: str | None = None):
     """The family factory: one detect() contract, family chosen by the file."""
     path = model_path or MODEL_PATH
@@ -144,7 +181,12 @@ def build_detector(model_path: Path | None = None, device: str | None = None):
             if _SCRFD_SCORE_MIN_OVERRIDDEN
             else spec.get("score_min", SCRFD_SCORE_MIN)
         )
-        return ScrfdDetector(path, spec.get("input", 640), device or DEVICE, score_min)
+        return ScrfdDetector(
+            path,
+            _parse_input_size(SCRFD_INPUT, spec.get("input", 640)),
+            device or DEVICE,
+            score_min,
+        )
     return FaceDetector(path)
 
 
@@ -247,7 +289,11 @@ class ScrfdDetector:
         import onnxruntime as ort  # deferred, like every family loader
 
         self.model_name = model_path.name
-        self.input_size = (input_size, input_size)
+        # (h, w). Square unless an operator asked for a frame-shaped input —
+        # see _parse_input_size: letterboxing 16:9 into a square throws away
+        # 44% of the canvas on padding, and with it the resolution the small
+        # faces need.
+        self.input_size = input_size if isinstance(input_size, tuple) else (input_size, input_size)
         self.score_min = SCRFD_SCORE_MIN if score_min is None else float(score_min)
         providers, provider_options = providers_for(device)
         self._session = ort.InferenceSession(
@@ -267,10 +313,11 @@ class ScrfdDetector:
         # error the operator can act on NOW, not an ORT stack trace later.
         shape = self._session.get_inputs()[0].shape
         static_hw = [d for d in shape[-2:] if isinstance(d, int)]
-        if static_hw and any(d != input_size for d in static_hw):
+        configured_hw = [d for d in self.input_size if isinstance(d, int)]
+        if static_hw and list(static_hw) != configured_hw[: len(static_hw)]:
             raise ValueError(
                 f"{model_path.name} expects a {'x'.join(map(str, static_hw))} input, "
-                f"configured {input_size} — check MODEL_SPECS/spec_for"
+                f"configured {'x'.join(map(str, self.input_size))} — check MODEL_SPECS/spec_for"
             )
         self._input_name = self._session.get_inputs()[0].name
         self._lock = threading.Lock()

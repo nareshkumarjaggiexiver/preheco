@@ -66,6 +66,11 @@ services:
       # family default is InsightFace's permissive det_thresh 0.5; YuNet's
       # equivalent was 0.8. Raise it and the invention stops being a face.
       FACES_SCRFD_SCORE_MIN: ${FACES_SCRFD_SCORE_MIN-}
+      # Network input for the scrfd family: "640" (square, the family default)
+      # or frame-shaped "1472x832". A 16:9 frame in a square canvas spends 44%
+      # of its pixels on padding, which is exactly the resolution the small
+      # faces needed — see _parse_input_size.
+      FACES_SCRFD_INPUT: ${FACES_SCRFD_INPUT-}
       FACES_SCORE_MIN: ${FACES_SCORE_MIN-}
 
   embed:
