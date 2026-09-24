@@ -60,6 +60,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # same pip cache and a TensorRT bump never re-resolves the proven CUDA set.
 # Without these libs the EP fails to dlopen and ORT drops the session to
 # CUDA+CPU — /health shows requested=TRT with no TensorRT in `active`.
+#
+# OPT-IN (WITH_TENSORRT=1, which build-images.sh passes when HECO_TRT=1). On
+# 2026-09-24 this layer made every GPU image 12.9 GB instead of 4.7 — it sits
+# on a different service image each time, so nothing is shared — and six of
+# them plus their build cache filled the Windows drive under the .94 box's
+# WSL disk until WSL itself crashed mid-build. Without it HECO_DEVICE=TRT
+# degrades to CUDA+CPU, and /health says so.
+ARG WITH_TENSORRT=0
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install tensorrt-cu13-libs==10.16.1.11
+    if [ "$WITH_TENSORRT" = "1" ]; then \
+        pip install tensorrt-cu13-libs==10.16.1.11; \
+    else \
+        echo "TensorRT not built in (WITH_TENSORRT=0): HECO_DEVICE=TRT runs CUDA+CPU"; \
+    fi
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/site-packages/tensorrt_libs
