@@ -31,8 +31,13 @@
 # building at once on one card. Every later start deserialises from the
 # volume in under a second. The cache is per compose PROJECT (volumes are
 # project-scoped): two stacks never write one engine file at the same time.
-# Changing a model, FACES_SCRFD_INPUT or EMBED_BATCH is a new engine and a
-# cold build on next load; so is a new GPU or TensorRT version.
+# Engines sit in <HECO_TRT_CACHE>/<first 12 hex of the weights' sha256>
+# (heco_common/ort.py model_key), so changed WEIGHTS are a new engine and a
+# cold build whatever the file is called — the EP's own engine name ignores
+# the weights, and until 2026-09-25 a same-architecture swap or an in-place
+# re-fetch silently ran the old engine. FACES_SCRFD_INPUT, EMBED_BATCH, a
+# new GPU or TensorRT version are cold builds too. The first start after
+# that re-key builds every engine once; the old ones sit unused at the root.
 #
 # Rollback is total: drop this -f and the fp32 CUDA arm returns untouched
 # (the cache volume just sits unused).

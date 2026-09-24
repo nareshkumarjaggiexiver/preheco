@@ -158,3 +158,75 @@ def test_a_cpu_detector_never_warms_up_or_reads_trt(monkeypatch):
                         lambda self, *a, **k: calls.append(1) or real(self, *a, **k))
     det = m.PersonDetector(m.DEFAULT_MODEL, 416, "yolox", "CPU")
     assert calls == [] and det.trt is None
+
+
+# ------------------------------------------------- TensorRT load (fake ORT)
+
+_TRT_LIST = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+class _TrtSession:
+    """TensorRT in the session until the first run(); with ``falls_back``,
+    ORT's silent rebuild on [CUDA, CPU] after a failed engine build (measured
+    on the box: no exception, only a changed provider list)."""
+
+    def __init__(self, falls_back: bool, options: dict, size: int):
+        self.falls_back, self.options, self.size, self.ran = falls_back, options, size, False
+
+    def get_providers(self):
+        if self.ran and self.falls_back:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return list(_TRT_LIST)
+
+    def get_provider_options(self):
+        return {"TensorrtExecutionProvider": self.options}
+
+    def get_inputs(self):
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(name="images", shape=[1, 3, self.size, self.size])]
+
+    def run(self, _names, _feeds):
+        import numpy as np
+
+        self.ran = True
+        anchors = sum((self.size // s) ** 2 for s in (8, 16, 32))
+        return [np.zeros((1, anchors, 85), dtype=np.float32)]
+
+
+def _fake_ort(monkeypatch, falls_back: bool, size: int = 64) -> list:
+    """Install a fake onnxruntime; returns the (model, options) each session got."""
+    import sys
+    import types
+
+    seen: list = []
+    mod = types.ModuleType("onnxruntime")
+    mod.SessionOptions = lambda: types.SimpleNamespace()
+
+    def session(model, sess_options=None, providers=None, provider_options=None):
+        seen.append((model, provider_options[0]))
+        return _TrtSession(falls_back, provider_options[0], size)
+
+    mod.InferenceSession = session
+    monkeypatch.setitem(sys.modules, "onnxruntime", mod)
+    return seen
+
+
+def test_trt_engines_are_keyed_on_the_weights_not_the_file_name(monkeypatch, tmp_path):
+    """persons loads by PATH, and the EP's engine name carries the file name
+    but not the weights: re-fetched in place, the old engine answered. The
+    engine directory is the weights' hash, so new bytes build a new engine."""
+    from heco_common.ort import model_key
+
+    import app.model as m
+
+    monkeypatch.setenv("HECO_TRT_CACHE", str(tmp_path / "cache"))
+    weight = tmp_path / "yolox_s.onnx"
+    seen = _fake_ort(monkeypatch, falls_back=False)
+    weight.write_bytes(b"yolox-weights-v1")
+    m.PersonDetector(weight, 64, "yolox", "TRT")
+    weight.write_bytes(b"yolox-weights-v2")
+    m.PersonDetector(weight, 64, "yolox", "TRT")
+    (_, o1), (_, o2) = seen
+    assert o1["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(b"yolox-weights-v1"))
+    assert o2["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(b"yolox-weights-v2"))

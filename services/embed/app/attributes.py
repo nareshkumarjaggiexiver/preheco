@@ -169,7 +169,8 @@ class AttributeModel:
         import onnxruntime as ort  # deferred, like every family loader
 
         self.model_name = model_path.name
-        providers, provider_options = providers_for(device)
+        # `model`: a TensorRT engine keyed on the weights (heco_common.ort).
+        providers, provider_options = providers_for(device, model=model_path)
         # ONE intra-op thread, deliberately. ORT's default pool (one thread
         # per core) spin-waits after every run, and inside the embedder's
         # loop those spinning threads steal the cores cv2's SFace is about
@@ -229,7 +230,7 @@ class AttributeModel:
             # Same reason as the embedder: an explicit 1..max profile, or
             # every new batch size rebuilds the engine inside a request.
             providers, provider_options = providers_for(
-                device, trt_batch_profile(inp.name, sample, self.batch_max))
+                device, trt_batch_profile(inp.name, sample, self.batch_max), model=model_path)
             self._session = ort.InferenceSession(
                 str(model_path), options, providers=providers, provider_options=provider_options
             )

@@ -203,7 +203,10 @@ class PersonDetector:
         # One image at a time through one graph — there is nothing to run in
         # parallel BETWEEN nodes, so an inter-op pool is pure overhead.
         opts.inter_op_num_threads = 1
-        providers, provider_options = providers_for(device)
+        # Under TRT the engine directory is keyed on the weights' content
+        # (heco_common.ort.model_key): a weight re-fetched in place under
+        # its old name otherwise ran the OLD engine. Other devices: ignored.
+        providers, provider_options = providers_for(device, model=model_path)
         self._session = ort.InferenceSession(
             str(model_path),
             sess_options=opts,
