@@ -157,6 +157,24 @@ def close_source(body: CloseSource) -> dict:
     return {"ok": True, "released": True, "owner": holder}
 
 
+
+#: The last (seq, ref) written to the shared transport. A frame is immutable
+#: for its seq, so re-writing it on a poll is pure waste — see get_frame.
+_last_ref: tuple[int, str | None] = (-1, None)
+_last_ref_lock = threading.Lock()
+
+
+def _cached_ref(img, seq: int) -> str | None:
+    """The shared-transport ref for this seq, writing it at most once."""
+    global _last_ref
+    with _last_ref_lock:
+        if _last_ref[0] == seq:
+            return _last_ref[1]
+    ref = frameref.write_frame(img, seq)
+    with _last_ref_lock:
+        _last_ref = (seq, ref)
+    return ref
+
 @app.get("/frame")
 def get_frame(jpeg: bool = True) -> Frame:
     """Return the latest captured frame as base64 JPEG.
@@ -181,7 +199,15 @@ def get_frame(jpeg: bool = True) -> Frame:
     # to tmpfs so the three consuming stages can take them without a codec.
     # imageB64 is still produced unconditionally — the ref is an optimisation
     # and a consumer must always have something to fall back to.
-    frame_ref = frameref.write_frame(img, seq)
+    # ONCE PER SEQ, not once per request. The runner polls this endpoint at
+    # source_poll_s (50 Hz) waiting for the seq to advance, and every poll
+    # returns the SAME frame — so writing on each one wrote 24 MB to tmpfs
+    # fifty times a second for one frame. With the JPEG encode still in the
+    # path its 13.9 ms throttled the polling and hid this; removing the encode
+    # let it run free and ref-only measured SLOWER than the JPEG it replaced
+    # (2.32 fps against 5.14). The frame for a given seq is immutable, so the
+    # ref is too.
+    frame_ref = _cached_ref(img, seq)
     # `jpeg=0` says the caller has verified it can read refs, so the encode is
     # waste — 13.9 ms per 4K frame, measured. Honoured ONLY when a ref was
     # actually written: a caller that declines the JPEG and gets no ref either
