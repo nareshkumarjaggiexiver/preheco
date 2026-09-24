@@ -1,0 +1,49 @@
+# Shared-frame transport — the pixels stop being JSON.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpumax.yml \
+#                  -f docker-compose.shm.yml up -d
+#
+# A tmpfs (RAM, never disk) mounted into ingest and the three stages that
+# consume a frame. Ingest writes each frame once as raw BGR and hands the
+# others its name; they read it straight out of the page cache. Measured cost
+# this removes, per 4K frame on the .94 box: one 13.9 ms JPEG encode, three
+# 17.8 ms decodes, and ~15 ms of base64+JSON for a 2.1 MB payload — about
+# 82 ms of a 224 ms budget, spent turning memory into text and back.
+#
+# SIZE. 512 MB holds ~20 uncompressed 4K frames; HECO_FRAMES_KEEP (default 8)
+# bounds how many exist at once, so this has generous headroom. tmpfs counts
+# against the box's RAM, not its disk.
+#
+# THIS DOES NOT CHANGE THE CONTRACT. imageB64 still travels on every request
+# and every consumer still decodes it when the ref does not resolve — an
+# un-mounted service, a frame already retired, a half-finished deploy. Drop
+# the -f and the pipeline is exactly what it was.
+#
+# WHAT IT COSTS ARCHITECTURALLY: the stages must now share a host to benefit.
+# HTTP did not require that — HECO_PERSONS_URL exists so a stage could live on
+# another machine. They still CAN; they just fall back to JPEG when they do.
+x-frames: &frames
+  HECO_FRAMES_DIR: /frames
+  HECO_FRAMES_KEEP: ${HECO_FRAMES_KEEP-}
+
+services:
+  ingest:
+    environment: *frames
+    volumes: ["frames:/frames"]
+  persons:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+  faces:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+  embed:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+
+volumes:
+  frames:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=512m

@@ -9,6 +9,7 @@ import binascii
 
 import cv2
 import numpy as np
+from heco_common import frameref
 
 
 def b64_to_bgr(image_b64: str) -> np.ndarray:
@@ -26,3 +27,20 @@ def b64_to_bgr(image_b64: str) -> np.ndarray:
     if img is None:
         raise ValueError("imageB64 does not decode to an image")
     return img
+
+
+def frame_from(image_b64: str | None, frame_ref: str | None = None) -> np.ndarray:
+    """A frame from the shared transport if it is there, else from base64.
+
+    The ref is an OPTIMISATION and never a dependency: no mount, a retired
+    frame, a producer one version behind — each falls through to the JPEG the
+    caller always sends. See heco_common.frameref for why that fallback can
+    be relied on and why a ref can never be a torn read.
+    """
+    if frame_ref:
+        img = frameref.read_frame(frame_ref)
+        if img is not None:
+            return img
+    if not image_b64:
+        raise ValueError("neither frameRef nor imageB64 yielded a frame")
+    return b64_to_bgr(image_b64)

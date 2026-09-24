@@ -40,6 +40,7 @@ from fastapi import FastAPI, HTTPException
 from heco_common.config import env_int
 from heco_common.gate_auth import install_bearer_gate
 from heco_common.imaging import encode_jpeg_b64
+from heco_common import frameref
 from heco_common.schemas import CloseSource, Frame, Health, OpenSource
 
 from . import __version__
@@ -176,9 +177,15 @@ def get_frame() -> Frame:
     # that blinked: both freeze `seq`. The worker knows which it is (it retries
     # a live stream forever and only sets ended for a finished file), and until
     # now it kept that to itself.
+    # The shared transport, when one is mounted: the SAME pixels written once
+    # to tmpfs so the three consuming stages can take them without a codec.
+    # imageB64 is still produced unconditionally — the ref is an optimisation
+    # and a consumer must always have something to fall back to.
+    frame_ref = frameref.write_frame(img, seq)
     return Frame(
         tMs=t_ms, imageB64=encode_jpeg_b64(img, quality=quality),
         w=w, h=h, seq=seq, ended=bool(getattr(worker, "ended", False)),
+        frameRef=frame_ref,
     )
 
 

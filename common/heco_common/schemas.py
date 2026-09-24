@@ -168,6 +168,11 @@ class CloseSource(BaseModel):
 class Frame(BaseModel):
     """GET /frame response: the latest frame, base64-JPEG in JSON.
 
+    ``frameRef`` names the SAME frame in the shared transport when one is
+    configured (heco_common.frameref). It is additive and advisory: imageB64
+    is always populated, so a consumer that cannot use the ref — no mount, a
+    retired frame, an older build — is unaffected.
+
     ``seq`` increments per captured frame. A stalled ``seq`` alone is ambiguous
     — a finished FILE and a blinking CAMERA both stop advancing it — so
     ``ended`` disambiguates: it is True only when the source is genuinely
@@ -185,6 +190,10 @@ class Frame(BaseModel):
     h: int = Field(gt=0)
     seq: int = Field(ge=0)
     ended: bool = False
+    #: The same frame in the shared transport, when one is mounted. Additive:
+    #: imageB64 above is always populated, so a consumer that ignores this
+    #: field — or cannot resolve it — behaves exactly as it always did.
+    frameRef: str | None = None
 
 
 # ----------------------------------------------------------------- persons

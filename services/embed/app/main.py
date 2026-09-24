@@ -17,7 +17,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .codec import b64_to_bgr
+from .codec import frame_from
 from .recognizer import MODEL_PATH, FaceEmbedder, build_embedder
 
 log = logging.getLogger("embed")
@@ -97,6 +97,8 @@ class EmbedRequest(BaseModel):
     """POST /embed body: the frame plus the faces to align and embed."""
 
     imageB64: str = Field(min_length=1)
+    #: See persons.DetectRequest.frameRef — same contract, same fallback.
+    frameRef: str | None = None
     faces: list[FaceIn]
 
 
@@ -131,7 +133,7 @@ def embed(req: EmbedRequest) -> dict:
     if emb is None:
         raise HTTPException(status_code=503, detail=_load_error or "model not loaded")
     try:
-        img = b64_to_bgr(req.imageB64)
+        img = frame_from(req.imageB64, req.frameRef)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
