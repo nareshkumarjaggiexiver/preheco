@@ -76,14 +76,19 @@ def measure(n_frames: int = 16, costs_ms: dict | None = None, **settings) -> dic
 #: name -> settings, in the order the table prints them.
 ARMS = {
     "serial": {},
+    "parallel-detect": {"parallel_detect": True},
     "overlap": {"pipeline_overlap": True},
+    "overlap+parallel-detect": {"pipeline_overlap": True, "parallel_detect": True},
 }
 
 
-def table(n_frames: int = 24, whole_frame: bool = True) -> dict:
-    """Every arm on the same footage; name -> measure()."""
+def table(n_frames: int = 24, whole_frame: bool = True, arms=None) -> dict:
+    """Every arm (or the named ones) on the same footage; name -> measure()."""
     base = {"faces_whole_frame": whole_frame}
-    return {name: measure(n_frames, **base, **arm) for name, arm in ARMS.items()}
+    return {
+        name: measure(n_frames, **base, **arm)
+        for name, arm in ARMS.items() if arms is None or name in arms
+    }
 
 
 if __name__ == "__main__":

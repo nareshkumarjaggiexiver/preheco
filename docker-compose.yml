@@ -389,6 +389,13 @@ services:
       # order. Off is the loop exactly as it ran (pinned call for call).
       # GET /health `knobs` shows what the container actually resolved.
       HECO_PIPELINE_OVERLAP: ${HECO_PIPELINE_OVERLAP-}
+      # PARALLEL DETECT (lever L3; 1 = on, default off). With the whole-frame
+      # face search, persons and faces /detect for the same frame go out side
+      # by side instead of one after the other — with or without the overlap.
+      # Persons measured 31-43 ms through its HTTP service against 8.6 ms of
+      # model time, so what this hides is mostly transport. No effect on the
+      # crop path, which needs this frame's tracks before it can search.
+      HECO_PARALLEL_DETECT: ${HECO_PARALLEL_DETECT-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

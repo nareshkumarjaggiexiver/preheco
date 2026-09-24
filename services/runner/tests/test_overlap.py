@@ -1,4 +1,4 @@
-"""Stage overlap (lever L3): detection one frame ahead, decisions in order.
+"""Stage overlap and parallel detect (lever L3): detection off the loop thread.
 
 HECO_PIPELINE_OVERLAP moves the stateless half of the chain — persons, and
 the face search when it needs no tracks — onto ONE worker thread that runs a
@@ -18,6 +18,12 @@ thread in frame order.  These pin that promise from outside:
   compose;
 * and it is worth having: the synthetic latency harness (persons 30 ms,
   faces 70 ms, embed 20 ms, match 5 ms) reads ~1.25x the serial frame rate.
+
+HECO_PARALLEL_DETECT issues persons and the whole-frame face search for one
+frame side by side, with or without the overlap; the same promises are
+pinned for it, plus that the two calls really do run at the same time and
+that on the crop path — where faces must wait for the tracker — it changes
+nothing at all.
 """
 
 import json
@@ -283,17 +289,112 @@ def test_every_lever_knob_reaches_the_container():
     assert set(cfg.knobs(cfg.Settings())) <= runner_env_passthroughs()
 
 
-def test_the_overlap_is_worth_having():
-    """The synthetic harness: ~1.25x on the whole-frame chain, ~1.3x on crops.
+@pytest.mark.parametrize("overlap", [False, True])
+def test_parallel_detect_reasons_exactly_as_the_pinned_serial_run(overlap, tmp_path):
+    """The whole-frame scenario, both detectors side by side: same reasoning."""
+    want = _fixture()["whole-frame"]
+    settings, _extra = SCENARIOS["whole-frame"]
+    fake = Recorder(NIGHT, NIGHT_SCRIPT)
+    golden = tmp_path / "g.jsonl"
+    final = make_loop(
+        fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}}, golden_path=str(golden),
+        **{**settings, "parallel_detect": True, "pipeline_overlap": overlap},
+    ).run()
+    assert _per_host(json.loads(json.dumps(fake.stage_calls))) == _per_host(want["calls"])
+    assert _ledger(golden) == want["ledger"]
+    assert {k: final.get(k) for k in STATUS_KEYS} == want["status"]
+    assert json.loads(json.dumps(fake.run_ended)) == want["ended"]
+    config = json.loads(json.dumps(fake.run_created["config"]))
+    levers = {"parallelDetect": True, **({"pipelineOverlap": True} if overlap else {})}
+    assert config.pop("levers") == levers
+    assert config == want["config"]
 
-    persons 30 + faces 70 + embed 20 + match 5 = 125 ms serial; with
-    detection a frame ahead the loop is bound by max(100, 25) ms on the whole
-    frame and by max(30, 95) ms on crops.  Asserted with slack for a busy CI
-    box; `python -m tests.latency_harness` prints the table.
+
+def test_parallel_detect_changes_nothing_on_the_crop_path(tmp_path):
+    """Crops need this frame's tracks first: the full call ORDER is today's."""
+    want = _fixture()["crops"]
+    settings, _extra = SCENARIOS["crops"]
+    fake = Recorder(NIGHT, NIGHT_SCRIPT)
+    make_loop(
+        fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}},
+        **{**settings, "parallel_detect": True},
+    ).run()
+    assert json.loads(json.dumps(fake.stage_calls)) == want["calls"]
+
+
+class Timed(latency_harness.Slow):
+    """The slow fake, writing down when each detector call started and ended."""
+
+    def __init__(self, n_frames: int):
+        super().__init__(n_frames, {"persons": 30.0, "faces": 70.0})
+        self.spans: dict[tuple[str, int], tuple[float, float]] = {}
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Time persons and faces /detect per frame."""
+        host, path = request.url.host, request.url.path
+        if host in ("persons", "faces") and path == "/detect":
+            frame = scene_index(json.loads(request.content)["imageB64"])
+            t = time.perf_counter()
+            out = super().handler(request)
+            self.spans[(host, frame)] = (t, time.perf_counter())
+            return out
+        return super().handler(request)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_persons_and_faces_really_run_side_by_side(overlap):
+    """Every frame's two detector calls overlap in time — the whole point."""
+    n = 5
+    fake = Timed(n)
+    final = make_loop(
+        fake, RUN, faces_whole_frame=True, parallel_detect=True, pipeline_overlap=overlap,
+        flush_interval_s=3600.0, tap_interval_s=3600.0,
+    ).run()
+    assert final["frames"] == n
+    for frame in range(n):
+        (p0, p1), (f0, f1) = fake.spans[("persons", frame)], fake.spans[("faces", frame)]
+        assert p0 < f1 and f0 < p1, f"frame {frame}: persons and faces ran one after the other"
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("host", ["persons", "faces"])
+def test_a_parallel_failure_settles_the_run_exactly_as_the_inline_call_did(host, overlap):
+    """Side by side or not, a failing detector fails the same frame the same way."""
+    frames = [{"boxes": [A], "faces": [FA]} for _ in range(8)]
+    arms = {}
+    for parallel in (False, True):
+        fake = FailsAt(frames, host, at=3)
+        final = make_loop(
+            fake, RUN, faces_whole_frame=True, frame_prefetch=False,
+            parallel_detect=parallel, pipeline_overlap=overlap and parallel,
+        ).run()
+        arms[parallel] = (fake, final)
+    (serial, s_final), (par, p_final) = arms[False], arms[True]
+    assert p_final["error"] == s_final["error"] and host in p_final["error"]
+    assert p_final["frames"] == s_final["frames"] == 3
+    assert par.tracker_calls == serial.tracker_calls
+    assert par.run_ended["notes"] == serial.run_ended["notes"]
+    assert par.after_close == []
+    alive = [t.name for t in threading.enumerate() if t.name.startswith("face-detect")]
+    assert alive == [], f"the parallel detector thread outlived the run: {alive}"
+
+
+def test_the_levers_are_worth_having():
+    """The synthetic harness: each lever buys what the stage costs predict.
+
+    persons 30 + faces 70 + embed 20 + match 5 = 125 ms serial.  Whole
+    frame: parallel-only max(30, 70) + 25 = 95 ms; the overlap alone is bound
+    by the worker's 30 + 70 = 100 ms; both together by max(70, 25) = 70 ms.
+    Crops: the overlap is bound by the loop's 70 + 25 = 95 ms, and parallel
+    detect has nothing to parallelise.  Asserted with slack for a busy box;
+    `python -m tests.latency_harness` prints the full table.
     """
-    for whole, floor in ((True, 1.12), (False, 1.15)):
-        rows = latency_harness.table(n_frames=10, whole_frame=whole)
-        assert rows["overlap"]["frames"] == rows["serial"]["frames"] == 10
-        assert rows["overlap"]["unique"] == rows["serial"]["unique"]
-        gain = rows["overlap"]["fps"] / rows["serial"]["fps"]
-        assert gain >= floor, f"overlap bought only x{gain:.2f} ({'whole' if whole else 'crops'})"
+    whole = latency_harness.table(n_frames=6, whole_frame=True)
+    assert {r["frames"] for r in whole.values()} == {6}
+    assert len({r["unique"] for r in whole.values()}) == 1, "no arm may change the count"
+    assert whole["overlap"]["fps"] >= 1.12 * whole["serial"]["fps"]
+    assert whole["parallel-detect"]["fps"] >= 1.12 * whole["serial"]["fps"]
+    assert whole["overlap+parallel-detect"]["fps"] >= 1.2 * whole["overlap"]["fps"]
+    crops = latency_harness.table(n_frames=6, whole_frame=False, arms=("serial", "overlap"))
+    assert crops["overlap"]["unique"] == crops["serial"]["unique"]
+    assert crops["overlap"]["fps"] >= 1.15 * crops["serial"]["fps"]
