@@ -693,9 +693,11 @@ class _Detections:
     so the loop can raise it at the exact point the inline call would have.
 
     ``face_decided`` says the worker settled this frame's face search: the
-    whole frame needs no tracks, so it was searched here — or, under the
-    cadence (L4), ruled unnecessary: ``face_skipped``.  False leaves the
-    search to the loop thread, after the tracker, as it always ran.
+    whole frame (or the operator's region) needs no tracks, so it was
+    searched here — or, under the cadence (L4), ruled unnecessary:
+    ``face_skipped``.  False leaves the search to the loop thread, after the
+    tracker, as it always ran.  ``region_unplaced``: a region was set and
+    this frame carried no size to place it by (counted on the loop thread).
     """
 
     persons: dict | None = None
@@ -1440,13 +1442,14 @@ class RunLoop:
         """This frame's detector calls, made without touching loop state.
 
         Persons always; the face search too when it needs no tracks — the
-        whole frame.  A crop search is built from THIS frame's tracks, and
-        the tracker is stateful, so it waits for the loop thread exactly as
-        before.  With HECO_PARALLEL_DETECT the two are issued side by side
-        (faces on a second thread) rather than one after the other.  Runs on
-        the detect worker under the overlap, or inline for parallel-only; it
-        POSTs, clocks, and hands back replies (or the exception a call
-        raised) for :meth:`_pipeline_step` to account in frame order.
+        whole frame, or the operator's region (L7).  A crop search is built
+        from THIS frame's tracks, and the tracker is stateful, so it waits for
+        the loop thread exactly as before.  With HECO_PARALLEL_DETECT the two
+        are issued side by side (faces on a second thread) rather than one
+        after the other.  Runs on the detect worker under the overlap, or
+        inline for parallel-only; it POSTs, clocks, and hands back replies
+        (or the exception a call raised) for :meth:`_pipeline_step` to
+        account in frame order.
 
         Under the cadence (L4) the whole-frame search is RULED ON first, from
         this frame's person boxes and ``snapshot`` (settled tracks as the
@@ -1455,7 +1458,6 @@ class RunLoop:
         (:func:`heco_counting.face_search.may_skip`): a search that has to
         wait for persons' answer cannot also be issued beside it.
         """
-        image_b64 = frame["imageB64"]
         det = _Detections()
         # The search needs no tracks when it is the whole frame or the
         # operator's region (L7) — the region wins, whatever the switch says.
@@ -1470,12 +1472,12 @@ class RunLoop:
             cadence and self._cadence_may_skip(snapshot, now_s)
         ):
             faces_side = self._face_pool().submit(
-                _clocked, partial(self._post_faces, image_b64, within)
+                _clocked, partial(self._post_faces, frame, within)
             )
             if cadence:
                 self._note_face_search(now_s)
         try:
-            det.persons, det.persons_ms = _clocked(partial(self._post_persons, image_b64))
+            det.persons, det.persons_ms = _clocked(partial(self._post_persons, frame))
         except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
             det.persons_error = e
         if faces_side is not None:
@@ -1498,7 +1500,7 @@ class RunLoop:
                     return det
                 self._note_face_search(now_s)
             try:
-                det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, within))
+                det.faces, det.faces_ms = _clocked(partial(self._post_faces, frame, within))
             except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
                 det.faces_error = e
         return det
@@ -1626,14 +1628,18 @@ class RunLoop:
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
 
-    def _post_persons(self, image_b64: str) -> dict:
-        """POST one frame to persons /detect (inline or from the detect worker)."""
-        return self._post(f"{self.s.persons_url}/detect", {"imageB64": image_b64})
+    def _post_persons(self, frame: dict) -> dict:
+        """POST one frame to persons /detect (inline or from the detect worker).
 
-    def _post_faces(self, image_b64: str, within: list | None) -> dict:
+        Takes the FRAME, not its picture, so a transport that carries more
+        than the JPEG (a shared-memory frame reference) is one line here.
+        """
+        return self._post(f"{self.s.persons_url}/detect", {"imageB64": frame["imageB64"]})
+
+    def _post_faces(self, frame: dict, within: list | None) -> dict:
         """POST one frame to faces /detect; ``within`` None searches it whole."""
         return self._post(
-            f"{self.s.faces_url}/detect", {"imageB64": image_b64, "within": within}
+            f"{self.s.faces_url}/detect", {"imageB64": frame["imageB64"], "within": within}
         )
 
     def _take_detected(
@@ -2191,7 +2197,7 @@ class RunLoop:
             det = self._detect(frame, self._cadence_snapshot())
         if det is None:
             persons = self._timed(
-                "person-detect", "personDetectMs", partial(self._post_persons, image_b64)
+                "person-detect", "personDetectMs", partial(self._post_persons, frame)
             )
         else:
             persons = self._take_detected(
@@ -2227,7 +2233,7 @@ class RunLoop:
         if s.face_cadence:
             self._cadence_tracks = tracks  # what "settled" is judged on next
 
-        faces_out = self._search_faces(image_b64, frame, trackable, tracks, det)
+        faces_out = self._search_faces(frame, trackable, tracks, det)
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
@@ -2616,8 +2622,7 @@ class RunLoop:
         self._count_stage()
 
     def _search_faces(
-        self, image_b64: str, frame: dict, trackable: list, tracks: list,
-        det: _Detections | None,
+        self, frame: dict, trackable: list, tracks: list, det: _Detections | None
     ) -> dict:
         """This frame's face search, booked on the face-detect stage.
 
@@ -2700,7 +2705,7 @@ class RunLoop:
         else:
             within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
         reply = self._timed(
-            "face-detect", "faceDetectMs", partial(self._post_faces, image_b64, within)
+            "face-detect", "faceDetectMs", partial(self._post_faces, frame, within)
         )
         self.board.frame("face-detect")
         return reply
