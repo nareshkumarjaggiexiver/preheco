@@ -128,6 +128,99 @@ def providers_for(
     )
 
 
+def _varint(buf: bytes | bytearray, i: int) -> tuple[int, int]:
+    """Decode one protobuf varint at `i`; (value, next index)."""
+    value, shift = 0, 0
+    while True:
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, i
+        shift += 7
+
+
+def _fields(buf: bytes | bytearray, start: int, end: int):
+    """(field, wire type, value start, value end) for each field of one message."""
+    i = start
+    while i < end:
+        key, i = _varint(buf, i)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            _, j = _varint(buf, i)
+        elif wire == 1:
+            j = i + 8
+        elif wire == 2:
+            n, i = _varint(buf, i)
+            j = i + n
+        elif wire == 5:
+            j = i + 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+        yield field, wire, i, j
+        i = j
+
+
+def _sub(buf, start: int, end: int, field: int):
+    """Spans of every length-delimited `field` directly inside a message."""
+    return [(s, e) for f, w, s, e in _fields(buf, start, end) if f == field and w == 2]
+
+
+def distinct_input_dims(model: bytes) -> bytes | None:
+    """The ONNX model with repeated symbolic input dims renamed apart, or None.
+
+    WHY TensorRT NEEDS THIS. TensorRT treats two input dimensions that carry
+    the same symbolic NAME as one dimension. The InsightFace SCRFD exports
+    name both H and W "?", so a frame-shaped 1472x832 input is a
+    contradiction and the engine build fails ("Input dimensions with this
+    name have different constant values", measured 2026-09-24 on the
+    4060) — after which ORT quietly re-runs the session on CUDA. A square
+    640 input hides it. Renaming the second "?" gives TensorRT two free
+    dimensions; ONNX Runtime itself never cared about the names.
+
+    Only the ModelProto.graph.input shapes are touched, and each rename
+    keeps its byte length, so no length prefix anywhere in the file moves.
+    None when nothing repeats: the caller then loads the file unchanged.
+    """
+    try:
+        return _distinct_input_dims(bytearray(model))
+    except (IndexError, ValueError):
+        return None  # not a parseable ModelProto: let ORT say what is wrong
+
+
+def _distinct_input_dims(buf: bytearray) -> bytes | None:
+    """distinct_input_dims on a mutable copy; raises on a malformed buffer."""
+    spans: list[tuple[int, int]] = []  # dim_param spans, per input shape
+    groups: list[list[tuple[int, int]]] = []
+    for gs, ge in _sub(buf, 0, len(buf), 7):  # ModelProto.graph
+        for vs, ve in _sub(buf, gs, ge, 11):  # GraphProto.input
+            for ts, te in _sub(buf, vs, ve, 2):  # ValueInfoProto.type
+                for tts, tte in _sub(buf, ts, te, 1):  # TypeProto.tensor_type
+                    for ss, se in _sub(buf, tts, tte, 2):  # Tensor.shape
+                        group = []
+                        for ds, de in _sub(buf, ss, se, 1):  # TensorShapeProto.dim
+                            group += _sub(buf, ds, de, 2)  # Dimension.dim_param
+                        groups.append(group)
+                        spans += group
+    used = {bytes(buf[s:e]) for s, e in spans}
+    changed = False
+    for group in groups:
+        seen: set[bytes] = set()
+        for s, e in group:
+            name = bytes(buf[s:e])
+            if name in seen and e > s:
+                for c in b"HWDCN0123456789abcdefghijklmnopqrstuvwxyz":
+                    candidate = name[:-1] + bytes([c])
+                    if candidate not in used:
+                        buf[s:e] = candidate
+                        used.add(candidate)
+                        name = candidate
+                        changed = True
+                        break
+            seen.add(name)
+    return bytes(buf) if changed else None
+
+
 def announce_device(service: str, requested: str, active: list[str]) -> None:
     """The one line that keeps a benchmark honest, same shape everywhere."""
     sys.stderr.write(

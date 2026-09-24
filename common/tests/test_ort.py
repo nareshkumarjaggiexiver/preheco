@@ -96,3 +96,92 @@ def test_trt_truth_is_none_when_tensorrt_did_not_load():
     never dressed up as a TensorRT block."""
     assert ort.trt_truth(_Session(["CUDAExecutionProvider", "CPUExecutionProvider"])) is None
     assert ort.trt_truth(_Session([], raises=True)) is None
+
+
+# ------------------------------------------------- distinct_input_dims
+# A hand-encoded ModelProto (field numbers from onnx/onnx.proto), just enough
+# graph for the walker: inputs and outputs with named symbolic dims.
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        n, low = n >> 7, n & 0x7F
+        out.append(low | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _blob(field: int, payload: bytes) -> bytes:
+    return _varint(field << 3 | 2) + _varint(len(payload)) + payload
+
+
+def _int(field: int, value: int) -> bytes:
+    return _varint(field << 3) + _varint(value)
+
+
+def _vi(name: str, dims) -> bytes:
+    shape = b"".join(
+        _blob(1, _blob(2, d.encode()) if isinstance(d, str) else _int(1, d)) for d in dims)
+    tensor = _int(1, 1) + _blob(2, shape)
+    return _blob(1, name.encode()) + _blob(2, _blob(1, tensor))
+
+
+def _model(inputs, outputs=()) -> bytes:
+    graph = _blob(2, b"g")
+    graph += b"".join(_blob(11, _vi(n, d)) for n, d in inputs)
+    graph += b"".join(_blob(12, _vi(n, d)) for n, d in outputs)
+    return _int(1, 8) + _blob(7, graph) + _blob(8, _int(2, 13))
+
+
+def _input_dim_params(model: bytes) -> list[list[str]]:
+    """Read back each graph input's dim_params with the module's own walker."""
+    out = []
+    for gs, ge in ort._sub(model, 0, len(model), 7):
+        for vs, ve in ort._sub(model, gs, ge, 11):
+            names = []
+            for ts, te in ort._sub(model, vs, ve, 2):
+                for tts, tte in ort._sub(model, ts, te, 1):
+                    for ss, se in ort._sub(model, tts, tte, 2):
+                        for ds, de in ort._sub(model, ss, se, 1):
+                            names += [model[s:e].decode() for s, e in ort._sub(model, ds, de, 2)]
+            out.append(names)
+    return out
+
+
+def test_scrfd_style_shared_question_marks_are_renamed_apart():
+    """InsightFace names H and W both "?" — TensorRT reads that as ONE dim
+    and a 1472x832 input fails its engine build. Renamed apart, same byte
+    length, outputs untouched, everything else byte-identical."""
+    model = _model([("input.1", [1, 3, "?", "?"])], [("score_8", ["?", 1])])
+    fixed = ort.distinct_input_dims(model)
+    assert fixed is not None and len(fixed) == len(model)
+    names = _input_dim_params(fixed)[0]
+    assert names[0] == "?" and names[1] != "?" and len(names[1]) == 1
+    tail = model.index(b"score_8")
+    assert fixed[tail:] == model[tail:], "the output value_info is not touched"
+    diffs = [i for i, (a, b) in enumerate(zip(model, fixed, strict=True)) if a != b]
+    assert len(diffs) == 1, "exactly one byte renamed"
+
+
+def test_nothing_repeated_means_nothing_to_do():
+    """Distinct names, static shapes, or a dynamic batch alone: None, so the
+    caller loads the file itself (and its engine cache keeps its key)."""
+    assert ort.distinct_input_dims(_model([("x", [1, 3, "h", "w"])])) is None
+    assert ort.distinct_input_dims(_model([("x", [1, 3, 640, 640])])) is None
+    assert ort.distinct_input_dims(_model([("x", ["N", 3, 112, 112])])) is None
+
+
+def test_a_rename_never_collides_with_a_name_already_in_use():
+    """A new name is one no graph input already uses (TensorRT unifies by name)."""
+    model = _model([("a", ["H", "?", "?"]), ("b", ["N", "W"])])
+    fixed = ort.distinct_input_dims(model)
+    first, second = _input_dim_params(fixed)
+    assert len(set(first)) == 3 and not set(first) & {"W", "N"}
+    assert second == ["N", "W"]
+
+
+def test_a_file_that_is_not_a_model_is_left_for_ort_to_refuse():
+    """Truncated or foreign bytes: None (load the file as-is), never a crash
+    of our own in front of ORT's real error message."""
+    assert ort.distinct_input_dims(b"not-a-real-graph") is None
+    assert ort.distinct_input_dims(_model([("x", [1, 3, "?", "?"])])[:-9]) is None
