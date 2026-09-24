@@ -44,6 +44,20 @@ def test_frames_past_the_keep_window_are_retired(shared):
     assert not (shared / old).exists()
 
 
+def test_the_keep_window_never_drops_below_the_frames_in_flight(shared, monkeypatch):
+    """Overlap + prefetch hold three served frames; under ref-only a KEEP of 2
+    retired one of them and embed failed the run ("cannot read ..."). The
+    window is floored at MIN_KEEP whatever the env asks for."""
+    monkeypatch.setenv(fr.KEEP_ENV, "2")
+    assert fr._keep() == fr.MIN_KEEP == 4
+    refs = [fr.write_frame(_img(10, 10), seq) for seq in range(1, 5)]
+    assert all(fr.read_frame(r) is not None for r in refs), "the newest four are readable"
+    fr.write_frame(_img(10, 10), 5)
+    assert fr.read_frame(refs[0]) is None and fr.read_frame(refs[1]) is not None
+    monkeypatch.setenv(fr.KEEP_ENV, "12")
+    assert fr._keep() == 12
+
+
 def test_a_reader_holding_the_file_is_not_disturbed_by_retirement(shared):
     """THE property the naming scheme exists for.
 

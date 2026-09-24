@@ -62,6 +62,14 @@ FRAMES_DIR_ENV = "HECO_FRAMES_DIR"
 #: 24 MB, so the default keeps ~200 MB of tmpfs in flight.
 KEEP_ENV = "HECO_FRAMES_KEEP"
 DEFAULT_KEEP = 8
+#: ...and never fewer than this, whatever the env says. The runner holds up
+#: to THREE served frames at once — the frame being decided, the detect
+#: worker's frame (HECO_PIPELINE_OVERLAP) and the prefetched one — where the
+#: serial loop holds two. Verified with refs written on serve and the real
+#: sweep, ref-only on: KEEP=2 ended serially and FAILED under the overlap
+#: ("cannot read 'f2_160x120.bgr'" from embed — no JPEG to fall back to);
+#: KEEP=3 ended both. Four is those three and one for the frame being written.
+MIN_KEEP = 4
 
 #: Only ever touch files we wrote: the sweeper unlinks by pattern, and a
 #: pattern that could match something else is a sweeper that deletes it.
@@ -78,11 +86,12 @@ def frames_dir() -> Path | None:
 
 
 def _keep() -> int:
+    """HECO_FRAMES_KEEP, floored at MIN_KEEP (see there for the failure below it)."""
     try:
         n = int(os.environ.get(KEEP_ENV) or DEFAULT_KEEP)
     except ValueError:
         return DEFAULT_KEEP
-    return max(1, n)
+    return max(MIN_KEEP, n)
 
 
 def write_frame(img: np.ndarray, seq: int, directory: Path | None = None) -> str | None:

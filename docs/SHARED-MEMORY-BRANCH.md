@@ -114,7 +114,10 @@ now moves the shared frame exactly as it moves the JPEG:
   seqs apart at 15 fps) — or any camera outrunning a slow consumer by more
   than the keep — retired the frame the runner was still embedding: a JPEG
   decode with the JPEG alongside, a 400 under ref-only. Numbered by write,
-  the keep means "the last N frames handed out". tmpfs is bounded at KEEP
+  the keep means "the last N frames handed out" — never fewer than 4:
+  overlap + prefetch hold three served frames at once (decided, detecting,
+  prefetched), and under ref-only a KEEP of 2 failed the run with "cannot
+  read" from embed where serial survived. tmpfs is bounded at KEEP
   frames (+1 in flight), and a run's frames are cleared when its source is
   closed or replaced (`frameref.clear`), instead of lingering until another
   run's writes happened to retire them.
