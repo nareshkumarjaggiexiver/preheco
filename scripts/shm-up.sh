@@ -46,6 +46,10 @@ export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
 # it removes exactly p00047 (a half face behind a pillar) and no real guest.
 export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
+# The review's light guard OFF, as demo-up.sh starts the camera stacks (fixed
+# chandelier light; see there) — so a comparison against them compares the
+# transport, not two review policies. HECO_REVIEW_LIGHT_TOL=0.07 turns it on.
+export HECO_REVIEW_LIGHT_TOL=${HECO_REVIEW_LIGHT_TOL:-0}
 # THIS TREE'S IMAGES. Main's stacks run heco-*:latest / :cuda; this candidate
 # runs :shm / :shmcuda, so building one tree can never swap the other's code
 # (it did, until 2026-09-24 — see scripts/build-images.sh).
