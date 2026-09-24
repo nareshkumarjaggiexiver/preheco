@@ -1,0 +1,51 @@
+# A SECOND stack on one box — the two-camera arm.
+#
+#   COMPOSE_PROJECT_NAME=heco-pipeline-b \
+#   docker compose -p heco-pipeline-b \
+#     -f docker-compose.yml -f docker-compose.gpumax.yml -f docker-compose.camB.yml up -d
+#
+# WHY A WHOLE SECOND STACK AND NOT A SECOND SOURCE. Ingest owns ONE capture
+# slot by design: a second /open is refused 409 naming the run that holds it,
+# because the alternative — two runs quietly sharing one camera — is a count
+# nobody can explain. So two cameras is two ingests, and two ingests is two of
+# everything, which compose already knows how to do: a different project name
+# gives a separate network, separate container names and separate DNS, so the
+# inter-service URLs (http://ingest:7101, …) keep working UNCHANGED inside it.
+#
+# All this file does is move the HOST ports, because those are the one thing
+# the two projects genuinely share.
+#
+# `!override` is load-bearing on every one of them: compose MERGES sequences
+# across files, so a plain `ports:` here would ADD 7201:7101 beside the
+# inherited 7101:7101 and the second stack would die claiming a port the
+# first already holds — which is exactly what it did before this tag.
+#
+#   camera A   7100..7106   (docker-compose.yml)
+#   camera B   7200..7206   (here)
+#
+# WHAT THE TWO STACKS SHARE ON DISK, deliberately:
+#   * models/  read-only, identical weights — sharing is free.
+#   * match data dir: galleries are per-RUN files (gallery-<runId>.db), so two
+#     live runs cannot collide; the staff store is per-SITE and SHOULD be
+#     shared, since both cameras are the same venue and a staff member
+#     enrolled at one gate must be recognised at the other.
+#
+# WHAT IT COSTS. Both stacks share one GPU. Measured at 4K on the 4060 with
+# one camera the GPU sits near 50%, so two fit — but they are not free of each
+# other, and the honest expectation is a lower per-camera frame rate than a
+# single stack achieves, not the same number twice.
+services:
+  ingest:
+    ports: !override ["7201:7101"]
+  persons:
+    ports: !override ["7202:7102"]
+  tracker:
+    ports: !override ["7203:7103"]
+  faces:
+    ports: !override ["7204:7104"]
+  embed:
+    ports: !override ["7205:7105"]
+  match:
+    ports: !override ["7206:7106"]
+  runner:
+    ports: !override ["7200:7100"]
