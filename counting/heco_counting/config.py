@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 #: nowhere else.
 QUALITY_FIELDS = {
     "minPx": "quality_min_px",
+    "minConf": "quality_min_conf",
     "minIedPx": "quality_min_ied_px",
     "minFrontality": "quality_min_frontality",
     "minSharpness": "quality_min_sharpness",
@@ -41,6 +42,9 @@ class CountingConfig:
     #: are opt-in per camera, because a guessed floor costs guests off an
     #: invoice (see heco_counting.gate).
     quality_min_px: float = 56.0
+    #: Detector confidence floor; 0 = unarmed. Belongs to the detector family
+    #: (yunet 0.8, scrfd 0.5), so there is no safe default to inherit.
+    quality_min_conf: float = 0.0
     quality_canon_px: float = 80.0
     quality_min_ied_px: float = 0.0
     quality_min_frontality: float = 0.0
@@ -112,6 +116,7 @@ def gate_config(config, armed) -> dict:
     """
     return {
         "qualityMinPx": config.quality_min_px,
+        "qualityMinConf": getattr(config, "quality_min_conf", 0.0),
         "qualityCanonPx": config.quality_canon_px,
         "qualityMinIedPx": config.quality_min_ied_px,
         "qualityMinFrontality": config.quality_min_frontality,

@@ -93,7 +93,8 @@ def test_the_gate_record_carries_every_key_including_the_unarmed_ones():
     """
     rec = gate_config(CountingConfig(), armed=())
     assert set(rec) == {
-        "qualityMinPx", "qualityCanonPx", "qualityMinIedPx", "qualityMinFrontality",
+        "qualityMinPx", "qualityMinConf", "qualityCanonPx", "qualityMinIedPx",
+        "qualityMinFrontality",
         "qualityMinSharpness", "qualityMinEyeSpan", "qualityRequireLandmarks",
         "faceReverifyIntervalS", "gateArmed",
     }
