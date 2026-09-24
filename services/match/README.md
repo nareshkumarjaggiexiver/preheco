@@ -37,7 +37,7 @@ evidence (project hard rule: measure first).
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
-| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes}}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
+| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes}, setAside:[{a, b, cosine, clothes, why, reasons}]}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
 | POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
 | POST | `/gallery/sweep` | `{maxAgeS?}` | `{swept:[runId], maxAgeS}` — retention backstop |
 
@@ -359,6 +359,13 @@ is never mistaken for a silenced one. Every signal needs its evidence on
 BOTH sides — one measured identity against an unmeasured one is one
 opinion, not a disagreement.
 
+**Every set-aside pair stays inspectable.** `setAside` lists them —
+`{a, b, cosine, clothes, why, reasons}`, ranked like the queue, at most
+`limit` — with every signal that spoke in `reasons`; `excluded` counts each
+pair once, under the first. An operator who disagrees merges the pair with
+the ordinary `/merge`: setting aside writes no `cannot_link` and merges
+nothing.
+
 **Clothing (0.13.0).** Each identity's torso reads come from its **body
 log** — every sighting's v3 descriptor, not the five a template cap keeps
 (on run f0bfc5 those sat inside two seconds for 20 of 44 identities).
@@ -374,6 +381,10 @@ time gap still agrees at a best cross of 0.77–0.97, and the queue's
 different-people pairs anywhere from 0.10 to 0.97 (two white shirts agree:
 clothing only speaks for pairs dressed differently) — the default 0.35
 sets aside #3, #6, #7 and #23 and none of the nine same-person splits.
+`why.clothes` = `{selfA, selfB, cross, nA, nB}` on every row, queue or
+set aside, whether or not the rule is on: each side's median
+self-agreement (null under two reads), the best cross (null when a side
+has no read) and each side's read count.
 
 ## Run
 

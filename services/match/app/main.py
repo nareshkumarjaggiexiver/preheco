@@ -14,7 +14,8 @@ Endpoints:
     POST /review/duplicates {runId, limit?}
         -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
             considered, returned, dropped,
-            excluded: {gender, age, stature, clothes}}
+            excluded: {gender, age, stature, clothes},
+            setAside:[{a, b, cosine, clothes, why, reasons}]}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -633,6 +634,10 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
     perspective fit; ``adultM`` (1.75 m, the North Indian adult average this
     deployment is anchored on) converts them, and ``aM``/``bM`` are that
     product ready to print.
+
+    Since 0.13.0 clothing may set a pair aside too, and every set-aside
+    pair comes back in ``setAside`` with its ``reasons`` — the machine's
+    exclusions stay inspectable and mergeable by the operator.
 
     Read-only: no template is written, no key is merged, `galleryN` is
     untouched.  Acting on a row is the operator's existing one-click /merge.

@@ -237,24 +237,104 @@ def test_setting_aside_writes_nothing_and_the_operator_can_still_merge(
     assert merged["merged"] is True
 
 
-def test_clash_zero_is_off_and_off_never_reads_the_log(client, ticking, monkeypatch):
-    """Off is the old code path: the queue as it was, the body log untouched."""
+def test_clash_zero_is_off_and_the_evidence_is_still_shown(client, ticking, monkeypatch):
+    """Off: the pair is back in the queue, nothing set aside, why.clothes intact."""
     kh = sightings(client, "r", hub(), [RED] * 3)
     ks = sightings(client, "r", spoke(1), [BLUE] * 3)
     on = review(client)
-    assert on["excluded"]["clothes"] == 1
+    assert on["excluded"]["clothes"] == 1 and len(on["setAside"]) == 1
 
     monkeypatch.setenv("HECO_REVIEW_CLOTHES_CLASH", "0")
-
-    def boom(self):
-        raise AssertionError("clothing off must not read the body log")
-
-    monkeypatch.setattr(store.VectorStore, "sighting_evidence", boom)
     off = review(client)
     assert off["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    assert off["setAside"] == []
     assert in_queue(off, kh, ks)
     (pair,) = off["pairs"]
     assert pair["clothes"] == pytest.approx(0.10), "the ranking clothes number is unchanged"
+    assert pair["why"]["clothes"]["cross"] == pytest.approx(0.10)
+    assert on["setAside"][0]["why"] == pair["why"], "the evidence does not depend on the knob"
+
+
+# ------------------------------------------------------------- setAside
+
+
+def test_a_set_aside_pair_comes_back_with_its_evidence_and_reason(client, ticking):
+    """The machine's exclusion stays inspectable: evidence, reason, face score."""
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    ks = sightings(client, "r", spoke(1), [BLUE] * 4)
+    got = review(client)
+    (row,) = got["setAside"]
+    assert {row["a"], row["b"]} == {kh, ks}
+    assert row["reasons"] == ["clothes"]
+    assert row["cosine"] == pytest.approx(0.30, abs=1e-5)
+    assert row["clothes"] == pytest.approx(0.10), "best template torso, as on queue rows"
+    wc = row["why"]["clothes"]
+    hub_side, spoke_side = ("A", "B") if row["a"] == kh else ("B", "A")
+    assert wc["self" + hub_side] == pytest.approx(1.0)
+    assert wc["self" + spoke_side] == pytest.approx(1.0)
+    assert wc["cross"] == pytest.approx(0.10)
+    assert (wc["n" + hub_side], wc["n" + spoke_side]) == (3, 4)
+
+
+def test_queue_rows_carry_why_clothes_and_null_is_not_zero(client, ticking):
+    """One side unmeasured: its self is null, the cross is null, its n is 0."""
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    sightings(client, "r", spoke(1), [None] * 2)
+    (row,) = review(client)["pairs"]
+    wc = row["why"]["clothes"]
+    hub_side, spoke_side = ("A", "B") if row["a"] == kh else ("B", "A")
+    assert wc["self" + hub_side] == pytest.approx(1.0)
+    assert wc["self" + spoke_side] is None
+    assert wc["cross"] is None
+    assert (wc["n" + hub_side], wc["n" + spoke_side]) == (3, 0)
+
+
+def test_side_signals_land_in_set_aside_with_every_reason_that_spoke(client, ticking):
+    """A child-aged hub in red against an adult in blue: age AND clothes.
+
+    Counted once, under the first reason; listed with both.
+    """
+    kh = None
+    for _ in range(3):
+        res = client.post("/match", json={
+            "runId": "r", "embedding": hub(), "quality": 90.0, "appearance": RED,
+            "body": BODY, "attributes": {"gender": "M", "genderP": 0.6, "age": 8.0},
+        }).json()
+        kh = res["personKey"]
+    ks = None
+    for _ in range(3):
+        res = client.post("/match", json={
+            "runId": "r", "embedding": spoke(1), "quality": 90.0, "appearance": BLUE,
+            "body": BODY, "attributes": {"gender": "M", "genderP": 0.6, "age": 40.0},
+        }).json()
+        ks = res["personKey"]
+    got = review(client)
+    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}
+    (row,) = got["setAside"]
+    assert {row["a"], row["b"]} == {kh, ks}
+    assert row["reasons"] == ["age", "clothes"]
+
+
+def test_set_aside_is_ranked_like_the_queue_and_capped_at_limit(client, ticking):
+    """Three set-aside pairs, limit 2: the two strongest faces come back."""
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    keys = {}
+    for i, cos in ((1, 0.30), (2, 0.33), (3, 0.25)):
+        keys[cos] = sightings(client, "r", spoke(i, cos), [BLUE] * 3)
+    got = review(client, limit=2)
+    assert got["excluded"]["clothes"] == 3
+    assert [round(r["cosine"], 2) for r in got["setAside"]] == [0.33, 0.30]
+    assert all(kh in (r["a"], r["b"]) for r in got["setAside"])
+
+
+def test_an_operator_can_merge_a_pair_straight_out_of_set_aside(client, ticking):
+    """Mergeable means the ordinary /merge, on the keys setAside names."""
+    sightings(client, "r", hub(), [RED] * 3)
+    sightings(client, "r", spoke(1), [BLUE] * 3)
+    (row,) = review(client)["setAside"]
+    before = client.post("/match", json={"runId": "r", "embedding": hub()}).json()["galleryN"]
+    res = client.post("/merge", json={"runId": "r", "keep": row["a"], "drop": row["b"]}).json()
+    assert res == {"merged": True, "galleryN": before - 1}
 
 
 def test_health_reports_the_clothing_policy_and_min_n_is_at_least_two(client, monkeypatch):

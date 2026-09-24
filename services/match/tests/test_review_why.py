@@ -614,8 +614,10 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             "stature": {
                 "a": None, "b": None, "adultM": pytest.approx(1.75), "aM": None, "bM": None,
             },
+            "clothes": {"selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0},
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
+    assert got["setAside"] == []
 
 
 def test_a_v2_torso_against_a_v3_torso_is_unmeasured_not_zero(client):
