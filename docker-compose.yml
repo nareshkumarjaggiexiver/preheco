@@ -373,6 +373,11 @@ services:
       HECO_QUALITY_MIN_IED_PX: ${HECO_QUALITY_MIN_IED_PX-}
       HECO_QUALITY_MIN_FRONTALITY: ${HECO_QUALITY_MIN_FRONTALITY-}
       HECO_QUALITY_MIN_SHARPNESS: ${HECO_QUALITY_MIN_SHARPNESS-}
+      # The rest of the console's "Measured pose gate" (demo-up.sh arms it as
+      # the box default): eye span, and the landmark check that rejects
+      # detections on clothing.
+      HECO_QUALITY_MIN_EYE_SPAN: ${HECO_QUALITY_MIN_EYE_SPAN-}
+      HECO_QUALITY_REQUIRE_LANDMARKS: ${HECO_QUALITY_REQUIRE_LANDMARKS-}
       # A floor on the L2 norm of the RAW ArcFace feature, applied AFTER the
       # embedder has run (the only gate that can): the norm is the one
       # quality signal the recogniser itself emits, and it collapses on a
