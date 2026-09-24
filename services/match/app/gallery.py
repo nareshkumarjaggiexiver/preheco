@@ -1059,16 +1059,17 @@ def stature_ratios(sightings: list, min_n: int) -> dict[str, float]:
     }
 
 
-def _exclusion(
+def _side_reasons(
     gender: dict, age: dict, stature: dict,
     gender_min_p: float, age_child_max: float, age_adult_min: float, stature_gap: float,
-) -> str | None:
-    """Which side signal, if any, says this pair cannot be one person.
+) -> list[str]:
+    """Which of sex, age and stature say this pair cannot be one person.
 
-    Checked in the order gender, age, stature, and the first to speak names
-    the exclusion — a pair is counted under one reason, never three.  Every
-    signal has an off switch at zero, and every signal needs its evidence on
-    BOTH sides: one measured identity and one unmeasured is not a
+    Every one that speaks, in the order gender, age, stature; the review
+    COUNTS a pair under the first reason only (``excluded`` sums to the
+    pairs set aside) and lists them all in ``setAside[].reasons``.  Every
+    signal has an off switch at zero, and every signal needs its evidence
+    on BOTH sides: one measured identity and one unmeasured is not a
     disagreement, it is one opinion, and absent is not zero.
 
     * gender — both confident at or above ``gender_min_p`` and different.
@@ -1080,6 +1081,7 @@ def _exclusion(
       budget and a pair straddling it is still asked about.
     * stature — both ratios measured and ``|a-b| >= stature_gap``.
     """
+    reasons: list[str] = []
     ga, gb, pa, pb = gender["a"], gender["b"], gender["pA"], gender["pB"]
     if (
         gender_min_p > 0
@@ -1088,7 +1090,7 @@ def _exclusion(
         and pa >= gender_min_p and pb >= gender_min_p
         and ga != gb
     ):
-        return "gender"
+        reasons.append("gender")
     aa, ab = age["a"], age["b"]
     if (
         age_child_max > 0 and age_adult_min > 0
@@ -1098,11 +1100,11 @@ def _exclusion(
             or (ab <= age_child_max and aa >= age_adult_min)
         )
     ):
-        return "age"
+        reasons.append("age")
     sa, sb = stature["a"], stature["b"]
     if stature_gap > 0 and sa is not None and sb is not None and abs(sa - sb) >= stature_gap:
-        return "stature"
-    return None
+        reasons.append("stature")
+    return reasons
 
 
 #: The clothing rule's floor in TIME: an identity's torso reads must span at
@@ -1284,10 +1286,24 @@ def review_duplicates(
     metres for a human to read (``aM``/``bM`` carry that product ready-made),
     and the exclusion gap is on the ratio, so the anchor never moves it.
 
+    EVERY PAIR SET ASIDE STAYS INSPECTABLE.  ``setAside`` lists them —
+    ``{a, b, cosine, clothes, why, reasons}``, ranked like the queue and
+    capped at ``limit`` — with every signal that spoke in ``reasons`` (the
+    pair is counted in ``excluded`` under the first).  An operator who
+    disagrees with the machine can read the evidence and merge the pair with
+    the ordinary /merge: nothing here wrote a cannot_link or a merge.
+
+    ``why.clothes`` is ``{selfA, selfB, cross, nA, nB}`` over the v3 torso
+    reads of each identity's body log: each side's median self-agreement
+    (null under two reads), the best cross intersection (null when either
+    side has none) and how many reads each side had — reported whether or
+    not the clothing rule is on.
+
     Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
-    "excluded": {"gender": g, "age": a, "stature": s, "clothes": c}}``.
-    ``dropped`` is stated rather than swallowed: a truncated queue that
-    looks complete is how a real duplicate goes unreviewed.
+    "excluded": {"gender": g, "age": a, "stature": s, "clothes": c},
+    "setAside": [...]}``.  ``dropped`` is stated rather than swallowed: a
+    truncated queue that looks complete is how a real duplicate goes
+    unreviewed.
     """
     store = open_store(db_path(data_dir, run_id))
     excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
@@ -1299,8 +1315,8 @@ def review_duplicates(
         genders = {k: identity_gender(attrs[k]) for k in keys}
         ages = {k: identity_age(attrs[k]) for k in keys}
         statures = stature_ratios(store.body_sightings(), stature_min_n)
-        torsos = torso_reads(store.sighting_evidence()) if clothes_clash > 0 else {}
-        candidates, considered = [], 0
+        torsos = torso_reads(store.sighting_evidence())
+        candidates, set_aside, considered = [], [], 0
         for a, b in itertools.combinations(keys, 2):
             considered += 1
             if store.cannot_link(a, b):
@@ -1316,6 +1332,8 @@ def review_duplicates(
             ]
             clothes = max(scores) if scores else None
             sa, sb = statures.get(a), statures.get(b)
+            ta, tb = torsos.get(a), torsos.get(b)
+            cross = None if ta is None or tb is None else best_cross(ta.vectors, tb.vectors)
             why = {
                 "gender": {
                     "a": genders[a][0], "b": genders[b][0],
@@ -1327,20 +1345,26 @@ def review_duplicates(
                     "aM": None if sa is None else sa * adult_m,
                     "bM": None if sb is None else sb * adult_m,
                 },
+                "clothes": {
+                    "selfA": None if ta is None else ta.agreement,
+                    "selfB": None if tb is None else tb.agreement,
+                    "cross": cross,
+                    "nA": 0 if ta is None else ta.n,
+                    "nB": 0 if tb is None else tb.n,
+                },
             }
-            reason = _exclusion(
+            reasons = _side_reasons(
                 why["gender"], why["age"], why["stature"],
                 gender_min_p, age_child_max, age_adult_min, stature_gap,
             )
-            if reason is None and clothes_clash > 0:
-                ta, tb = torsos.get(a), torsos.get(b)
-                cross = None if ta is None or tb is None else best_cross(ta.vectors, tb.vectors)
-                if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
-                    reason = "clothes"
-            if reason is not None:
-                excluded[reason] += 1
+            if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
+                reasons.append("clothes")
+            entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
+            if reasons:
+                excluded[reasons[0]] += 1
+                set_aside.append({**entry, "reasons": reasons})
                 continue
-            candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why})
+            candidates.append(entry)
 
     # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
     # measurement. The clothes-first order was built for run 0f5c6d, where
@@ -1363,12 +1387,14 @@ def review_duplicates(
     # a later look rather than no look at all.
     candidates.sort(key=review_order)
     kept = candidates[: max(0, limit)]
+    set_aside.sort(key=review_order)
     return {
         "pairs": kept,
         "considered": considered,
         "returned": len(kept),
         "dropped": len(candidates) - len(kept),
         "excluded": excluded,
+        "setAside": set_aside[: max(0, limit)],
     }
 
 

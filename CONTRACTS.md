@@ -1716,3 +1716,22 @@ pair aside — on BOTH identities' own testimony.
   splits); the queue's different-people pairs anywhere from 0.10 to 0.97
   (two white shirts agree). 0.35 sets aside #3, #6, #7, #23 and no split.
 
+### setAside and why.clothes (match 0.13.0)
+
+- `POST /review/duplicates` reply gains **`setAside: [{a, b, cosine,
+  clothes, why, reasons: [...]}]`** — every pair any signal set aside
+  (gender, age and stature included), ranked like `pairs` (face cosine
+  desc, clothes the tiebreak), at most `limit`. `reasons` lists EVERY
+  signal that spoke, in check order `gender, age, stature, clothes`;
+  `excluded` counts the pair once, under `reasons[0]`, so
+  `sum(excluded)` is the number of pairs set aside. Exclusion only removes
+  a pair from the ranked queue: it never writes `cannot_link` and never
+  merges, and `/merge` on a set-aside pair works as on any other.
+- Every row (`pairs` and `setAside`) gains **`why.clothes: {selfA, selfB,
+  cross, nA, nB}`** — v3 torso reads from the body log only: each side's
+  median pairwise self-agreement (null under two reads), the best cross
+  intersection (null when either side has none), each side's read count
+  (0 when none). Reported whether or not `HECO_REVIEW_CLOTHES_CLASH` is on.
+  The row's top-level `clothes` keeps its meaning (best intersection over
+  the identities' TEMPLATE descriptors, the ranking tiebreak).
+
