@@ -389,6 +389,13 @@ services:
       # and can be read out with `docker cp`.
       HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
       HECO_FACES_WHOLE_FRAME: ${HECO_FACES_WHOLE_FRAME-}
+      # WHITE BALANCE for the colour descriptors (0|1, default 0 = off). On,
+      # each frame's illuminant is estimated once (shades-of-grey, ~2.4 ms
+      # at 4K) and torso colour is read under neutral light. Run f0bfc5's
+      # camera AWB already held the warm hall neutral (gains within 2%), so
+      # it changed nothing there; a venue with coloured stage light is where
+      # to try it. Reported on runner /health as knobs.appearanceWb.
+      HECO_APPEARANCE_WB: ${HECO_APPEARANCE_WB-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
