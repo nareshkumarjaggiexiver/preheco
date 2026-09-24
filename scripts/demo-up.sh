@@ -97,6 +97,19 @@ export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
 # a dark railing across her face, which the norm floor passes (23.7) — reads
 # 0.27; the lowest genuine face 0.42, the 5th percentile 0.51. 0 turns it off.
 export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
+# The pose gate as the BOX DEFAULT — the console's "Measured pose gate"
+# (landmarks required, frontality 0.55, eye span 0.30), so a run started with
+# "Box default" or from the API drops half faces too. Before this every such
+# run had no pose floor at all. The operator's rule (2026-09-25): a guest whose
+# full face was never seen — p00005 of the live test, a man in profile at full
+# zoom, large enough to pass every size floor — is to be neglected. Measured
+# the same night on the busiest Sharon 2-minute clip, every frame: 27 guests
+# with no gate, 19 with it; the 8 it removed were pure profiles, backs of
+# heads and faces half behind a pillar, and every frontal guest stayed. A
+# console quality profile, when chosen, still overrides these per run.
+export HECO_QUALITY_REQUIRE_LANDMARKS=${HECO_QUALITY_REQUIRE_LANDMARKS:-1}
+export HECO_QUALITY_MIN_FRONTALITY=${HECO_QUALITY_MIN_FRONTALITY:-0.55}
+export HECO_QUALITY_MIN_EYE_SPAN=${HECO_QUALITY_MIN_EYE_SPAN:-0.30}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF (match default 0.07). It holds back a colour
 # set-aside when two identities' face skin says they were read under
@@ -192,6 +205,7 @@ knobs() {
        HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
        HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL -- "$@"
   show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
+       HECO_QUALITY_REQUIRE_LANDMARKS HECO_QUALITY_MIN_FRONTALITY HECO_QUALITY_MIN_EYE_SPAN \
        HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
        HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S HECO_SOURCE_STALL_S -- "$@"
   show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
@@ -260,7 +274,8 @@ PY
   echo '    sides with 8+ reads are held to 0.55) · HEAD_CLASH 0.45 · BEARD_MIN_N 3 · BEARD_PALE 0 ·'
   echo '    LIGHT_TOL 0.07 in the service (0 from this script: fixed chandelier light — the guard is off) ·'
   echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
-  echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
+  echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script) · pose gate off in the service (this script:'
+  echo '    REQUIRE_LANDMARKS 1 · MIN_FRONTALITY 0.55 · MIN_EYE_SPAN 0.30). 0 turns a signal off.'
   echo '    levers: this script turns ON TRT 1 · FACES_SCRFD_INPUT 1472x832 · PIPELINE_OVERLAP 1 · PARALLEL_DETECT 1 ·'
   echo '    HWDEC 1 + INGEST_DECODER nvdec + INGEST_CV_THREADS 1 · INGEST_LIVE_TIMEOUT_S 10 · SOURCE_STALL_S 600 (runner default 45)'
   echo '    (HECO_DEMO_LEVERS=0: all off);'

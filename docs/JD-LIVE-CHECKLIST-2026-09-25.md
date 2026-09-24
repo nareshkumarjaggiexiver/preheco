@@ -46,8 +46,14 @@ change.
 
 ## 4. The run
 
-- Use the camera's **main** stream (4K H.265) for analysis. Full focal
-  length is fine: bigger faces help.
+- Use the camera's **main** stream (4K H.265) for analysis.
+- **Check the camera's fps at the zoom you will use.** At Sharon the same
+  CP Plus model halved its frame rate at full zoom (15 to about 7.5 fps,
+  indoor lights on) and went back to 15 fps at 50% zoom: at the long end
+  the lens lets in far less light and the camera slows its shutter. If it
+  halves, zoom out, or cap the shutter at 1/25 s in the camera's exposure
+  settings and let gain make up the brightness. The box processed about
+  99% of the frames the camera sent either way.
 - Start the run from the console on camera A. Use camera B only for a
   second camera.
 - Watch: processed fps against the camera's fps, dropped frames, and on the
