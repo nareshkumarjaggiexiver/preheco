@@ -159,6 +159,28 @@ def test_state_is_touched_in_frame_order_and_detection_runs_one_ahead(whole_fram
         assert late == [], f"persons({frame}) ran while frame {late[0][1]} was undecided"
 
 
+@pytest.mark.parametrize("async_reporting", [False, True])
+def test_the_ledger_and_the_taps_see_frames_in_order(async_reporting):
+    """Every frame on the ledger once, in order; every tap round in order.
+
+    Synchronous reporting with no interval and no duty guard taps EVERY
+    frame, so the tap stream is the frame stream; the async plane is
+    drop-not-queue by design, so there the promise is order, not coverage.
+    """
+    n = 10
+    frames = [{"boxes": [A], "faces": [FA]} for _ in range(n)]
+    fake = Scene(frames, [])
+    make_loop(
+        fake, RUN, pipeline_overlap=True, faces_whole_frame=True,
+        tap_interval_s=0.0, tap_duty_factor=0.0, async_reporting=async_reporting,
+    ).run()
+    assert [r["seq"] for r in fake.frame_records] == list(range(n))
+    seqs = [t["payload"]["seq"] for t in fake.taps if t["stage"] == "ingest"]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+    if not async_reporting:
+        assert seqs == list(range(n))
+
+
 class FailsAt(Scene):
     """A detector that answers 500 on one frame (read off the payload)."""
 
