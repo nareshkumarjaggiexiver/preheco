@@ -27,6 +27,11 @@ export HECO_EMBEDDER_ID=arcface-w600k-r50
 export HECO_MATCH_NEARMISS_FLOOR=0
 export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
+# THIS TREE'S IMAGES. Main's stacks run heco-*:latest / :cuda; this candidate
+# runs :shm / :shmcuda, so building one tree can never swap the other's code
+# (it did, until 2026-09-24 — see scripts/build-images.sh).
+export HECO_IMAGE_TAG=${HECO_IMAGE_TAG:-shm}
+export HECO_CUDA_TAG=${HECO_CUDA_TAG:-shmcuda}
 
 C=(-p heco-shm
    -f docker-compose.yml
@@ -61,11 +66,12 @@ PY
 }
 
 case "${1:-both}" in
+  build)    ./scripts/build-images.sh; exit 0 ;;
   ref-only) export HECO_FRAMES_REF_ONLY=1; docker compose "${C[@]}" up -d ;;
   both|up)  docker compose "${C[@]}" up -d ;;
   down)     docker compose "${C[@]}" down; exit 0 ;;
   status)   status; exit 0 ;;
-  *) echo "usage: $0 [up|ref-only|down|status]" >&2; exit 2 ;;
+  *) echo "usage: $0 [build|up|ref-only|down|status]" >&2; exit 2 ;;
 esac
 
 sleep 25
