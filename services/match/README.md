@@ -425,6 +425,18 @@ light; different people differ too (median 0.083), so 21 of the replay's 31
 true colour-only set-asides are asked again. Gender, age and stature are
 never held.
 
+**The well-seen tier (0.15.1).** When BOTH identities have at least
+`HECO_REVIEW_CLOTHES_WELL_SEEN_N` (8) torso reads under the same span and
+self-agreement bars, the clothing clash is `HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH`
+(0.55) instead of 0.35. The best cross is charitable — right for an
+identity seen three times (one person's first three reads against their
+last three scored 0.506 on run e5bae3), too kind to one seen thirty times.
+On e5bae3, 27 identities with 16+ reads scored their early half against
+their late half at 0.887 and up, while the queue asked about a white shirt
+against a blue one (0.374) and a black kurta against a light check
+(0.496); 0.55 sets both aside. Older galleries (f0bfc5, c84098, 8b8b87)
+replay unchanged.
+
 ## Run
 
 ```sh
@@ -486,6 +498,8 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_MATCH_NEARMISS_CLOTHES` | `0.78` | Torso-intersection bar the weak band requires. **0.033 above the worst measured impostor clothing reading (0.747, two genuinely different men)** — a hair, not a margin, which is why this band only ever suggests. Expect wrong suggestions at venues with uniforms or a dress code; turn the band off there via the weak floor. Empty string means unset. |
 | `HECO_REVIEW_CLOTHES_CLASH` | `0.35` | Best cross-identity torso intersection under which a pair whose identities each wear one garment is set aside from the review queue. **0 disables clothing set-asides**; `why.clothes` still reports the reads. |
 | `HECO_REVIEW_CLOTHES_MIN_N` | `3` | v3 torso reads (spanning two seconds) each identity needs before its clothing counts; clamped to at least 2. |
+| `HECO_REVIEW_CLOTHES_WELL_SEEN_N` | `8` | Torso reads BOTH identities need before the well-seen clash applies. **0 disables the tier** (the 0.35 rule stays). |
+| `HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH` | `0.55` | The clothing clash for a well-seen pair (both sides at `WELL_SEEN_N` reads or more). |
 | `HECO_REVIEW_HEAD_CLASH` | `0.45` | Best cross head intersection under which two HEADWEAR identities (both heads at least half chromatic) that each read one head are set aside. **0 disables head set-asides.** |
 | `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-dark or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
 | `HECO_REVIEW_BEARD_PALE` | `0` | `1` lets none against a grey or white beard set a pair aside too (off: a warm light reads a white beard as none). |

@@ -77,7 +77,10 @@ def _env_s(name: str, default: float) -> float:
 #: clothes / head / beard set-aside when the pair's skin says the light
 #: differed (HECO_REVIEW_LIGHT_TOL, why.light, keptByLight); none against a
 #: pale beard sets nothing aside unless HECO_REVIEW_BEARD_PALE.  Additive.
-VERSION = "0.15.0"
+#: 0.15.1 (2026-09-25): a pair whose identities BOTH have 8+ torso reads is
+#: set aside on clothing under 0.55, not 0.35 (HECO_REVIEW_CLOTHES_WELL_SEEN_N
+#: / _CLASH; /health reviewClothesWellSeenN / reviewClothesWellSeenClash).
+VERSION = "0.15.1"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -439,6 +442,8 @@ def health() -> dict:
         "reviewClothesClash": config.review_clothes_clash(),
         "reviewClothesMinN": config.review_clothes_min_n(),
         "reviewClothesSelfMin": config.review_clothes_self_min(),
+        "reviewClothesWellSeenN": config.review_clothes_well_seen_n(),
+        "reviewClothesWellSeenClash": config.review_clothes_well_seen_clash(),
         "reviewHeadClash": config.review_head_clash(),
         "reviewBeardMinN": config.review_beard_min_n(),
         "reviewBeardPale": config.review_beard_pale(),
@@ -731,6 +736,8 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             clothes_clash=config.review_clothes_clash(),
             clothes_min_n=config.review_clothes_min_n(),
             clothes_self_min=config.review_clothes_self_min(),
+            clothes_well_seen_n=config.review_clothes_well_seen_n(),
+            clothes_well_seen_clash=config.review_clothes_well_seen_clash(),
             head_clash=config.review_head_clash(),
             beard_min_n=config.review_beard_min_n(),
             beard_pale=config.review_beard_pale(),

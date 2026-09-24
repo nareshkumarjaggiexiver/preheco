@@ -347,6 +347,28 @@ DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
 DEFAULT_REVIEW_CLOTHES_MIN_N = 3
 DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
 
+# THE WELL-SEEN TIER (2026-09-25).  CLOTHES_CLASH is charitable on purpose —
+# one agreeing pair of reads out of hundreds keeps a pair asked — and that
+# charity is right for an identity seen a few times: one person's FIRST three
+# reads against their LAST three scored a best cross as low as 0.506 on run
+# e5bae3 (the Sharon 10-minute clip; 37 identities with 6+ reads, p5 0.73).
+# It is too kind to the well seen, where the best of hundreds of cross pairs
+# finds a lucky one.  When BOTH identities have WELL_SEEN_N reads or more
+# (same two-second span and self-agreement bars), the clash is WELL_SEEN_CLASH
+# instead.  Run e5bae3 (49 identities, 1,880 body-log torsos): 27 identities
+# with 16+ reads scored their early half against their late half at a best
+# cross of 0.887 and up (median 0.97); f0bfc5's nine same-person splits
+# 0.77-0.97.  The queue held, as the operator saw them, a white shirt against
+# a blue one at 0.374 (29 and 31 reads) and a black kurta against a light
+# check at 0.496 (17 and 37) — both set aside at 0.55, 0.22 under the lowest
+# same-person split.  Still asked: a cream shirt against a light stripe
+# (0.736 — colour cannot see a stripe) and every pair with a side under 8
+# reads.  Replayed offline on f0bfc5, c84098 and 8b8b87 (identities there
+# carry fewer reads) and b5367d: no pair moved.  WELL_SEEN_N 0 turns the tier
+# off; CLOTHES_CLASH 0 turns both off.
+DEFAULT_REVIEW_CLOTHES_WELL_SEEN_N = 8
+DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH = 0.55
+
 # Head: turban and hair colour above the eyes, per sighting in the body log,
 # under the clothing rule's own-testimony bar (three reads over two seconds
 # agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
@@ -463,6 +485,20 @@ def review_clothes_self_min() -> float:
     """Median pairwise intersection an identity's own torso reads must reach
     (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
     return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
+
+
+def review_clothes_well_seen_n() -> int:
+    """Torso reads BOTH identities need before the well-seen clash applies
+    (env HECO_REVIEW_CLOTHES_WELL_SEEN_N; 0 = the tier is off)."""
+    return max(0, int(_env_f(
+        "HECO_REVIEW_CLOTHES_WELL_SEEN_N", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_N
+    )))
+
+
+def review_clothes_well_seen_clash() -> float:
+    """Best cross-torso intersection under which a WELL-SEEN pair is set aside
+    (env HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH)."""
+    return _env_f("HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH)
 
 
 def review_head_clash() -> float:
