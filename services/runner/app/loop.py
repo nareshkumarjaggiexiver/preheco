@@ -73,7 +73,7 @@ from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
-from heco_counting import appearance, association, gate, zones
+from heco_counting import appearance, association, face_search, gate, zones
 from heco_counting import config as counting_config
 from heco_counting.ports import MatchRefused
 
@@ -693,7 +693,8 @@ class _Detections:
     so the loop can raise it at the exact point the inline call would have.
 
     ``face_decided`` says the worker settled this frame's face search: the
-    whole frame needs no tracks, so it was searched here.  False leaves the
+    whole frame needs no tracks, so it was searched here — or, under the
+    cadence (L4), ruled unnecessary: ``face_skipped``.  False leaves the
     search to the loop thread, after the tracker, as it always ran.
     """
 
@@ -701,6 +702,7 @@ class _Detections:
     persons_ms: float = 0.0
     persons_error: BaseException | None = None
     face_decided: bool = False
+    face_skipped: bool = False
     faces: dict | None = None
     faces_ms: float = 0.0
     faces_error: BaseException | None = None
@@ -765,6 +767,12 @@ class RunLoop:
         # The second detector thread HECO_PARALLEL_DETECT issues faces on,
         # created on first use and shut down with the frame source.
         self._face_pool_ex: concurrent.futures.ThreadPoolExecutor | None = None
+        # FACE-SEARCH CADENCE state (L4): the frame time of the last face
+        # search that actually ran (read and written under _lock — the detect
+        # worker decides whole-frame searches, the loop thread crop ones), and
+        # the latest tracker output, which is what "settled" is measured on.
+        self._last_face_search_s: float | None = None
+        self._cadence_tracks: list = []
         # The single-slot frame prefetcher (see _next_frame_prefetched).
         self._prefetch: concurrent.futures.Future | None = None
         self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(
@@ -1103,6 +1111,12 @@ class RunLoop:
             "framesSkippedNoMotion": None,
             "framesDroppedLive": None,
             "ingestBacklogMax": None,
+            # FACE-SEARCH CADENCE (L4): frames whose face search was skipped
+            # because every body in them was a settled, recently verified
+            # guest.  Read beside `unique` — a saving is only trustworthy if
+            # it is visible.  None when the cadence is off: nothing was
+            # decided, so nothing was measured.
+            "faceDetectSkippedSettled": 0 if settings.face_cadence else None,
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -1287,7 +1301,8 @@ class RunLoop:
         """The throughput levers' own counters, for the notes and the results.
 
         Only what was MEASURED: the ingest counters appear when ingest
-        reported them.  An absent key means "not measured" — the planner's
+        reported them, the cadence's skip count when the cadence ran.  An
+        absent key means "not measured" — the planner's
         results door refuses a null (every value must be a finite number),
         and a zero would claim a measurement nobody made.  With every lever
         off and an older ingest this is empty, and the run row is exactly
@@ -1296,7 +1311,7 @@ class RunLoop:
         out: dict = {}
         for key in (
             "framesCaptured", "framesSkippedNoMotion", "framesDroppedLive",
-            "ingestBacklogMax",
+            "ingestBacklogMax", "faceDetectSkippedSettled",
         ):
             if st.get(key) is not None:
                 out[key] = st[key]
@@ -1370,7 +1385,7 @@ class RunLoop:
             max_workers=1, thread_name_prefix="frame-detect"
         )
         try:
-            pending = pool.submit(self._fetch_and_detect)
+            pending = pool.submit(self._fetch_and_detect, self._cadence_snapshot())
             while not self._stop.is_set():
                 t = time.perf_counter()
                 item = pending.result()  # a FETCH failure raises here, as it always did
@@ -1378,20 +1393,23 @@ class RunLoop:
                 if item is None:
                     return
                 # Frame k+1's fetch and detection start NOW, before frame k is
-                # decided: that is the whole overlap.
-                pending = pool.submit(self._fetch_and_detect)
+                # decided: that is the whole overlap.  The cadence's evidence
+                # is taken HERE too, on this thread — the state after frame
+                # k-1 — so what the worker decides on is fixed, not a race.
+                pending = pool.submit(self._fetch_and_detect, self._cadence_snapshot())
                 yield item
         finally:
             self._halt.set()
             pool.shutdown(wait=True, cancel_futures=True)
 
-    def _fetch_and_detect(self) -> tuple[dict, "_Detections"] | None:
+    def _fetch_and_detect(self, snapshot=None) -> tuple[dict, "_Detections"] | None:
         """The detect worker's job: the next frame, then its detections.
 
         Owns the frame fetch in overlap mode (the prefetcher, when on, is
         driven from here and only from here), and clocks a non-prefetched
         fetch straight onto the board rather than through ``_timed``, whose
-        per-frame bookkeeping belongs to the loop thread.
+        per-frame bookkeeping belongs to the loop thread.  ``snapshot`` is
+        the cadence's evidence as the loop thread saw it at submit time.
         """
         if self.s.frame_prefetch:
             frame = self._next_frame_prefetched()
@@ -1401,9 +1419,9 @@ class RunLoop:
             self.board.observe("ingest", "ingestMs", (time.perf_counter() - t) * 1000.0)
         if frame is None or self._stop.is_set() or self._halt.is_set():
             return None
-        return frame, self._detect(frame)
+        return frame, self._detect(frame, snapshot)
 
-    def _detect(self, frame: dict) -> _Detections:
+    def _detect(self, frame: dict, snapshot=None) -> _Detections:
         """This frame's detector calls, made without touching loop state.
 
         Persons always; the face search too when it needs no tracks — the
@@ -1414,15 +1432,28 @@ class RunLoop:
         the detect worker under the overlap, or inline for parallel-only; it
         POSTs, clocks, and hands back replies (or the exception a call
         raised) for :meth:`_pipeline_step` to account in frame order.
+
+        Under the cadence (L4) the whole-frame search is RULED ON first, from
+        this frame's person boxes and ``snapshot`` (settled tracks as the
+        loop thread last saw them — see :meth:`_cadence_snapshot`), and may
+        be skipped.  Side by side only when the rule cannot skip anyway
+        (:func:`heco_counting.face_search.may_skip`): a search that has to
+        wait for persons' answer cannot also be issued beside it.
         """
         image_b64 = frame["imageB64"]
         det = _Detections()
         whole = self.s.faces_whole_frame
+        cadence = whole and self.s.face_cadence
+        now_s = _frame_clock(frame)
         faces_side = None
-        if whole and self.s.parallel_detect:
+        if whole and self.s.parallel_detect and not (
+            cadence and self._cadence_may_skip(snapshot, now_s)
+        ):
             faces_side = self._face_pool().submit(
                 _clocked, partial(self._post_faces, image_b64, None)
             )
+            if cadence:
+                self._note_face_search(now_s)
         try:
             det.persons, det.persons_ms = _clocked(partial(self._post_persons, image_b64))
         except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
@@ -1440,11 +1471,90 @@ class RunLoop:
             return det  # inline order: a frame whose persons failed searches no faces
         if whole:
             det.face_decided = True
+            if cadence:
+                bodies = self._cadence_bodies(det.persons, frame)
+                if self._cadence_due(bodies, snapshot, now_s) is None:
+                    det.face_skipped = True
+                    return det
+                self._note_face_search(now_s)
             try:
                 det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, None))
             except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
                 det.faces_error = e
         return det
+
+    # ------------------------------------------------ face-search cadence (L4)
+
+    def _cadence_snapshot(self) -> tuple | None:
+        """The cadence's evidence, taken on the loop thread: tracks and lock times.
+
+        The latest tracker output (boxes copied) and when each track's
+        identity lock was last refreshed.  Settledness itself is judged
+        against the frame being decided, so a snapshot carries times, not
+        verdicts.  None with the cadence off.
+        """
+        if not self.s.face_cadence:
+            return None
+        with self._lock:
+            lock_at = {tid: e["at"] for tid, e in self._locks.items()}
+        tracks = [
+            {"id": t.get("id"), "box": dict(t["box"])}
+            for t in self._cadence_tracks
+            if t.get("id") in lock_at and t.get("box")
+        ]
+        return tracks, lock_at
+
+    def _cadence_settled(self, snapshot, now_s: float | None) -> list[dict]:
+        """Which snapshot tracks are settled at ``now_s`` (the rule's input)."""
+        if snapshot is None:
+            return []
+        tracks, lock_at = snapshot
+        return face_search.settled_tracks(
+            tracks, lock_at, now_s,
+            float(self.s.face_reverify_interval_s), float(self.s.heal_window_s),
+        )
+
+    def _cadence_due(self, bodies: list, snapshot, now_s: float | None) -> str | None:
+        """Why this frame must be searched, or None when the cadence may skip it."""
+        return face_search.search_due(
+            bodies, self._cadence_settled(snapshot, now_s), now_s,
+            self._last_face_search(), float(self.s.face_cadence_max_gap_s),
+        )
+
+    def _cadence_may_skip(self, snapshot, now_s: float | None) -> bool:
+        """Whether the rule could skip this frame at all, before persons answers."""
+        return face_search.may_skip(
+            len(self._cadence_settled(snapshot, now_s)), now_s,
+            self._last_face_search(), float(self.s.face_cadence_max_gap_s),
+        )
+
+    def _cadence_bodies(self, persons: dict | None, frame: dict) -> list:
+        """The person boxes a detect-worker ruling must see: the TRACKABLE ones.
+
+        A box inside a detections-mode zone never forms a track, so it can
+        never be settled, and a face inside it is excluded anyway — leaving
+        it in would keep the search running for a wall TV all night.  The
+        zones' own rule on COPIES, with a silent observer: the worker books
+        nothing; the loop thread does the counting when the frame's turn comes.
+        """
+        boxes = [dict(b) for b in (persons or {}).get("boxes", [])]
+        return zones.apply_detection_zones(boxes, frame, self.zones, _SILENT)
+
+    def _last_face_search(self) -> float | None:
+        """Frame time of the last face search that ran (None before the first)."""
+        with self._lock:
+            return self._last_face_search_s
+
+    def _note_face_search(self, now_s: float | None) -> None:
+        """Record that this frame's face search runs — the max gap counts from here."""
+        with self._lock:
+            self._last_face_search_s = now_s
+
+    def _skip_face_search(self, n_bodies: int) -> dict:
+        """Book a skipped search: counted, on the ledger, and no faces."""
+        self._bump("faceDetectSkippedSettled")
+        self._event(f"face search skipped: {n_bodies} settled")
+        return {"faces": []}
 
     def _face_pool(self) -> concurrent.futures.ThreadPoolExecutor:
         """The parallel detector's second thread, created on first use.
@@ -1519,6 +1629,12 @@ class RunLoop:
             levers["pipelineOverlap"] = True
         if self.s.parallel_detect:
             levers["parallelDetect"] = True
+        if self.s.face_cadence:
+            levers["faceCadence"] = {
+                "maxGapS": float(self.s.face_cadence_max_gap_s),
+                # The settledness window it ran against (0 = skips nothing).
+                "reverifyIntervalS": float(self.s.face_reverify_interval_s),
+            }
         return {"levers": levers} if levers else {}
 
     def _open_source(self) -> None:
@@ -1701,6 +1817,14 @@ class RunLoop:
             f"counting from {source_label(self.request['source'])} "
             f"(plannerRun={planner_run_id}, site={self.request.get('siteId') or 'none'})"
         )
+        if self.s.face_cadence and float(self.s.face_reverify_interval_s) <= 0:
+            # Said once, at the start: a lever that is on and cannot act is the
+            # "looked set, changed nothing" failure, and the knob is the cause.
+            self.log.warning(
+                "HECO_FACE_CADENCE is on but faceReverifyIntervalS is 0 — no track "
+                "is ever 'recently verified', so the cadence will skip nothing; set "
+                "HECO_FACE_REVERIFY_INTERVAL_S (2-3 s) or the run's quality profile"
+            )
         # Honour any pending consent withdrawals BEFORE the first frame is
         # matched: purge tombstoned staff from the site store now, so a member
         # deleted while the pipeline was off never matches again.
@@ -2024,7 +2148,7 @@ class RunLoop:
         if det is None and self._detects_inline():
             # HECO_PARALLEL_DETECT on a serial run: the detector calls the
             # worker would make, issued side by side from here.
-            det = self._detect(frame)
+            det = self._detect(frame, self._cadence_snapshot())
         if det is None:
             persons = self._timed(
                 "person-detect", "personDetectMs", partial(self._post_persons, image_b64)
@@ -2060,6 +2184,8 @@ class RunLoop:
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
         self._note_tracks(tracks)
+        if s.face_cadence:
+            self._cadence_tracks = tracks  # what "settled" is judged on next
 
         faces_out = self._search_faces(image_b64, trackable, tracks, det)
         faces = faces_out.get("faces", [])
@@ -2462,6 +2588,8 @@ class RunLoop:
         """
         s = self.s
         if det is not None and det.face_decided:
+            if det.face_skipped:
+                return self._skip_face_search(len(trackable))
             reply = self._take_detected(
                 det.faces, det.faces_ms, det.faces_error, "face-detect", "faceDetectMs"
             )
@@ -2488,6 +2616,15 @@ class RunLoop:
         within = dedupe_boxes(
             list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
         )
+        # FACE-SEARCH CADENCE (L4): ruled on here, from THIS frame's tracks,
+        # before the re-verify gate stamps anything — a skipped frame searched
+        # nobody, so no track may be marked as verified by it.
+        if s.face_cadence:
+            now_s = self._now()
+            due = self._cadence_due(trackable, self._cadence_snapshot(), now_s)
+            if due is None:
+                return self._skip_face_search(len(trackable))
+            self._note_face_search(now_s)
         # RE-VERIFY GATE: skip the crops belonging to tracks that have already
         # resolved to an identity and were verified recently.  Off by default.
         # Everyone still unidentified — everyone who can change the count — is
@@ -4916,6 +5053,30 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+
+
+class _SilentObserver:
+    """A CountingObserver that books nothing — for rulings made off the loop thread."""
+
+    def bump(self, key: str, by: int = 1) -> None:
+        """Discard a counter bump."""
+
+    def observe(self, stage: str, metric: str, value: float) -> None:
+        """Discard a metric observation."""
+
+    def event(self, text: str) -> None:
+        """Discard a ledger event."""
+
+
+_SILENT = _SilentObserver()
+
+
+def _frame_clock(frame: dict) -> float | None:
+    """A frame's own time in seconds (its tMs), or None when it carries none."""
+    t_ms = frame.get("tMs")
+    if isinstance(t_ms, int | float) and not isinstance(t_ms, bool):
+        return float(t_ms) / 1000.0
+    return None
 
 
 def _clocked(fn) -> tuple:

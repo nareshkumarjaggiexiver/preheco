@@ -139,6 +139,30 @@ class Settings:
     # as long as they stay turned — precisely the case the gate exists to stop.
     face_reverify_interval_s: float = 0.0
 
+    # FACE-SEARCH CADENCE (lever L4, HECO_FACE_CADENCE).  Off by default.  On,
+    # a frame's face search is SKIPPED when there is at least one person box,
+    # every person box is covered one to one (IoU >= 0.5) by a SETTLED track —
+    # one holding an identity lock whose last comfortable face match is
+    # younger than face_reverify_interval_s — and less than
+    # face_cadence_max_gap_s of footage has passed since the last search that
+    # ran (heco_counting.face_search).  A newcomer, a stale lock, an
+    # unconfirmed body, an empty frame: all searched, every frame.
+    #
+    # WHY.  The whole-frame SCRFD search is the largest single cost of the 4K
+    # chain on the CUDA box and saturates the GPU alone (two concurrent
+    # inferences measured 1.05x), and most wedding frames are the same
+    # identified guests standing where they stood — searching again only
+    # re-confirms answers the run holds.  Skipped frames still run the
+    # tracker and track-presence co-presence; they are counted in
+    # faceDetectSkippedSettled beside `unique`.
+    #
+    # DEPENDS ON face_reverify_interval_s: at 0 nothing is ever "recently
+    # verified", so the cadence skips nothing (said at run start, and visible
+    # in GET /health knobs and the run config).  2-3 s is the intended
+    # pairing with the 1 s max gap.
+    face_cadence: bool = False
+    face_cadence_max_gap_s: float = 1.0
+
     flush_interval_s: float = 2.0  # planner stats/samples cadence
     sample_batch_max: int = 200  # planner ingest contract: batch <= 200 rows
 
@@ -540,6 +564,10 @@ def from_env() -> Settings:
         face_reverify_interval_s=env_float(
             "HECO_FACE_REVERIFY_INTERVAL_S", s.face_reverify_interval_s
         ),
+        face_cadence=env_bool("HECO_FACE_CADENCE", s.face_cadence),
+        face_cadence_max_gap_s=env_float(
+            "HECO_FACE_CADENCE_MAX_GAP_S", s.face_cadence_max_gap_s
+        ),
         run_retention_s=env_float("HECO_RUN_RETENTION_S", s.run_retention_s),
         flush_interval_s=env_float("HECO_FLUSH_INTERVAL_S", s.flush_interval_s),
         request_timeout_s=env_float("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s),
@@ -592,4 +620,9 @@ def knobs(s: Settings) -> dict:
     return {
         "HECO_PIPELINE_OVERLAP": s.pipeline_overlap,
         "HECO_PARALLEL_DETECT": s.parallel_detect,
+        "HECO_FACE_CADENCE": s.face_cadence,
+        "HECO_FACE_CADENCE_MAX_GAP_S": s.face_cadence_max_gap_s,
+        # The cadence's settledness window: shown beside it because at 0 the
+        # cadence skips nothing (a per-run quality profile may override it).
+        "HECO_FACE_REVERIFY_INTERVAL_S": s.face_reverify_interval_s,
     }

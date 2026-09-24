@@ -396,6 +396,21 @@ services:
       # model time, so what this hides is mostly transport. No effect on the
       # crop path, which needs this frame's tracks before it can search.
       HECO_PARALLEL_DETECT: ${HECO_PARALLEL_DETECT-}
+      # FACE-SEARCH CADENCE (lever L4; 1 = on, default off). A frame's face
+      # search is skipped when every person box is covered one-to-one (IoU >=
+      # 0.5) by a SETTLED track — identity lock, face-verified within
+      # HECO_FACE_REVERIFY_INTERVAL_S — and less than
+      # HECO_FACE_CADENCE_MAX_GAP_S (default 1.0 s of footage) has passed since
+      # the last search. Newcomers, stale locks and empty frames are always
+      # searched; skipped frames still track and still assert track presence,
+      # and are counted as faceDetectSkippedSettled. SKIPS NOTHING while
+      # HECO_FACE_REVERIFY_INTERVAL_S is 0 (its default) — set 2-3 s with it.
+      HECO_FACE_CADENCE: ${HECO_FACE_CADENCE-}
+      HECO_FACE_CADENCE_MAX_GAP_S: ${HECO_FACE_CADENCE_MAX_GAP_S-}
+      # Seconds a track that already holds an identity goes between face
+      # verifications: the crop path's re-verify saving, and the cadence's
+      # "settled" window. 0 (default) = verify every frame.
+      HECO_FACE_REVERIFY_INTERVAL_S: ${HECO_FACE_REVERIFY_INTERVAL_S-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
