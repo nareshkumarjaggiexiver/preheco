@@ -1,0 +1,29 @@
+# Ports for the shared-memory stack, so it can run BESIDE the two camera
+# stacks instead of instead of them.
+#
+#   camera A   7100..7106   docker-compose.yml
+#   camera B   7200..7206   docker-compose.camB.yml
+#   shm        7300..7306   here
+#
+# Running it alongside is the point: the shm branch is a candidate, and a
+# candidate you have to take production down to try is one nobody tries. Same
+# `!override` reason as camB — compose MERGES sequences, so a plain `ports:`
+# would ADD these beside the inherited ones and the stack would die claiming a
+# port camera A already holds.
+#
+# THREE STACKS SHARE ONE 8 GB CARD. That has already bitten once: on
+# 2026-09-24 the shm stack's persons/faces/embed came up reporting
+# `CUDA -> CPUExecutionProvider` while the two camera stacks stayed on the
+# GPU, and the ref-only throughput measured from it was a CPU pipeline
+# compared against a GPU one. ALWAYS check the device truth before believing
+# a number from this stack:
+#
+#   for p in 7302 7304 7305; do curl -s localhost:$p/health; done
+services:
+  ingest:  { ports: !override ["7301:7101"] }
+  persons: { ports: !override ["7302:7102"] }
+  tracker: { ports: !override ["7303:7103"] }
+  faces:   { ports: !override ["7304:7104"] }
+  embed:   { ports: !override ["7305:7105"] }
+  match:   { ports: !override ["7306:7106"] }
+  runner:  { ports: !override ["7300:7100"] }
