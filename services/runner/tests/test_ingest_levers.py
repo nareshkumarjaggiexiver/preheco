@@ -67,17 +67,21 @@ class Queued(Scene):
         return super().handler(request)
 
 
+@pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("prefetch", [False, True])
-def test_every_published_frame_is_processed_once_and_in_order(prefetch, tmp_path):
+def test_every_published_frame_is_processed_once_and_in_order(prefetch, overlap, tmp_path):
     """A FIFO hands out distinct frames with gaps in seq; none is lost or repeated.
 
     The seq gaps are the motion gate's withheld frames, not a stall and not a
     duplicate — the loop's "new seq?" test must take each queued frame exactly
-    once, whichever thread fetched it.
+    once, whichever thread fetched it: the loop, the prefetcher, or the
+    detect worker (HECO_PIPELINE_OVERLAP).
     """
     fake = Queued()
     golden = tmp_path / "g.jsonl"
-    final = make_loop(fake, RUN, frame_prefetch=prefetch, golden_path=str(golden)).run()
+    final = make_loop(
+        fake, RUN, frame_prefetch=prefetch, pipeline_overlap=overlap, golden_path=str(golden),
+    ).run()
     assert final["state"] == "ended" and final["endReason"] == "source-ended"
     assert final["frames"] == len(PUBLISHED)
     seqs = [json.loads(line)["seq"] for line in golden.read_text().splitlines()]
@@ -186,8 +190,9 @@ class Keepalive(Scene):
         return super().handler(request)
 
 
+@pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("repeat", [True, False])
-def test_keepalives_hold_a_still_room_open_past_the_stall_window(repeat):
+def test_keepalives_hold_a_still_room_open_past_the_stall_window(repeat, overlap):
     """A still scene is not a dead camera.
 
     The stall window here is 0.2 s and the room stays still for ~0.6 s: the
@@ -199,6 +204,7 @@ def test_keepalives_hold_a_still_room_open_past_the_stall_window(repeat):
     t = time.monotonic()
     final = make_loop(
         fake, RUN, source_stall_s=0.2, source_poll_s=0.005, frame_prefetch=False,
+        pipeline_overlap=overlap,
     ).run()
     assert time.monotonic() - t >= 0.6, "the run outlived the stall window"
     assert final["frames"] == fake.n, "every keepalive was processed"
