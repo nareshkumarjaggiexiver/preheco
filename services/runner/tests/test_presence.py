@@ -684,3 +684,57 @@ def test_a_zero_or_negative_lock_floor_disables_presence_binding(floor):
     fake, final = run_scene(frames, script, track_lock_min_cosine=floor)
     assert fake.splits == []
     assert final["trackPresenceSplits"] == 0
+
+
+def balance_riders(n: int) -> dict:
+    """Norms, attributes and half-balance for n faces: the middle one has a
+    dark bar across half of it (0.27, run f0bfc5's p00002) but a strong norm —
+    the case the norm floor cannot see."""
+    out = riders(n)
+    out["norms"] = [30.0, 29.0, 28.0][:n]
+    out["balance"] = [0.81, 0.27, 0.74][:n]
+    return out
+
+
+def test_the_balance_gate_drops_a_half_hidden_face_the_norm_floor_passes():
+    """p00002's shape: a clean norm, one half dark. Armed at 0.33 with the
+    norm floor also armed, the norm floor passes her and the balance floor
+    drops her — with her vector, norm and attributes, index-consistently."""
+    frames = [{"boxes": [A, B], "faces": [FA, F_NOBODY, FB]}]
+    script = [
+        scripted_verdict("p00001", True, None),
+        scripted_verdict("p00002", True, None),
+    ]
+    fake, final = run_scene(frames, script, embed=balance_riders,
+                            quality_min_feat_norm=18.0, quality_min_balance=0.33)
+
+    assert [b["embedding"][0] for b in fake.match_bodies] == [0.0, 2.0]
+    assert [b["featNorm"] for b in fake.match_bodies] == [30.0, 28.0]
+    assert (final["gatedByFeatNorm"], final["gatedByBalance"]) == (0, 1)
+    rec = fake.frame_records[0]
+    assert rec["faces"]["gatedBy"] == {"balance": 1}
+    assert rec["faces"]["faces"][1]["gate"] == "balance"
+    assert [f.get("balance") for f in rec["faces"]["faces"]] == [0.81, 0.27, 0.74], \
+        "every face's reading is in the ledger, kept or not, so the floor can be re-priced"
+
+
+def test_the_balance_floor_is_off_by_default_and_an_unmeasured_face_is_kept():
+    """0 gates nothing and arms nothing; armed, a face the embedder could not
+    measure (None: off the frame edge, an older embed) is kept and counted."""
+    frames = [{"boxes": [A, B], "faces": [FA, F_NOBODY, FB]}]
+    script = [scripted_verdict(f"p0000{i}", True, None) for i in (1, 2, 3)]
+    fake, final = run_scene(frames, script, embed=balance_riders)
+    assert len(fake.match_bodies) == 3 and final["gatedByBalance"] == 0
+    assert "balance" not in fake.run_created["config"]["gateArmed"]
+    assert "qualityMinBalance" not in fake.run_created["config"], "off leaves the record as it was"
+
+    def unmeasured(n):
+        out = balance_riders(n)
+        out["balance"] = [None, None, None][:n]
+        return out
+
+    fake, final = run_scene(frames, script, embed=unmeasured, quality_min_balance=0.33)
+    assert len(fake.match_bodies) == 3, "absent is not zero: nobody is dropped on a missing reading"
+    assert final["gatedByBalance"] == 0 and final["gatedUnmeasured"] >= 1
+    assert "balance" in fake.run_created["config"]["gateArmed"]
+    assert fake.run_created["config"]["qualityMinBalance"] == 0.33

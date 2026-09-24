@@ -99,12 +99,12 @@ gets measured on pilot footage.
 | `FACES_SHARPNESS_NORM_PX` | `64` | square every crop is resized to before the Laplacian |
 | `FACES_MODEL` | `models/face_detection_yunet_2023mar.onnx` | weights path |
 | `FACES_SCRFD_INPUT` | `640` | scrfd network input, `640` or frame-shaped `1472x832` (a 4K whole frame then resolves 42 px faces instead of 96 px) |
-| `HECO_DEVICE` | `CPU` | ORT providers for the scrfd family: `CUDA`, `TRT` (TensorRT fp16, then CUDA, then CPU; SCRFD-10G 1472x832 20.0 -> 5.4 ms on the 4060, boxes IoU >= 0.991, landmarks within 0.22 px vs fp32). yunet is cv2 and ignores it |
+| `HECO_DEVICE` | `CPU` | ORT providers for the scrfd family: `CUDA`, `TRT` (TensorRT fp16, then CUDA, then CPU; SCRFD-10G 1472x832 20.0 -> 5.4 ms on the 4060; vs fp32 on 40 frames no face gained or lost at score 0.5 or 0.7, boxes IoU min 0.987, landmarks within 0.30 px). yunet is cv2 and ignores it |
 | `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |
 
 ### Switching a stack to SCRFD-2.5G (the live profile)
 
-Weights: `scrfd_2.5g_kps.onnx` = InsightFace `buffalo_m.zip` (release v0.7) member `det_2.5g.onnx`, sha256 `041f73f4…eaee0af9` (full pins in `models-restricted.lock`); already in `services/faces/models/` of both .94 deploy trees. It is ~2.5x cheaper than SCRFD-10G (1472x832 CUDA 8.2 vs 20.4 ms) but kept 14 of 10G's 17 faces on the bench frames at scoreMin 0.7 — on TensorRT prefer 10G. To switch, with no count running on that stack:
+Weights: `scrfd_2.5g_kps.onnx` = InsightFace `buffalo_m.zip` (release v0.7) member `det_2.5g.onnx`, sha256 `041f73f4…eaee0af9` (full pins in `models-restricted.lock`); already in `services/faces/models/` of both .94 deploy trees. It is ~2.5x cheaper than SCRFD-10G (1472x832 CUDA 8.2 vs 20.4 ms) but loses about 1 in 5 countable face sightings (≥ 56 px) at scoreMin 0.7 — 40 frames of the bench clip: 7 of 34 at 640, 7 of 41 at 1472x832, faces up to 242 px, all of them 0.70-0.83 on 10G — so do not run it live until its own `FACES_SCRFD_SCORE_MIN` is calibrated on labelled footage; on TensorRT prefer 10G. To switch, with no count running on that stack:
 
 1. Console: pick the install's `… live (SCRFD-2.5G + ArcFace-R50)` profile and **Switch models** — or
    `curl -X POST http://localhost:5173/api/pipeline/installs/<pipelineId>/apply-profile -H 'content-type: application/json' -d '{"profileId":"<profile id>"}'` — or on the box

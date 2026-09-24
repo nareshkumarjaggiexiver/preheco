@@ -347,6 +347,28 @@ DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
 DEFAULT_REVIEW_CLOTHES_MIN_N = 3
 DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
 
+# THE WELL-SEEN TIER (2026-09-25).  CLOTHES_CLASH is charitable on purpose —
+# one agreeing pair of reads out of hundreds keeps a pair asked — and that
+# charity is right for an identity seen a few times: one person's FIRST three
+# reads against their LAST three scored a best cross as low as 0.506 on run
+# e5bae3 (the Sharon 10-minute clip; 37 identities with 6+ reads, p5 0.73).
+# It is too kind to the well seen, where the best of hundreds of cross pairs
+# finds a lucky one.  When BOTH identities have WELL_SEEN_N reads or more
+# (same two-second span and self-agreement bars), the clash is WELL_SEEN_CLASH
+# instead.  Run e5bae3 (49 identities, 1,880 body-log torsos): 27 identities
+# with 16+ reads scored their early half against their late half at a best
+# cross of 0.887 and up (median 0.97); f0bfc5's nine same-person splits
+# 0.77-0.97.  The queue held, as the operator saw them, a white shirt against
+# a blue one at 0.374 (29 and 31 reads) and a black kurta against a light
+# check at 0.496 (17 and 37) — both set aside at 0.55, 0.22 under the lowest
+# same-person split.  Still asked: a cream shirt against a light stripe
+# (0.736 — colour cannot see a stripe) and every pair with a side under 8
+# reads.  Replayed offline on f0bfc5, c84098 and 8b8b87 (identities there
+# carry fewer reads) and b5367d: no pair moved.  WELL_SEEN_N 0 turns the tier
+# off; CLOTHES_CLASH 0 turns both off.
+DEFAULT_REVIEW_CLOTHES_WELL_SEEN_N = 8
+DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH = 0.55
+
 # Head: turban and hair colour above the eyes, per sighting in the body log,
 # under the clothing rule's own-testimony bar (three reads over two seconds
 # agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
@@ -371,6 +393,30 @@ DEFAULT_REVIEW_HEAD_CLASH = 0.45
 # are 0.47-0.75 dark against 0.03-0.48 for 21 shaven or moustached men.
 # BEARD_MIN_N 0 turns the signal off.
 DEFAULT_REVIEW_BEARD_MIN_N = 3
+# ...and none against a PALE beard (grey or white) only when this is on: an
+# 8% warm light read a white beard as "none" (app.appearance.beards_differ).
+DEFAULT_REVIEW_BEARD_PALE = False
+
+# THE LIGHT GUARD.  The clothes, head and beard set-asides compare colours,
+# and a duplicate is minted exactly when a face fails to match — a change of
+# light is one cause.  Replayed on run f0bfc5's crops (34 single-person
+# identities split at their time median, the late half re-read under a
+# per-channel shift): a +/-8% shift set one genuine duplicate aside, +/-15%
+# two or three, a stage wash seven or eight — and a light on one person (a
+# spotlight, a videographer's lamp) does that with HECO_APPEARANCE_WB on.
+# The face's own skin moves with the light (heco_counting.appearance
+# skin_tone): its median log(R/G), log(B/G) differ between one person's two
+# halves by 0.020 (median; p90 0.048) under one light and by 0.08-0.10 in
+# every one of those false set-asides at +/-8%, 0.11+ beyond.  So a colour
+# set-aside is HELD BACK — the pair stays in the ranked queue — when the two
+# identities' skin readings differ by more than this, on either ratio.  At
+# 0.07 it held back every false set-aside of the replay (8% to stage wash,
+# frame WB on and off) and kept 10 of the 31 true colour-only set-asides of
+# the f0bfc5 replay (different people's skin differs too: median 0.083) —
+# the trade this pipeline always makes: a question asked twice over a guest
+# hidden once.  0 turns the guard off.  Skin unmeasured on either side (a
+# runner before match 0.15.0): no guard, today's rule.
+DEFAULT_REVIEW_LIGHT_TOL = 0.07
 
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
@@ -441,6 +487,20 @@ def review_clothes_self_min() -> float:
     return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
 
 
+def review_clothes_well_seen_n() -> int:
+    """Torso reads BOTH identities need before the well-seen clash applies
+    (env HECO_REVIEW_CLOTHES_WELL_SEEN_N; 0 = the tier is off)."""
+    return max(0, int(_env_f(
+        "HECO_REVIEW_CLOTHES_WELL_SEEN_N", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_N
+    )))
+
+
+def review_clothes_well_seen_clash() -> float:
+    """Best cross-torso intersection under which a WELL-SEEN pair is set aside
+    (env HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH)."""
+    return _env_f("HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH)
+
+
 def review_head_clash() -> float:
     """Best cross head intersection under which a pair whose identities each
     read ONE head is set aside (env HECO_REVIEW_HEAD_CLASH; 0 = off)."""
@@ -451,6 +511,21 @@ def review_beard_min_n() -> int:
     """Beard reads each identity needs before its class may set a pair aside
     (env HECO_REVIEW_BEARD_MIN_N; 0 = off)."""
     return max(0, int(_env_f("HECO_REVIEW_BEARD_MIN_N", DEFAULT_REVIEW_BEARD_MIN_N)))
+
+
+def review_beard_pale() -> bool:
+    """May none against a PALE (grey or white) beard set a pair aside
+    (env HECO_REVIEW_BEARD_PALE, 0|1; default off — see beards_differ)?"""
+    raw = os.environ.get("HECO_REVIEW_BEARD_PALE")
+    if raw is None or not raw.strip():
+        return DEFAULT_REVIEW_BEARD_PALE
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def review_light_tol() -> float:
+    """Largest skin-reading gap at which a colour set-aside still applies
+    (env HECO_REVIEW_LIGHT_TOL; 0 = the guard is off)."""
+    return max(0.0, _env_f("HECO_REVIEW_LIGHT_TOL", DEFAULT_REVIEW_LIGHT_TOL))
 
 
 def adult_height_m() -> float:

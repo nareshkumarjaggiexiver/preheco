@@ -75,7 +75,7 @@ def test_embed_returns_128_floats_per_face(monkeypatch):
     )
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs"}
+    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs", "balance"}
     assert len(body["embeddings"]) == 2
     for emb, norm in zip(body["embeddings"], body["norms"], strict=True):
         assert len(emb) == 128
@@ -296,7 +296,7 @@ def test_embed_serves_norms_and_attributes_beside_the_embeddings(tmp_path, monke
     r = client.post("/embed", json={"imageB64": _b64(img), "faces": faces})
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs"}
+    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs", "balance"}
     assert len(body["embeddings"]) == len(body["norms"]) == len(body["attributes"]) == 2
     for emb, norm in zip(body["embeddings"], body["norms"], strict=True):
         assert norm == pytest.approx(float(np.linalg.norm(np.asarray(emb, np.float64))), rel=1e-6)

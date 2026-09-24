@@ -182,7 +182,7 @@ def track_payload(tracks: list[dict]) -> dict:
 
 #: Report-only signals carried through to the console beside each face, so an
 #: operator can see the evidence a rejection was made on and not just its name.
-_SIGNALS = ("iedPx", "frontality", "sharpness")
+_SIGNALS = ("iedPx", "frontality", "sharpness", "balance")
 
 
 def face_payload(faces: list[dict], min_px: float, canon_px: float) -> dict:

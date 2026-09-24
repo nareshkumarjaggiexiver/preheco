@@ -40,6 +40,8 @@
 # THE REVIEW EXCLUSIONS (gender, age, stature, clothes, head, beard) and the
 # track-presence split are NOT exported here: their defaults live in the
 # services (match config.py, runner config.py) and are on out of the box.
+# One exception, the light guard (HECO_REVIEW_LIGHT_TOL, below): this
+# deployment turns it OFF.
 # `status` prints what the running containers actually hold, so an operator
 # can see a knob that was set — or one that was not — without reading a
 # compose file.
@@ -58,8 +60,9 @@
 # it (and are off by default like the rest):
 #
 #   HECO_TRT=1     docker-compose.trt.yml, LAST: persons/faces/embed on
-#                  TensorRT fp16. The :cuda images must carry TensorRT
-#                  (scripts/build-images.sh since lever/models), and each model's
+#                  TensorRT fp16. The :cuda images must carry TensorRT —
+#                  build them with HECO_TRT=1 ./scripts/build-images.sh; a plain
+#                  build leaves it out (f1b2f07) — and each model's
 #                  first start builds its engine: YOLOX-s ~157 s, SCRFD ~34 s,
 #                  ArcFace ~35 s, genderage ~20 s — warm them before a count.
 #   HECO_HWDEC=1   docker-compose.hwdec.yml: the ffmpeg ingest image
@@ -88,7 +91,19 @@ export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
 # floor would have erased read 22+). 2.8% of templates dropped, all from
 # identities that keep better ones. 0 turns it off.
 export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
+# Half-balance floor, measured on run f0bfc5's sightings: p00002 — a girl with
+# a dark railing across her face, which the norm floor passes (23.7) — reads
+# 0.27; the lowest genuine face 0.42, the 5th percentile 0.51. 0 turns it off.
+export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
+# The review's light guard OFF (match default 0.07). It holds back a colour
+# set-aside when two identities' face skin says they were read under
+# different light — and on f0bfc5's replay it also sent 21 of 31 correct
+# colour set-asides back to the queue, the wrong pairs the operator keeps
+# reporting. The operator's venues are lit by fixed chandeliers ("it is
+# fixed light", 2026-09-25), so the guard costs here and buys nothing. A
+# venue with stage washes or a videographer's lamp: HECO_REVIEW_LIGHT_TOL=0.07.
+export HECO_REVIEW_LIGHT_TOL=${HECO_REVIEW_LIGHT_TOL:-0}
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
 B=("${A[@]}" -f docker-compose.camB.yml)
@@ -129,13 +144,15 @@ knobs() {
   show "$name" match HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
        HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
        HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
-       HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N -- "$@"
-  show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM \
+       HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_CLOTHES_WELL_SEEN_N \
+       HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
+       HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL -- "$@"
+  show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
        HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
        HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S -- "$@"
   show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
        INGEST_MOTION_KEEPALIVE_S INGEST_BUFFER_S INGEST_BUFFER_MB INGEST_DECODER \
-       INGEST_CV_THREADS -- "$@"
+       INGEST_CV_THREADS INGEST_LIVE_TIMEOUT_S -- "$@"
   show "$name" faces HECO_DEVICE FACES_MODEL FACES_SCRFD_INPUT HECO_TRT_CACHE -- "$@"
   show "$name" embed HECO_DEVICE EMBED_BATCH HECO_TRT_CACHE -- "$@"
 }
@@ -160,7 +177,10 @@ dev = d.get("device") or {}
 if port.endswith("01"):
     # INGEST's device block is the DECODER (L6): requested vs what the open
     # capture decodes with (null until a source is open), and why not.
-    err = f"   <-- FELL BACK: {dev['error']}" if dev.get("error") else ""
+    err = dev.get("error") or ""
+    if err:
+        down = err.startswith("live source down")
+        err = f"   <-- {'SOURCE DOWN' if down else 'FELL BACK'}: {err}"
     print(f"  :{port} ingest decoder {dev.get('requested')} -> {dev.get('active')}{err}")
     raise SystemExit
 active = (dev.get("active") or ["?"])[0]
@@ -173,6 +193,10 @@ print(f"  :{port} {d.get('model','?'):34s} ok={str(d.get('ok')):5s} "
       f"{requested} -> {active}{flag}")
 if dev.get("trt"):
     print(f"        tensorrt: {dev['trt']}")
+if dev.get("attributes"):  # embed under TRT: the gender/age pass's own truth
+    att = dev["attributes"]
+    print(f"        attribute pass: {att.get('requested')} -> {(att.get('active') or ['?'])[0]}"
+          f"   tensorrt: {att.get('trt')}")
 # The attribute head is the embed service's second model and its own truth:
 # absent, every review pair reads "not measured" for gender and age and the
 # gender/age exclusions never fire. Say so here rather than in a queue.
@@ -188,11 +212,15 @@ PY
   knobs B -p heco-pipeline-b "${B[@]}"
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
   echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
-  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · HEAD_CLASH 0.45 · BEARD_MIN_N 3 ·'
-  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script). 0 turns a signal off.'
+  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · CLOTHES_WELL_SEEN_N 8 / _CLASH 0.55 (both'
+  echo '    sides with 8+ reads are held to 0.55) · HEAD_CLASH 0.45 · BEARD_MIN_N 3 · BEARD_PALE 0 ·'
+  echo '    LIGHT_TOL 0.07 in the service (0 from this script: fixed chandelier light — the guard is off) ·'
+  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
+  echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
   echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
   echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
+  echo '    INGEST_LIVE_TIMEOUT_S 0 (OpenCV 30 s / ffmpeg own timeouts; 10 recommended for live cameras) ·'
   echo '    EMBED_BATCH 0 · FACES_SCRFD_INPUT 640 · TensorRT only with HECO_TRT=1 (device truth above).'
 }
 

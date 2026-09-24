@@ -253,7 +253,8 @@ def test_head_clash_zero_is_off(client, ticking, monkeypatch):
     ("a", "b", "apart"),
     [
         (DARK, NONE, True),      # a full beard against a clean chin
-        (WHITE, NONE, True),
+        (WHITE, NONE, False),    # a warm light reads a white beard as none: off
+        (GREY, NONE, False),     # ...by default (HECO_REVIEW_BEARD_PALE)
         (DARK, WHITE, True),     # pair #1: black beard against white
         (DARK, GREY, False),     # salt-and-pepper sits between: never set against
         (WHITE, GREY, False),
@@ -287,6 +288,25 @@ def test_beard_needs_min_n_reads_over_two_seconds_on_both_sides(client, monkeypa
     assert {row["why"]["beard"]["a"], row["why"]["beard"]["b"]} == {"dark", "none"}, (
         "the classes are still shown"
     )
+
+
+@pytest.mark.parametrize("pale", [WHITE, GREY])
+def test_none_against_a_pale_beard_only_with_its_switch(client, ticking, monkeypatch, pale):
+    """HECO_REVIEW_BEARD_PALE=1 brings back none-vs-grey/white.
+
+    Off by default: the pale test compares the chin's saturation with the
+    cheek's, and an 8% warm light read f0bfc5's white-bearded elder as
+    "none" — his genuine duplicate set aside.  The classes are still shown.
+    """
+    seen(client, hub(), beards=[pale] * 3)
+    seen(client, spoke(1), beards=[NONE] * 3)
+    got = review(client)
+    assert got["excluded"]["beard"] == 0
+    assert {only_pair(got)["why"]["beard"]["a"], only_pair(got)["why"]["beard"]["b"]} == {
+        "none", "white" if pale is WHITE else "grey"}
+    monkeypatch.setenv("HECO_REVIEW_BEARD_PALE", "1")
+    assert review(client)["excluded"]["beard"] == 1
+    assert client.get("/health").json()["reviewBeardPale"] is True
 
 
 def test_beard_min_n_zero_is_off(client, ticking, monkeypatch):

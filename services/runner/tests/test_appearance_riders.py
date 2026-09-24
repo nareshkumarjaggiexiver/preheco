@@ -123,6 +123,20 @@ def test_head_and_beard_ride_the_match_when_the_face_has_landmarks():
     assert len(head) == 40 and sum(head) == pytest.approx(1.0)
     assert sum(head[:24]) == pytest.approx(1.0), "all chromatic: a red head"
     assert beard == pytest.approx([1.0, 0.0, 0.0, 0.0]), "the chin is the cheek"
+    assert "skin" not in body, "pure red has no green to take a ratio against"
+
+
+def test_the_skin_reading_rides_the_match():
+    """A skin-toned face: [log(R/G), log(B/G)] of its cheek — the light it was
+    read under, which match 0.15.0 uses to hold a colour set-aside back."""
+    import math
+
+    skin_bgr = (110, 140, 190)
+    fake = LandmarkTorsoFrames(images=[solid_jpeg_b64(skin_bgr)])
+    make_loop(fake, REQUEST).run()
+    (body,) = fake.match_bodies
+    b, g, r = skin_bgr
+    assert body["skin"] == pytest.approx([math.log(r / g), math.log(b / g)], abs=0.03)
 
 
 def test_a_face_without_usable_landmarks_sends_neither():
@@ -131,6 +145,7 @@ def test_a_face_without_usable_landmarks_sends_neither():
     make_loop(fake, REQUEST).run()
     assert fake.match_bodies
     assert all("head" not in b and "beard" not in b for b in fake.match_bodies)
+    assert all("skin" not in b for b in fake.match_bodies)
 
 
 def test_an_opaque_frame_sends_neither():
@@ -164,4 +179,5 @@ def test_the_same_frame_reask_carries_the_faces_head_and_beard():
     first, second, reask = fake.match_bodies[:3]
     assert reask.get("excludeKeys") == ["p00001"]
     assert reask["head"] == second["head"] and reask["beard"] == second["beard"]
+    assert reask.get("skin") == second.get("skin"), "the light rides the re-ask too"
     assert first["head"] != second["head"], "red man and blue man read differently"

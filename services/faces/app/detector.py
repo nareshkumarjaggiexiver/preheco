@@ -327,7 +327,6 @@ class ScrfdDetector:
         # faces need.
         self.input_size = input_size if isinstance(input_size, tuple) else (input_size, input_size)
         self.score_min = SCRFD_SCORE_MIN if score_min is None else float(score_min)
-        providers, provider_options = providers_for(device)
         model: str | bytes = str(model_path)
         if is_trt(device):
             # The InsightFace exports name BOTH spatial dims "?", which
@@ -335,6 +334,12 @@ class ScrfdDetector:
             # the engine build and ORT drops to CUDA. Renamed apart in
             # memory; the file on the read-only mount is untouched.
             model = distinct_input_dims(model_path.read_bytes()) or model
+        # Under TRT the engine directory is keyed on exactly the graph handed
+        # to ORT (heco_common.ort.model_key). Loaded from BYTES the EP's own
+        # engine name has no file name in it at all, so any same-architecture
+        # weight (POST /model, FACES_MODEL) ran the old engine: measured, a
+        # shifted bias "built" in 0.08 s and answered the original's scores.
+        providers, provider_options = providers_for(device, model=model)
         self._session = ort.InferenceSession(
             model, providers=providers, provider_options=provider_options
         )

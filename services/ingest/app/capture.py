@@ -15,7 +15,10 @@ Sources:
   disabled via INGEST_FILE_PACE (see README "tune").
 * **rtsp url** — TCP transport by default (INGEST_RTSP_TCP), because UDP
   RTP loss under event-venue WiFi shreds H.264/H.265 frames. Read failures
-  trigger release + reopen with a 1 s pause, forever, until stopped.
+  trigger release + reopen with a 1 s pause, forever, until stopped. On the
+  cv2 decoder a camera that goes SILENT (TCP left open) fails a read only
+  after OpenCV's own 30 s timeouts, one stale frame at a time — ~90 s to
+  reconnect, measured; INGEST_LIVE_TIMEOUT_S (app.config) bounds that.
 
 Levers (app.config): with every lever off the worker runs the loop below
 exactly as it always has. Arm one — the motion gate or the live buffer — and
@@ -107,6 +110,12 @@ class CaptureWorker(threading.Thread):
         self._latest: tuple[int, int, np.ndarray] | None = None  # (seq, tMs, frame)
         # The file's own FPS, probed once and shared by pacing and the gate.
         self._fps: float | None = None
+        # A FILE that stops short of its own length was CUT, not finished:
+        # set when a cut could not be resumed, so /health can say why the
+        # worker stopped producing. Never set for a file that really ended.
+        self.interrupted: str | None = None
+        self.resumes = 0
+        self._frame_count: int | None = None
         self._pace_s = self._pacing_interval() if is_file else 0.0
         self.levers = levers if levers is not None else Levers()
         # L6 DEVICE TRUTH, served from /health: what was asked for, what
@@ -115,6 +124,7 @@ class CaptureWorker(threading.Thread):
         self._ff: FfmpegSource | None = None
         if self.levers.decoder != "cpu":
             self._ff = self._start_decoder()
+        self._start_error = self.decoder["error"]
         # LEVER MODE — see _run_levered. Decided once, here: a worker never
         # switches loops mid-stream. A hardware decoder that fell back to cpu
         # with no other lever armed IS today's worker, so it runs today's loop.
@@ -141,6 +151,15 @@ class CaptureWorker(threading.Thread):
             "captured": 0, "published": 0, "skipped": 0,
             "dropped": 0, "served": 0, "backlogMax": 0,
         }
+        # A LIVE source's reconnect record (see _note_down / _note_up):
+        # reads that blocked for INGEST_LIVE_TIMEOUT_S, reopenings, and
+        # reopenings that failed. Served on /health only in lever mode or
+        # with that knob set, so OFF keeps today's /health exactly.
+        self._live = {"stalls": 0, "reconnects": 0, "reconnectFailures": 0}
+        self._down_since_fail = 0  # failed reopenings since the source was last up
+        # The start-up fallback reason (a hardware decoder that fell back to
+        # cpu) survives a reconnect: _note_up restores it, never clears it.
+        self._start_error: str | None = None
         if self.levered and is_file:
             self._probe_fps()  # the gate's footage clock needs it even unpaced
         self._cap = self._open() if self._ff is None else None
@@ -223,7 +242,12 @@ class CaptureWorker(threading.Thread):
             "knobs": self.levers.knobs(),
             "decoder": dict(self.decoder),
             "counters": None,
+            "resumes": self.resumes,
+            "interrupted": self.interrupted,
         }
+        if not self.is_file and (self.levered or self.levers.live_timeout_s > 0):
+            with self._lock:
+                out["live"] = dict(self._live)
         if self.levered:
             out["counters"] = {
                 **counts,
@@ -249,6 +273,11 @@ class CaptureWorker(threading.Thread):
 
     def run(self) -> None:
         """Read loop: newest frame wins the slot; files pace and loop."""
+        if self.is_file and not self.loop:
+            # The file's length, read NOW, while the source is known good: a
+            # lookup made at the moment of a cut asks the server that just
+            # went away, reads "unknown", and a cut would pass for the end.
+            self._expected_frames()
         if self.levered:
             self._run_levered()
             return
@@ -286,15 +315,28 @@ class CaptureWorker(threading.Thread):
                         if self._stop_evt.is_set():
                             return
                         continue  # slot free now; decode the next frame
+                    started = time.monotonic()
                     ok = self._cap.grab()
                     frame = None
                 else:
+                    started = time.monotonic()
                     ok, frame = self._cap.read()
+                if ok and self._stalled(started):
+                    ok, frame = False, None  # stale, out of a dead stream: reconnect
                 if not ok:
                     if self.is_file and self.loop:
                         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     if self.is_file:
+                        # A read that fails before the file's own length is a
+                        # CUT stream (the planner serving it restarted), not
+                        # the end: resume at this frame, or stop producing so
+                        # the run fails loudly — never `ended` on half a file.
+                        if self._cut_short(seq):
+                            if self._resume_at(seq):
+                                continue
+                            self._give_up(seq)
+                            return
                         self.ended = True
                         return
                     # Live stream hiccup: release, breathe, reopen.
@@ -303,8 +345,12 @@ class CaptureWorker(threading.Thread):
                         return
                     try:
                         self._cap = self._open()
-                    except CaptureError:
+                    except CaptureError as exc:
+                        if self.levers.live_timeout_s > 0:
+                            self._note_down(exc)
                         continue  # keep retrying until stopped
+                    if self.levers.live_timeout_s > 0:
+                        self._note_up()
                     continue
                 seq += 1
                 # Only a RETRIEVED frame fills the slot; a grabbed one was
@@ -383,6 +429,15 @@ class CaptureWorker(threading.Thread):
                         # (an ffmpeg decoder loops the file itself: -stream_loop)
                         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
+                    if self.is_file and self._cut_short(seq):
+                        # Same rule as the loop above. The cv2 decoder can
+                        # reopen and seek; an ffmpeg decoder that exited
+                        # "cleanly" on a cut HTTP stream is not resumed yet —
+                        # it stops producing, so the run fails loudly.
+                        if self._ff is None and self._resume_at(seq):
+                            continue
+                        self._give_up(seq)
+                        return
                     if self.is_file:
                         with self._lock:
                             self._exhausted = True
@@ -393,8 +448,10 @@ class CaptureWorker(threading.Thread):
                         return
                     try:
                         self._reopen_source()
-                    except CaptureError:
+                    except CaptureError as exc:
+                        self._note_down(exc)
                         continue
+                    self._note_up()
                     if self._gate is not None:
                         self._gate.reset()  # a new stream: compare with nothing old
                     continue
@@ -411,8 +468,15 @@ class CaptureWorker(threading.Thread):
     def _next_raw(self) -> RawFrame | None:
         """Decode the next frame, or None at EOF / on a read failure."""
         if self._ff is not None:
-            return self._ff.read()
+            frame = self._ff.read()
+            if frame is None and self._ff.stalled:
+                with self._lock:
+                    self._live["stalls"] += 1  # INGEST_LIVE_TIMEOUT_S fired
+            return frame
+        started = time.monotonic()
         ok, frame = self._cap.read()
+        if ok and self._stalled(started):
+            return None  # stale, out of a dead stream: the caller reconnects
         return RawFrame.from_bgr(self._fit(frame)) if ok else None
 
     def _start_decoder(self) -> FfmpegSource | None:
@@ -437,12 +501,17 @@ class CaptureWorker(threading.Thread):
         return ff
 
     def _new_ffmpeg(self) -> FfmpegSource:
+        # INGEST_LIVE_TIMEOUT_S reaches the ffmpeg decoders as a read watchdog
+        # on a live source (a file is never "silent"); off, today's call.
+        timeout = self.levers.live_timeout_s
+        live_timeout = {} if self.is_file or timeout <= 0 else {"read_timeout_s": timeout}
         return FfmpegSource(
             self.source,
             self.levers.decoder,
             loop=self.is_file and self.loop,
             rtsp_tcp=env_bool("INGEST_RTSP_TCP", True),
             abort=self._stop_evt,
+            **live_timeout,
         )
 
     def _release_source(self) -> None:
@@ -464,6 +533,57 @@ class CaptureWorker(threading.Thread):
             self._ff = self._new_ffmpeg()
         except DecoderError as exc:
             raise CaptureError(str(exc)) from exc
+
+    def _stalled(self, started: float) -> bool:
+        """INGEST_LIVE_TIMEOUT_S: did one read of a LIVE cv2 source block for it?
+
+        With the knob set, OpenCV's own read timeout is that long too, so a
+        read can only have taken it by waiting on a stream that stopped
+        sending; what it returns then is a frame flushed out of the decoder
+        (measured: one stale frame per 30 s timeout, each resetting the
+        runner's stall clock while nothing new arrived). Counted, and the
+        caller drops it and reconnects. Always False with the knob off and for
+        files; the ffmpeg decoders get the same rule as a socket read timeout
+        (FfmpegSource read_timeout_s), counted in _next_raw.
+        """
+        limit = self.levers.live_timeout_s
+        if limit <= 0 or self.is_file or self._ff is not None:
+            return False
+        if time.monotonic() - started < limit:
+            return False
+        with self._lock:
+            self._live["stalls"] += 1
+        return True
+
+    def _note_down(self, exc: Exception) -> None:
+        """A live source's reopening failed: say so on /health, and once on stderr.
+
+        Without this a camera whose decoder cannot restart (VRAM pressure while
+        TensorRT builds, a driver reset) stayed dark for the rest of the run
+        with ``device`` still reading active=nvdec, error=null and nothing
+        logged — 40 failed restarts measured, the DecoderError that named the
+        cause thrown away — and the runner said only ``source-stalled``.
+        """
+        reason = f"live source down, reconnecting: {exc}"
+        with self._lock:
+            self._live["reconnectFailures"] += 1
+            self._down_since_fail += 1
+            first = self._down_since_fail == 1
+            self.decoder["error"] = reason
+        if first:
+            sys.stderr.write(f"[heco-device] ingest {self.decoder['active']}: {reason}\n")
+
+    def _note_up(self) -> None:
+        """A live source reopened: count it, and clear what _note_down said."""
+        with self._lock:
+            self._live["reconnects"] += 1
+            failed, self._down_since_fail = self._down_since_fail, 0
+            self.decoder["error"] = self._start_error
+        if failed:
+            sys.stderr.write(
+                f"[heco-device] ingest {self.decoder['active']}: live source back "
+                f"after {failed} failed reconnect(s)\n"
+            )
 
     def _admit(self, seq: int, t0: float, frame: RawFrame) -> None:
         """Gate one decoded frame, then publish it into the store or skip it."""
@@ -529,11 +649,23 @@ class CaptureWorker(threading.Thread):
     # ---------------------------------------------------------- internals
 
     def _open(self) -> cv2.VideoCapture:
-        """Create the VideoCapture; RTSP gets TCP transport unless disabled."""
+        """Create the VideoCapture; RTSP gets TCP transport unless disabled.
+
+        A LIVE source with INGEST_LIVE_TIMEOUT_S set is opened on the FFmpeg
+        backend with that open and read timeout (OpenCV's default is 30 s
+        each); unset, the call is exactly today's.
+        """
         if not self.is_file and env_bool("INGEST_RTSP_TCP", True):
             # FFmpeg backend reads this env at open time.
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        cap = cv2.VideoCapture(self.source)
+        limit_ms = int(self.levers.live_timeout_s * 1000)
+        if not self.is_file and limit_ms > 0:
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG, [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, limit_ms,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, limit_ms,
+            ])
+        else:
+            cap = cv2.VideoCapture(self.source)
         if not cap.isOpened():
             cap.release()
             # NEVER the raw source: it embeds rtsp://user:pass@ and this
@@ -554,6 +686,88 @@ class CaptureWorker(threading.Thread):
         if pace <= 0:
             return 0.0
         return 1.0 / (self._probe_fps() * pace)
+
+    #: A file that stops within this many frames of its own length ended;
+    #: further from the end it was cut. The last frames of an NVR file can
+    #: legitimately fail to decode (a trailing partial GOP), and a lockstep
+    #: run's final frame is known to go out with `ended` set.
+    CUT_TOLERANCE_FRAMES = 30
+    #: Seconds between resume attempts: ~2 minutes in all, enough to ride out
+    #: a planner restart (the file is streamed from the planner's disk).
+    RESUME_BACKOFF_S = (1, 2, 3, 5, 8, 13, 20, 30, 30)
+
+    def _expected_frames(self) -> int | None:
+        """The file's own frame count (container metadata), probed once.
+
+        None when the container does not say — a stream whose length is
+        unknown cannot be judged cut, and keeps today's behaviour.
+        """
+        if self._frame_count is None:
+            cap = getattr(self, "_cap", None)
+            if cap is not None and hasattr(cap, "get"):
+                # The capture already open knows its length: no second
+                # connection to the server that is streaming the file.
+                n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            else:  # an ffmpeg decoder holds the stream; ask OpenCV once
+                probe = cv2.VideoCapture(self.source)
+                n = probe.get(cv2.CAP_PROP_FRAME_COUNT) if probe.isOpened() else 0.0
+                probe.release()
+            self._frame_count = int(n) if n and n > 0 else 0
+        return self._frame_count or None
+
+    def _cut_short(self, frames_read: int) -> bool:
+        """Did this file stop well short of its own length?
+
+        THE CASE (2026-09-25). The planner serves footage to ingest over HTTP
+        from its own disk; restarting it mid-run cut the stream ("Stream ends
+        prematurely at 329869580, should be 629262502"), OpenCV's read simply
+        failed, and this worker called that the end of the file: the run
+        settled as source-ended with 4709 of 9000 frames counted — a short
+        count reported as complete. Run 8b8b87 lost its last 554 frames the
+        same way.
+        """
+        total = self._expected_frames()
+        return bool(total) and frames_read < total - self.CUT_TOLERANCE_FRAMES
+
+    def _resume_at(self, frames_read: int) -> bool:
+        """Reopen the file and continue from frame ``frames_read``.
+
+        Retries on the backoff above (the source may still be coming back);
+        True once a capture is open and positioned, False when stopped or out
+        of attempts. The frame sequence stays contiguous: the next frame
+        decoded is the one after the last frame this worker delivered.
+        """
+        for delay in self.RESUME_BACKOFF_S:
+            if self._stop_evt.wait(delay):
+                return False
+            try:
+                cap = self._open()
+            except CaptureError:
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frames_read)
+            old, self._cap = self._cap, cap
+            if old is not None:
+                old.release()
+            self.resumes += 1
+            sys.stderr.write(
+                f"[heco-ingest] file source cut at frame {frames_read} of "
+                f"{self._expected_frames()}; resumed there (resume #{self.resumes})\n"
+            )
+            return True
+        return False
+
+    def _give_up(self, frames_read: int) -> None:
+        """Stop producing WITHOUT claiming the file ended.
+
+        The runner then sees its source stall and fails the run with the
+        gallery kept — an incomplete count said out loud, where `ended` would
+        have filed it as complete.
+        """
+        self.interrupted = (
+            f"file source cut at frame {frames_read} of {self._expected_frames()} "
+            f"and could not be resumed after {len(self.RESUME_BACKOFF_S)} attempts"
+        )
+        sys.stderr.write(f"[heco-ingest] {self.interrupted}\n")
 
     def _probe_fps(self) -> float:
         """The file's own FPS (fallback 25), probed once with a throwaway capture."""

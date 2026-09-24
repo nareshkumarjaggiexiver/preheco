@@ -98,3 +98,44 @@ def align_face(img: np.ndarray, landmarks) -> np.ndarray:
     return cv2.warpAffine(
         img, matrix, (TEMPLATE_SIZE, TEMPLATE_SIZE), flags=cv2.INTER_LINEAR
     )
+
+
+#: The cheek-to-cheek band of the 112 template, eyebrows to chin, split at the
+#: nose line (x = 56): the two halves a half-hidden face disagrees on.
+_BAND_ROWS = slice(35, 100)
+_LEFT_COLS = slice(18, 56)
+_RIGHT_COLS = slice(56, 94)
+#: warpAffine fills outside the source picture with exact black; a pixel that
+#: dark in every channel is off-picture, not a shadow on the face.
+_PAD_MAX = 6
+#: A half more than this far outside the picture cannot be judged.
+_PAD_FRAC_MAX = 0.2
+
+
+def half_balance(aligned: np.ndarray) -> float | None:
+    """How evenly the two halves of an aligned face are seen, 0..1.
+
+    The darker half's mean brightness (HSV V) over the brighter half's, on
+    the 112x112 ArcFace-aligned crop. A face lit evenly reads ~0.8 (median
+    over run f0bfc5's sightings); one with something dark across half of it
+    reads low. Measured on 180 sightings of that run: p00002 — a girl with a
+    railing across her face, frontal, sharp, confidently detected, feature
+    norm 23.7, so every other floor passes her — read 0.27, and the lowest
+    genuine face 0.42 (a Sikh guest head-down, turban on one side), 5th
+    percentile 0.51.
+
+    None — never 0 — when either half is more than a fifth off-picture (the
+    face at a frame edge): absent is not zero, and an armed floor must never
+    reject a face it could not measure.
+    """
+    if aligned is None or aligned.ndim != 3 or aligned.shape[:2] != (TEMPLATE_SIZE, TEMPLATE_SIZE):
+        return None
+    v = aligned.max(axis=2).astype(np.float64)
+    band, pad = v[_BAND_ROWS], v[_BAND_ROWS] < _PAD_MAX
+    left, right = band[:, _LEFT_COLS], band[:, _RIGHT_COLS]
+    lp, rp = pad[:, _LEFT_COLS], pad[:, _RIGHT_COLS]
+    if lp.mean() > _PAD_FRAC_MAX or rp.mean() > _PAD_FRAC_MAX:
+        return None
+    lm, rm = float(left[~lp].mean()), float(right[~rp].mean())
+    hi = max(lm, rm)
+    return None if hi <= 0.0 else round(min(lm, rm) / hi, 4)

@@ -101,6 +101,12 @@ services:
       # per core). 1 cut the NVDEC + gate path from 45.4 to 30.1 ms of CPU per
       # 4K frame on the .94 box — see app/config.py cv_threads_from_env.
       INGEST_CV_THREADS: ${INGEST_CV_THREADS-}
+      # A LIVE source on the cv2 decoder: open/read timeout, seconds, and a
+      # read that blocked that long is a dead stream — dropped and reopened.
+      # Empty = OpenCV's own 30 s, which took ~90 s to reconnect a camera that
+      # went silent (measured) against the runner's 45 s stall window; 10 is
+      # the demo value. The ffmpeg decoders time out on their own.
+      INGEST_LIVE_TIMEOUT_S: ${INGEST_LIVE_TIMEOUT_S-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.
@@ -314,6 +320,10 @@ services:
       HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
       HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
       HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
+      # WELL_SEEN (0.15.1): both identities with 8+ reads are held to a
+      # clash of 0.55 instead (match config.py says why); N 0 = off.
+      HECO_REVIEW_CLOTHES_WELL_SEEN_N: ${HECO_REVIEW_CLOTHES_WELL_SEEN_N-}
+      HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH: ${HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH-}
       # HEAD AND BEARD SET-ASIDES (0.14.0), read per sighting beside the torso.
       # HEAD_CLASH: two HEADWEAR identities (turban against turban; a covered
       # head is never set against a bare one - dupattas and rumals come and
@@ -323,6 +333,15 @@ services:
       # none-vs-beard or dark-vs-white sets a pair aside; default 3, 0 = off.
       HECO_REVIEW_HEAD_CLASH: ${HECO_REVIEW_HEAD_CLASH-}
       HECO_REVIEW_BEARD_MIN_N: ${HECO_REVIEW_BEARD_MIN_N-}
+      # BEARD_PALE (0.15.0): none against a grey or white beard sets a pair
+      # aside only when 1 - an 8% warm light read a white beard as none.
+      # LIGHT_TOL (0.15.0): a clothes/head/beard set-aside is HELD BACK (the
+      # pair stays asked, why.light.held says so) when the two identities'
+      # face-skin readings differ by more than this - they were read under
+      # different light. f0bfc5 replay: one light 0.020 (p90 0.048), every
+      # false set-aside 0.08+; 0.07 held all of them. Default 0.07, 0 = off.
+      HECO_REVIEW_BEARD_PALE: ${HECO_REVIEW_BEARD_PALE-}
+      HECO_REVIEW_LIGHT_TOL: ${HECO_REVIEW_LIGHT_TOL-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -362,6 +381,10 @@ services:
       # face behind a pillar; every landmark gate passed both. Dropped faces
       # count as gatedBy "featnorm". Default 0 = off, like every other floor.
       HECO_QUALITY_MIN_FEAT_NORM: ${HECO_QUALITY_MIN_FEAT_NORM-}
+      # Half-balance floor (runner Settings.quality_min_balance): drops a face
+      # with one half hidden or dark — the railing-across-the-face case the
+      # norm floor cannot see. 0 = off; demo-up.sh arms 0.33 (measured).
+      HECO_QUALITY_MIN_BALANCE: ${HECO_QUALITY_MIN_BALANCE-}
       # Track heal (see services/runner/README.md): window 20 s, cosine floor
       # 0.45 — above the 0.377 measured impostor ceiling; tonight's heal
       # evidence was 0.69. Unset renders as "" which env_float reads as

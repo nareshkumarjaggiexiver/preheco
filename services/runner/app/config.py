@@ -506,9 +506,10 @@ class Settings:
     # BEFORE unit-normalisation — tracks recognisability: a lit, frontal face
     # embeds long; an occluded, blurred or side-on one embeds short (the
     # observation MagFace formalised).  It is the one signal that sees an
-    # OCCLUDER: p00002 on run f0bfc5 is a girl with a railing across her face
-    # — sharp, frontal, confidently detected, so every geometric floor passed
-    # her — and she became a counted guest.  Read after the embedder, so it
+    # OCCLUDER that hides much of a face: p00047 on run f0bfc5, a girl half
+    # behind a pillar, read 17.7 — under every clear face.  (It does NOT see a
+    # dark bar across a face: p00002, behind a railing, read 23.7, a typical
+    # clear face — quality_min_balance below is that gate.)  Read after the embedder, so it
     # costs nothing extra; dropped faces are stamped gateReason "featnorm" and
     # counted in gatedByFeatNorm.  A reply without norms (an older embed
     # service) gates nothing and is counted gatedUnmeasured: an armed floor
@@ -516,6 +517,18 @@ class Settings:
     # norm distribution off a run's ledger (verdicts[].featNorm) before
     # arming, because the gate is the pipeline's only irreversible discard.
     quality_min_feat_norm: float = 0.0
+    # HALF-BALANCE FLOOR — the second post-embedder gate: how evenly the two
+    # halves of the aligned face were seen (embed align.half_balance, the
+    # darker half's brightness over the brighter's).  A face with a dark
+    # railing, an arm or a shoulder across half of it reads low while every
+    # other signal calls it clean: p00002 on run f0bfc5 (and again on the
+    # 2026-09-25 re-runs) read 0.27 against 0.42 for the lowest genuine face
+    # of 180 sightings — a Sikh guest head-down with his turban on one side —
+    # and 0.51 at the 5th percentile.  Dropped faces are stamped gateReason
+    # "balance" and counted gatedByBalance; a face the embedder could not
+    # measure (off the frame edge, an older embed service) is kept and counted
+    # gatedUnmeasured.  0 = off.
+    quality_min_balance: float = 0.0
 
     # APPEARANCE WHITE BALANCE (heco_counting.appearance.frame_gains).  Off
     # by default.  On: each decoded frame's illuminant is estimated once
@@ -620,6 +633,9 @@ def from_env() -> Settings:
         presence_split=env_int("HECO_PRESENCE_SPLIT", s.presence_split),
         quality_min_feat_norm=env_float(
             "HECO_QUALITY_MIN_FEAT_NORM", s.quality_min_feat_norm
+        ),
+        quality_min_balance=env_float(
+            "HECO_QUALITY_MIN_BALANCE", s.quality_min_balance
         ),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),

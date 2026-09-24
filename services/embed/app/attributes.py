@@ -40,6 +40,7 @@ from heco_common.ort import (
     is_trt,
     providers_for,
     trt_batch_profile,
+    trt_truth,
 )
 
 #: The default weight location — beside the embedder's, gitignored, never
@@ -169,7 +170,8 @@ class AttributeModel:
         import onnxruntime as ort  # deferred, like every family loader
 
         self.model_name = model_path.name
-        providers, provider_options = providers_for(device)
+        # `model`: a TensorRT engine keyed on the weights (heco_common.ort).
+        providers, provider_options = providers_for(device, model=model_path)
         # ONE intra-op thread, deliberately. ORT's default pool (one thread
         # per core) spin-waits after every run, and inside the embedder's
         # loop those spinning threads steal the cores cv2's SFace is about
@@ -229,16 +231,21 @@ class AttributeModel:
             # Same reason as the embedder: an explicit 1..max profile, or
             # every new batch size rebuilds the engine inside a request.
             providers, provider_options = providers_for(
-                device, trt_batch_profile(inp.name, sample, self.batch_max))
+                device, trt_batch_profile(inp.name, sample, self.batch_max), model=model_path)
             self._session = ort.InferenceSession(
                 str(model_path), options, providers=providers, provider_options=provider_options
             )
             self.providers_active = list(self._session.get_providers())
+        #: TensorRT's own read-back (trt_truth) — None off TRT and whenever
+        #: the engine did not come up; embed /health serves it beside the
+        #: embedder's under device.attributes.
+        self.trt = None
         if is_trt(device):
             # Build (or load) the TensorRT engine at load, not in a request —
             # and read the truth after it (a failed build drops ORT to CUDA).
             self._session.run(None, {self._input_name: np.zeros((1, *sample), self._np_dtype)})
             self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
             announce_device("embed-attributes", self.device_requested, self.providers_active)
 
     def blob(self, img: np.ndarray, box) -> np.ndarray:
