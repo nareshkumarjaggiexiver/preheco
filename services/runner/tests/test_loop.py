@@ -1331,7 +1331,43 @@ def test_ref_only_stays_off_unless_configured():
     assert cfg.Settings().frames_ref_only is False
 
 
-def test_ref_only_needs_proof_not_just_configuration(monkeypatch):
+def _readable_ref(monkeypatch, tmp_path) -> str:
+    """A real shared frame the runner itself can read (HECO_FRAMES_DIR)."""
+    import numpy as np
+    from heco_common import frameref
+
+    monkeypatch.setenv("HECO_FRAMES_DIR", str(tmp_path))
+    return frameref.write_frame(np.zeros((8, 8, 3), np.uint8), 1)
+
+
+def _probe_loop(client, **settings):
+    """A bare RunLoop with just what _negotiate_ref_only touches."""
+    from app import loop as loop_mod
+
+    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
+    loop.client = client
+    loop.log = _OneArgLog()
+    loop._stop = threading.Event()
+    loop._held_frame = None
+    loop.s = SimpleNamespace(
+        frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
+        faces_url="http://f", embed_url="http://e", **settings,
+    )
+    loop._post = lambda url, payload: {}
+    return loop
+
+
+class _Frame:
+    """A GET /frame answer: 200 with a body, or the 503 of 'not yet'."""
+
+    def __init__(self, body, status_code=200):
+        self.body, self.status_code, self.content = body, status_code, b"{}"
+
+    def json(self):
+        return self.body
+
+
+def test_ref_only_needs_proof_not_just_configuration(monkeypatch, tmp_path):
     """Configuration is a REQUEST; the probe is evidence.
 
     With ref-only on, a stage that cannot resolve the ref is sent no pixels at
@@ -1339,25 +1375,12 @@ def test_ref_only_needs_proof_not_just_configuration(monkeypatch):
     every container reports healthy. The probe turns that into one log line
     and a run that simply keeps its JPEGs.
     """
-    from app import loop as loop_mod
-
-    class _Resp:
-        content = b"{}"
-        def json(self): return {"frameRef": "f1_8x8.bgr"}
-
-    class _Client:
-        def get(self, url, **kw): return _Resp()
-
-    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
-    loop.client = _Client()
-    loop.log = _OneArgLog()
-    loop.s = SimpleNamespace(
-        frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
-        faces_url="http://f", embed_url="http://e",
-    )
-    # every stage accepts the ref -> ref-only is used
-    loop._post = lambda url, payload: {}
+    ref = _readable_ref(monkeypatch, tmp_path)
+    frame = {"seq": 1, "imageB64": "abc", "frameRef": ref}
+    loop = _probe_loop(SimpleNamespace(get=lambda url, **kw: _Frame(frame)))
+    # every stage (and the runner itself) reads the ref -> ref-only is used
     assert loop._negotiate_ref_only() is True
+    assert loop._held_frame == frame, "the probe's frame is the run's first frame"
 
     # ONE stage cannot read it -> the whole run keeps its JPEGs
     def _refuse(url, payload):
@@ -1367,57 +1390,53 @@ def test_ref_only_needs_proof_not_just_configuration(monkeypatch):
     loop._post = _refuse
     assert loop._negotiate_ref_only() is False
 
+    # ...and neither can the runner itself (no mount on it): its torso, head
+    # and beard reads would have had no pixels for the whole run.
+    loop._post = lambda url, payload: {}
+    monkeypatch.delenv("HECO_FRAMES_DIR")
+    assert loop._negotiate_ref_only() is False
+    assert any("runner itself" in line for line in loop.log.lines)
+
 
 def test_ref_only_declines_when_ingest_offers_no_ref(monkeypatch):
     """No shared mount on the producer side is not an error — it is the old
     pipeline, which is always a valid answer."""
-    from app import loop as loop_mod
+    gets = []
 
-    class _Resp:
-        content = b"{}"
-        def json(self): return {"seq": 1}          # no frameRef
+    def _get(url, **kw):
+        gets.append(url)
+        return _Frame({"seq": 1, "imageB64": "abc"})          # no frameRef
 
-    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
-    loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
-    loop.log = _OneArgLog()
-    loop._stop = threading.Event()
-    loop.s = SimpleNamespace(frames_ref_only=True, ingest_url="http://i")
-    loop._post = lambda url, payload: {}
-    # It polls for a couple of seconds first — a source that never offers a
-    # ref is a real answer, just not an instant one.
+    loop = _probe_loop(SimpleNamespace(get=_get))
     assert loop._negotiate_ref_only() is False
+    # ONE ask: a frame without a ref IS the answer. Asking twenty times, as
+    # the first cut did, dequeued twenty frames from a live buffer (and moved
+    # a lockstep reader twenty frames on) that the run then never counted.
+    assert gets == ["http://i/frame"]
+    assert loop._held_frame == {"seq": 1, "imageB64": "abc"}, "and the run still gets it"
 
 
-def test_ref_only_waits_for_the_first_frame_instead_of_reading_503_as_refusal():
+def test_ref_only_waits_for_the_first_frame_instead_of_reading_503_as_refusal(
+    monkeypatch, tmp_path
+):
     """REGRESSION (2026-09-24). The probe runs right after the source opens,
     and a source that has not decoded its first frame yet answers 503. Taking
     that as "no shared transport" silently kept the JPEGs on a stack that was
     configured correctly and writing refs the whole time — the optimisation
     was off and nothing said so."""
-    from app import loop as loop_mod
-
+    ref = _readable_ref(monkeypatch, tmp_path)
     calls = {"n": 0}
 
-    class _Resp:
-        content = b"{}"
-        def json(self):
-            calls["n"] += 1
-            # the first two polls are the 'no frame captured yet' shape
-            if calls["n"] <= 2:
-                return {"detail": "no frame captured yet — retry"}
-            return {"frameRef": "f9_8x8.bgr"}
+    def _get(url, **kw):
+        calls["n"] += 1
+        # the first two polls are the 'no frame captured yet' shape
+        if calls["n"] <= 2:
+            return _Frame({"detail": "no frame captured yet — retry"}, status_code=503)
+        return _Frame({"seq": 9, "imageB64": "abc", "frameRef": ref})
 
-    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
-    loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
-    loop.log = _OneArgLog()
-    loop._stop = threading.Event()
-    loop.s = SimpleNamespace(
-        frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
-        faces_url="http://f", embed_url="http://e",
-    )
-    loop._post = lambda url, payload: {}
+    loop = _probe_loop(SimpleNamespace(get=_get))
     assert loop._negotiate_ref_only() is True
-    assert calls["n"] >= 3, "it polled past the not-yet answers"
+    assert calls["n"] == 3, "it polled past the not-yet answers, and no further"
 
 
 def test_ref_only_probe_gives_up_rather_than_blocking_a_stopped_run():

@@ -3,9 +3,10 @@
 #   docker compose -f docker-compose.yml -f docker-compose.gpumax.yml \
 #                  -f docker-compose.shm.yml up -d
 #
-# A tmpfs (RAM, never disk) mounted into ingest and the three stages that
-# consume a frame. Ingest writes each frame once as raw BGR and hands the
-# others its name; they read it straight out of the page cache. Measured cost
+# A tmpfs (RAM, never disk) mounted into ingest, the three stages that
+# consume a frame, and the runner (which cuts its descriptors from it).
+# Ingest writes each frame once as raw BGR and hands the others its name;
+# they read it straight out of the page cache. Measured cost
 # this removes, per 4K frame on the .94 box: one 13.9 ms JPEG encode, three
 # 17.8 ms decodes, and ~15 ms of base64+JSON for a 2.1 MB payload — about
 # 82 ms of a 224 ms budget, spent turning memory into text and back.
@@ -49,11 +50,16 @@ services:
     volumes: ["frames:/frames:ro"]
 
   runner:
-    # The runner mounts nothing — it never touches a frame's pixels. It only
-    # needs the switch that lets it stop asking ingest for a JPEG, and it
-    # proves the stages can read refs before using it.
+    # The runner READS frames too: its torso, head and beard descriptors (the
+    # appearance veto, the heal veto, the review queue's evidence) and its
+    # face cards are cut from the decoded frame, and a ref-only frame has no
+    # JPEG to decode. So it mounts the frames read-only, and the ref-only
+    # switch proves the runner AND the three stages can read a ref before it
+    # stops asking ingest for JPEGs — otherwise the run keeps its JPEGs.
     environment:
+      <<: *frames
       HECO_FRAMES_REF_ONLY: ${HECO_FRAMES_REF_ONLY-}
+    volumes: ["frames:/frames:ro"]
 
 volumes:
   frames:
