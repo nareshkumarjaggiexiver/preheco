@@ -233,6 +233,52 @@ def test_trt_loads_the_dims_renamed_graph_and_other_devices_the_file(fake_ort, m
     assert seen[-1] == str(fake_ort["weight"]), "nothing to rename: the file, as ever"
 
 
+class _TrtSession(_FakeSession):
+    """TensorRT in the session until the first run(); with ``falls_back``,
+    ORT's silent rebuild on [CUDA, CPU] after a failed engine build — what
+    the box did with the original SCRFD bytes at 1472x832 (\"Falling back to
+    [CUDAExecutionProvider, CPUExecutionProvider] and retrying\")."""
+
+    _TRT = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def __init__(self, falls_back, options):
+        super().__init__()
+        self.falls_back, self.options, self.ran = falls_back, options, False
+
+    def get_providers(self):
+        if self.ran and self.falls_back:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return list(self._TRT)
+
+    def get_provider_options(self):
+        return {"TensorrtExecutionProvider": self.options}
+
+    def run(self, _names, feeds):
+        self.ran = True
+        return _zero_tensors()
+
+
+@pytest.mark.parametrize("falls_back", [True, False])
+def test_trt_device_truth_is_read_after_the_dry_run(fake_ort, monkeypatch, tmp_path, falls_back):
+    """The providers ORT reports at construction are NOT the truth under TRT:
+    a failed engine build inside the first run() drops the session to CUDA
+    without raising. /health must then say CUDA and trt=null — and, when the
+    engine did build, carry TensorRT's own read-back of its options."""
+    monkeypatch.setenv("HECO_TRT_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(d, "distinct_input_dims", lambda raw: None)
+    mod = sys.modules["onnxruntime"]
+    monkeypatch.setattr(mod, "InferenceSession", lambda model, providers, provider_options: (
+        _TrtSession(falls_back, provider_options[0])))
+    det = d.ScrfdDetector(fake_ort["weight"], 640, "TRT")
+    if falls_back:
+        assert det.providers_active == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert det.trt is None
+    else:
+        assert det.providers_active[0] == "TensorrtExecutionProvider"
+        assert det.trt["fp16"] is True
+        assert det.trt["engineCache"].startswith(str(tmp_path / "cache"))
+
+
 def test_trt_engine_dir_is_keyed_on_the_graph_handed_to_ort(fake_ort, monkeypatch, tmp_path):
     """Loaded from BYTES, the EP's own engine name carries no file name: any
     same-architecture weight ran the cached engine (a bias shifted by +2.0
