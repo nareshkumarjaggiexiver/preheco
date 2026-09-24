@@ -692,14 +692,27 @@ def apply_gains(crop_bgr: np.ndarray, gains: tuple[float, float, float]) -> np.n
 # shaded chin is skin that kept its saturation), WHITE when a pale pixel is
 # at least 0.9 of the cheek's brightness.
 
-#: The head descriptor's wire length: 24 hue + 3 brightness + 13 reserved.
+#: The head descriptor's wire length: 24 hue + 3 brightness, then the
+#: headwear share and its flag (below), then 11 reserved.
 HEAD_DIM = 40
 #: 24 hue bins of 15 degrees, SOFT-assigned and wrapping: a turban red
 #: (H 0) and orange (H 12.6) share no bin, and H 179 is red like H 0.
 HEAD_H_BINS = 24
 #: Achromatic pixels by brightness: black / grey / white hair.
 HEAD_V_BINS = 3
-HEAD_RESERVED = HEAD_DIM - HEAD_H_BINS - HEAD_V_BINS  # 13
+HEAD_RESERVED = HEAD_DIM - HEAD_H_BINS - HEAD_V_BINS  # 13 (27, 28 now carry the share)
+#: Slot 27: the HEADWEAR share — the fraction of the window's lit pixels that
+#: are chromatic AND outside the skin window — and slot 28: 1.0, "27 was
+#: measured" (a runner before 2026-09-25 sends zeros there).  The histogram's
+#: chromatic share could not tell cloth from skin: a bald or balding scalp is
+#: chromatic skin and read 0.91 (p00062 on run f0bfc5), a "headwear" the
+#: review then set against real turbans at 0.21-0.26.  Measured on f0bfc5's
+#: 45 identities: every bald, balding or haired head 0.01-0.11 (p00062 0.03),
+#: the blue, maroon and pink turbans 0.51-0.82 — and the peach turban 0.09,
+#: because it sits inside the skin window: skin-toned cloth reads bare,
+#: which only ever keeps a question asked.
+HEAD_WEAR_SLOT = 27
+HEAD_WEAR_FLAG = 28
 #: Chromatic from this chroma (max - min channel, 8-bit) up.
 HEAD_CHROMA_MIN = 20
 #: Weight of a skin-window pixel (1.0 everywhere else).
@@ -913,8 +926,10 @@ def head_descriptor(
     lit (not blown) pixel votes, skin-window pixels at HEAD_SKIN_WEIGHT:
     those with chroma >= HEAD_CHROMA_MIN into 24 soft, wrapping hue bins
     (0..23), the rest into 3 soft brightness bins (24..26: black, grey,
-    white); 27..39 are reserved zeros; the whole sums to 1.  ``gains``
-    (:func:`frame_gains`) are applied first, as for the torso.
+    white), summing to 1; 27 is the headwear share (chromatic pixels outside
+    the skin window over all lit ones) and 28 is 1.0 (27 measured); 29..39
+    are reserved zeros.  ``gains`` (:func:`frame_gains`) are applied first,
+    as for the torso.
 
     None — never a zero vector — without two eye landmarks, for a window
     under HEAD_MIN_SIDE_PX, or with fewer than HEAD_MIN_PX lit pixels.
@@ -930,7 +945,8 @@ def head_descriptor(
     if int(lit.sum()) < HEAD_MIN_PX:
         return None
     hsv = cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)
-    weight = np.where(lit, np.where(_skin_window(colour, hsv[:, :, 1]), HEAD_SKIN_WEIGHT, 1.0), 0.0)
+    skin = _skin_window(colour, hsv[:, :, 1])
+    weight = np.where(lit, np.where(skin, HEAD_SKIN_WEIGHT, 1.0), 0.0)
     chromatic = (_max3(colour).astype(np.int16) - _min3(colour)) >= HEAD_CHROMA_MIN
     out = np.zeros(HEAD_DIM, dtype=np.float64)
     sel = lit & chromatic
@@ -942,7 +958,10 @@ def head_descriptor(
     total = float(out.sum())
     if total <= 0.0:
         return None
-    return (out / total).tolist()
+    out /= total
+    out[HEAD_WEAR_SLOT] = float((lit & chromatic & ~skin).sum()) / float(lit.sum())
+    out[HEAD_WEAR_FLAG] = 1.0
+    return out.tolist()
 
 
 def beard_descriptor(

@@ -34,8 +34,11 @@ import numpy as np
 
 from .appearance import (
     BEARD_DIM,
+    HEAD_BINS,
     HEAD_DIM,
     HEAD_H_BINS,
+    HEAD_WEAR_FLAG,
+    HEAD_WEAR_SLOT,
     SKIN_DIM,
     TORSO_DIM,
     beard_class,
@@ -1224,8 +1227,35 @@ def _reads_of(evidence: list, field: str, dim: int) -> dict[str, IdentityReads]:
 
 
 def head_reads(evidence: list) -> dict[str, IdentityReads]:
-    """Each identity's head descriptors (40 floats) from the body log."""
-    return _reads_of(evidence, "head", HEAD_DIM)
+    """Each identity's head HISTOGRAMS (bins 0..26 of the 40) from the body log.
+
+    Sliced, because slots 27 and 28 carry the headwear share and its flag:
+    intersected with the histogram, the flag alone (1.0 on both sides)
+    would read any two heads as agreeing.
+    """
+    by_key: dict[str, list] = {}
+    for row in evidence:
+        vec = row.head
+        if vec is None or vec.size != HEAD_DIM:
+            continue
+        by_key.setdefault(row.key, []).append((_seconds(row.created_at), vec[:HEAD_BINS]))
+    return {k: identity_reads(v) for k, v in by_key.items()}
+
+
+def head_wear(evidence: list) -> dict[str, float]:
+    """Each identity's mean HEADWEAR share, over its reads that measured one.
+
+    The share is the head window's chromatic pixels OUTSIDE the skin window
+    (slot 27, flagged by slot 28); an identity whose reads predate it is
+    absent, and the rule falls back to the histogram's chromatic share.
+    """
+    by_key: dict[str, list[float]] = {}
+    for row in evidence:
+        vec = row.head
+        if vec is None or vec.size != HEAD_DIM or vec[HEAD_WEAR_FLAG] < 0.5:
+            continue
+        by_key.setdefault(row.key, []).append(float(vec[HEAD_WEAR_SLOT]))
+    return {k: float(np.mean(v)) for k, v in by_key.items()}
 
 
 def beard_reads(evidence: list) -> dict[str, IdentityReads]:
@@ -1269,33 +1299,53 @@ _HEAD_SELF_MIN = 0.6
 #: wedding the same guest's head is covered and uncovered within the night —
 #: a dupatta drawn over the hair for the ceremony, a rumal or patka for the
 #: Gurdwara — so "pink turban against black hair" (#15, head cross 0.41) is
-#: exactly what one person minted twice can look like.  A bald scalp reads
-#: as its skin colour (0.91 chromatic) and counts as headwear here: the
-#: residual, a bald man with a rumal on in one identity only, is rare.
+#: exactly what one person minted twice can look like.
 _HEAD_WEAR_MIN = 0.5
+#: ...but a bald or balding scalp is chromatic too — its skin: p00062 read
+#: 0.91 and, once his reads spanned two seconds, was set against the run's
+#: blue, maroon and pink turbans at 0.21-0.26 — a balding guest in a safa
+#: for the baraat set aside against himself bare-headed later.  So where the
+#: runner measured it (head_wear), headwear is the share of the window
+#: that is chromatic OUTSIDE the skin window, at this floor: on f0bfc5 every
+#: bald, balding or haired head read 0.01-0.11 (p00062 0.03), the blue,
+#: maroon and pink turbans 0.51-0.82.  A skin-toned (peach) turban reads
+#: bare (0.09) and is asked, never set aside, on its head.
+_HEAD_WEAR_MIN_SKINLESS = 0.3
 
 
-def headwear_share(reads: IdentityReads | None) -> float | None:
-    """The chromatic share of an identity's mean head reading, or None."""
+def headwear_share(reads: IdentityReads | None, wear: float | None = None) -> float | None:
+    """An identity's headwear share: ``wear`` (skin left out) when measured,
+    else the chromatic share of its mean head reading; None without reads."""
+    if wear is not None:
+        return float(wear)
     if reads is None or not reads.vectors:
         return None
     return float(np.mean([float(v[:HEAD_H_BINS].sum()) for v in reads.vectors]))
 
 
 def head_apart(
-    ha: IdentityReads | None, hb: IdentityReads | None, sim: float | None, clash: float
+    ha: IdentityReads | None,
+    hb: IdentityReads | None,
+    sim: float | None,
+    clash: float,
+    wear_a: float | None = None,
+    wear_b: float | None = None,
 ) -> bool:
     """Do two identities' headwear — turban against turban — say two people?
 
     Both identities must read one head (:data:`_HEAD_MIN_N` reads over
     _CLOTHES_MIN_SPAN_S agreeing at :data:`_HEAD_SELF_MIN`), both heads must
-    be headwear (:data:`_HEAD_WEAR_MIN`), and the best reading of one
-    against any of the other must stay under ``clash``.  ``clash <= 0`` is
-    off.
+    be headwear (``wear_*`` — the skin-free share, :func:`head_wear` — at
+    :data:`_HEAD_WEAR_MIN_SKINLESS`, or without it the chromatic share at
+    :data:`_HEAD_WEAR_MIN`), and the best reading of one against any of the
+    other must stay under ``clash``.  ``clash <= 0`` is off.
     """
-    for r in (ha, hb):
-        share = headwear_share(r)
-        if share is None or share < _HEAD_WEAR_MIN:
+    for r, wear in ((ha, wear_a), (hb, wear_b)):
+        if r is None:
+            return False
+        share = headwear_share(r, wear)
+        floor = _HEAD_WEAR_MIN if wear is None else _HEAD_WEAR_MIN_SKINLESS
+        if share is None or share < floor:
             return False
     return clothes_apart(ha, hb, sim, clash, _HEAD_MIN_N, _HEAD_SELF_MIN)
 
@@ -1539,6 +1589,7 @@ def review_duplicates(
 
     torsos = torso_reads(evidence, tpl_torsos)
     heads = head_reads(evidence)
+    wears = head_wear(evidence)
     beards = beard_reads(evidence)
     skins = skin_medians(evidence)
     candidates, set_aside = [], []
@@ -1579,6 +1630,8 @@ def review_duplicates(
                 "selfB": None if hb is None else hb.agreement,
                 "nA": 0 if ha is None else ha.n,
                 "nB": 0 if hb is None else hb.n,
+                "wearA": wears.get(a),
+                "wearB": wears.get(b),
             },
             "beard": {
                 "a": beard_a, "b": beard_b,
@@ -1606,7 +1659,7 @@ def review_duplicates(
             )
         ):
             colour.append("clothes")
-        if head_apart(ha, hb, head_sim, head_clash):
+        if head_apart(ha, hb, head_sim, head_clash, wears.get(a), wears.get(b)):
             colour.append("head")
         if beard_differ:
             colour.append("beard")
