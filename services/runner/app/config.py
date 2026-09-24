@@ -413,11 +413,55 @@ class Settings:
     # person's face in the frame twice, and co-presence will assert they are
     # two different people — blocking a fold that was correct.  That is the
     # deliberate side of this project's asymmetry: a blocked fold OVER-counts,
-    # which is VISIBLE and an operator can merge; a wrong fold UNDER-counts
-    # SILENTLY and nobody ever sees it.  Fixed mirrors and screens are handled
-    # by exclusion zones; a hand-held phone is not, and that is the residual.
+    # which is VISIBLE (though not operator-fixable: /merge refuses a
+    # cannot_link pair for a human too, and only a fresh run clears the
+    # row); a wrong fold UNDER-counts SILENTLY and nobody ever sees it.  Fixed
+    # mirrors and screens are handled by exclusion zones; a hand-held phone
+    # is not, and that is the residual.
     # 0 turns the mechanism off completely: nothing recorded, nothing sent.
     copresence_split: int = 1
+
+    # TRACK-PRESENCE CO-PRESENCE (see loop._track_presence).  1 = on, 0 = off.
+    #
+    # Face co-presence above only fires between identities whose FACES were
+    # matched in one frame, so a guest standing in the frame with their back
+    # to the camera is never asserted co-present with anyone.  THE MEASUREMENT
+    # (run f0bfc5, 2026-09-23, Punjab wedding-hall overview camera, 74 guests,
+    # a 500-pair review queue): pair #5 was p00048 (girl, yellow top) against
+    # p00052 (woman, dark green dress) at face 0.338 — and p00048 was IN THE
+    # SAME FRAME as p00052, back-turned.  The ledger held the proof and the
+    # loop could not use it.
+    #
+    # A track that has already resolved to an identity at >=
+    # track_lock_min_cosine (the same 0.45 floor the lock and the heal use,
+    # above the 0.377 measured impostor ceiling) stays that person until the
+    # tracker drops the id or another track CONTESTS the box (IoU >= 0.4 —
+    # the geometry of a tracker identity swap).  While bound, the track stands
+    # in for the face: over a person box that carries no face verdict this
+    # frame, it puts its identity in the frame, and every distinct pair on
+    # different bodies goes through the same cannot_link door
+    # (loop._assert_co_presence), counted as trackPresenceSplits.  Replayed
+    # over f0bfc5's ledger (scratchpad replay.py): 48 pairs proven distinct
+    # against 25 from faces alone, pair #5 retired at seq 9283, and 8 of the
+    # 500 queued pairs gone — with no threshold moved.  0 turns it off:
+    # nothing bound, nothing asserted, and the run behaves exactly as before.
+    presence_split: int = 1
+
+    # POST-EMBED FEATURE-NORM FLOOR (see loop._gate_feat_norm).  0 = off, the
+    # default.  ArcFace's raw feature norm — the L2 length of the vector
+    # BEFORE unit-normalisation — tracks recognisability: a lit, frontal face
+    # embeds long; an occluded, blurred or side-on one embeds short (the
+    # observation MagFace formalised).  It is the one signal that sees an
+    # OCCLUDER: p00002 on run f0bfc5 is a girl with a railing across her face
+    # — sharp, frontal, confidently detected, so every geometric floor passed
+    # her — and she became a counted guest.  Read after the embedder, so it
+    # costs nothing extra; dropped faces are stamped gateReason "featnorm" and
+    # counted in gatedByFeatNorm.  A reply without norms (an older embed
+    # service) gates nothing and is counted gatedUnmeasured: an armed floor
+    # never rejects a face it could not measure.  NOT CALIBRATED — read the
+    # norm distribution off a run's ledger (verdicts[].featNorm) before
+    # arming, because the gate is the pipeline's only irreversible discard.
+    quality_min_feat_norm: float = 0.0
 
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
@@ -501,6 +545,10 @@ def from_env() -> Settings:
         same_frame_clash=env_float("HECO_SAME_FRAME_CLASH", s.same_frame_clash),
         face_card_improve=env_float("HECO_FACE_CARD_IMPROVE", s.face_card_improve),
         copresence_split=env_int("HECO_COPRESENCE_SPLIT", s.copresence_split),
+        presence_split=env_int("HECO_PRESENCE_SPLIT", s.presence_split),
+        quality_min_feat_norm=env_float(
+            "HECO_QUALITY_MIN_FEAT_NORM", s.quality_min_feat_norm
+        ),
         source_poll_s=env_float("HECO_SOURCE_POLL_S", s.source_poll_s),
         source_stall_s=env_float("HECO_SOURCE_STALL_S", s.source_stall_s),
         tap_interval_s=env_float("HECO_TAP_INTERVAL_S", s.tap_interval_s),

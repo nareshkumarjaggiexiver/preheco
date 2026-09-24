@@ -14,6 +14,14 @@ and its output is the input verbatim — letting tests assert the exact
 normalized/transposed blob ArcFaceEmbedder fed the graph, which pins the
 NCHW-vs-NHWC branch and the dtype cast at value level, not just by shape.
 
+The attribute tests need a graph shaped like genderage (an image in, THREE
+numbers out), so `reduce_mean_model` adds one more single-node graph:
+ReduceMean over the spatial axes, keepdims=0, so the "prediction" is the
+per-channel mean of the exact crop AttributeModel fed — [mean R, mean G,
+mean B] in RGB order — which pins the InsightFace warp, the BGR->RGB swap
+and the absence of mean/std normalisation at value level, and lets a test
+steer gender (R vs G) and age (B) by painting the frame.
+
 Correctness of the encoding is self-checking: every fixture is loaded
 through onnxruntime.InferenceSession inside the tests, so a byte this
 module gets wrong fails the suite loudly. Field numbers are from
@@ -77,9 +85,56 @@ def flatten_model(elem_type: int, input_shape: tuple[int, ...]) -> bytes:
     return _int(1, 8) + _blob(7, graph) + _blob(8, opset)  # ir_version 8
 
 
+# AttributeProto.AttributeType values (onnx/onnx.proto).
+ATTR_INT, ATTR_INTS = 2, 7
+
+
+def _attr_int(name: str, value: int) -> bytes:
+    """AttributeProto {name(1), i(3), type(20)=INT}."""
+    return _string(1, name) + _int(3, value) + _int(20, ATTR_INT)
+
+
+def _attr_ints(name: str, values: tuple[int, ...]) -> bytes:
+    """AttributeProto {name(1), ints(8)..., type(20)=INTS} — unpacked repeated."""
+    return _string(1, name) + b"".join(_int(8, v) for v in values) + _int(20, ATTR_INTS)
+
+
+def reduce_mean_model(elem_type: int, input_shape: tuple[int, ...],
+                      axes: tuple[int, ...] = (2, 3)) -> bytes:
+    """A ModelProto: ReduceMean(x, axes, keepdims=0) -> y of (batch, channels).
+
+    `axes` are the two spatial axes: (2, 3) for an NCHW input, (1, 2) for
+    NHWC. Opset 13 ReduceMean takes `axes` as an attribute (it became an
+    input in opset 18), which keeps the graph free of initializers.
+    """
+    kept = [d for i, d in enumerate(input_shape) if i not in axes]
+    node = (
+        _string(1, "x") + _string(2, "y")
+        + _string(3, "reduce_mean") + _string(4, "ReduceMean")
+        + _blob(5, _attr_ints("axes", axes)) + _blob(5, _attr_int("keepdims", 0))
+    )
+    graph = (
+        _blob(1, node)
+        + _string(2, "tiny")
+        + _blob(11, _value_info("x", elem_type, input_shape))
+        + _blob(12, _value_info("y", elem_type, tuple(kept)))
+    )
+    opset = _int(2, 13)
+    return _int(1, 8) + _blob(7, graph) + _blob(8, opset)
+
+
 def write_model(directory: Path, filename: str, elem_type: int,
                 input_shape: tuple[int, ...]) -> Path:
     """Serialize a flatten_model to `directory/filename` and return the path."""
     path = Path(directory) / filename
     path.write_bytes(flatten_model(elem_type, input_shape))
+    return path
+
+
+def write_reduce_mean_model(directory: Path, filename: str, elem_type: int,
+                            input_shape: tuple[int, ...],
+                            axes: tuple[int, ...] = (2, 3)) -> Path:
+    """Serialize a reduce_mean_model to `directory/filename` and return the path."""
+    path = Path(directory) / filename
+    path.write_bytes(reduce_mean_model(elem_type, input_shape, axes))
     return path

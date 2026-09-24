@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .appearance import best_intersection
+from .appearance import best_intersection, intersection
 from .store import Neighbour, VectorStore, as_unit, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -66,6 +66,12 @@ class MatchResult:
     # the enrolment wrong can retract exactly that row via POST /template/forget
     # instead of guessing; the runner's same-frame guard is the only caller.
     template_id: int | None = None
+    # Rowid of the body_sightings row this call logged (None when the call
+    # carried no usable body).  Same purpose as template_id: the runner's
+    # same-frame guard hands it back via POST /template/forget when it proves
+    # the sighting was a different body, so the box leaves the wrong
+    # identity's stature evidence instead of staying there for the run.
+    body_id: int | None = None
     # Set ONLY on a mint whose best cosine against the pre-existing gallery
     # landed inside one of the TWO near-miss bands:
     # {"key": the near-missed identity, "cosine": that best score,
@@ -409,6 +415,15 @@ def match(
     # against the rest of the gallery (an existing guest if one fits, a fresh
     # mint otherwise) instead of re-landing on the key it cannot belong to.
     exclude_keys: set[str] | None = None,
+    # The embed service's reading of this face ({"gender", "genderP", "age"}),
+    # the raw feature's L2 norm, and the sighting's containing PERSON box
+    # ({"h", "w", "yBottom", "frameH"}, raw detector px).  Stored, never
+    # judged: attributes and the norm ride with any template this call
+    # writes; the body is logged on every guest call.  Their only reader is
+    # the review queue (see review_duplicates).  None = not measured.
+    attributes: dict | None = None,
+    feat_norm: float | None = None,
+    body: dict | None = None,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -504,6 +519,16 @@ def match(
     cannot-link must never change WHO someone is — only what is suggested
     about them.  :func:`_near_miss` carries the full argument.
 
+    ATTRIBUTES, FEATURE NORM AND BODY ARE RECORDED, NOT CONSULTED (v4,
+    2026-09-24).  ``attributes`` (sex, its probability, age) and ``feat_norm``
+    are written beside any template this call stores; ``body`` is appended to
+    the sighting log on every guest call whether or not a template is
+    written.  Nothing here reads them back.  They exist for
+    :func:`review_duplicates`, which uses them to set aside pairs that cannot
+    be one person — and even there they only remove questions from a human's
+    list, never answer one.  ``None`` for any of them is "not measured" and
+    stores NULL.
+
     The defaults here are the pre-M1 behaviour (cap 1, no enrolment, no
     appearance veto, no near-miss flag of either basis); the service passes
     the real values from :mod:`app.config`, so a caller that only wants the
@@ -554,11 +579,14 @@ def match(
                     quality=quality,
                     sub_canon=sub_canon,
                     appearance=appearance,
+                    attributes=attributes,
+                    feat_norm=feat_norm,
                 )
                 # Redundancy, NOT quality — see _should_enrol clause 5 for the
                 # measurement that killed the quality rule here.
                 store.prune_redundant(hit.key, templates_per_person)
                 overlap = _overlap_after_write(store, hit.key, embedding, appearance, threshold)
+            body_id = _log_body(store, hit.key, body, quality)
             return MatchResult(
                 hit.key,
                 False,
@@ -570,11 +598,14 @@ def match(
                 appearance_sim=appearance_sim,
                 appearance_vetoed=vetoed,
                 template_id=template_id,
+                body_id=body_id,
                 overlap=overlap,
             )
         key = store.add_auto(
-            embedding, quality=quality, sub_canon=sub_canon, prefix="p", appearance=appearance
+            embedding, quality=quality, sub_canon=sub_canon, prefix="p",
+            appearance=appearance, attributes=attributes, feat_norm=feat_norm,
         )
+        body_id = _log_body(store, key, body, quality)
         # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
         # BEFORE this mint wrote anything — and against the near-missed
         # identity's already-stored descriptors, the same before-the-write
@@ -597,8 +628,34 @@ def match(
         best = hit.cosine if hit is not None else None
         return MatchResult(
             key, True, best, store.distinct_count(), sub_canon, 1, False,
-            near_miss=near_miss,
+            near_miss=near_miss, body_id=body_id,
         )
+
+
+def _log_body(
+    store: VectorStore, key: str, body: dict | None, face_w: float | None
+) -> int | None:
+    """Append the sighting's person box to ``key``'s body log; its rowid.
+
+    Tolerant of a partial box on purpose: the runner sends ``None`` when no
+    person box contained the face, and a box with a missing or non-positive
+    dimension is not a measurement either.  Silence, not an error — the
+    verdict this rides on has already been decided and must not fail over a
+    logging field.  ``face_w`` is the call's ``quality`` (face box width px),
+    stored beside the box so the stature reader can see a head-and-shoulders
+    crop for what it is; a non-positive one is stored as unknown.
+    """
+    if not body:
+        return None
+    try:
+        h, w = float(body["h"]), float(body["w"])
+        y_bottom, frame_h = float(body["yBottom"]), int(body["frameH"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if h <= 0 or w <= 0 or frame_h <= 0:
+        return None
+    fw = float(face_w) if face_w is not None and float(face_w) > 0 else None
+    return store.add_body_sighting(key, h, w, y_bottom, frame_h, fw)
 
 
 def _overlap_after_write(
@@ -758,12 +815,292 @@ def best_cosine(data_dir: Path, run_id: str, embedding: list[float]) -> float | 
     return float(hit.cosine) if hit is not None else None
 
 
+# ------------------------------------------ the review queue's side evidence
+#
+# Everything from here to review_duplicates() exists to REMOVE questions from
+# a human's list, never to answer one.  Run f0bfc5 (2026-09-23, a Punjab
+# wedding hall from an overview camera, 74 guests) put 500 pairs in the queue;
+# its top five, read by eye, included a man against an elderly woman (#3), a
+# black beard against a white one (#1) and a child against an adult (#5).
+# Each of those the pipeline could have settled itself, from evidence the
+# face score does not carry: sex, age, and how tall the body is.  None of it
+# is allowed near a verdict — the count moves only on a face match or a human
+# click — but a pair the evidence says cannot be one person need not be asked.
+
+
+def identity_gender(
+    rows: list[tuple[str | None, float | None, float | None]],
+) -> tuple[str | None, float | None]:
+    """An identity's sex and confidence from its templates' attribute readings.
+
+    Each template with a reading is one vote: its reported sex at its reported
+    probability, folded to P(male) so the votes are on one axis.  The identity's
+    belief is the mean over voting templates — TEMPLATE-weighted, every view
+    counting once — SHRUNK towards 0.5 by two pseudo-votes of 0.5 each:
+    ``p_male = (sum(votes) + 1) / (n + 2)``.  The answer is the side that
+    favours, with its confidence ``max(p, 1-p)``.
+
+    WHY THE SHRINK (measured on run f0bfc5's 594 re-embedded sightings): a
+    plain mean makes one template exactly as confident as its one view, and a
+    duplicate is by construction minted on the view that FAILED to match —
+    head-down, turned, small — which is the view the attribute head flips on.
+    Eight of 37 identities with two or more reads carried BOTH a >= 0.8 male
+    read and a >= 0.8 female read (p00048, a girl: eleven M >= 0.8 and one F
+    0.92; p00049, an elderly woman: F 0.84 and M 0.87), and 7 of the 72 keys
+    held a single template.  With the shrink one M 1.0 template reads 0.67,
+    three unanimous read 0.80 (the review bar), five read 0.86, and p00048's
+    fifteen reads give 0.765 — under the bar, so a second identity minted on
+    her one upright female view could not be set aside on sex.  A frontal
+    0.97 M with a head-down 0.55 F reads M at 0.605: the sure view is not
+    outvoted, and the unsure one costs enough that the bar will not trust
+    the pair.
+
+    ``(None, None)`` when no template carries a reading — a runner without
+    the attribute model, or a gallery from before the columns.  Absent is not
+    a default sex.
+    """
+    votes = [
+        (p if g == "M" else 1.0 - p)
+        for g, p, _ in rows
+        if g in ("M", "F") and p is not None
+    ]
+    if not votes:
+        return None, None
+    p_male = (float(np.sum(votes)) + 1.0) / (len(votes) + 2.0)
+    if p_male >= 0.5:
+        return "M", p_male
+    return "F", 1.0 - p_male
+
+
+def identity_age(
+    rows: list[tuple[str | None, float | None, float | None]],
+) -> float | None:
+    """An identity's age: the MEDIAN over its templates' readings, or None.
+
+    Median, not mean, because the attribute head's age error on a small or
+    turned face is not symmetric — a 40 px profile is as likely to read 15
+    years off as 3 — and one such view must not drag a child into the adult
+    band.  None when no template carries a reading.
+    """
+    ages = [a for _, _, a in rows if a is not None]
+    return float(np.median(ages)) if ages else None
+
+
+#: Standing-box geometry, shared with scratchpad replay.py (the reference).
+#: A box is STANDING when it is at least twice as tall as wide (seated and
+#: bending bodies are squatter), its bottom edge sits more than 60 px above
+#: the frame's bottom (a body cut off by the frame edge has no measurable
+#: height), and its top is more than 5 px below the frame's top (same, above).
+_STANDING_ASPECT = 2.0
+_STANDING_BOTTOM_MARGIN_PX = 60.0
+_STANDING_TOP_MARGIN_PX = 5.0
+#: A standing body is at least this many FACE WIDTHS tall.  Run f0bfc5's
+#: ledger (2808 face-bearing person boxes): full standing adults read p10
+#: 10.0 / median 11.0 / p95 12.4 face widths, the smallest child (p00001)
+#: min 5.7 / p10 9.9 — and the head-to-waist boxes an occlusion produces
+#: (p00052 behind a table, seq 9075-9091: 205x470 px on a 112 px face) read
+#: 2.9-4.3, with an aspect of 2.3 that passes the h/w test.  Fifteen of
+#: those in a row put her median at 0.59 of adult height against 1.05 from
+#: her full boxes.  6.0 drops 47 of the run's 1268 standing boxes, moves no
+#: identity's 8-frame median by 0.2, and keeps every child measured.  A row
+#: without a face width (written before the column) is not filtered.
+_STANDING_MIN_FACE_WIDTHS = 6.0
+#: An identity's standing boxes must span at least this many distinct write
+#: SECONDS before its median is trusted, on top of the min_n row bar.  Two,
+#: not min_n: a run's face-bearing standing sightings arrive in bursts of a
+#: few seconds (f0bfc5: 53 identities with >= 8 standing boxes spanned a
+#: median of 4 distinct video seconds; only 3 of them spanned 8), so a bar
+#: of eight seconds would have measured almost nobody, while a bar of two
+#: is exactly what rejects the case it exists for — one occlusion's 15
+#: consecutive waist-up frames are one second at 15 fps.
+_STATURE_MIN_MOMENTS = 2
+#: The perspective fit needs this many standing boxes before it is a fit and
+#: not a line through noise; below it every stature is null (not measured).
+#: 50 is replay.py's bar and is well under a minute of one guest walking.
+_STATURE_FIT_MIN_N = 50
+#: Residual band kept on each of the three re-fit passes: a box under 0.6 or
+#: over 1.5 of the predicted height is a child, a seated body the aspect test
+#: missed, or a tracker box lagging a turn — not a data point for the camera's
+#: perspective.
+_STATURE_TRIM = (0.6, 1.5)
+
+
+def _moment(created_at: str | None) -> str | None:
+    """The second a row was written, as a label; None when the row has no time.
+
+    Eight boxes are eight measurements only when they are eight different
+    moments: fifteen consecutive frames of one occlusion are half a second of
+    one pose.  ISO timestamps sort as text, so the label is the prefix up to
+    the seconds field (``2026-09-24T21:14:03``).
+    """
+    if not created_at:
+        return None
+    return created_at[:19]
+
+
+def standing_sightings(sightings: list) -> list[tuple[str, float, float, str | None]]:
+    """Filter the body log to standing boxes: ``(key, y_bottom, h, moment)`` each.
+
+    A box is standing when it is at least twice as tall as wide, its bottom
+    edge sits more than 60 px above the frame's bottom, its top more than
+    5 px below the frame's top, and — when the sighting's face width is
+    known — it is at least _STANDING_MIN_FACE_WIDTHS face widths tall, which
+    is what separates a standing body from a head-and-shoulders crop with a
+    standing box's aspect.  Rows are :class:`app.store.BodySighting`
+    (``face_w`` / ``created_at`` optional); ``moment`` is the write second.
+    """
+    out = []
+    for row in sightings:
+        key, h, w, y_bottom, frame_h = row[0], float(row[1]), float(row[2]), float(row[3]), row[4]
+        face_w = row[5] if len(row) > 5 else None
+        created_at = row[6] if len(row) > 6 else None
+        if w <= 0 or h <= 0:
+            continue
+        if h / w < _STANDING_ASPECT:
+            continue
+        if y_bottom >= frame_h - _STANDING_BOTTOM_MARGIN_PX:
+            continue
+        if (y_bottom - h) <= _STANDING_TOP_MARGIN_PX:
+            continue
+        if face_w is not None and face_w > 0 and h < _STANDING_MIN_FACE_WIDTHS * face_w:
+            continue
+        out.append((key, y_bottom, h, _moment(created_at)))
+    return out
+
+
+def stature_fit(standing: list[tuple]) -> tuple[float, float] | None:
+    """Fit ``h = a * y_bottom + b`` over standing boxes, robustly; ``(a, b)``.
+
+    The camera looks down the hall, so a standing body's box height is a
+    near-linear function of where its feet are: lower in frame = nearer the
+    lens = taller box.  Run f0bfc5 fitted h = 0.602 * y_bottom + 300 px over
+    1268 standing sightings.  An ordinary least-squares line first, then three
+    passes that drop every box outside 0.6..1.5 of the line's prediction and
+    refit — children, seated bodies and lagging tracker boxes are exactly the
+    outliers a plain fit would bend towards, and they are the ones the
+    result is meant to measure AGAINST.  scratchpad replay.py is the
+    reference; this is that algorithm, guarded.
+
+    ``None`` under _STATURE_FIT_MIN_N boxes, or when a trim pass would leave
+    fewer than two points (the previous pass's line stands).
+    """
+    if len(standing) < _STATURE_FIT_MIN_N:
+        return None
+    y = np.array([row[1] for row in standing], dtype=np.float64)
+    h = np.array([row[2] for row in standing], dtype=np.float64)
+    design = np.vstack([y, np.ones_like(y)]).T
+    coef = np.linalg.lstsq(design, h, rcond=None)[0]
+    lo, hi = _STATURE_TRIM
+    for _ in range(3):
+        predicted = design @ coef
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(predicted > 0, h / predicted, np.nan)
+        mask = (ratio > lo) & (ratio < hi)
+        if mask.sum() < 2:
+            break
+        coef = np.linalg.lstsq(design[mask], h[mask], rcond=None)[0]
+    return float(coef[0]), float(coef[1])
+
+
+def stature_ratios(sightings: list, min_n: int) -> dict[str, float]:
+    """Each identity's median standing-height ratio against the run's fit.
+
+    1.0 is "as tall as the fit says a standing body is at that spot"; the
+    fit is dominated by adults, so 1.0 is an average adult and f0bfc5's child
+    p00009 read 0.73.  An identity needs ``min_n`` standing boxes spanning
+    at least _STATURE_MIN_MOMENTS distinct write seconds to appear at all —
+    a single frame mid-stride or half behind a pillar is 30% off, the median
+    over eight is not, and eight consecutive frames are one moment, not
+    eight — and a box the fit predicts a non-positive height for (above the
+    vanishing line, a fit artefact) is skipped.  Rows without a timestamp
+    (a pure-function caller) count as one moment each.  Identities with no
+    trusted ratio are simply absent from the dict; the caller reads absence
+    as None.  Empty when the run has too few standing boxes for a fit.
+    """
+    standing = standing_sightings(sightings)
+    coef = stature_fit(standing)
+    if coef is None:
+        return {}
+    a, b = coef
+    by_key: dict[str, list[float]] = {}
+    moments: dict[str, set] = {}
+    untimed: dict[str, int] = {}
+    for key, y_bottom, h, moment in standing:
+        predicted = a * y_bottom + b
+        if predicted <= 0:
+            continue
+        by_key.setdefault(key, []).append(h / predicted)
+        if moment is None:
+            untimed[key] = untimed.get(key, 0) + 1
+        else:
+            moments.setdefault(key, set()).add(moment)
+    need = max(1, min_n)
+    return {
+        key: float(np.median(ratios))
+        for key, ratios in by_key.items()
+        if len(ratios) >= need
+        and len(moments.get(key, ())) + untimed.get(key, 0) >= min(need, _STATURE_MIN_MOMENTS)
+    }
+
+
+def _exclusion(
+    gender: dict, age: dict, stature: dict,
+    gender_min_p: float, age_child_max: float, age_adult_min: float, stature_gap: float,
+) -> str | None:
+    """Which side signal, if any, says this pair cannot be one person.
+
+    Checked in the order gender, age, stature, and the first to speak names
+    the exclusion — a pair is counted under one reason, never three.  Every
+    signal has an off switch at zero, and every signal needs its evidence on
+    BOTH sides: one measured identity and one unmeasured is not a
+    disagreement, it is one opinion, and absent is not zero.
+
+    * gender — both confident at or above ``gender_min_p`` and different.
+      One side sure and the other unsure never excludes; the unsure side is
+      exactly the head-down or turned-away view the attribute model gets
+      wrong, and it must not vote.
+    * age — one median at or below ``age_child_max``, the other at or above
+      ``age_adult_min``; the gap between the bands is the model's error
+      budget and a pair straddling it is still asked about.
+    * stature — both ratios measured and ``|a-b| >= stature_gap``.
+    """
+    ga, gb, pa, pb = gender["a"], gender["b"], gender["pA"], gender["pB"]
+    if (
+        gender_min_p > 0
+        and ga is not None and gb is not None
+        and pa is not None and pb is not None
+        and pa >= gender_min_p and pb >= gender_min_p
+        and ga != gb
+    ):
+        return "gender"
+    aa, ab = age["a"], age["b"]
+    if (
+        age_child_max > 0 and age_adult_min > 0
+        and aa is not None and ab is not None
+        and (
+            (aa <= age_child_max and ab >= age_adult_min)
+            or (ab <= age_child_max and aa >= age_adult_min)
+        )
+    ):
+        return "age"
+    sa, sb = stature["a"], stature["b"]
+    if stature_gap > 0 and sa is not None and sb is not None and abs(sa - sb) >= stature_gap:
+        return "stature"
+    return None
+
+
 def review_duplicates(
     data_dir: Path,
     run_id: str,
     threshold: float,
     floor: float,
     limit: int = 50,
+    gender_min_p: float = 0.0,
+    age_child_max: float = 0.0,
+    age_adult_min: float = 0.0,
+    stature_gap: float = 0.0,
+    stature_min_n: int = 8,
+    adult_m: float = 1.75,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -795,17 +1132,43 @@ def review_duplicates(
       the queue so the likeliest pair is read first, and pairs whose torsos
       were never measurable still appear — ranked last among themselves by
       face score — because absent is not zero and an unmeasured guest must
-      not fall silently off a review list.
+      not fall silently off a review list.  A v2 (48-d) torso against a v3
+      (64-d) one is not comparable and reads as unmeasured, not as 0.
+    * **Sex, age and stature may SET A PAIR ASIDE (v4, 2026-09-24)** — after
+      the band test and before the cap, so an excluded pair neither costs a
+      slot nor counts as dropped.  Run f0bfc5 flooded the queue with 500
+      pairs whose top five included a man against an elderly woman and a
+      child against an adult; the pipeline had the evidence to settle those
+      and asked anyway.  Each pair carries a ``why`` — both identities' sex
+      with confidence, median age, and stature ratio (null wherever not
+      measured; absent is not zero) — and the reply's ``excluded`` counts
+      say how many pairs each signal set aside, so a queue that was quieted
+      is never mistaken for one that was quiet.  The rules and their off
+      switches are in :func:`_exclusion`; the knobs in :mod:`app.config`.
+      Nothing set aside is written anywhere — not to ``cannot_link``, which
+      remains a human's or co-presence's word — and nothing is merged.
 
-    Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d}``.
-    ``dropped`` is stated rather than swallowed: a truncated queue that looks
-    complete is how a real duplicate goes unreviewed.
+    Stature is metres-free on the wire by design: ``stature.a``/``b`` are
+    ratios against the run's own perspective fit (1.0 = an average standing
+    adult at that spot), ``adultM`` is the anchor that turns a ratio into
+    metres for a human to read (``aM``/``bM`` carry that product ready-made),
+    and the exclusion gap is on the ratio, so the anchor never moves it.
+
+    Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
+    "excluded": {"gender": g, "age": a, "stature": s}}``.  ``dropped`` is
+    stated rather than swallowed: a truncated queue that looks complete is
+    how a real duplicate goes unreviewed.
     """
     store = open_store(db_path(data_dir, run_id))
+    excluded = {"gender": 0, "age": 0, "stature": 0}
     with store.reading():
         keys = store.keys()
         vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
         apps = {k: store.appearances_for(k) for k in keys}
+        attrs = {k: store.attributes_for(k) for k in keys}
+        genders = {k: identity_gender(attrs[k]) for k in keys}
+        ages = {k: identity_age(attrs[k]) for k in keys}
+        statures = stature_ratios(store.body_sightings(), stature_min_n)
         candidates, considered = [], 0
         for a, b in itertools.combinations(keys, 2):
             considered += 1
@@ -816,11 +1179,32 @@ def review_duplicates(
             cosine = max(float(x @ y) for x in vecs[a] for y in vecs[b])
             if cosine < floor or cosine >= threshold:
                 continue
-            pairs = [(p, q) for p in apps[a] for q in apps[b]]
-            clothes = (
-                max(float(np.minimum(p, q).sum()) for p, q in pairs) if pairs else None
+            scores = [
+                s for s in (intersection(p, q) for p in apps[a] for q in apps[b])
+                if s is not None
+            ]
+            clothes = max(scores) if scores else None
+            sa, sb = statures.get(a), statures.get(b)
+            why = {
+                "gender": {
+                    "a": genders[a][0], "b": genders[b][0],
+                    "pA": genders[a][1], "pB": genders[b][1],
+                },
+                "age": {"a": ages[a], "b": ages[b]},
+                "stature": {
+                    "a": sa, "b": sb, "adultM": adult_m,
+                    "aM": None if sa is None else sa * adult_m,
+                    "bM": None if sb is None else sb * adult_m,
+                },
+            }
+            reason = _exclusion(
+                why["gender"], why["age"], why["stature"],
+                gender_min_p, age_child_max, age_adult_min, stature_gap,
             )
-            candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes})
+            if reason is not None:
+                excluded[reason] += 1
+                continue
+            candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why})
 
     # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
     # measurement. The clothes-first order was built for run 0f5c6d, where
@@ -848,6 +1232,7 @@ def review_duplicates(
         "considered": considered,
         "returned": len(kept),
         "dropped": len(candidates) - len(kept),
+        "excluded": excluded,
     }
 
 
@@ -871,6 +1256,20 @@ def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():
         return store.forget_template(template_id)
+
+
+def forget_body_sighting(data_dir: Path, run_id: str, body_id: int) -> bool:
+    """Retract one body-log row by rowid; True if a row went.
+
+    The same caller and the same reason as :func:`forget_template`: the box
+    was logged under the key /match resolved before the runner could prove
+    the sighting was a different body.  Left in place it is a stranger's
+    height in the loser's stature median — and the re-ask logs the same box
+    again under the corrected key, so the fit would hold it twice.
+    """
+    store = open_store(db_path(data_dir, run_id))
+    with store.transaction():
+        return store.forget_body_sighting(body_id)
 
 
 def split(data_dir: Path, run_id: str, a: str, b: str) -> int:

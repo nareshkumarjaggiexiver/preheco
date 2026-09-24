@@ -109,12 +109,42 @@ def test_intersection_partial_overlap_is_exact():
     assert intersection(hist(0, 1), hist(1, 2)) == pytest.approx(0.5, abs=1e-6)
 
 
-def test_intersection_rejects_length_mismatch():
-    """A wire bug must raise, not quietly score 0.0 and become a veto."""
-    with pytest.raises(ValueError):
-        intersection(hist(0), [0.5, 0.5])
-    with pytest.raises(ValueError):
-        intersection([], [])
+def test_intersection_length_mismatch_is_none_not_zero_not_raise():
+    """A v2 (48) against a v3 (64) descriptor is NOT COMPARABLE: None.
+
+    This used to raise, on the argument that a mismatch was a wire bug.  Then
+    v3 arrived while every retained gallery still held v2 rows, and the
+    mismatch became ordinary: a new runner's sighting against a template from
+    before the upgrade.  Raising would take the /match verdict down; 0.0
+    would read as a maximal clash and veto every enrolment against an older
+    template.  Absent is not zero, and every caller already handles None.
+    """
+    v2 = hist(0)
+    v3 = [0.0] * 64
+    v3[0] = 1.0
+    assert intersection(v2, v3) is None
+    assert intersection(v3, v2) is None
+    assert intersection(hist(0), [0.5, 0.5]) is None
+    assert intersection([], []) is None
+    # The same-length comparison is untouched by the change.
+    assert intersection(v3, v3) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_best_intersection_skips_incomparable_rows_and_is_none_when_none_compare():
+    """A mixed identity is compared on the rows that CAN be compared.
+
+    One v3 query against [v2, v2] is unmeasured (None, never 0); against
+    [v2, v3-matching] it scores the v3 row and ignores the v2 one.
+    """
+    from app.appearance import APPEARANCE_DIM, LEGACY_APPEARANCE_DIM, best_intersection
+
+    assert (LEGACY_APPEARANCE_DIM, APPEARANCE_DIM) == (48, 64)
+    v3 = np.zeros(64, dtype=np.float32)
+    v3[5] = 1.0
+    stored_v2_only = [np.asarray(hist(0), dtype=np.float32), np.asarray(hist(1), dtype=np.float32)]
+    assert best_intersection(v3.tolist(), stored_v2_only) is None
+    mixed = [np.asarray(hist(5), dtype=np.float32), v3.copy()]
+    assert best_intersection(v3.tolist(), mixed) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_best_intersection_absent_is_none_not_zero():
@@ -350,14 +380,25 @@ def test_verdicts_match_a_descriptorless_run_frame_for_frame(client):
 
 
 def test_wrong_length_appearance_is_a_readable_422(client):
-    """47 or 2 floats is a caller bug, named as such before it can veto anything."""
-    for bad in ([0.5, 0.5], [1.0 / 47] * 47):
+    """47, 63 or 2 floats is a caller bug, named as such before it can veto anything.
+
+    48 (v2) and 64 (v3) are both legal — a v3 runner and a retained v2 gallery
+    coexist for a day — and the 422 names both so the caller knows which it
+    missed.
+    """
+    for bad in ([0.5, 0.5], [1.0 / 47] * 47, [1.0 / 63] * 63):
         res = client.post(
             "/match",
             json={"runId": "run-bad", "embedding": _json(pose(0.0)), "appearance": bad},
         )
         assert res.status_code == 422, res.text
-        assert "48" in res.text, "the error must name the contract"
+        assert "48" in res.text and "64" in res.text, "the error must name the contract"
+    for ok in ([1.0 / 48] * 48, [1.0 / 64] * 64):
+        res = client.post(
+            "/match",
+            json={"runId": "run-ok", "embedding": _json(pose(0.0)), "appearance": ok},
+        )
+        assert res.status_code == 200, res.text
 
 
 def test_appearance_sim_is_null_for_staff_hits_and_first_mints(client, tmp_path):

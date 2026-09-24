@@ -23,8 +23,8 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
 | tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?,eyeSpanRatio?,landmarksPlausible?}]} — YuNet (OpenCV zoo, MIT) |
-| embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[128]]} — SFace (OpenCV zoo) |
-| match     | 7106 | POST /match {runId, embedding, quality?, appearance?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, templateId, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
+| embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[dim]], norms:[float], attributes:[{gender,genderP,age} \| null]} — SFace 128-d or ArcFace 512-d; `norms`/`attributes` since 2026-09-24 (v4 below) |
+| match     | 7106 | POST /match {runId, embedding, quality?, appearance?, attributes?, featNorm?, body?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, templateId, bodyId, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
 | runner    | 7100 | POST /runs {eventId, source, plannerUrl} — drives the loop, batches stats to the planner |
 
 All services: GET /health → {ok, model, version}. Frames as base64 JPEG in
@@ -783,9 +783,12 @@ one.
 
 ### The descriptor (computed by the RUNNER; the match service only stores and compares)
 
-- **48 floats**: an L1-normalised **12×4 Hue×Saturation histogram** of the
-  torso crop (OpenCV HSV: H 0–179 → 12 bins, S 0–255 → 4 bins). Pixels with
-  V < 40 or V > 240 are masked out (shadow / blowout).
+- **48 floats** (v1/v2; **48 or 64 since v4**, 2026-09-24 — see the v4
+  block at the end): an L1-normalised **12×4 Hue×Saturation histogram** of
+  the torso crop (OpenCV HSV: H 0–179 → 12 bins, S 0–255 → 4 bins). Pixels
+  with V < 40 or V > 240 are masked out (shadow / blowout). v2 (2026-08-06)
+  re-partitioned the same 48 into 12×3 H×S chromatic bins + 3 soft
+  brightness bins + 12 reserved; v3 (64 floats) adds texture and edges.
 - **Torso crop**: within the person box, from the face box's bottom edge down
   to `min(face bottom + 2.5 × face height, person box bottom)`; horizontally
   the person box inset 15% each side.
@@ -821,7 +824,8 @@ one.
 ### Wire and storage
 
 - `POST /match` request gains optional **`appearance`**: exactly 48 floats
-  (any other present length is a readable 422 naming the contract).
+  (any other present length is a readable 422 naming the contract; since
+  v4, 48 OR 64, and a 48 compared with a 64 is `null`, never 0).
 - The response gains **`appearanceSim`**: `float|null` — best intersection
   against the matched identity's stored descriptors; `null` for staff hits,
   new mints, or when either side lacks a descriptor — and
@@ -1562,3 +1566,122 @@ the machine was configured with, and an unknown field is ignored so a console
 one version ahead cannot fail a run. Whatever resolves is recorded in the run
 row's gate config, because "which floors were in force when this number was
 produced" has to survive the environment that produced it.
+
+## v4 — the review queue's side evidence: sex, age, stature, and a torso that starts below the neck (embed + runner + match + counting + planner, 2026-09-24)
+
+Run f0bfc5 (Punjab wedding-hall overview camera, 74 guests) put 500 pairs
+in the review queue; its top five held a man against an elderly woman, a
+black beard against a white one and a child against an adult — questions
+the pipeline held the evidence to not ask. `docs/PIPELINE-REVIEW-2026-09-24.md`
+("Duplicate review fixes") carries the measurements; this is the wire.
+
+### embed 0.x → `/embed` reply (E1)
+
+- **`norms`**: `[float]`, index-parallel to `embeddings` — the L2 norm of
+  the RAW feature before unit-normalisation (a recognisability proxy:
+  occluded, blurred and turned faces embed short).
+- **`attributes`**: `[{gender: "M"|"F", genderP: 0..1, age: years} | null]`,
+  index-parallel — the InsightFace buffalo_l `genderage.onnx` head
+  (1×3×96×96 RGB, no normalisation, output `[F, M, age/100]`), cropped at
+  1.5× the box like InsightFace does. `genderP` is the probability OF THE
+  REPORTED sex. The whole list is absent when no attribute model is
+  configured (`EMBED_ATTR_MODEL`; default `models/genderage.onnx` if that
+  file exists, else off). `GET /health` gains **`attrModel`**: name | null.
+- Absent is not zero: a runner reading a reply without `norms` or
+  `attributes` pads with `null` and gates nothing on them.
+
+### runner (R1, R2)
+
+- `POST /match` per face gains, each only when known: **`attributes`**
+  (the face's reading), **`featNorm`**, and **`body`** `{h, w, yBottom,
+  frameH}` — the sighting's containing PERSON box in raw detector pixels
+  (null without a containing box, a frame height, or a positive extent).
+  A malformed reading is not forwarded (the match service 422s it and a
+  422 on `/match` would fail the run); an age under zero is clamped to 0.
+- Env: **`HECO_PRESENCE_SPLIT`** (default 1; 0 = off) — track-presence
+  co-presence: a track bound to an identity by a comfortable face match
+  (≥ `HECO_TRACK_LOCK_MIN_COSINE`, the face sitting where a head sits in
+  the track box) stands in for the face on a faceless body, and the pair
+  goes through `/split` like a face pair, counted **`trackPresenceSplits`**.
+  **`HECO_QUALITY_MIN_FEAT_NORM`** (default 0 = off) drops a face AFTER
+  embedding when its raw norm is under the floor; `gatedBy featnorm`,
+  counted **`gatedByFeatNorm`**.
+- Status/results gain **`trackPresenceSplits`**, **`gatedByFeatNorm`** and
+  **`appearanceRefused`** (a match service one release behind refused the
+  64-float descriptor with a 422; the runner re-asked without it — the run
+  counted, with no torso evidence on the gallery side).
+- `POST /template/forget` is called with **`bodyId`** beside (or instead
+  of) `templateId` on a same-frame split, so the loser's box leaves the
+  wrong identity's stature evidence.
+
+### match 0.11.0 → 0.12.0 (M1, M2)
+
+- `MatchRequest` accepts `appearance` of length **48 (v2) or 64 (v3)**;
+  `attributes`, `featNorm`, `body` per R1, all optional. Reply gains
+  **`bodyId`**: rowid of the body-sighting row this call logged, or null.
+- Storage: `vectors` gains nullable **`gender TEXT, gender_p REAL, age
+  REAL, feat_norm REAL`** (migrated in place by ADD COLUMN, like
+  `appearance`); new table **`body_sightings(id, key, h, w, y_bottom,
+  frame_h, created_at, face_w)`** appended on every guest `/match` carrying
+  `body` — matched or minted, enrolled or not; not pruned with templates;
+  re-keyed by `/merge`, deleted by `/mark-staff`. `face_w` is the call's
+  `quality` (the face box width), added the same evening (ADD COLUMN).
+- `POST /template/forget {runId, templateId?, bodyId?}` — at least one;
+  reply gains **`bodyForgotten`**.
+- `POST /review/duplicates` pairs gain **`why`**:
+  `{gender: {a, b, pA, pB}, age: {a, b}, stature: {a, b, adultM, aM, bM}}`
+  — null wherever nothing was measured. Sex per identity is the template
+  mean of P(male) SHRUNK by two pseudo-votes, `(Σ + 1) / (n + 2)`, so one
+  confident view is never a confident identity (one M 1.0 reads 0.67, three
+  unanimous 0.80). Age is the template median. Stature `a`/`b` are RATIOS
+  of the identity's median standing box height against a robust linear fit
+  of box height vs box bottom-y over every standing box in the run
+  (standing: h/w ≥ 2, bottom > 60 px above the frame edge, top > 5 px
+  below it, and — when `face_w` is known — at least 6 face widths tall);
+  an identity needs ≥ `HECO_REVIEW_STATURE_MIN_N` (8) standing boxes
+  spanning ≥ 2 distinct write seconds, else null. `adultM`
+  (`HECO_STATURE_ADULT_M`, 1.75 m — the North Indian adult average) turns a
+  ratio into `aM`/`bM`; display only.
+- Reply gains **`excluded: {gender, age, stature}`** — pairs set aside
+  after the band test and before the cap: gender when BOTH identities'
+  confidence ≥ `HECO_REVIEW_GENDER_MIN_P` (0.8) and they disagree; age
+  when one median ≤ `HECO_REVIEW_AGE_CHILD_MAX` (12) and the other ≥
+  `HECO_REVIEW_AGE_ADULT_MIN` (20); stature when both measured and
+  `|a − b| ≥ HECO_REVIEW_STATURE_GAP` (0.2). 0 on any knob turns that
+  signal off. Set aside is NOT written anywhere — no `cannot_link`, no
+  merge — and `/health` reports every knob.
+- `clothes` keeps its meaning (best histogram intersection); a 48-d against
+  a 64-d descriptor is `null`, never 0, never an exception.
+
+### counting — `torso_descriptor` v3 (A1)
+
+64 floats, `APPEARANCE_DIM = 64`: colour (the v2 39 bins, over a band from
+face-bottom + 0.5 face heights to min(face-bottom + 3.0 face heights,
+person bottom), the person box inset 15% a side and clipped to the face's
+column ±1.5 face widths; skin-toned pixels — YCrCb Cr 133–173 / Cb 77–127
+at saturation < 150 — at a quarter weight) **weighted 0.9**, uniform
+LBP(8,1) 10-bin texture **0.07**, Sobel edge-density 3 bins **0.03**, 12
+reserved zeros; each part L1-normalised before weighting. None for the
+contract's three conditions (no person box, crop < 24 px, < 100 lit
+non-skin pixels) and for two more: a face within 0.4 face widths of the
+person box's side, and a band with no interior cloth pixel after the
+64-px resize. The pattern weight was cut from the drafted 0.3 on a
+measurement (plain cloth agrees with plain cloth on weave; 0.3 lifted every
+impostor pair by ~0.2 and separated nothing); two plain garments of
+different colours floor at 0.10.
+
+### planner (P1)
+
+`GET /api/pipeline/runs/:id/duplicates` passes `why` and `excluded`
+through (null, not zeros, from an older gallery); each review row shows
+one readings line ("both men · ages 41 / 63 · stature 1.71 m / 1.58 m",
+absent as "not measured", metres at two decimals); the summary appends
+"N more pairs were set aside: gender G, age A, stature S" when any count
+is non-zero. FrameCheck's default person height is 1.75 m.
+
+### Rollout
+
+Match before runner, per tree: a 0.11.0 match refuses the 64-float
+descriptor (the runner degrades to "torso not measured" and counts
+`appearanceRefused`); a new match accepts a 48-float runner.
+

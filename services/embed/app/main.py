@@ -2,8 +2,15 @@
 
 Contract (CONTRACTS.md):
     POST /embed {imageB64, faces: [{box, landmarks, conf?}]}
-        -> {embeddings: [[128 floats]], alignMs}
-    GET  /health -> {ok, model, version}
+        -> {embeddings: [[128 floats]], alignMs,
+            norms: [float],                       # L2 norm of each RAW feature
+            attributes: [{gender, genderP, age} | null] | null,
+            attrMs: float | null}
+    GET  /health -> {ok, model, version, device, attrModel, attrError}
+
+`norms` and `attributes` are index-parallel to `embeddings`. `attributes`
+is null as a WHOLE when no attribute model is configured (EMBED_ATTR_MODEL
+— see attributes.py); null means "not measured", never "nobody".
 
 Callers (the runner) apply the POC quality gate first — only faces at or above
 the 56 px floor should reach embedding (sub-canon ones flagged upstream).
@@ -11,14 +18,16 @@ the 56 px floor should reach embedding (sub-canon ones flagged upstream).
 
 import logging
 import threading
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .attributes import ATTR_MODEL_EXPLICIT, ATTR_MODEL_PATH, AttributeModel, build_attributes
 from .codec import frame_from
-from .recognizer import MODEL_PATH, FaceEmbedder, build_embedder
+from .recognizer import DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
 
 log = logging.getLogger("embed")
 
@@ -78,11 +87,66 @@ def _get_embedder() -> FaceEmbedder | None:
 
 def _current_stat() -> tuple | None:
     """(mtime_ns, size) of the model file, or None while it is absent."""
+    return _stat_of(MODEL_PATH)
+
+
+def _stat_of(path: Path | None) -> tuple | None:
+    """(mtime_ns, size) of `path`, or None while it is absent (or unset)."""
+    if path is None:
+        return None
     try:
-        st = MODEL_PATH.stat()
+        st = path.stat()
         return (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
+
+
+_attributes: AttributeModel | None = None
+_attr_error: str | None = None
+_attr_lock = threading.Lock()
+_attr_failed_stat: tuple | None = None
+
+
+def _get_attributes() -> AttributeModel | None:
+    """Load the optional genderage model lazily, with the embedder's retry rules.
+
+    Same sticky-per-file-state loop as `_get_embedder` — one failed load is
+    memoized until the file's (mtime, size) changes, then retried once —
+    with two differences that follow from the pass being OPTIONAL:
+
+      * the DEFAULT file merely being absent is the pass being off, not an
+        error: nothing is logged, /health says attrModel null and the
+        next probe stats again (so a bind mount delivering the weights
+        after boot switches the pass on without a restart);
+      * a file the operator NAMED (EMBED_ATTR_MODEL) that is missing or
+        refused IS an error — but it is served as /health attrError, not
+        as ok:false. Embedding still works and the count must not stop for
+        an advisory signal; what must not happen is the loss being silent,
+        which is why the reason is served and logged rather than swallowed.
+    """
+    global _attributes, _attr_error, _attr_failed_stat
+    if _attributes is not None:
+        return _attributes
+    if ATTR_MODEL_PATH is None:
+        return None  # EMBED_ATTR_MODEL=off
+    with _attr_lock:
+        if _attributes is not None:
+            return _attributes
+        attempt_stat = _stat_of(ATTR_MODEL_PATH)
+        if attempt_stat is None and not ATTR_MODEL_EXPLICIT:
+            _attr_error = None
+            return None  # default file absent: off, quietly
+        if _attr_error is not None and attempt_stat == _attr_failed_stat:
+            return None  # same broken file — stay cheap
+        try:
+            _attributes = build_attributes(ATTR_MODEL_PATH, DEVICE)
+            _attr_error = None
+            _attr_failed_stat = None
+        except Exception as exc:  # noqa: BLE001 — surfaced in /health, see above
+            _attr_error = f"{type(exc).__name__}: {exc}"
+            _attr_failed_stat = attempt_stat
+            log.error("attribute model load failed: %s", _attr_error)
+    return _attributes
 
 
 class FaceIn(BaseModel):
@@ -110,10 +174,16 @@ class EmbedRequest(BaseModel):
 def health() -> dict:
     """Liveness + model identity; ok is false until the weights are loadable."""
     emb = _get_embedder()
+    attrs = _get_attributes()
     return {
         "ok": emb is not None,
         "model": emb.model_name if emb else MODEL_PATH.name,
         "version": __version__,
+        # The optional gender/age pass: its file name while loaded, null
+        # while off — and, when a NAMED file will not load, the reason
+        # (ok stays true: embedding works, the loss must just not be silent).
+        "attrModel": attrs.model_name if attrs else None,
+        "attrError": None if attrs is not None else _attr_error,
         # While unhealthy, say WHY: an operator staring at a red healthcheck
         # needs the blocking error (missing file? truncated? bad dtype?)
         # without docker exec — the deploy-integrity lesson.
@@ -141,7 +211,15 @@ def embed(req: EmbedRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        embeddings, align_ms = emb.embed(img, [f.model_dump() for f in req.faces])
+        embeddings, norms, attributes, align_ms, attr_ms = emb.embed_faces(
+            img, [f.model_dump() for f in req.faces], _get_attributes()
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"embeddings": embeddings, "alignMs": align_ms}
+    return {
+        "embeddings": embeddings,
+        "alignMs": align_ms,
+        "norms": norms,
+        "attributes": attributes,
+        "attrMs": attr_ms,
+    }
