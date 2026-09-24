@@ -51,4 +51,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         nvidia-cudnn-cu13==9.26.0.51 \
         nvidia-cufft==12.4.0.43 \
         nvidia-curand==10.4.4.72
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
+# TensorRT, for HECO_DEVICE=TRT (the fp16 arm; heco_common/ort.py). The
+# TensorRT EP inside onnxruntime-gpu 1.30.0 links libnvinfer.so.10 and
+# libnvonnxparser.so.10 against libcudart.so.13 (ldd, 2026-09-24), so the
+# match is TensorRT 10.x built for CUDA 13: tensorrt-cu13-libs 10.x. The 11.x
+# wheels ship libnvinfer.so.11 and would leave the EP exactly as dead as no
+# TensorRT at all. Its OWN layer, after the CUDA one, so this ~2 GB rides the
+# same pip cache and a TensorRT bump never re-resolves the proven CUDA set.
+# Without these libs the EP fails to dlopen and ORT drops the session to
+# CUDA+CPU — /health shows requested=TRT with no TensorRT in `active`.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install tensorrt-cu13-libs==10.16.1.11
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/site-packages/tensorrt_libs
