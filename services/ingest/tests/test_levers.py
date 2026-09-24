@@ -457,3 +457,40 @@ def test_every_knob_reaches_the_container():
     compose = (REPO / "docker-compose.yml").read_text()
     for name in ENV_KNOBS:
         assert f"{name}: ${{{name}-}}" in compose, f"{name} has no compose passthrough"
+
+
+def test_a_polled_frame_is_encoded_once_and_served_identically(client, synthetic, monkeypatch):
+    """The runner polls every 20 ms while it waits; one frame is one encode.
+
+    Byte-identical on every poll, and keyed by worker as well as seq: a new
+    /open restarts seq at 1 and must not be handed the old run's frame 1.
+    """
+    from app import main as m
+
+    calls = []
+    real = m.encode_jpeg_b64
+
+    def spy(img, quality=85):
+        calls.append(int(img[0, 0, 0]))
+        return real(img, quality=quality)
+
+    monkeypatch.setattr(m, "encode_jpeg_b64", spy)
+    synthetic(lambda i: np.full((48, 64, 3), 10, np.uint8), n_frames=1, fps=10.0)
+    client.post("/open", json={"path": __file__})
+    for _ in range(300):
+        first = client.get("/frame")
+        if first.status_code == 200:
+            break
+        time.sleep(0.005)
+    polls = [client.get("/frame").content for _ in range(20)]
+    assert all(p == first.content for p in polls)
+    assert calls == [10], "the same frame was encoded more than once"
+
+    synthetic(lambda i: np.full((48, 64, 3), 99, np.uint8), n_frames=1, fps=10.0)
+    client.post("/open", json={"path": __file__})
+    for _ in range(300):
+        second = client.get("/frame")
+        if second.status_code == 200:
+            break
+        time.sleep(0.005)
+    assert second.json()["seq"] == 1 and calls == [10, 99], "a new source reused the old JPEG"
