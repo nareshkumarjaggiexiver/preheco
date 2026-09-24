@@ -10,9 +10,12 @@
 # 17.8 ms decodes, and ~15 ms of base64+JSON for a 2.1 MB payload — about
 # 82 ms of a 224 ms budget, spent turning memory into text and back.
 #
-# SIZE. 512 MB holds ~20 uncompressed 4K frames; HECO_FRAMES_KEEP (default 8)
-# bounds how many exist at once, so this has generous headroom. tmpfs counts
-# against the box's RAM, not its disk.
+# SIZE. A 4K BGR frame is 24 MB, so HECO_FRAMES_KEEP (default 8) wants ~200 MB
+# and the mount must hold comfortably more than that — a tmpfs that fills
+# makes every write fail and every frame fall back to JPEG, which is the slow
+# path plus the cost of trying. 1 GB is ~40 frames of headroom. tmpfs counts
+# against the box's RAM, not its disk, and only pages actually written are
+# resident.
 #
 # THIS DOES NOT CHANGE THE CONTRACT. imageB64 still travels on every request
 # and every consumer still decodes it when the ref does not resolve — an
@@ -53,4 +56,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: size=512m
+      o: size=${HECO_FRAMES_TMPFS_SIZE:-1g}
