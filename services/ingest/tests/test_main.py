@@ -98,8 +98,9 @@ def _take_fresh(client, n, jpeg=True, budget_s=5.0):
 def test_under_the_gate_keep_counts_frames_handed_out_not_capture_seqs(
     client, synthetic, shared, monkeypatch
 ):
-    """Seqs 1, 11, 21, 31, 41 are published; with KEEP=2 the frame before the
-    newest must survive, as the runner may still be embedding it."""
+    """Seqs 1, 11, 21, 31, 41 are published; with KEEP=2 (floored at 4:
+    overlap + prefetch hold three frames) the frame before the newest must
+    survive, as the runner may still be embedding it."""
     monkeypatch.setenv("HECO_FRAMES_KEEP", "2")
     _open_gated_still_room(client, synthetic)
     got = _take_fresh(client, 5)
@@ -109,7 +110,7 @@ def test_under_the_gate_keep_counts_frames_handed_out_not_capture_seqs(
     assert numbers == list(range(numbers[0], numbers[0] + 5)), "numbered by write"
     on_disk = _frames_on(shared)
     assert refs[-1] in on_disk and refs[-2] in on_disk, "the one before the newest survives"
-    assert len(on_disk) <= 3, "bounded: the newest KEEP (+1), whatever the backlog"
+    assert len(on_disk) <= 4, "bounded: the newest max(KEEP, 4), whatever the backlog"
 
 
 def test_a_levered_frame_is_written_when_taken_and_jpeg_0_is_honoured(

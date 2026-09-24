@@ -11,7 +11,8 @@
 # 17.8 ms decodes, and ~15 ms of base64+JSON for a 2.1 MB payload — about
 # 82 ms of a 224 ms budget, spent turning memory into text and back.
 #
-# SIZE. A 4K BGR frame is 24 MB, so HECO_FRAMES_KEEP (default 8) wants ~200 MB
+# SIZE. A 4K BGR frame is 24 MB, so HECO_FRAMES_KEEP (default 8, never under
+# 4: overlap + prefetch hold three frames in flight) wants ~200 MB
 # and the mount must hold comfortably more than that — a tmpfs that fills
 # makes every write fail and every frame fall back to JPEG, which is the slow
 # path plus the cost of trying. 1 GB is ~40 frames of headroom. tmpfs counts
