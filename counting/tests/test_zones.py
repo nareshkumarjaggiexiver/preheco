@@ -14,12 +14,15 @@ class Obs:
         self.counts, self.metrics, self.events = {}, [], []
 
     def bump(self, key, by=1):
+        """Add to a named counter."""
         self.counts[key] = self.counts.get(key, 0) + by
 
     def observe(self, stage, metric, value):
+        """Record one metric sample."""
         self.metrics.append((stage, metric, value))
 
     def event(self, text):
+        """Record one event line."""
         self.events.append(text)
 
 
