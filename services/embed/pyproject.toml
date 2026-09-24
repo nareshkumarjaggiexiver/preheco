@@ -11,3 +11,7 @@ ignore = ["D203", "D213"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Relative to this file: the tests import ``app.*`` and must resolve it from
+# the repo root as well as from services/embed (match and runner do the same
+# through their pytest.ini).
+pythonpath = ["."]
