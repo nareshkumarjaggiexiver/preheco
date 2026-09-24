@@ -189,6 +189,15 @@ def summarise(record: dict, camera_fps: float) -> dict:
     fps = frames / wall if frames is not None and wall else None
     footage_fps = (captured if captured is not None else frames) / wall if wall and (
         captured is not None or frames is not None) else None
+    # KEPT CAMERA RATE means nothing was lost. On a paced (--no-lockstep) run
+    # ingest decodes at camera rate whatever the runner manages, so footage
+    # fps alone reads True for a run that dropped most of its frames (300 of
+    # 900 processed, 600 dropped, 60 s: footage 15.0 fps, "True"). A run that
+    # dropped any frame did not keep up; absent (lever-off, lockstep) is not a
+    # drop, and footage fps decides as before.
+    dropped = results.get("framesDroppedLive")
+    kept = None if footage_fps is None else (
+        footage_fps >= camera_fps and not dropped)
     stages = {}
     for stage, metric in STAGE_METRICS:
         m = (_stage(record, stage).get("metrics") or {}).get(metric)
@@ -206,7 +215,8 @@ def summarise(record: dict, camera_fps: float) -> dict:
         "fps": fps,
         "footageFps": footage_fps,
         "cameraFps": camera_fps,
-        "keptCameraRate": None if footage_fps is None else footage_fps >= camera_fps,
+        "keptCameraRate": kept,
+        "framesDroppedLive": dropped,
         "countStageFps": count.get("fps"),
         "levers": config.get("levers"),
         "faceRegion": config.get("faceRegion"),
@@ -228,7 +238,8 @@ def print_report(s: dict, out=None) -> None:
     p(f"run {s['runId']}: {s['status']} ({s['endReason']})")
     p(f"  unique {s['unique']}   frames {s['frames']}   wall {_fmt(s['wallS'])} s")
     p(f"  processed {_fmt(s['fps'], 2)} fps   footage {_fmt(s['footageFps'], 2)} fps   "
-      f"camera {s['cameraFps']:g} fps   kept camera rate: {_fmt(s['keptCameraRate'])}")
+      f"camera {s['cameraFps']:g} fps   kept camera rate: {_fmt(s['keptCameraRate'])} "
+      f"(dropped {_fmt(s.get('framesDroppedLive'))})")
     p(f"  count-stage fps (runner's own board): {_fmt(s['countStageFps'], 2)}")
     p(f"  levers {json.dumps(s['levers'])}   faceRegion {json.dumps(s['faceRegion'])}")
     p(f"  models {json.dumps(s['models'])}   devices {json.dumps(s['devices'])}")
