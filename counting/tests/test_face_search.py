@@ -81,3 +81,33 @@ def test_may_skip_is_false_whenever_the_search_is_certain():
     assert fs.may_skip(2, 10.0, None, 1.0) is False
     assert fs.may_skip(2, 10.0, 9.0, 1.0) is False
     assert fs.may_skip(2, None, 9.8, 1.0) is False
+
+
+# ------------------------------------------------ the face search region (L7)
+
+
+def test_a_region_becomes_whole_pixels_inside_the_frame():
+    """The 4K bench frame's central 1920x1080."""
+    region = {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}
+    assert fs.region_px(region, 3840, 2160) == {"x": 960, "y": 540, "w": 1920, "h": 1080}
+
+
+def test_a_region_is_clamped_and_an_unplaceable_one_is_none():
+    """Past the edge is clamped; no size, no region, nothing left: None."""
+    assert fs.region_px({"x": 0.9, "y": 0.0, "w": 0.2, "h": 1.0}, 100, 50) == {
+        "x": 90, "y": 0, "w": 10, "h": 50,
+    }
+    assert fs.region_px({"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, None, 50) is None
+    assert fs.region_px(None, 100, 50) is None
+    assert fs.region_px({"x": 1.0, "y": 0.0, "w": 0.1, "h": 0.1}, 100, 50) is None
+    assert fs.region_px({"x": "a", "y": 0, "w": 1, "h": 1}, 100, 50) is None
+
+
+def test_only_bodies_touching_the_region_count_for_the_cadence():
+    """A guest across the hall cannot hold a doorway's search open."""
+    region = {"x": 0, "y": 0, "w": 100, "h": 100}
+    inside = {"x": 10, "y": 10, "w": 20, "h": 40}
+    straddling = {"x": 90, "y": 50, "w": 40, "h": 80}
+    outside = {"x": 150, "y": 10, "w": 20, "h": 40}
+    assert fs.bodies_in([inside, straddling, outside], region) == [inside, straddling]
+    assert fs.bodies_in([inside, outside], None) == [inside, outside]
