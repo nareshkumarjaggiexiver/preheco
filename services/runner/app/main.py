@@ -123,6 +123,14 @@ class Source(BaseModel):
     #: the run then takes longer than the footage, which is the honest cost
     #: of examining all of it. See heco_common.schemas.OpenSource.lockstep.
     lockstep: bool = False
+    #: Per-run overrides of ingest's lever L1 knobs (INGEST_MOTION_GATE,
+    #: INGEST_BUFFER_S), forwarded to its /open.  Declared here because this
+    #: dict reaches ingest only through this model: undeclared, pydantic drops
+    #: them and a run that asked for the gate silently runs without it.  None
+    #: (absent) = the ingest container's own setting; the request is dumped
+    #: with exclude_none, so a run that sets neither opens exactly as before.
+    motionGate: bool | None = None
+    bufferS: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _one_of(self) -> "Source":
