@@ -269,16 +269,28 @@ def health() -> dict:
     compose healthcheck refuses the stack instead of letting it count with a
     default nobody chose. ``capture`` is the open worker's own settings and
     counters (null when nothing is open; counters null outside lever mode).
+
+    ``device`` is the decoder truth, the same shape the model services serve:
+    ``requested`` (INGEST_DECODER) against ``active`` (what the open worker
+    actually decodes with — null while nothing is open) and ``error``, the
+    reason when a hardware decoder fell back to cpu.
     """
     body = {
         **Health(ok=True, model="opencv-videocapture", version=__version__).model_dump(),
         "owner": state.owner,
     }
+    requested = None
     try:
-        body["knobs"] = levers_from_env().knobs()
+        knobs = levers_from_env().knobs()
+        body["knobs"], requested = knobs, knobs["decoder"]
     except ValueError as exc:
         body["ok"] = False
         body["knobs"] = {"error": str(exc)}
     worker = state.worker
     body["capture"] = worker.describe() if worker is not None else None
+    body["device"] = (
+        dict(worker.decoder)
+        if worker is not None
+        else {"requested": requested, "active": None, "error": None}
+    )
     return body

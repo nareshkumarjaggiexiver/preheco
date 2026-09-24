@@ -1,8 +1,12 @@
 """Decoded frames, and the store where published ones wait for the consumer.
 
 A :class:`RawFrame` keeps a picture in whatever layout its decoder produced
-and hands out its BGR image, fitted to INGEST_MAX_WIDTH, at most once — the
-runner polls the same frame repeatedly while it waits for the next seq.
+and converts it to BGR (fitted to INGEST_MAX_WIDTH) at most once, when
+someone takes it — the runner polls the same frame repeatedly while it waits
+for the next seq. For the cv2 decoder that layout already IS BGR; for the
+ffmpeg decoders (L6) it is NV12, half the bytes, so the FIFO holds twice the
+seconds under the same INGEST_BUFFER_MB, and a frame that is skipped, dropped
+or overwritten is never converted at all.
 
 :class:`FrameStore` is the L1 buffer. With ``INGEST_BUFFER_S = 0`` it is the
 newest-frame slot (capacity one; a new frame overwrites an unread one and the
@@ -18,11 +22,12 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 
 class RawFrame:
-    """One decoded picture; the cv2 decoder delivers ``bgr`` (HxWx3)."""
+    """One decoded picture: ``bgr`` (HxWx3) or ``nv12`` (flat, w*h*3/2 bytes)."""
 
     __slots__ = ("layout", "data", "w", "h", "_bgr")
 
@@ -46,13 +51,21 @@ class RawFrame:
         return int(self.data.nbytes)
 
     def luma_source(self) -> np.ndarray:
-        """What the motion gate shrinks to its small grey image."""
+        """What the motion gate shrinks: the Y plane when there is one."""
+        if self.layout == "nv12":
+            return self.data[: self.w * self.h].reshape(self.h, self.w)
         return self.data
 
     def bgr(self, fit: Callable[[np.ndarray], np.ndarray] | None = None) -> np.ndarray:
-        """The BGR image (after ``fit``), computed on first call and kept."""
+        """The BGR image (after ``fit``), converted on first call and kept."""
         if self._bgr is None:
-            self._bgr = fit(self.data) if fit is not None else self.data
+            if self.layout == "nv12":
+                img = cv2.cvtColor(
+                    self.data.reshape(self.h * 3 // 2, self.w), cv2.COLOR_YUV2BGR_NV12
+                )
+            else:
+                img = self.data
+            self._bgr = fit(img) if fit is not None else img
         return self._bgr
 
 
