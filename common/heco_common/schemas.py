@@ -177,6 +177,24 @@ class Frame(BaseModel):
     That distinction decides whether a run settles as a complete count or as a
     failure, and whether its gallery of face embeddings is safe to delete.
     ``tMs`` is milliseconds since the source was opened.
+
+    **Lever fields (additive, all optional).** Ingest sends them only when one
+    of its levers is armed (motion gate, live buffer — services/ingest
+    README); with every lever off the body is the six fields above, exactly.
+    Absent or null means NOT MEASURED, never zero:
+
+    * ``motion`` — fraction of this frame's small luma that changed against
+      the previous published frame; null when the gate is off, and for the
+      first frame (nothing to compare it with).
+    * ``backlog`` — published frames still queued behind this one.
+    * ``skipped`` — cumulative frames not published because nothing moved;
+      null when the gate is off.
+    * ``dropped`` — cumulative published frames discarded unread (the buffer
+      was full, or the newest-frame slot was overwritten before anyone took it).
+    * ``captured`` — cumulative frames decoded.
+
+    ``seq`` stays the CAPTURE number in lever mode, so a gap between two
+    served frames is exactly the skipped plus dropped frames between them.
     """
 
     tMs: int
@@ -185,6 +203,11 @@ class Frame(BaseModel):
     h: int = Field(gt=0)
     seq: int = Field(ge=0)
     ended: bool = False
+    motion: float | None = None
+    backlog: int | None = Field(default=None, ge=0)
+    skipped: int | None = Field(default=None, ge=0)
+    dropped: int | None = Field(default=None, ge=0)
+    captured: int | None = Field(default=None, ge=0)
 
 
 # ----------------------------------------------------------------- persons
