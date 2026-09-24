@@ -1735,3 +1735,28 @@ pair aside — on BOTH identities' own testimony.
   The row's top-level `clothes` keeps its meaning (best intersection over
   the identities' TEMPLATE descriptors, the ranking tiebreak).
 
+### Lighting — white balance for the colour descriptors (counting + runner)
+
+- `heco_counting.appearance.frame_gains(image_bgr) -> (gb, gg, gr) | None`:
+  shades-of-grey (p = 6) on every 8th pixel each way (~2.4 ms at 4K),
+  ignoring samples whose brightest channel is < 16 or any channel ≥ 250;
+  gains are the illuminant's inverse normalised to average 1, clamped to
+  [0.5, 2]; None under 1,000 usable samples. `torso_descriptor(...,
+  gains=None)` applies them to the band before the skin window and the
+  colour bins; the lit mask and the pattern parts keep reading the pixels
+  as delivered. `gains=None` is the descriptor as before, byte for byte.
+- Runner env **`HECO_APPEARANCE_WB`** (0|1, default 0): estimate once per
+  decoded frame and pass to every descriptor read off it (`wbMs` timed on
+  the count stage). `GET {runner}/health` gains **`knobs:
+  {appearanceWb}`**.
+- Default OFF, on a measurement: run f0bfc5's camera AWB already holds the
+  warm hall neutral (gains 1.006 / 0.985 / 1.009 B/G/R median, every frame
+  within 2%), and balancing moved no clothing number that matters (within
+  median 0.90 → 0.90, same-person split minimum 0.77 → 0.79, and raw and
+  balanced set aside the same pairs at every clash from 0.25 to 0.45).
+  Synthetic casts (red, blue, amber on four garments) are where it earns
+  its keep: colour part vs the neutral read 0.83–0.99 balanced against
+  0.00–0.995 raw with three of twelve not measurable at all — a grey-blue
+  garment under a warm cast sits wholly inside the skin window — and every
+  one measurable again balanced.
+

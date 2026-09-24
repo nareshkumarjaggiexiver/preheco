@@ -351,10 +351,22 @@ def skin_weights(crop_bgr: np.ndarray) -> np.ndarray:
     return _analyse(crop_bgr)[2]
 
 
-def _analyse(crop_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(lit, skin, weight)`` for one crop — one colour conversion each way."""
+def _analyse(
+    crop_bgr: np.ndarray, sensor_bgr: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(lit, skin, weight)`` for one crop — one colour conversion each way.
+
+    ``sensor_bgr`` is the crop as the CAMERA delivered it when ``crop_bgr``
+    has been white-balanced (:func:`apply_gains`): shadow and blowout are
+    facts about the sensor — a highlight clipped at 255 and scaled by a 0.8
+    gain reads 204, which is not cloth — so ``lit`` is read there, while the
+    skin window reads the balanced colours.  None (no balancing) reads both
+    off ``crop_bgr``, exactly as before gains existed.
+    """
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
+    if sensor_bgr is not None:
+        v = sensor_bgr.max(axis=2)  # OpenCV's 8-bit V is max(B, G, R)
     lit = (v >= V_MIN) & (v <= V_MAX)
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
@@ -450,7 +462,10 @@ def _l1(part: np.ndarray) -> np.ndarray | None:
 
 
 def torso_descriptor(
-    image_bgr: np.ndarray, face_box: dict, person_box: dict | None
+    image_bgr: np.ndarray,
+    face_box: dict,
+    person_box: dict | None,
+    gains: tuple[float, float, float] | None = None,
 ) -> list[float] | None:
     """The 64-float torso descriptor for one face, or None when unmeasurable.
 
@@ -476,6 +491,12 @@ def torso_descriptor(
     keeps no interior cloth pixel for the pattern parts.  None means "could
     not measure", and per the module convention it must never be treated
     as a clash.
+
+    ``gains`` — the frame's white-balance gains from :func:`frame_gains` —
+    are applied to the band before the skin window and the colour bins read
+    it; the lit mask and the pattern parts still read the pixels as the
+    camera delivered them (see :func:`_analyse`).  None is exactly the
+    descriptor as it was before gains existed.
     """
     if person_box is None:
         return None
@@ -487,12 +508,17 @@ def torso_descriptor(
         return None
     ix0, ix1, iy0, iy1 = band
     crop = image_bgr[iy0:iy1, ix0:ix1]
-    lit, skin, skin_w = _analyse(crop)
+    if gains is None:
+        colour_crop = crop
+        lit, skin, skin_w = _analyse(crop)
+    else:
+        colour_crop = apply_gains(crop, gains)
+        lit, skin, skin_w = _analyse(colour_crop, sensor_bgr=crop)
     cloth = lit & ~skin
     if int(cloth.sum()) < MIN_UNMASKED_PX:
         return None
 
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(colour_crop, cv2.COLOR_BGR2HSV)
     weights = np.where(lit, skin_w, 0.0)
     colour = _l1(_colour_part(hsv, weights))
     if colour is None:  # defensive: cloth.sum() >= 100 makes this unreachable
@@ -543,3 +569,85 @@ def intersection(a: list[float], b: list[float]) -> float | None:
     if va.shape != vb.shape or va.ndim != 1 or va.size == 0:
         return None
     return float(np.minimum(va, vb).sum())
+
+
+# ------------------------------------------------------------------ lighting
+#
+# A garment's colour on the wire is the garment times the LIGHT.  One event
+# runs under several: warm hall lamps, the stage's coloured washes, a DJ's
+# flashes, daylight at the door.  frame_gains() estimates the illuminant of
+# a whole frame so every colour descriptor can be read as if under neutral
+# light; it is advisory like the descriptors themselves, and off unless the
+# runner's HECO_APPEARANCE_WB asks for it.
+
+#: Shades-of-grey Minkowski norm (Finlayson & Trezzi 2004): p = 1 is
+#: grey-world, p = infinity is max-RGB; p = 6 is where their evaluation put
+#: the best single value, and it keeps one large coloured object (a red
+#: stage backdrop) from dragging the estimate the way grey-world's mean does.
+WB_P = 6
+#: The estimate reads every 8th pixel each way — a 4K frame becomes 480 x
+#: 270 = 129,600 samples, far more than an illuminant needs.  Striding, not
+#: resizing: area-averaging 8 MP costs more than the estimate itself.
+WB_STRIDE = 8
+#: A sample whose brightest channel is under this is sensor noise, not a
+#: colour: its ratios are what the codec left, not what the light did.
+WB_DARK = 16
+#: A sample with ANY channel at or above this is clipped: the channel stopped
+#: at 255 while the light kept going, so its ratio is not the light's.
+WB_BLOWN = 250
+#: Fewer usable samples than this and the frame is "not measured" (None):
+#: a black frame or a frame that is all blown sky has no illuminant to read.
+WB_MIN_SAMPLES = 1000
+#: Gains are normalised to average 1 (brightness is not the job) and then
+#: clamped: a correction beyond 2x on one channel is the estimate failing —
+#: a frame filled by one saturated garment — not a light that coloured.
+WB_GAIN_MIN = 0.5
+WB_GAIN_MAX = 2.0
+
+
+def frame_gains(image_bgr: np.ndarray) -> tuple[float, float, float] | None:
+    """Per-channel white-balance gains ``(gb, gg, gr)`` for one frame, or None.
+
+    Shades-of-grey (p = WB_P) on a 1/WB_STRIDE sampling of the frame,
+    ignoring near-black (max channel < WB_DARK) and clipped (any channel
+    >= WB_BLOWN) samples; the gains are the inverse of the estimated
+    illuminant, normalised so the three average 1, then clamped to
+    [WB_GAIN_MIN, WB_GAIN_MAX].  None when fewer than WB_MIN_SAMPLES
+    samples are usable — absent is not zero, and a caller handed None reads
+    the colours as the camera delivered them.
+    """
+    if image_bgr is None or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        return None
+    return gains_from_samples(image_bgr[::WB_STRIDE, ::WB_STRIDE])
+
+
+def gains_from_samples(small_bgr: np.ndarray) -> tuple[float, float, float] | None:
+    """:func:`frame_gains` on an image that is ALREADY the sample grid.
+
+    Split out so an evaluation holding 1/8-scale frames (not the 4K
+    originals) computes exactly the estimate the runner would.
+    """
+    b, g, r = small_bgr[:, :, 0], small_bgr[:, :, 1], small_bgr[:, :, 2]
+    top = np.maximum(np.maximum(b, g), r)
+    usable = (top >= WB_DARK) & (top < WB_BLOWN)
+    n = int(usable.sum())
+    if n < WB_MIN_SAMPLES:
+        return None
+    est = np.empty(3, dtype=np.float64)
+    for i, ch in enumerate((b, g, r)):
+        x = ch[usable].astype(np.float32) * np.float32(1.0 / 255.0)
+        x2 = x * x
+        est[i] = float(np.mean(x2 * x2 * x2, dtype=np.float64)) ** (1.0 / WB_P)
+    if not np.all(est > 0.0):
+        return None
+    g = 1.0 / est
+    g = np.clip(g / g.mean(), WB_GAIN_MIN, WB_GAIN_MAX)
+    return float(g[0]), float(g[1]), float(g[2])
+
+
+def apply_gains(crop_bgr: np.ndarray, gains: tuple[float, float, float]) -> np.ndarray:
+    """The crop under neutral light: each channel scaled by its gain, 8-bit."""
+    g = np.asarray(gains, dtype=np.float32).reshape(1, 1, 3)
+    return np.clip(np.rint(crop_bgr.astype(np.float32) * g), 0, 255).astype(np.uint8)
+
+

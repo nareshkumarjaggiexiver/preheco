@@ -320,6 +320,10 @@ def health() -> dict:
         # /proc. GPU truth lives at the persons service's /health `device`
         # block — the planner joins the two.
         "host": _host_facts(),
+        # Switches a run's evidence depends on, read back from the process
+        # that runs them: a knob that is set but never reached the container
+        # has cost this repo three evenings.
+        "knobs": {"appearanceWb": manager.settings.appearance_wb},
     }
 
 

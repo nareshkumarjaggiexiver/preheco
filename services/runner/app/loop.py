@@ -1859,6 +1859,15 @@ class RunLoop:
             except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
                 frame_img = None
             board.observe("count", "frameDecodeMs", (time.perf_counter() - td) * 1000.0)
+        # WHITE BALANCE (HECO_APPEARANCE_WB, off by default): the frame's
+        # illuminant, estimated ONCE and applied to every colour descriptor
+        # read off it.  None when off, undecodable, or unmeasurable (a black
+        # frame): the descriptors then read the pixels as delivered.
+        wb_gains = None
+        if self.s.appearance_wb and frame_img is not None:
+            tw = time.perf_counter()
+            wb_gains = appearance.frame_gains(frame_img)
+            board.observe("count", "wbMs", (time.perf_counter() - tw) * 1000.0)
 
         # match (one call per embedding; gallery keyed by the planner run id;
         # staff checked first when the run carries a siteId)
@@ -1896,7 +1905,7 @@ class RunLoop:
                 # part of the per-person residual the stage timers never saw.
                 ta = time.perf_counter()
                 face_desc = appearance.torso_descriptor(
-                    frame_img, face["box"], pbox
+                    frame_img, face["box"], pbox, wb_gains
                 )
                 board.observe("count", "appearanceMs", (time.perf_counter() - ta) * 1000.0)
             body = {"runId": planner_run_id, "embedding": emb, "quality": w}
