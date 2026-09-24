@@ -290,6 +290,24 @@ def _same_frame_split(v: dict) -> dict | None:
     }
 
 
+def _attrs(v: dict) -> dict | None:
+    """Compact a verdict's embedder attributes for the tap row.
+
+    ``{gender, genderP, age}`` from the embed service's attribute model
+    (wire E1), rounded; None when the embed service sent none — an older
+    build, or no model configured — so a console renders "not measured"
+    rather than a zero-year-old of no gender.
+    """
+    a = v.get("attrs")
+    if not a:
+        return None
+    return {
+        "gender": a.get("gender"),
+        "genderP": _r(a.get("genderP"), 3),
+        "age": _r(a.get("age"), 1),
+    }
+
+
 def verdict_rows(verdicts: list[dict]) -> list[dict]:
     """One frame's match verdicts, as the console reads them.
 
@@ -322,6 +340,13 @@ def verdict_rows(verdicts: list[dict]) -> list[dict]:
             # different body in this same frame had it too (None on every
             # ordinary verdict).  Not a suggestion — it already happened.
             "sameFrameSplit": _same_frame_split(v),
+            # The embedder's riders (wire E1): the raw feature norm the
+            # featnorm gate reads, and the attribute model's {gender,
+            # genderP, age}.  Both None when the embed service sent none —
+            # absent is not zero, and the ledger is where a norm floor gets
+            # priced before anyone arms it.
+            "featNorm": _r(v.get("featNorm"), 2),
+            "attrs": _attrs(v),
         }
         for v in verdicts[:ROW_CAP]
     ]

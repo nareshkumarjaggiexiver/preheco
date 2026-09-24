@@ -14,7 +14,11 @@ never arrived.  Alongside them, CO-PRESENCE
 this pipeline can be CERTAIN of — two faces at different positions in one
 frame are two different people — as a gallery ``cannot_link``, which both
 silences a wrong "likely duplicate" banner and stops either fold above from
-merging two people who were standing together.  Every stage is timed; aggregates and
+merging two people who were standing together.  TRACK PRESENCE
+(:meth:`RunLoop._track_presence`) extends that certainty to a guest whose
+face is not visible this frame: a track already bound to an identity stands
+in for the face, so a back-turned guest is still asserted distinct from
+everyone matched beside them.  Every stage is timed; aggregates and
 sampled raw rows flush to the planner every ``flush_interval_s`` seconds.  On
 top of that (CONTRACTS.md v1): annotated debug frames + structured taps go up
 every ``tap_interval_s``, and operator feedback is polled every
@@ -63,7 +67,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from heco_common.auth import TokenProvider
-from heco_common.geometry import dedupe_boxes
+from heco_common.geometry import dedupe_boxes, iou_xywh
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
@@ -388,7 +392,10 @@ def apply_models(client, settings: Settings, stages: dict) -> dict:
                     f"{stage} refused ({detail}) AND rolling back "
                     f"{', '.join(rollback_failures)} failed — the box is in a mixed "
                     "state; re-probe /health per service for the truth")}
-            return {"ok": False, "error": f"{stage} refused: {detail} — every other stage rolled back"}
+            return {
+                "ok": False,
+                "error": f"{stage} refused: {detail} — every other stage rolled back",
+            }
         applied.append(stage)
     return {"ok": True, "applied": {s: stages[s] for s in applied}, "before": before}
 
@@ -427,7 +434,8 @@ def refuse_model_profile(
             )
         expected = entry.get("file") or entry.get("id")
         running = live.get(stage)
-        if running == "unreachable" or (isinstance(running, str) and running.startswith("unloaded")):
+        unloaded = isinstance(running, str) and running.startswith("unloaded")
+        if running == "unreachable" or unloaded:
             # Not a mismatch — a HEALTH problem, with a health remedy. The
             # mismatch sentence's "restart with the profile applied" would
             # send an operator to exactly the wrong fix.
@@ -489,18 +497,60 @@ class MatchClient:
         appearance: list[float] | None = None,
         site_id: str | None = None,
         exclude_keys: list[str] | None = None,
+        attributes: dict | None = None,
+        feat_norm: float | None = None,
+        body: dict | None = None,
     ) -> dict:
-        """Resolve one embedding against this run's gallery."""
-        body: dict = {
+        """Resolve one embedding against this run's gallery.
+
+        ``attributes`` ({gender, genderP, age}), ``feat_norm`` (the raw
+        feature's L2 length) and ``body`` ({h, w, yBottom, frameH}: the
+        sighting's containing PERSON box) are the R1 riders the review queue
+        reasons from — a man against a woman, a child against an adult, a
+        short guest against a tall one.  Each is sent only when known, like
+        ``appearance``: absent is not zero, and a null on the wire says
+        nothing an omitted key does not.
+        """
+        wire: dict = {
             "runId": self._run_id, "embedding": embedding, "quality": quality,
         }
         if appearance is not None:
-            body["appearance"] = appearance
+            wire["appearance"] = appearance
         if site_id:
-            body["siteId"] = site_id
+            wire["siteId"] = site_id
         if exclude_keys:
-            body["excludeKeys"] = exclude_keys
-        return self._call("/match", body)
+            wire["excludeKeys"] = exclude_keys
+        if attributes is not None:
+            wire["attributes"] = attributes
+        if feat_norm is not None:
+            wire["featNorm"] = feat_norm
+        if body is not None:
+            wire["body"] = body
+        try:
+            return self._call("/match", wire)
+        except MatchRefused as e:
+            # VERSION SKEW, degraded rather than fatal.  A match service one
+            # release behind (0.11.0) refuses the 64-float v3 descriptor with
+            # a 422 naming "appearance"; the per-face /match call sits on the
+            # frame loop's critical path with no other handler, so that 422
+            # would fail the WHOLE RUN on its first descriptor-bearing face.
+            # The descriptor is advisory by contract, so the honest fallback
+            # is the one an unmeasurable torso already takes: ask again
+            # without it, count it (appearanceRefused), and let the run say
+            # "torso not measured" instead of "failed".  Nothing else is
+            # retried — any other 4xx is the gallery's answer.
+            if (
+                e.status_code == 422 and "appearance" in wire
+                and "appearance" in str(e).lower()
+            ):
+                bare = {k: v for k, v in wire.items() if k != "appearance"}
+                self._loop._bump("appearanceRefused")
+                self._loop.log.warning(
+                    f"match refused the torso descriptor ({e}) — re-asking "
+                    "without it; the match service is a release behind"
+                )
+                return self._call("/match", bare)
+            raise
 
     def merge(self, *, doomed: str, keeper: str, only_if_singleton: bool = True) -> dict:
         """Fold one identity into another."""
@@ -513,11 +563,23 @@ class MatchClient:
         """Assert two identities are different people."""
         return self._call("/split", {"runId": self._run_id, "a": a, "b": b})
 
-    def forget_template(self, *, template_id: int) -> dict:
-        """Retract a template that turned out to belong to somebody else."""
-        return self._call("/template/forget", {
-            "runId": self._run_id, "templateId": template_id,
-        })
+    def forget_template(
+        self, *, template_id: int | None = None, body_id: int | None = None
+    ) -> dict:
+        """Retract a template and/or a body-sighting row that belong to somebody else.
+
+        Both rowids come from one /match reply; the same-frame guard hands
+        back whichever it got.  The body row matters even when no template
+        was enrolled: the box was logged under the wrong key on every guest
+        call, and left there it is a stranger's height in that identity's
+        stature evidence.
+        """
+        wire: dict = {"runId": self._run_id}
+        if template_id is not None:
+            wire["templateId"] = template_id
+        if body_id is not None:
+            wire["bodyId"] = body_id
+        return self._call("/template/forget", wire)
 
 
 class LoopObserver:
@@ -568,6 +630,57 @@ def enrol_score(face: dict) -> float:
     return float(face["box"]["w"])
 
 
+def _contains(box: dict, cx: float, cy: float) -> bool:
+    """Whether the point (cx, cy) lies inside an xywh box (edges inclusive)."""
+    x, y = float(box.get("x", 0.0)), float(box.get("y", 0.0))
+    return x <= cx <= x + float(box.get("w", 0.0)) and y <= cy <= y + float(box.get("h", 0.0))
+
+
+def parse_embed_reply(reply: dict) -> tuple[list, list, list]:
+    """Split one /embed reply into index-parallel embeddings, norms, attributes.
+
+    The wire (E1) grew two optional lists beside ``embeddings``: ``norms``,
+    the L2 length of each RAW feature before unit-normalisation, and
+    ``attributes``, ``{gender, genderP, age}`` or null per face.  An older
+    embed service sends neither, and a reply may carry one without the other,
+    so each list is padded with None (or cut) to the embedding count — the
+    three can then be zipped without a caller ever reading a neighbour's
+    value by mistake.  Absent is None, never 0: a norm of 0.0 would fail any
+    armed floor, and a face nobody measured must not be gated on that.
+    """
+    embeddings = list(reply.get("embeddings") or [])
+    n = len(embeddings)
+
+    def parallel(key: str) -> list:
+        raw = reply.get(key)
+        vals = list(raw)[:n] if isinstance(raw, list) else []
+        return vals + [None] * (n - len(vals))
+
+    return embeddings, parallel("norms"), [_clean_attributes(a) for a in parallel("attributes")]
+
+
+def _clean_attributes(a) -> dict | None:
+    """One attribute reading as /match will accept it, or None.
+
+    The match service validates the rider at its boundary (gender M/F,
+    genderP 0..1, age >= 0) and a 422 there would fail the run over a field
+    that is recorded and never judged.  So the runner does not forward a
+    reading it cannot vouch for: a malformed one is "not measured", and an
+    age the head reports under zero (its output is a regression, unclamped)
+    is clamped to 0 — a very young reading, not an error.  Never observed on
+    594 real sightings or 200 noise images; hardening, not a fix.
+    """
+    if not isinstance(a, dict):
+        return None
+    try:
+        gender, p, age = a.get("gender"), float(a.get("genderP")), float(a.get("age"))
+    except (TypeError, ValueError):
+        return None
+    if gender not in ("M", "F") or not (0.0 <= p <= 1.0) or age != age:
+        return None
+    return {"gender": gender, "genderP": p, "age": max(0.0, age)}
+
+
 class RunLoop:
     """Owns one run: the pipeline loop, its stats, and its lifecycle."""
 
@@ -605,6 +718,13 @@ class RunLoop:
         # what the run row records.
         self.s = settings = _apply_quality_profile(settings, request.get("quality"))
         self.gate = gate.GateThresholds.from_settings(settings)
+        # The floors in force, for the status and the run row.  The norm
+        # floor is the runner's own (it reads the embedder's output, which
+        # the library gate never sees), so it is appended here rather than
+        # declared in GateThresholds.
+        self._gate_armed: tuple[str, ...] = self.gate.armed + (
+            ("featnorm",) if float(settings.quality_min_feat_norm) > 0 else ()
+        )
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
@@ -699,6 +819,13 @@ class RunLoop:
         # Whether the cap has already been reported; the warning is worth
         # saying once and worthless once per frame.
         self._copresence_capped: bool = False
+        # TRACK PRESENCE (:meth:`_track_presence`): track_id -> {key, cosine,
+        # frame}, the identity a track is currently standing in for.  Bound
+        # by a comfortable face match on the track, dropped the frame the
+        # tracker loses the id or another track contests the box, re-bound
+        # by a comfortable match to somebody else.  Loop-thread only, like
+        # _copresence_sent; bounded by the live track set by construction.
+        self._presence: dict[int, dict] = {}
         # Snapshot of the frame just processed, for debug taps.  WRITTEN only
         # by the loop thread, and always REBOUND to a fresh dict rather than
         # updated in place — that is what lets the reporter thread hold on to
@@ -791,6 +918,15 @@ class RunLoop:
             # makes /merge refuse, so a fold can never erase one of two
             # co-present guests.
             "coPresenceSplits": 0,
+            # TRACK-PRESENCE SPLITS: cannot_link assertions that NEEDED a
+            # track standing in for a face — one of the pair had no face
+            # verdict this frame, only a track bound to them earlier (see
+            # :meth:`_track_presence`).  Kept apart from coPresenceSplits
+            # because the evidence is weaker by exactly one tracker: a face
+            # is certain, a bound track is a tracker's word that it is still
+            # following the same body.  Run f0bfc5's ledger replays to 48
+            # pairs with presence against 25 from faces alone.
+            "trackPresenceSplits": 0,
             # SAME-FRAME SPLITS: sightings taken OFF an identity because a
             # different body in the SAME frame was wearing it too (see
             # :meth:`_split_same_key`).  This is the only counter in the run
@@ -842,6 +978,12 @@ class RunLoop:
             # each /match reply's appearanceVetoed flag).
             "healVetoedByAppearance": 0,
             "enrolVetoedByAppearance": 0,
+            # appearanceRefused: /match calls the match service answered 422
+            # about the torso descriptor (a release behind: it only knows the
+            # 48-float v2) and that were re-asked without it.  Non-zero means
+            # every torso in this run went unmeasured on the gallery side and
+            # the match image needs rebuilding — see MatchClient.match.
+            "appearanceRefused": 0,
             # Folds (heal or lock) that went ahead on a MEDIOCRE clothing
             # reading — inside [heal_appearance_clash, heal_appearance_unsure).
             # Not a veto and not an error: the fold happened, and this says how
@@ -899,6 +1041,11 @@ class RunLoop:
             # gatedByLandmarks is a detector finding shirts, not a camera
             # needing a better angle.
             "gatedByLandmarks": 0,
+            # Faces dropped AFTER the embedder because their raw feature norm
+            # sat under an armed floor (see _gate_feat_norm) — the occluder
+            # gate, counted apart because it is the one reason a face can be
+            # embedded and still not matched.
+            "gatedByFeatNorm": 0,
             "gatedUnmeasured": 0,
             # RE-VERIFY SAVING: person crops NOT searched for a face this run
             # because the track already held an identity and had been verified
@@ -910,7 +1057,7 @@ class RunLoop:
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
-            "gateArmed": self.gate.armed,
+            "gateArmed": self._gate_armed,
             "error": None,
         }
 
@@ -1341,6 +1488,11 @@ class RunLoop:
             # or lock fold erasing one of the two, which is the silent
             # under-count this loop fears most.
             f"coPresenceSplits={st['coPresenceSplits']} "
+            # The same assertion made on a track's word rather than a second
+            # face — a back-turned guest proven distinct from the one matched
+            # beside them.  Beside coPresenceSplits so a report can see how
+            # much of the certain evidence needed the tracker to stand in.
+            f"trackPresenceSplits={st['trackPresenceSplits']} "
             # Silent under-counts caught: bodies the matcher had merged into
             # one identity and the frame itself disproved.
             f"sameFrameSplits={st['sameFrameSplits']} "
@@ -1358,6 +1510,7 @@ class RunLoop:
             # weak to mean anything and the fold went ahead regardless.
             f"healUncertainAppearance={st['healUncertainAppearance']} "
             f"enrolVetoedByAppearance={st['enrolVetoedByAppearance']} "
+            f"appearanceRefused={st['appearanceRefused']} "
             # Mints flagged as probable splits of an existing guest (match's
             # nearMiss wire, CONTRACTS.md v2).  Read beside `unique`: each is
             # a suggested one-click operator merge that was NOT auto-applied
@@ -1387,6 +1540,7 @@ class RunLoop:
             "healedSplits": st["healedSplits"],
             "lockedTrackFolds": st["lockedTrackFolds"],
             "coPresenceSplits": st["coPresenceSplits"],
+            "trackPresenceSplits": st["trackPresenceSplits"],
             "sameFrameSplits": st["sameFrameSplits"],
             "faceCardsPosted": st["faceCardsPosted"],
             "frameRecordsPosted": st["frameRecordsPosted"],
@@ -1395,6 +1549,7 @@ class RunLoop:
             "healVetoedByAppearance": st["healVetoedByAppearance"],
             "healUncertainAppearance": st["healUncertainAppearance"],
             "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
+            "appearanceRefused": st["appearanceRefused"],
             "nearMissMints": st["nearMissMints"],
             "galleryOverlaps": st["galleryOverlaps"],
             "excludedByZone": st["excludedByZone"],
@@ -1425,7 +1580,11 @@ class RunLoop:
         omitted, so a config with no IED key means an OLD run, not an unarmed
         one.
         """
-        return counting_config.gate_config(self.s, self.gate.armed)
+        cfg = counting_config.gate_config(self.s, self._gate_armed)
+        # The runner's own floor, recorded beside the library's: a run gated
+        # on feature norm must say so months later, the same as any other.
+        cfg["qualityMinFeatNorm"] = float(self.s.quality_min_feat_norm)
+        return cfg
 
     def _models_config(self) -> dict:
         """Which model each stage ACTUALLY had loaded when this run started.
@@ -1624,6 +1783,14 @@ class RunLoop:
         self._count_gated(outcome)
 
         if not kept:
+            # No face survived the gate — but a guest standing with their
+            # back to the camera is still IN the frame, and a track bound to
+            # them earlier stands in for the face (see _track_presence).  So
+            # the presence bookkeeping and the assertion run on EVERY
+            # processed frame, not only the ones that reached the matcher.
+            self._assert_co_presence(
+                planner_run_id, [], self._track_presence(tracks, boxes, [])
+            )
             self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, [])
             self._count_stage()
             return
@@ -1638,14 +1805,10 @@ class RunLoop:
         )
         board.frame("embed")
         samples.add("embed", t_ms, {"embedMs": self._last_ms})
-        embeddings = embedded.get("embeddings", [])
-        # The sweep's raw material (doc 15 M3): kept-face order IS embedding
-        # order IS verdict order — the one in-order contract, again. Golden
-        # file only, never the ledger (see Settings.golden_embeddings).
-        self._frame_embeddings = (
-            [[float(x) for x in e] for e in embeddings]
-            if self.s.golden_embeddings else []
-        )
+        # Three index-parallel lists (wire E1): the vectors, each RAW
+        # feature's norm, and {gender, genderP, age} per face — the last two
+        # None throughout from an embed service that predates them.
+        embeddings, norms, attrs = parse_embed_reply(embedded)
         # HOW MANY FACE CROPS ACTUALLY REACHED THE EMBEDDER — a funnel rung
         # nothing else reports. The stage's own counter counts FRAMES, and the
         # gate-survivor count is what was OFFERED, not what came back: the
@@ -1659,6 +1822,20 @@ class RunLoop:
         # priced alongside the size of what was seen.
         for face in kept[: len(embeddings)]:
             board.observe("embed", "faceBoxWPx", float(face["box"]["w"]))
+
+        # FEATURE-NORM FLOOR — the one gate that runs AFTER the embedder,
+        # because its signal is the embedder's own (see _gate_feat_norm).
+        # Everything index-parallel leaves together: face, vector, norm, attrs.
+        kept, embeddings, norms, attrs = self._gate_feat_norm(
+            kept, embeddings, norms, attrs
+        )
+        # The sweep's raw material (doc 15 M3): kept-face order IS embedding
+        # order IS verdict order — the one in-order contract, again. Golden
+        # file only, never the ledger (see Settings.golden_embeddings).
+        self._frame_embeddings = (
+            [[float(x) for x in e] for e in embeddings]
+            if self.s.golden_embeddings else []
+        )
 
         # TORSO APPEARANCE (app/appearance.py) — decoded ONCE per frame, only
         # when a gate survivor could actually carry a descriptor (there must be
@@ -1694,7 +1871,15 @@ class RunLoop:
         # standing right beside it — because the constraint that forbids it was
         # written at the end of the frame, after the fold had already happened.
         decided: list[tuple] = []
-        for face, emb in zip(kept, embeddings, strict=False):
+        # The R1 riders per face — {attributes, featNorm, body} — kept
+        # index-parallel to ``decided`` the way ``embeddings`` is, so a
+        # same-frame re-resolve can re-send them with the vector.
+        extras: list[dict] = []
+        # The frame's height, for the body rider: ingest states it beside the
+        # picture, and the JPEG header (read at the first _remember) is the
+        # fallback for a source that does not.
+        frame_h = frame.get("h") or (self._native_dims[1] if self._native_dims else None)
+        for face, emb, norm, attr in zip(kept, embeddings, norms, attrs, strict=False):
             w = float(face["box"]["w"])
             # ONCE per face: the descriptor rides the /match body (advisory —
             # the matcher may refuse to ENROL a clashing sighting as a new
@@ -1719,10 +1904,16 @@ class RunLoop:
                 body["appearance"] = face_desc
             if site_id:
                 body["siteId"] = site_id
+            # The sighting's BODY (R1): the raw containing person box and the
+            # frame height, so the match service can fit stature across the
+            # whole run.  None without a box or a height — absent is not zero.
+            body_box = self._body_box(pbox, frame_h)
+            extras.append({"attributes": attr, "featNorm": norm, "body": body_box})
             m = self._timed("match", "matchMs", partial(
                 self.match_port.match,
                 embedding=body["embedding"], quality=body["quality"],
                 appearance=body.get("appearance"), site_id=body.get("siteId"),
+                attributes=attr, feat_norm=norm, body=body_box,
             ))
             board.frame("match")
             if m.get("cosine") is not None:
@@ -1761,6 +1952,13 @@ class RunLoop:
                     # Same contract as nearMiss: a suggestion, never a merge.
                     "overlap": m.get("overlap"),
                     "box": face.get("box"),
+                    # The embedder's riders on THIS face (wire E1), carried
+                    # so the ledger and the taps can show why a review pair
+                    # was set aside — a man against a woman, a child against
+                    # an adult — and what the norm gate saw.  None when the
+                    # embed service sent none: absent is not zero.
+                    "attrs": attr,
+                    "featNorm": norm,
                 }
             )
             decided.append((face, m, face_desc, pbox_id))
@@ -1779,12 +1977,16 @@ class RunLoop:
         # it — otherwise there is no pair to assert and the merge stands
         # (run fa8fc3: two men, one key, silently counted as one).
         decided = self._split_same_key(
-            planner_run_id, site_id, decided, embeddings, verdicts
+            planner_run_id, site_id, decided, embeddings, verdicts, extras
         )
 
         # CO-PRESENCE, asserted between the passes: every distinct pair of
         # guests THIS FRAME held is two different people, certainly — and the
         # folds in pass two must not be able to contradict it.
+        # ...with TRACK PRESENCE beside the faces: a guest whose face is not
+        # visible this frame is still in it when a track bound to them is
+        # (run f0bfc5: p00048 back-turned in p00052's frame, review pair #5).
+        present = self._track_presence(tracks, boxes, decided)
         self._assert_co_presence(
             planner_run_id,
             [
@@ -1792,15 +1994,22 @@ class RunLoop:
                 for _f, m, _d, pbox_id in decided
                 if m.get("personKey") and not m.get("isStaff")
             ],
+            present,
         )
         # The keys this frame actually held, for the fold guard below: a fold
         # whose TARGET is visibly elsewhere in this same frame is folding two
-        # co-present people together, whatever the tracker believes.
+        # co-present people together, whatever the tracker believes.  Track
+        # presence counts here too: the tracker's word is trusted for the
+        # irreversible assertion above, so it must at least be trusted for
+        # the reversible refusal — a fold INTO a key whose bound track stands
+        # on another body this frame is refused like a fold into a face.
         frame_bodies: dict[str, set] = {}
         for _f, m, _d, pbox_id in decided:
             k = m.get("personKey")
             if k and not m.get("isStaff"):
                 frame_bodies.setdefault(k, set()).add(pbox_id)
+        for k, tok in present:
+            frame_bodies.setdefault(k, set()).add(tok)
 
         for face, m, face_desc, _pbox_id in decided:
             if m.get("isStaff"):
@@ -2037,6 +2246,7 @@ class RunLoop:
         decided: list[tuple],
         embeddings: list,
         verdicts: list[dict],
+        extras: list[dict] | None = None,
     ) -> list[tuple]:
         """Undo a merge the matcher made because it only ever sees one face.
 
@@ -2079,7 +2289,9 @@ class RunLoop:
 
         ``embeddings`` is index-parallel to ``decided`` (both come from the
         same zip in the caller) and is needed to re-ask about a face: the
-        vector is not carried in the reply.
+        vector is not carried in the reply.  ``extras`` rides beside it for
+        the same reason — the re-ask must carry the same attributes, norm and
+        body the first ask did, or the re-resolved sighting is stored blind.
 
         Returns ``decided`` rebuilt with the corrected replies, and rewrites
         the matching entries of ``verdicts`` in place, so pass two, the tap
@@ -2123,10 +2335,11 @@ class RunLoop:
                 if keeper_desc is None or desc is None:
                     continue  # absent is not zero
                 sim = appearance.intersection(keeper_desc, desc)
-                if sim >= floor:
-                    continue  # same cloth: a reflection or a screen, not a guest
+                if sim is None or sim >= floor:
+                    continue  # same cloth (or not comparable): not provably a guest
                 fixed = self._resolve_excluding(
-                    planner_run_id, site_id, face, m, embeddings[i], desc, key
+                    planner_run_id, site_id, face, m, embeddings[i], desc, key,
+                    extra=extras[i] if extras and i < len(extras) else None,
                 )
                 if fixed is None:
                     continue
@@ -2179,6 +2392,7 @@ class RunLoop:
         embedding: list,
         desc: list | None,
         key: str,
+        extra: dict | None = None,
     ) -> dict | None:
         """Retract the wrong enrolment, then re-ask /match with ``key`` barred.
 
@@ -2190,17 +2404,22 @@ class RunLoop:
         the merge and a later frame may.
         """
         template_id = m.get("templateId")
-        if template_id is not None:
+        body_id = m.get("bodyId")
+        if template_id is not None or body_id is not None:
             try:
-                self.match_port.forget_template(template_id=int(template_id))
+                self.match_port.forget_template(
+                    template_id=None if template_id is None else int(template_id),
+                    body_id=None if body_id is None else int(body_id),
+                )
             except MatchRefused as e:
                 # Not fatal: the split is still worth making. Say so, because a
                 # surviving poisoned template is exactly what re-merges these
-                # two in a later frame.
+                # two in a later frame — and a surviving body row is a
+                # stranger's box in the loser's stature evidence.
                 self.log.warning(
-                    f"could not retract template {template_id} from {key} "
-                    f"after a same-frame split: {e} — the wrong view stays in "
-                    "the gallery and may recapture this guest"
+                    f"could not retract template {template_id} / body row "
+                    f"{body_id} from {key} after a same-frame split: {e} — the "
+                    "wrong view stays in the gallery and may recapture this guest"
                 )
         body = {
             "runId": planner_run_id,
@@ -2212,6 +2431,11 @@ class RunLoop:
             body["appearance"] = desc
         if site_id:
             body["siteId"] = site_id
+        # The R1 riders the first ask carried ({attributes, featNorm, body}),
+        # each only when known — the same omit-when-absent rule as appearance.
+        for wire, value in (extra or {}).items():
+            if value is not None:
+                body[wire] = value
         try:
             return self._timed(
                 "match", "matchMs", lambda b=body: self._post(f"{self.s.match_url}/match", b)
@@ -2223,8 +2447,21 @@ class RunLoop:
             )
             return None
 
-    def _assert_co_presence(self, planner_run_id: str, seen: list[tuple]) -> None:
+    def _assert_co_presence(
+        self,
+        planner_run_id: str,
+        seen: list[tuple],
+        presence: list[tuple] | None = None,
+    ) -> None:
         """Tell the gallery that everyone seen in ONE frame is a different person.
+
+        ``seen`` is the face evidence — (key, body token) per matched guest —
+        and ``presence`` the track evidence (:meth:`_track_presence`): the
+        same shape, for guests whose face was not visible this frame but
+        whose bound track was.  Both feed one union; a pair that needed a
+        presence entry to be different bodies is counted trackPresenceSplits
+        instead of coPresenceSplits, because the two rest on different
+        evidence and a report must be able to tell them apart.
 
         THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
         counted THREE).  The count was RIGHT; the noise was wrong.  Two "likely
@@ -2274,9 +2511,13 @@ class RunLoop:
         those two keys are different people.  That blocks the heal which
         correctly folded exactly such a phone-face on the 2026-08-06 bench.
         The trade is deliberate and follows the asymmetry this whole project
-        runs on: a blocked fold OVER-counts, which is VISIBLE and which an
-        operator can merge away; a wrong fold UNDER-counts SILENTLY and nobody
-        ever sees it.  Fixed mirrors and screens are the operator's exclusion
+        runs on: a blocked fold OVER-counts, which is VISIBLE; a wrong fold
+        UNDER-counts SILENTLY and nobody ever sees it.  Visible is not the
+        same as fixable, though: a cannot_link row is permanent within the
+        run — POST /merge refuses the pair for the operator too (store.merge
+        has no override), no endpoint deletes the row, and the review queue
+        withholds the pair — so a wrong assertion is an over-count of one
+        that only a fresh run clears.  Fixed mirrors and screens are the operator's exclusion
         zones to draw; a hand-held phone is not, and that is the residual.
 
         BEST EFFORT, always — the count is the product, and a co-presence
@@ -2305,8 +2546,11 @@ class RunLoop:
         # mechanism rests on.  A face with no containing box pairs with
         # everything: we cannot show it shares a body, and asserting difference
         # fails toward over-count, which is the visible direction.
-        by_key: dict[str, set] = {}
+        face_by_key: dict[str, set] = {}
         for key, pbox_id in seen:
+            face_by_key.setdefault(key, set()).add(pbox_id)
+        by_key: dict[str, set] = {k: set(v) for k, v in face_by_key.items()}
+        for key, pbox_id in presence or ():
             by_key.setdefault(key, set()).add(pbox_id)
         keys = sorted(by_key)
         if len(keys) < 2:
@@ -2329,15 +2573,29 @@ class RunLoop:
                         )
                     return
                 if self._send_co_presence_split(planner_run_id, a, b):
-                    self._bump("coPresenceSplits")
-                    self._event(f"co-presence {a} != {b}")
-                    self.log.info(
-                        f"co-presence split: {a} and {b} were matched in the "
-                        f"same frame (#{self._frame_no}) — two faces at "
-                        "different positions in one frame are two different "
-                        "people, so the pair is now cannot_link: no merge "
-                        "suggestion, and no fold can erase either of them"
-                    )
+                    # WHICH evidence made the pair: two faces, as always, or
+                    # a track standing in for one of them.
+                    if self._different_bodies(face_by_key, a, b):
+                        self._bump("coPresenceSplits")
+                        self._event(f"co-presence {a} != {b}")
+                        self.log.info(
+                            f"co-presence split: {a} and {b} were matched in the "
+                            f"same frame (#{self._frame_no}) — two faces at "
+                            "different positions in one frame are two different "
+                            "people, so the pair is now cannot_link: no merge "
+                            "suggestion, and no fold can erase either of them"
+                        )
+                    else:
+                        self._bump("trackPresenceSplits")
+                        self._event(f"track-presence {a} != {b}")
+                        self.log.info(
+                            f"track-presence split: {a} and {b} shared frame "
+                            f"#{self._frame_no}, one of them by a track bound "
+                            "earlier rather than a face — two bodies in one "
+                            "frame are two people, so the pair is now "
+                            "cannot_link: no merge suggestion, and no fold can "
+                            "erase either of them"
+                        )
 
     def _send_co_presence_split(self, planner_run_id: str, a: str, b: str) -> bool:
         """POST one co-presence cannot_link; True when the pair is settled.
@@ -2385,6 +2643,185 @@ class RunLoop:
             del self._copresence_pairs[:-500]
         return True
 
+    #: Two tracks whose boxes overlap by at least this IoU are CONTESTED this
+    #: frame: that is the geometry of a tracker identity swap, so neither
+    #: track's binding is evidence until they separate.
+    _PRESENCE_CONTEST_IOU = 0.4
+    #: A bound track stands in for a person box only when the two overlap by
+    #: at least this much — the same body, not a neighbour the box brushed.
+    _PRESENCE_BODY_IOU = 0.5
+
+    def _track_presence(
+        self, tracks: list, boxes: list, decided: list[tuple]
+    ) -> list[tuple]:
+        """Who is in this frame WITHOUT a face, on the word of their track.
+
+        THE GAP (run f0bfc5, 2026-09-23, Punjab wedding-hall overview camera,
+        74 guests, 500 pairs in the review queue).  Pair #5 was p00048 (girl,
+        yellow top) against p00052 (woman, dark green dress) at face 0.338 —
+        and p00048 was IN THE SAME FRAME as p00052, with her back to the
+        camera.  Face co-presence (:meth:`_assert_co_presence`) needs two
+        faces, so a back-turned guest is never proven distinct from anyone,
+        and the ledger held the evidence the loop could not use.
+
+        THE RULE, ported from the replay that measured it (scratchpad
+        replay.py; 48 pairs proven distinct against 25 from faces alone, pair
+        #5 retired at seq 9283, 8 of the 500 queued pairs gone):
+
+        * a track BINDS to identity K when a kept face on it (the same
+          centre-in-box rule the lock uses, :meth:`_track_for`) matched K at
+          >= ``track_lock_min_cosine`` and the track is not contested this
+          frame — the lock's own floor, above the 0.377 measured impostor
+          ceiling, because a track bound on impostor-range evidence would
+          assert false cannot_links all night.  A mint never binds: its
+          cosine is a distance to OTHER people, not to the key it was given.
+          A comfortable match to a DIFFERENT key re-binds — fresh evidence
+          beats a stale claim;
+        * the binding drops when the tracker stops reporting the id, and the
+          frame two tracks CONTEST each other (IoU >= 0.4) — the shape of an
+          identity swap, and the loop's other track mechanisms are guarded
+          against exactly that failure for the same reason;
+        * a bound track is present on the person box it best overlaps (IoU
+          >= 0.5) IF that box carries no face verdict this frame — where a
+          face was matched, the face speaks, and the track says nothing;
+        * TWO GUARDS the replay did not have, priced on the same ledger.
+          A face binds only where a HEAD sits in a standing box — its centre
+          in the top 35% of the track box and within 35% of a box width of
+          its middle — because the nearest-centre tie rule otherwise binds a
+          face to a shorter NEIGHBOUR's box that overlaps the head (seq 1012:
+          p00006's face bound the plaid-shirt man behind her, and that track
+          then asserted her key on his body for 200 frames; 131 of 2671
+          bindings were > 0.3 widths off centre).  And a bound track whose
+          box CONTAINS the centre of any matched face this frame says
+          nothing, whichever raw box that face was keyed to: the detector
+          double-boxes one body (full + upper, 12 of 2671 bind frames,
+          IoU 0.07-0.45, under every dedupe floor), the face lands on the
+          upper box, the track on the full one, and one body became two
+          tokens — a false cannot_link between one person's two keys.  Cost
+          on the replay: 47 of 48 pairs kept (the one lost rested on the
+          mis-binding), both queue pairs still retired, 246 fewer bindings.
+
+        Returns (key, body token) entries in the shape ``seen`` uses, for
+        the union in :meth:`_assert_co_presence`.  The token is the person
+        box's, so a bound track over the very box a face resolved on can
+        never be counted a second body.
+
+        THE COST, stated: the evidence is a tracker's word that it still
+        follows the same body, which is weaker than a face by exactly one
+        tracker.  A swap the contest test does not see (two people passing
+        without their boxes ever overlapping 0.4) can bind the wrong person
+        for a frame and assert a wrong cannot_link.  That is an OVER-count
+        by a refused fold, the visible direction — but NOT one an operator
+        can undo: the row is permanent within the run (POST /merge refuses
+        the pair for a human too, nothing deletes a cannot_link, and the
+        review queue withholds the pair), so only a fresh run clears it.
+        Which is why the two guards above err towards silence, and why the
+        assertions are counted apart (trackPresenceSplits) so a run can say
+        how much of its certainty came from tracks.
+
+        Off (``presence_split`` 0) and without tracks or boxes this binds
+        nothing, returns nothing, and the frame is exactly what it was.
+        """
+        if self.s.presence_split <= 0:
+            return []
+        if not tracks:
+            self._presence.clear()  # every id absent: every binding drops
+            return []
+        live = {t.get("id") for t in tracks}
+        for tid in [t for t in self._presence if t not in live]:
+            del self._presence[tid]
+        # Contested tracks, computed ONCE per frame: n is the people in
+        # frame, so the pair walk is a few dozen IoUs at most.
+        boxed = [t for t in tracks if t.get("box")]  # a track with no box is no evidence
+        contested: set = set()
+        for i, a in enumerate(boxed):
+            for b in boxed[i + 1:]:
+                if iou_xywh(a["box"], b["box"]) >= self._PRESENCE_CONTEST_IOU:
+                    contested.add(a.get("id"))
+                    contested.add(b.get("id"))
+        for tid in contested:
+            self._presence.pop(tid, None)
+        # Bind (or re-bind) from this frame's comfortable face matches, and
+        # note which bodies a face already spoke for.
+        floor = float(self.s.track_lock_min_cosine)
+        face_bodies: set = set()
+        by_id = {t.get("id"): t for t in boxed}
+        matched_centres: list[tuple[float, float]] = []
+        for face, m, _desc, pbox_id in decided:
+            if pbox_id is not None:
+                face_bodies.add(pbox_id)
+            key, cosine = m.get("personKey"), m.get("cosine")
+            if m.get("isStaff"):
+                # Certain evidence that whoever is bound to this track is
+                # not that guest: a staff face on the body unbinds it.
+                tid = self._track_for(face, tracks)
+                if tid is not None:
+                    self._presence.pop(tid, None)
+                continue
+            if not key:
+                continue
+            fb = face["box"]
+            # Every keyed face — a mint included — speaks for the body it
+            # sits in; the double-box guard below reads these.
+            matched_centres.append((fb["x"] + fb["w"] / 2.0, fb["y"] + fb["h"] / 2.0))
+            if cosine is None or m.get("isNew"):
+                continue  # a mint's cosine is a distance to OTHER people
+            if floor <= 0 or float(cosine) < floor:
+                continue  # lock disabled, or inside impostor range: no claim
+            tid = self._track_for(face, tracks)
+            if tid is None or tid in contested:
+                continue
+            if not self._head_sits_in(fb, by_id.get(tid, {}).get("box")):
+                continue  # the tie rule handed the face a neighbour's box: no claim
+            self._presence[tid] = {
+                "key": key, "cosine": float(cosine), "frame": self._frame_no,
+            }
+        present: list[tuple] = []
+        if not boxes:
+            return present
+        for t in boxed:
+            entry = self._presence.get(t.get("id"))
+            if entry is None:
+                continue
+            tb = t["box"]
+            if any(_contains(tb, cx, cy) for cx, cy in matched_centres):
+                continue  # a keyed face is inside this track: the face speaks
+            best, best_iou = None, 0.0
+            for b in boxes:
+                v = iou_xywh(b, tb)
+                if v > best_iou:
+                    best, best_iou = b, v
+            if best is None or best_iou < self._PRESENCE_BODY_IOU:
+                continue
+            tok = association.body_token(best)
+            if tok in face_bodies:
+                continue  # a face resolved on this body: the face speaks
+            present.append((entry["key"], tok))
+        return present
+
+    #: A face binds a track only when its centre sits where a head sits in a
+    #: standing body's box: within this fraction of the box height from the
+    #: top, and within this fraction of the box width from the box's middle.
+    #: 0.35 on both: a head is the top ~15% of a standing box and the face of
+    #: a seated or bending body still clears 0.35, while the confirmed
+    #: mis-bindings on f0bfc5 sat 0.44-0.9 of the way down a neighbour's box.
+    _PRESENCE_HEAD_Y_FRAC = 0.35
+    _PRESENCE_HEAD_X_FRAC = 0.35
+
+    @classmethod
+    def _head_sits_in(cls, face_box: dict, track_box: dict | None) -> bool:
+        """Whether ``face_box``'s centre is where a head sits in ``track_box``."""
+        if not track_box:
+            return False
+        tw, th = float(track_box.get("w", 0.0)), float(track_box.get("h", 0.0))
+        if tw <= 0 or th <= 0:
+            return False
+        cx = float(face_box["x"]) + float(face_box["w"]) / 2.0
+        cy = float(face_box["y"]) + float(face_box["h"]) / 2.0
+        dy = (cy - float(track_box["y"])) / th
+        dx = abs(cx - (float(track_box["x"]) + tw / 2.0)) / tw
+        return 0.0 <= dy <= cls._PRESENCE_HEAD_Y_FRAC and dx <= cls._PRESENCE_HEAD_X_FRAC
+
     #: gate reason -> the status counter that records it.
     #: Entries in ``_last_face_verify`` past which it is pruned against the
     #: live track set.  Well above any plausible simultaneous-track count, so
@@ -2399,6 +2836,7 @@ class RunLoop:
         "eyespan": "gatedByEyeSpan",
         "frontality": "gatedByFrontality",
         "sharpness": "gatedBySharpness",
+        "featnorm": "gatedByFeatNorm",
     }
 
     def _reverify_within(self, within: list[dict], tracks: list[dict]) -> list[dict]:
@@ -2473,6 +2911,63 @@ class RunLoop:
                     self._status[key] += n
             self._status["gatedUnmeasured"] += outcome.unmeasured
 
+    def _gate_feat_norm(
+        self, kept: list[dict], embeddings: list, norms: list, attrs: list
+    ) -> tuple[list[dict], list, list, list]:
+        """Drop faces whose raw feature norm sits under the armed floor.
+
+        The second gate, AFTER the embedder, because its signal only exists
+        there: ArcFace's raw feature length tracks recognisability (a lit,
+        frontal face embeds long; an occluded, blurred or side-on one embeds
+        short — MagFace's observation), and it is the one signal that sees an
+        OCCLUDER.  p00002 on run f0bfc5 was a girl with a railing across her
+        face — sharp, frontal, confidently detected, so every geometric floor
+        passed her — and she became a counted guest.
+
+        Index-consistency is the whole discipline here: kept-face order IS
+        embedding order IS verdict order, so a face leaves together with its
+        vector, its norm and its attributes, or the next face would be
+        matched on somebody else's embedding.  Faces beyond the embedder's
+        reply (the zip(strict=False) shortfall) stay in ``kept`` unjudged, and
+        the match loop drops them exactly as it always has.
+
+        Stamped and counted like every other gate reason (``gateReason``
+        "featnorm", ``gatedByFeatNorm``), so the console can say WHICH floor
+        cost a guest.  A face without a norm — an older embed service — is
+        kept and counted ``gatedUnmeasured`` once: an armed floor never
+        rejects a face it could not measure.
+        """
+        floor = float(self.s.quality_min_feat_norm)
+        if floor <= 0.0 or not embeddings:
+            return kept, embeddings, norms, attrs
+        out_faces: list[dict] = []
+        out_emb: list = []
+        out_norms: list = []
+        out_attrs: list = []
+        dropped = unmeasured = 0
+        for i, face in enumerate(kept):
+            if i >= len(embeddings):
+                out_faces.append(face)  # no vector to judge; dropped downstream as before
+                continue
+            norm = norms[i]
+            if norm is None:
+                if not face.get("gateUnmeasured"):
+                    unmeasured += 1
+                face["gateUnmeasured"] = list(face.get("gateUnmeasured") or []) + ["featnorm"]
+            elif float(norm) < floor:
+                face["gateReason"] = "featnorm"
+                dropped += 1
+                continue
+            out_faces.append(face)
+            out_emb.append(embeddings[i])
+            out_norms.append(norm)
+            out_attrs.append(attrs[i])
+        if dropped or unmeasured:
+            with self._lock:
+                self._status["gatedByFeatNorm"] += dropped
+                self._status["gatedUnmeasured"] += unmeasured
+        return out_faces, out_emb, out_norms, out_attrs
+
     # ------------------------------------------------ exclusion zones + heal
 
     def _apply_zones(self, faces: list, frame: dict) -> list:
@@ -2525,6 +3020,27 @@ class RunLoop:
     def _person_box_for(face: dict, boxes: list) -> dict | None:
         """Delegates to :func:`heco_counting.association.person_box_for`."""
         return association.person_box_for(face, boxes)
+
+    @staticmethod
+    def _body_box(pbox: dict | None, frame_h) -> dict | None:
+        """The sighting's containing PERSON box for the wire (R1), or None.
+
+        The RAW detector box, not the track box: stature is read off how tall
+        a body stands where it stands, and a track box can be a stale
+        prediction.  ``frameH`` is what makes ``yBottom`` mean anything — the
+        match service's stature fit discards bodies the frame edge cuts off —
+        so a frame with no known height sends no body at all rather than one
+        it cannot place.  Absent is not zero.
+        """
+        if pbox is None or frame_h is None:
+            return None
+        try:
+            h, w, fh = float(pbox["h"]), float(pbox["w"]), int(frame_h)
+            if not (h > 0 and w > 0 and fh > 0):
+                return None  # a box with no extent is no box; the wire would 422 it
+            return {"h": h, "w": w, "yBottom": float(pbox["y"]) + h, "frameH": fh}
+        except (KeyError, TypeError, ValueError):
+            return None
 
     #: At most this many un-healed mints remembered per track.  A real track
     #: double- or maybe triple-mints in a blurry crossing; dozens would mean
@@ -2808,6 +3324,8 @@ class RunLoop:
         if before_desc is None or now_desc is None:
             return False
         sim = appearance.intersection(before_desc, now_desc)
+        if sim is None:
+            return False  # different descriptor generations: not comparable, not a clash
         clash_floor = self.s.heal_appearance_clash
         if clash_floor > 0 and sim < clash_floor:
             self._bump("healVetoedByAppearance")
@@ -3662,6 +4180,12 @@ class RunLoop:
         """
         if not person_key:
             return
+        # A track bound to a key that no longer exists would go on asserting
+        # cannot_links about a ghost — inert rows at best, and at worst a
+        # constraint between the ghost and the very identity it was folded
+        # into.  Loop-thread only, like every caller of this method.
+        for tid in [t for t, e in self._presence.items() if e.get("key") == person_key]:
+            del self._presence[tid]
         with self._lock:
             self._retired.append({
                 "personKey": person_key,

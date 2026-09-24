@@ -63,8 +63,16 @@ class MatchPort(Protocol):
         appearance: list[float] | None = None,
         site_id: str | None = None,
         exclude_keys: list[str] | None = None,
+        attributes: dict | None = None,
+        feat_norm: float | None = None,
+        body: dict | None = None,
     ) -> dict:
-        """Resolve one embedding against the gallery; returns the verdict."""
+        """Resolve one embedding against the gallery; returns the verdict.
+
+        ``attributes`` ({gender, genderP, age}), ``feat_norm`` and ``body``
+        ({h, w, yBottom, frameH}) are the R1 riders the review queue reads;
+        each is None when not measured.
+        """
         ...
 
     def merge(self, *, doomed: str, keeper: str) -> dict:
@@ -75,15 +83,13 @@ class MatchPort(Protocol):
         """Assert two identities are different people (co-presence)."""
         ...
 
-    def forget_template(self, *, template_id: int) -> dict:
-        """Retract a template that turned out to belong to somebody else.
+    def forget_template(
+        self, *, template_id: int | None = None, body_id: int | None = None
+    ) -> dict:
+        """Retract a wrongly-enrolled template and/or its body-sighting row.
 
-        Addressed by TEMPLATE id alone, with no person key. The template is
-        the thing being retracted and the gallery already knows whose it is —
-        naming the person too would let a caller retract a template from the
-        wrong identity's record, which is unrecoverable. (Learned by wiring
-        it: an earlier draft of this signature sent a personKey the service
-        does not accept, and the runner's own test refused the wire change.)
+        Both rowids come from one /match reply (``templateId``, ``bodyId``);
+        the same-frame guard hands back whichever it got.
         """
         ...
 
