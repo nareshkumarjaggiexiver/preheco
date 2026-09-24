@@ -152,3 +152,35 @@ def test_frames_are_written_to_the_configured_directory(shared):
     fr.write_frame(_img(16, 16), 42)
     assert (shared / "f42_16x16.bgr").exists()
     assert os.environ[fr.FRAMES_DIR_ENV] == str(shared)
+
+
+def test_a_full_directory_can_recover(shared, monkeypatch):
+    """REGRESSION (2026-09-24). The sweep ran only AFTER a successful write,
+    so a full tmpfs failed the write, skipped the sweep, and could never
+    retire anything again — the mount sat at 98% holding 21 frames against a
+    keep of 8, and every frame from then on fell back to JPEG silently.
+
+    Simulated here by failing the write once: the sweep must still have run,
+    because making room is a precondition, not a reward.
+    """
+    for seq in range(1, 12):
+        fr.write_frame(_img(10, 10), seq)
+    assert len(list(shared.glob("f*.bgr"))) <= 4, "keep=3 plus the newest"
+
+    real_open = open
+    calls = {"n": 0}
+
+    def _failing_open(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("No space left on device")
+        return real_open(*args, **kwargs)
+
+    # Only the FIRST open fails; undo() is deliberately not used, because it
+    # would also revert the fixture's HECO_FRAMES_DIR and the next write would
+    # return None for an entirely different reason.
+    monkeypatch.setattr("builtins.open", _failing_open)
+    assert fr.write_frame(_img(10, 10), 99) is None, "the failed write reports failure"
+    # and the sweep ran anyway, so the next write has room
+    assert fr.write_frame(_img(10, 10), 100) is not None
+    assert len(list(shared.glob("f*.bgr"))) <= 4

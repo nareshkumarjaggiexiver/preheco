@@ -102,6 +102,13 @@ def write_frame(img: np.ndarray, seq: int, directory: Path | None = None) -> str
     if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
         return None  # not the contract's BGR uint8 — say nothing, let JPEG carry it
     h, w = img.shape[:2]
+    # SWEEP FIRST. Sweeping only after a successful write is a deadlock: a
+    # full tmpfs fails the write, the sweep never runs, and nothing is ever
+    # retired again — measured live, the mount sat at 98% holding 21 frames
+    # against a keep of 8, and every write from then on failed silently into
+    # the JPEG fallback. Making room is a precondition for writing, not a
+    # reward for having written.
+    _sweep(directory, seq, _keep())
     name = f"f{seq}_{w}x{h}.bgr"
     final = directory / name
     tmp = directory / f".{name}.part"
@@ -113,7 +120,6 @@ def write_frame(img: np.ndarray, seq: int, directory: Path | None = None) -> str
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
         return None
-    _sweep(directory, seq, _keep())
     return name
 
 
