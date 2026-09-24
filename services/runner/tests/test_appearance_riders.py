@@ -120,8 +120,9 @@ def test_head_and_beard_ride_the_match_when_the_face_has_landmarks():
     make_loop(fake, REQUEST).run()
     (body,) = fake.match_bodies
     head, beard = body["head"], body["beard"]
-    assert len(head) == 40 and sum(head) == pytest.approx(1.0)
+    assert len(head) == 40 and sum(head[:27]) == pytest.approx(1.0)
     assert sum(head[:24]) == pytest.approx(1.0), "all chromatic: a red head"
+    assert head[27:29] == pytest.approx([1.0, 1.0]), "all headwear (no skin), measured"
     assert beard == pytest.approx([1.0, 0.0, 0.0, 0.0]), "the chin is the cheek"
     assert "skin" not in body, "pure red has no green to take a ratio against"
 
