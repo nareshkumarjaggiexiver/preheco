@@ -37,6 +37,7 @@ evidence (project hard rule: measure first).
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
+| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes}}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
 | POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
 | POST | `/gallery/sweep` | `{maxAgeS?}` | `{swept:[runId], maxAgeS}` — retention backstop |
 
@@ -348,6 +349,32 @@ which is visible and an operator can merge; a wrong fold **under**-counts
 silently and nobody ever sees it. Fixed mirrors and screens are handled by
 exclusion zones; a hand-held phone is not, and that is the residual.
 
+## The review queue's set-asides
+
+`POST /review/duplicates` ranks identity pairs whose face cosine sits in
+`[HECO_REVIEW_FLOOR .. threshold)` for a human to look at. It never merges
+and never writes; a pair the evidence says cannot be one person is **set
+aside** instead of asked about, and counted in `excluded` so a quiet queue
+is never mistaken for a silenced one. Every signal needs its evidence on
+BOTH sides — one measured identity against an unmeasured one is one
+opinion, not a disagreement.
+
+**Clothing (0.13.0).** Each identity's torso reads come from its **body
+log** — every sighting's v3 descriptor, not the five a template cap keeps
+(on run f0bfc5 those sat inside two seconds for 20 of 44 identities).
+A pair is set aside when each identity has at least
+`HECO_REVIEW_CLOTHES_MIN_N` reads spanning two seconds whose median pairwise
+intersection is at least `HECO_REVIEW_CLOTHES_SELF_MIN` (it wears ONE
+garment), and the best intersection any read of one reaches against any
+read of the other is under `HECO_REVIEW_CLOTHES_CLASH`. v2 (48-float) rows
+never count; at most 24 reads per identity are compared, spread over its
+time on camera. Measured on f0bfc5 (45 identities of the first 32 pairs):
+own reads agree at a median 0.90 (p10 0.70), one person split across a
+time gap still agrees at a best cross of 0.77–0.97, and the queue's
+different-people pairs anywhere from 0.10 to 0.97 (two white shirts agree:
+clothing only speaks for pairs dressed differently) — the default 0.35
+sets aside #3, #6, #7 and #23 and none of the nine same-person splits.
+
 ## Run
 
 ```sh
@@ -407,6 +434,10 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_MATCH_NEARMISS_FLOOR` | `0.29` | Floor of the FACE near-miss band on a mint: best cosine in `[floor .. threshold)` earns `nearMiss` with `basis: "face"` (operator suggestion, never a merge — impostors measured face 0.377 / clothes 0.503). Just below the measured same-person misses (0.294/0.308/0.346/0.361). **0 disables both bands** (the weak band lives under this floor); empty string means unset. |
 | `HECO_MATCH_NEARMISS_WEAK_FLOOR` | `0.15` | Floor of the WEAK (clothing) band: cosine in `[weak floor .. near-miss floor)` **plus** clothing at or above the bar below earns `nearMiss` with `basis: "clothing"`. Exists because bench 6e1a5d measured one person splitting at face 0.212/clothing 0.797 and face 0.228/clothing 0.875 — both invisible to the face band. **0 disables the weak band only**; empty string means unset. |
 | `HECO_MATCH_NEARMISS_CLOTHES` | `0.78` | Torso-intersection bar the weak band requires. **0.033 above the worst measured impostor clothing reading (0.747, two genuinely different men)** — a hair, not a margin, which is why this band only ever suggests. Expect wrong suggestions at venues with uniforms or a dress code; turn the band off there via the weak floor. Empty string means unset. |
+
+| `HECO_REVIEW_CLOTHES_CLASH` | `0.35` | Best cross-identity torso intersection under which a pair whose identities each wear one garment is set aside from the review queue. **0 disables clothing set-asides** (the body log is then not even read). |
+| `HECO_REVIEW_CLOTHES_MIN_N` | `3` | v3 torso reads (spanning two seconds) each identity needs before its clothing counts; clamped to at least 2. |
+| `HECO_REVIEW_CLOTHES_SELF_MIN` | `0.6` | Median pairwise intersection an identity's own torso reads must reach — an identity whose reads disagree (two people merged, a band on a pillar) has no clothing to compare. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
 operator-supervised walk-through, never from a crossing, and staff flows

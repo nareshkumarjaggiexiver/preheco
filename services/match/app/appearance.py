@@ -111,3 +111,61 @@ def best_intersection(
         return None
     scores = [s for s in (intersection(query, s) for s in stored) if s is not None]
     return max(scores) if scores else None
+
+
+# ------------------------------------------------ the review queue's evidence
+#
+# Everything below reads an identity's appearance ACROSS its sightings for
+# POST /review/duplicates — never for a verdict.  An identity's reads are
+# the torso descriptors its body-log rows carry
+# (:meth:`app.store.VectorStore.sighting_evidence`), capped and spread over
+# its time on camera (:func:`spread`).
+
+#: The v3 torso length; v2 rows (48) never count in the review's clothing
+#: evidence — a v2 partition is not the colour-below-the-neck v3 reads.
+TORSO_DIM = APPEARANCE_DIM
+
+#: At most this many reads per identity feed a comparison, spread evenly
+#: over its time order: an identity seen for ten minutes holds hundreds of
+#: body-log rows, consecutive frames of one walk are one reading many times
+#: over, and a pair's best cross is a (reads x reads) table.  24 keeps the
+#: largest review (500 pairs) in tens of milliseconds.
+READS_PER_KEY = 24
+
+
+def spread(reads: list, cap: int = READS_PER_KEY) -> list:
+    """``reads`` (already in time order) thinned to at most ``cap``, evenly."""
+    if len(reads) <= cap:
+        return list(reads)
+    idx = np.linspace(0, len(reads) - 1, cap).round().astype(int)
+    return [reads[i] for i in sorted(set(idx.tolist()))]
+
+
+def self_agreement(vectors: list[np.ndarray]) -> float | None:
+    """Median pairwise histogram intersection among one identity's reads.
+
+    None under two reads — one reading agrees with nothing, it is not
+    "agreement 1.0".  Median, not mean or min: one read through an
+    occluder must not make a steady garment look unsteady, and one lucky
+    pair must not make an unsteady one look steady.
+    """
+    if len(vectors) < 2:
+        return None
+    m = np.stack(vectors).astype(np.float64)
+    inter = np.minimum(m[:, None, :], m[None, :, :]).sum(-1)
+    iu = np.triu_indices(len(vectors), k=1)
+    return float(np.median(inter[iu]))
+
+
+def best_cross(a: list[np.ndarray], b: list[np.ndarray]) -> float | None:
+    """The best intersection of any read of one identity with any of the other.
+
+    BEST, as the torso veto is charitable: a pair is called different only
+    when NO reading of one agrees with any reading of the other.  None when
+    either side has none.
+    """
+    if not a or not b:
+        return None
+    ma = np.stack(a).astype(np.float64)
+    mb = np.stack(b).astype(np.float64)
+    return float(np.minimum(ma[:, None, :], mb[None, :, :]).sum(-1).max())
