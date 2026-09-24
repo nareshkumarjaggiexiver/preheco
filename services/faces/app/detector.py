@@ -26,7 +26,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import (
+    announce_device,
+    distinct_input_dims,
+    is_trt,
+    providers_for,
+    trt_truth,
+)
 
 from . import scrfd
 
@@ -171,6 +177,32 @@ def _parse_input_size(raw: str | None, fallback: int) -> int | tuple[int, int]:
 SCRFD_INPUT = os.environ.get("FACES_SCRFD_INPUT") or None
 
 
+#: SCRFD's input normalisation, (x - 127.5) / 128, as a 256-entry table.
+#: Every entry is a multiple of 1/256 and so exact in float32: a lookup and
+#: the arithmetic agree bit for bit (pinned in test_detector.py).
+_SCRFD_NORM_LUT = ((np.arange(256, dtype=np.float32) - 127.5) / 128.0).astype(np.float32)
+
+
+def scrfd_blob(canvas: np.ndarray) -> np.ndarray:
+    """Turn a BGR uint8 canvas into SCRFD's (1, 3, H, W) float32 RGB blob.
+
+    The same numbers as ``((rgb.astype(float32) - 127.5) / 128).transpose``
+    — which made a uint8 RGB copy and then four full float32 passes over the
+    canvas (convert, subtract, divide, the contiguous copy of the transpose):
+    at 1472x832 that is ~15 MB per pass. Here each channel is split once and
+    looked up straight into its plane of the output. Measured on the laptop,
+    1472x832: 24 ms -> 4 ms, byte-identical.
+    """
+    h, w = canvas.shape[:2]
+    blob = np.empty((1, 3, h, w), dtype=np.float32)
+    # split is B, G, R; the graph wants R, G, B — hence reversed.
+    for ch, plane in enumerate(reversed(cv2.split(canvas))):
+        out = cv2.LUT(plane, _SCRFD_NORM_LUT, dst=blob[0, ch])
+        if not np.may_share_memory(out, blob):
+            blob[0, ch] = out  # cv2 declined the dst: copy, never leave it empty
+    return blob
+
+
 def build_detector(model_path: Path | None = None, device: str | None = None):
     """The family factory: one detect() contract, family chosen by the file."""
     path = model_path or MODEL_PATH
@@ -296,12 +328,23 @@ class ScrfdDetector:
         self.input_size = input_size if isinstance(input_size, tuple) else (input_size, input_size)
         self.score_min = SCRFD_SCORE_MIN if score_min is None else float(score_min)
         providers, provider_options = providers_for(device)
+        model: str | bytes = str(model_path)
+        if is_trt(device):
+            # The InsightFace exports name BOTH spatial dims "?", which
+            # TensorRT reads as one dimension: a 1472x832 input then fails
+            # the engine build and ORT drops to CUDA. Renamed apart in
+            # memory; the file on the read-only mount is untouched.
+            model = distinct_input_dims(model_path.read_bytes()) or model
         self._session = ort.InferenceSession(
-            str(model_path), providers=providers, provider_options=provider_options
+            model, providers=providers, provider_options=provider_options
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("faces", self.device_requested, self.providers_active)
+        #: TensorRT's own view of its options; None when it is not in the
+        #: session (set after the dry run below, see there).
+        self.trt = None
+        if not is_trt(device):
+            announce_device("faces", self.device_requested, self.providers_active)
         if len(self._session.get_outputs()) != 9:
             raise ValueError(
                 f"{model_path.name} has {len(self._session.get_outputs())} outputs — "
@@ -331,6 +374,14 @@ class ScrfdDetector:
             None, {self._input_name: np.zeros((1, 3, *self.input_size), np.float32)}
         )
         scrfd.select_faces(outputs, self.input_size, (1.0, 1.0), self.score_min, NMS_IOU)
+        if is_trt(device):
+            # The dry run is also where TensorRT builds (or loads) its
+            # engine — and where a failed build makes ORT silently rebuild
+            # the session on CUDA. The truth is read AFTER it, or /health
+            # would claim a TensorRT that is not running (measured: it did).
+            self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
+            announce_device("faces", self.device_requested, self.providers_active)
 
     def detect(self, img: np.ndarray) -> list[dict]:
         """Detect faces in a BGR image; returns contract face dicts (no quality)."""
@@ -359,10 +410,9 @@ class ScrfdDetector:
         rw, rh = int(w * ratio), int(h * ratio)
         canvas = np.zeros((ih, iw, 3), dtype=np.uint8)
         canvas[:rh, :rw] = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        blob = ((rgb.astype(np.float32) - 127.5) / 128.0).transpose(2, 0, 1)[None]
+        blob = scrfd_blob(canvas)
         with self._lock:
-            outputs = self._session.run(None, {self._input_name: np.ascontiguousarray(blob)})
+            outputs = self._session.run(None, {self._input_name: blob})
         # int() truncation means the canvas actually holds rw/w x rh/h of
         # the frame, not `ratio` on both axes — divide by the achieved pair
         # or every box drifts toward the origin (~4 px at 4MP frame edges).

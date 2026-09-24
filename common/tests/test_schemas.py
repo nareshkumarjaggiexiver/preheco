@@ -30,15 +30,38 @@ def test_open_source_requires_exactly_one():
 
 def test_frame_wire_shape():
     """Frame dumps the exact contract keys."""
-    f = S.Frame(tMs=120, imageB64="abc=", w=640, h=480, seq=7)
+    f = S.Frame(tMs=120, imageB64="abc=", w=640, h=480, seq=7, ended=False)
     # `ended` joined the contract so the runner can tell a finished FILE from a
     # blinking CAMERA — both freeze `seq`, and only one means the count is done.
     # `frameRef` joined it for the shared-frame transport, and is ADDITIVE:
     # imageB64 is still populated on every frame unless a caller explicitly
     # declines it, so a consumer that has never heard of the ref is unaffected.
-    assert set(f.model_dump()) == {"tMs", "imageB64", "w", "h", "seq", "ended", "frameRef"}
+    # The lever fields are optional too, and ingest serialises with
+    # exclude_unset: a frame built without them carries exactly the six keys
+    # plus the frameRef this branch passes explicitly (null with no mount).
+    assert set(f.model_dump(exclude_unset=True)) == {"tMs", "imageB64", "w", "h", "seq", "ended"}
+    ref = S.Frame(tMs=120, imageB64="abc=", w=640, h=480, seq=7, ended=False, frameRef=None)
+    assert set(ref.model_dump(exclude_unset=True)) == {
+        "tMs", "imageB64", "w", "h", "seq", "ended", "frameRef",
+    }
     assert f.ended is False, "a live source never claims to have ended"
     assert f.frameRef is None, "no shared transport unless the producer offers one"
+
+
+def test_frame_lever_fields_are_optional_and_null_means_unmeasured():
+    """The ingest lever counters are additive: absent/null is NOT zero."""
+    f = S.Frame(tMs=1, imageB64="a", w=2, h=2, seq=3)
+    for key in ("motion", "backlog", "skipped", "dropped", "captured"):
+        assert getattr(f, key) is None, f"{key} must default to unmeasured, not 0"
+    armed = S.Frame(
+        tMs=1, imageB64="a", w=2, h=2, seq=3, ended=False,
+        motion=None, backlog=0, skipped=None, dropped=4, captured=9,
+    )
+    wire = armed.model_dump(exclude_unset=True)
+    assert wire["motion"] is None and wire["skipped"] is None, "an explicit null travels"
+    assert wire["dropped"] == 4 and wire["captured"] == 9 and wire["backlog"] == 0
+    with pytest.raises(ValidationError):
+        S.Frame(tMs=1, imageB64="a", w=2, h=2, seq=3, dropped=-1)
 
 
 def test_track_shapes():

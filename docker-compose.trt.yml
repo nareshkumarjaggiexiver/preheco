@@ -1,0 +1,68 @@
+# TensorRT overlay — HECO_DEVICE=TRT (fp16) for persons, faces and embed.
+#
+# Layer it LAST, on top of the GPU-max overlay (which supplies the CUDA
+# images, the GPU reservation and the restricted-tier model env):
+#
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-persons -t heco-persons:cuda .
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-faces   -t heco-faces:cuda   .
+#   docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-embed   -t heco-embed:cuda   .
+#   HECO_CPUSET= PERSONS_MODEL=yolox_s.onnx \
+#   FACES_MODEL=scrfd_10g_kps.onnx FACES_SCRFD_INPUT=1472x832 \
+#   EMBED_MODEL=models/arcface_w600k_r50.onnx HECO_EMBEDDING_DIM=512 HECO_EMBEDDER_ID=arcface-w600k-r50 \
+#   docker compose -f docker-compose.yml -f docker-compose.gpumax.yml -f docker-compose.trt.yml up -d
+#
+# The images must carry TensorRT (docker/persons-cuda.Dockerfile pins
+# tensorrt-cu13-libs 10.16 since the lever-models branch); an image built
+# before that answers /health requested=TRT with no TensorRT in `active`
+# and `trt: null` — slower, never wrong. HECO_CUDA_TAG picks another tag.
+#
+# WHAT IT BUYS (4060, eight 4K frames of the Sharon bench clip, session.run
+# median, fp32 CUDA -> fp16 TensorRT): YOLOX-s 640 7.1 -> 3.3 ms; SCRFD-10G
+# 1472x832 20.0 -> 5.4 ms (640: 7.5 -> 2.5); ArcFace-R50 23.3 -> 8.6 ms per
+# 5.5-face frame (3.7 with EMBED_BATCH=1). Parity against fp32: person
+# boxes IoU >= 0.995, face boxes IoU >= 0.991 with landmarks within 0.22 px,
+# ArcFace cosine >= 0.9999, no gender flips. VRAM per stack under TRT:
+# persons 190 MiB, faces 250 MiB, embed 330 MiB.
+#
+# WHAT IT COSTS: a COLD START. TensorRT builds one engine per model, input
+# shape and GPU — measured cold on the 4060: YOLOX-s 157 s, SCRFD-10G 34 s,
+# ArcFace 32-38 s, genderage 20 s — and these run inside the first /health,
+# so the healthcheck's start period below is sized for three stacks
+# building at once on one card. Every later start deserialises from the
+# volume in under a second. The cache is per compose PROJECT (volumes are
+# project-scoped): two stacks never write one engine file at the same time.
+# Changing a model, FACES_SCRFD_INPUT or EMBED_BATCH is a new engine and a
+# cold build on next load; so is a new GPU or TensorRT version.
+#
+# Rollback is total: drop this -f and the fp32 CUDA arm returns untouched
+# (the cache volume just sits unused).
+services:
+  persons:
+    environment:
+      HECO_DEVICE: TRT
+      HECO_TRT_CACHE: /srv/trt-cache/persons
+    volumes:
+      - trt-cache:/srv/trt-cache
+    healthcheck:
+      start_period: 900s
+
+  faces:
+    environment:
+      HECO_DEVICE: TRT
+      HECO_TRT_CACHE: /srv/trt-cache/faces
+    volumes:
+      - trt-cache:/srv/trt-cache
+    healthcheck:
+      start_period: 900s
+
+  embed:
+    environment:
+      HECO_DEVICE: TRT
+      HECO_TRT_CACHE: /srv/trt-cache/embed
+    volumes:
+      - trt-cache:/srv/trt-cache
+    healthcheck:
+      start_period: 900s
+
+volumes:
+  trt-cache:

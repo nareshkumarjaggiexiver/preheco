@@ -21,6 +21,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
 from heco_common.geometry import dedupe_boxes
+from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -202,18 +203,31 @@ def health() -> dict:
         # because accelerator EPs fall back to CPU silently. scoreMin rides
         # along because the families' scores are NOT commensurable — a
         # golden-replay ledger must record which operating point made it.
-        "device": {
-            "requested": det.device_requested,
-            "active": det.providers_active,
-            "family": det.family,
-            "scoreMin": det.score_min,
-        } if det else None,
+        "device": _device_block(det) if det else None,
     }
     if det is None and _load_error:
         # The cause, not just the fact: an operator staring at an unhealthy
         # probe needs to know WHAT blocks the load without docker exec.
         body["error"] = _load_error
     return body
+
+
+def _device_block(det) -> dict:
+    """Build the /health device truth; `trt` rides along only when TRT was asked.
+
+    Keyed on the REQUEST, not on success: a TensorRT that failed to load
+    answers "trt": null beside an `active` list without it. Every other
+    device (and the cv2 yunet family) keeps today's block byte-for-byte.
+    """
+    block = {
+        "requested": det.device_requested,
+        "active": det.providers_active,
+        "family": det.family,
+        "scoreMin": det.score_min,
+    }
+    if is_trt(det.device_requested):
+        block["trt"] = getattr(det, "trt", None)
+    return block
 
 
 class ApplyModelRequest(BaseModel):

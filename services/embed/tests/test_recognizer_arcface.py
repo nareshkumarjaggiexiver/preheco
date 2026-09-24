@@ -170,3 +170,69 @@ def test_degenerate_landmarks_are_refused_in_embed(tmp_path):
     coincident["landmarks"] = [[50.0, 60.0]] * 5
     with pytest.raises(ValueError, match="degenerate landmarks"):
         emb.embed(_frame(), [coincident])
+
+
+# ------------------------------------------------- EMBED_BATCH
+
+def _faces(n):
+    return [_face(offset=40.0 + 30.0 * i) for i in range(n)]
+
+
+def test_batching_is_off_by_default_and_the_loop_is_unchanged(tmp_path):
+    """OFF is today: no EMBED_BATCH, per-face runs, and the vectors are the
+    exact per-face blobs (Flatten echoes its input)."""
+    emb = ArcFaceEmbedder(
+        write_model(tmp_path, "tiny_dyn.onnx", FLOAT, ("N", 3, 112, 112)), "CPU")
+    assert emb.batch_requested is False and emb.batch_active is False
+    img, faces = _frame(), _faces(3)
+    embeddings, _ = emb.embed(img, faces)
+    for got, face in zip(embeddings, faces, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got, np.float32), _expected_blob(img, face).transpose(2, 0, 1).ravel())
+
+
+def test_a_dynamic_batch_graph_runs_all_faces_in_one_run_same_vectors(tmp_path, monkeypatch):
+    """EMBED_BATCH on a dynamic-batch graph: ONE session.run for the request,
+    order preserved, and the same vectors the per-face loop gives."""
+    import app.recognizer as rec
+
+    path = write_model(tmp_path, "tiny_dyn.onnx", FLOAT, ("N", 3, 112, 112))
+    per_face = ArcFaceEmbedder(path, "CPU", batch=False)
+    batched = ArcFaceEmbedder(path, "CPU", batch=True)
+    assert batched.batch_active is True
+    runs = []
+    real_run = batched._session.run
+    monkeypatch.setattr(batched, "_session", type("S", (), {
+        "run": lambda self, names, feeds: runs.append(next(iter(feeds.values())).shape)
+        or real_run(names, feeds)})())
+    img, faces = _frame(), _faces(5)
+    want, want_norms, _, _, _ = per_face.embed_faces(img, faces)
+    got, got_norms, _, _, _ = batched.embed_faces(img, faces)
+    assert runs == [(5, 3, 112, 112)], "one run for the whole request"
+    assert got == want and got_norms == want_norms
+    # More faces than BATCH_MAX: chunks, still in order.
+    monkeypatch.setattr(rec, "BATCH_MAX", 2)
+    runs.clear()
+    got, _, _, _, _ = batched.embed_faces(img, faces)
+    assert runs == [(2, 3, 112, 112), (2, 3, 112, 112), (1, 3, 112, 112)]
+    assert got == want
+
+
+def test_a_static_batch_graph_keeps_the_per_face_loop(tmp_path):
+    """A graph exported with batch 1 cannot take five faces: batching stays
+    requested but NOT active, and /health's knobs say so."""
+    emb = ArcFaceEmbedder(
+        write_model(tmp_path, "tiny_static.onnx", FLOAT, (1, 3, 112, 112)), "CPU", batch=True)
+    assert emb.batch_requested is True and emb.batch_active is False
+    img, faces = _frame(), _faces(3)
+    embeddings, _ = emb.embed(img, faces)
+    assert len(embeddings) == 3
+
+
+def test_a_malformed_face_is_still_a_valueerror_when_batched(tmp_path):
+    """Every blob is built before the first run, so the 400 contract holds."""
+    emb = ArcFaceEmbedder(
+        write_model(tmp_path, "tiny_dyn.onnx", FLOAT, ("N", 3, 112, 112)), "CPU", batch=True)
+    bad = {"box": {"x": 1, "y": 1, "w": 5, "h": 5}, "landmarks": [[1, 2]] * 4}
+    with pytest.raises(ValueError):
+        emb.embed(_frame(), [_face(), bad])

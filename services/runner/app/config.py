@@ -151,6 +151,30 @@ class Settings:
     # as long as they stay turned — precisely the case the gate exists to stop.
     face_reverify_interval_s: float = 0.0
 
+    # FACE-SEARCH CADENCE (lever L4, HECO_FACE_CADENCE).  Off by default.  On,
+    # a frame's face search is SKIPPED when there is at least one person box,
+    # every person box is covered one to one (IoU >= 0.5) by a SETTLED track —
+    # one holding an identity lock whose last comfortable face match is
+    # younger than face_reverify_interval_s — and less than
+    # face_cadence_max_gap_s of footage has passed since the last search that
+    # ran (heco_counting.face_search).  A newcomer, a stale lock, an
+    # unconfirmed body, an empty frame: all searched, every frame.
+    #
+    # WHY.  The whole-frame SCRFD search is the largest single cost of the 4K
+    # chain on the CUDA box and saturates the GPU alone (two concurrent
+    # inferences measured 1.05x), and most wedding frames are the same
+    # identified guests standing where they stood — searching again only
+    # re-confirms answers the run holds.  Skipped frames still run the
+    # tracker and track-presence co-presence; they are counted in
+    # faceDetectSkippedSettled beside `unique`.
+    #
+    # DEPENDS ON face_reverify_interval_s: at 0 nothing is ever "recently
+    # verified", so the cadence skips nothing (said at run start, and visible
+    # in GET /health knobs and the run config).  2-3 s is the intended
+    # pairing with the 1 s max gap.
+    face_cadence: bool = False
+    face_cadence_max_gap_s: float = 1.0
+
     flush_interval_s: float = 2.0  # planner stats/samples cadence
     sample_batch_max: int = 200  # planner ingest contract: batch <= 200 rows
 
@@ -204,6 +228,36 @@ class Settings:
     #: file replays are frame-for-frame identical either way (the poller
     #: returns the NEXT seq whenever it is asked), so golden diffs hold.
     frame_prefetch: bool = True
+
+    # STAGE OVERLAP (lever L3, HECO_PIPELINE_OVERLAP).  Off by default, and
+    # off is the loop exactly as it has always run (pinned call for call:
+    # tests/test_call_sequence_pinned.py).
+    #
+    # THE MEASUREMENT.  One 4K camera through the CUDA box, whole-frame
+    # SCRFD-10G at 1472x832: ~200 ms a frame with every stage SERIAL in this
+    # loop, while the camera delivers a frame every 67 ms.  Persons and faces
+    # are the stateless half of that chain — each is a pure function of the
+    # frame — and everything else (the tracker, the gallery, the locks,
+    # co-presence, the ledger, the taps) is state that must be touched in
+    # frame order.  So ONE worker thread fetches frame k+1 and runs its
+    # detection (persons, then the face search when it needs no tracks: the
+    # whole frame) while this thread runs frame k's track -> gate -> embed ->
+    # match -> verdict pass.  At most one frame ahead; every piece of state
+    # stays on this thread; a stage failure in the worker is carried back and
+    # raised here, at the very point the inline call would have raised it.
+    # A crop search still waits for its frame's tracks, so on the crop path
+    # only persons moves to the worker.
+    pipeline_overlap: bool = False
+    # PARALLEL DETECT (lever L3, HECO_PARALLEL_DETECT).  Off by default.  With
+    # the whole-frame face search, persons and faces /detect for the SAME
+    # frame are issued side by side instead of one after the other — neither
+    # needs the other's answer.  Measured persons latency through its HTTP
+    # service is 31-43 ms against 8.6 ms of model time, so most of what this
+    # hides is transport, not GPU (two concurrent SCRFD inferences measured
+    # 1.05x: the GPU is already saturated by one).  Works with or without the
+    # overlap; on the crop path it does nothing, because a crop search needs
+    # this frame's tracks first.
+    parallel_detect: bool = False
 
     async_reporting: bool = True
     # How long the reporter sleeps when idle.  Short enough that a mint's
@@ -463,6 +517,20 @@ class Settings:
     # arming, because the gate is the pipeline's only irreversible discard.
     quality_min_feat_norm: float = 0.0
 
+    # APPEARANCE WHITE BALANCE (heco_counting.appearance.frame_gains).  Off
+    # by default.  On: each decoded frame's illuminant is estimated once
+    # (shades-of-grey, p = 6, on every 8th pixel, ~2.4 ms at 4K) and the
+    # torso descriptor reads its band under neutral light.  Proven on
+    # synthetic casts (four garments under red / blue / amber light agree
+    # with their neutral read at 0.83-0.99 balanced; raw, 0.00-0.995 and
+    # three of the twelve not measurable at all).  Measured on
+    # run f0bfc5 it changes nothing: the camera's own AWB already holds the
+    # warm hall at gains 1.006 / 0.985 / 1.009 (B/G/R median, every frame
+    # within 2%), and within-identity (median 0.90 -> 0.90) and cross-pair
+    # separation did not move — so it stays off until a venue with coloured
+    # light measures otherwise.
+    appearance_wb: bool = False
+
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
@@ -523,6 +591,10 @@ def from_env() -> Settings:
         face_reverify_interval_s=env_float(
             "HECO_FACE_REVERIFY_INTERVAL_S", s.face_reverify_interval_s
         ),
+        face_cadence=env_bool("HECO_FACE_CADENCE", s.face_cadence),
+        face_cadence_max_gap_s=env_float(
+            "HECO_FACE_CADENCE_MAX_GAP_S", s.face_cadence_max_gap_s
+        ),
         run_retention_s=env_float("HECO_RUN_RETENTION_S", s.run_retention_s),
         flush_interval_s=env_float("HECO_FLUSH_INTERVAL_S", s.flush_interval_s),
         request_timeout_s=env_float("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s),
@@ -555,8 +627,34 @@ def from_env() -> Settings:
         golden_path=os.environ.get("HECO_GOLDEN_PATH") or s.golden_path,
         golden_embeddings=os.environ.get("HECO_GOLDEN_EMBEDDINGS", "") == "1",
         frame_prefetch=os.environ.get("HECO_FRAME_PREFETCH", "1") != "0",
+        pipeline_overlap=env_bool("HECO_PIPELINE_OVERLAP", s.pipeline_overlap),
+        parallel_detect=env_bool("HECO_PARALLEL_DETECT", s.parallel_detect),
         async_reporting=env_bool("HECO_ASYNC_REPORTING", s.async_reporting),
         reporter_poll_s=env_float("HECO_REPORTER_POLL_S", s.reporter_poll_s),
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
         enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
+        appearance_wb=env_bool("HECO_APPEARANCE_WB", s.appearance_wb),
     )
+
+
+def knobs(s: Settings) -> dict:
+    """The throughput levers (and the appearance switch) as this process
+    resolved them, for GET /health.
+
+    Keyed by the variable an operator sets, so "is it on?" is answered
+    against the very name in the .env.  The failure this exists for is a
+    knob that LOOKED set and changed nothing: three knobs in this repo once
+    had no compose passthrough, and nothing anywhere said so.
+    """
+    return {
+        "HECO_PIPELINE_OVERLAP": s.pipeline_overlap,
+        "HECO_PARALLEL_DETECT": s.parallel_detect,
+        "HECO_FACE_CADENCE": s.face_cadence,
+        "HECO_FACE_CADENCE_MAX_GAP_S": s.face_cadence_max_gap_s,
+        # The cadence's settledness window: shown beside it because at 0 the
+        # cadence skips nothing (a per-run quality profile may override it).
+        "HECO_FACE_REVERIFY_INTERVAL_S": s.face_reverify_interval_s,
+        # Not a throughput lever: white balance for the review's colour
+        # evidence (torso, head, beard), off by default.
+        "HECO_APPEARANCE_WB": s.appearance_wb,
+    }

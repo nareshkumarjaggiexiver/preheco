@@ -20,6 +20,8 @@ synthetic tensors with known truth, no weights required.
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 #: The three detection strides of every published SCRFD variant.
@@ -33,6 +35,18 @@ def anchor_centers(height: int, width: int, stride: int) -> np.ndarray:
     ys, xs = np.mgrid[:height, :width]
     centers = np.stack([xs, ys], axis=-1).reshape(-1, 2).astype(np.float32) * stride
     return np.repeat(centers, NUM_ANCHORS, axis=0)
+
+
+@functools.lru_cache(maxsize=16)
+def _cached_centers(height: int, width: int, stride: int) -> np.ndarray:
+    """Return anchor_centers built once per grid, read-only.
+
+    The input size never changes between frames, so the grid is the same
+    every call; frozen so no caller can scribble on the cached array.
+    """
+    centers = anchor_centers(height, width, stride)
+    centers.flags.writeable = False
+    return centers
 
 
 def decode_stride(scores, boxes, kps, stride: int, input_hw: tuple[int, int]):
@@ -57,6 +71,32 @@ def decode_stride(scores, boxes, kps, stride: int, input_hw: tuple[int, int]):
     xyxy[:, 3] = centers[:, 1] + boxes[:, 3]
     landmarks = kps + centers[:, None, :]
     return scores, xyxy, landmarks
+
+
+def _decode_kept(scores, boxes, kps, stride: int, input_hw: tuple[int, int], score_min: float):
+    """decode_stride for the anchors at or above `score_min` ONLY.
+
+    At 1472x832 a frame has 50,232 anchors and a few dozen clear the score;
+    decoding all of them (boxes, five landmarks, their centres) and THEN
+    masking was the bulk of select_faces. Same arithmetic, element for
+    element, on the kept rows in the same order — so the same bits out
+    (pinned against decode_stride + mask in test_scrfd.py).
+    """
+    h = input_hw[0] // stride
+    w = input_hw[1] // stride
+    centers = _cached_centers(h, w, stride)
+    scores = np.asarray(scores).reshape(-1)
+    n = min(len(centers), len(scores))
+    keep = np.flatnonzero(scores[:n] >= score_min)
+    centers = centers[keep]
+    boxes = np.asarray(boxes).reshape(-1, 4)[keep] * stride
+    kps = np.asarray(kps).reshape(-1, 5, 2)[keep] * stride
+    xyxy = np.empty_like(boxes)
+    xyxy[:, 0] = centers[:, 0] - boxes[:, 0]
+    xyxy[:, 1] = centers[:, 1] - boxes[:, 1]
+    xyxy[:, 2] = centers[:, 0] + boxes[:, 2]
+    xyxy[:, 3] = centers[:, 1] + boxes[:, 3]
+    return scores[keep], xyxy, kps + centers[:, None, :]
 
 
 def nms(xyxy: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
@@ -102,13 +142,12 @@ def select_faces(outputs: list, input_hw, scale: tuple[float, float], score_min:
     """
     all_scores, all_xyxy, all_lm = [], [], []
     for si, stride in enumerate(STRIDES):
-        scores, xyxy, lm = decode_stride(
-            outputs[si], outputs[si + 3], outputs[si + 6], stride, input_hw)
-        mask = scores >= score_min
-        if mask.any():
-            all_scores.append(scores[mask])
-            all_xyxy.append(xyxy[mask])
-            all_lm.append(lm[mask])
+        scores, xyxy, lm = _decode_kept(
+            outputs[si], outputs[si + 3], outputs[si + 6], stride, input_hw, score_min)
+        if scores.size:
+            all_scores.append(scores)
+            all_xyxy.append(xyxy)
+            all_lm.append(lm)
     if not all_scores:
         return []
     sx, sy = scale

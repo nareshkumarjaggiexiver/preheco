@@ -351,10 +351,22 @@ def skin_weights(crop_bgr: np.ndarray) -> np.ndarray:
     return _analyse(crop_bgr)[2]
 
 
-def _analyse(crop_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``(lit, skin, weight)`` for one crop — one colour conversion each way."""
+def _analyse(
+    crop_bgr: np.ndarray, sensor_bgr: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(lit, skin, weight)`` for one crop — one colour conversion each way.
+
+    ``sensor_bgr`` is the crop as the CAMERA delivered it when ``crop_bgr``
+    has been white-balanced (:func:`apply_gains`): shadow and blowout are
+    facts about the sensor — a highlight clipped at 255 and scaled by a 0.8
+    gain reads 204, which is not cloth — so ``lit`` is read there, while the
+    skin window reads the balanced colours.  None (no balancing) reads both
+    off ``crop_bgr``, exactly as before gains existed.
+    """
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
+    if sensor_bgr is not None:
+        v = _max3(sensor_bgr)  # OpenCV's 8-bit V is max(B, G, R)
     lit = (v >= V_MIN) & (v <= V_MAX)
     ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
@@ -450,7 +462,10 @@ def _l1(part: np.ndarray) -> np.ndarray | None:
 
 
 def torso_descriptor(
-    image_bgr: np.ndarray, face_box: dict, person_box: dict | None
+    image_bgr: np.ndarray,
+    face_box: dict,
+    person_box: dict | None,
+    gains: tuple[float, float, float] | None = None,
 ) -> list[float] | None:
     """The 64-float torso descriptor for one face, or None when unmeasurable.
 
@@ -476,6 +491,12 @@ def torso_descriptor(
     keeps no interior cloth pixel for the pattern parts.  None means "could
     not measure", and per the module convention it must never be treated
     as a clash.
+
+    ``gains`` — the frame's white-balance gains from :func:`frame_gains` —
+    are applied to the band before the skin window and the colour bins read
+    it; the lit mask and the pattern parts still read the pixels as the
+    camera delivered them (see :func:`_analyse`).  None is exactly the
+    descriptor as it was before gains existed.
     """
     if person_box is None:
         return None
@@ -487,12 +508,17 @@ def torso_descriptor(
         return None
     ix0, ix1, iy0, iy1 = band
     crop = image_bgr[iy0:iy1, ix0:ix1]
-    lit, skin, skin_w = _analyse(crop)
+    if gains is None:
+        colour_crop = crop
+        lit, skin, skin_w = _analyse(crop)
+    else:
+        colour_crop = apply_gains(crop, gains)
+        lit, skin, skin_w = _analyse(colour_crop, sensor_bgr=crop)
     cloth = lit & ~skin
     if int(cloth.sum()) < MIN_UNMASKED_PX:
         return None
 
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(colour_crop, cv2.COLOR_BGR2HSV)
     weights = np.where(lit, skin_w, 0.0)
     colour = _l1(_colour_part(hsv, weights))
     if colour is None:  # defensive: cloth.sum() >= 100 makes this unreachable
@@ -543,3 +569,430 @@ def intersection(a: list[float], b: list[float]) -> float | None:
     if va.shape != vb.shape or va.ndim != 1 or va.size == 0:
         return None
     return float(np.minimum(va, vb).sum())
+
+
+# ------------------------------------------------------------------ lighting
+#
+# A garment's colour on the wire is the garment times the LIGHT.  One event
+# runs under several: warm hall lamps, the stage's coloured washes, a DJ's
+# flashes, daylight at the door.  frame_gains() estimates the illuminant of
+# a whole frame so every colour descriptor can be read as if under neutral
+# light; it is advisory like the descriptors themselves, and off unless the
+# runner's HECO_APPEARANCE_WB asks for it.
+
+#: Shades-of-grey Minkowski norm (Finlayson & Trezzi 2004): p = 1 is
+#: grey-world, p = infinity is max-RGB; p = 6 is where their evaluation put
+#: the best single value, and it keeps one large coloured object (a red
+#: stage backdrop) from dragging the estimate the way grey-world's mean does.
+WB_P = 6
+#: The estimate reads every 8th pixel each way — a 4K frame becomes 480 x
+#: 270 = 129,600 samples, far more than an illuminant needs.  Striding, not
+#: resizing: area-averaging 8 MP costs more than the estimate itself.
+WB_STRIDE = 8
+#: A sample whose brightest channel is under this is sensor noise, not a
+#: colour: its ratios are what the codec left, not what the light did.
+WB_DARK = 16
+#: A sample with ANY channel at or above this is clipped: the channel stopped
+#: at 255 while the light kept going, so its ratio is not the light's.
+WB_BLOWN = 250
+#: Fewer usable samples than this and the frame is "not measured" (None):
+#: a black frame or a frame that is all blown sky has no illuminant to read.
+WB_MIN_SAMPLES = 1000
+#: Gains are normalised to average 1 (brightness is not the job) and then
+#: clamped: a correction beyond 2x on one channel is the estimate failing —
+#: a frame filled by one saturated garment — not a light that coloured.
+WB_GAIN_MIN = 0.5
+WB_GAIN_MAX = 2.0
+
+
+def frame_gains(image_bgr: np.ndarray) -> tuple[float, float, float] | None:
+    """Per-channel white-balance gains ``(gb, gg, gr)`` for one frame, or None.
+
+    Shades-of-grey (p = WB_P) on a 1/WB_STRIDE sampling of the frame,
+    ignoring near-black (max channel < WB_DARK) and clipped (any channel
+    >= WB_BLOWN) samples; the gains are the inverse of the estimated
+    illuminant, normalised so the three average 1, then clamped to
+    [WB_GAIN_MIN, WB_GAIN_MAX].  None when fewer than WB_MIN_SAMPLES
+    samples are usable — absent is not zero, and a caller handed None reads
+    the colours as the camera delivered them.
+    """
+    if image_bgr is None or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        return None
+    return gains_from_samples(image_bgr[::WB_STRIDE, ::WB_STRIDE])
+
+
+def gains_from_samples(small_bgr: np.ndarray) -> tuple[float, float, float] | None:
+    """:func:`frame_gains` on an image that is ALREADY the sample grid.
+
+    Split out so an evaluation holding 1/8-scale frames (not the 4K
+    originals) computes exactly the estimate the runner would.
+    """
+    b, g, r = small_bgr[:, :, 0], small_bgr[:, :, 1], small_bgr[:, :, 2]
+    top = np.maximum(np.maximum(b, g), r)
+    usable = (top >= WB_DARK) & (top < WB_BLOWN)
+    n = int(usable.sum())
+    if n < WB_MIN_SAMPLES:
+        return None
+    est = np.empty(3, dtype=np.float64)
+    for i, ch in enumerate((b, g, r)):
+        x = ch[usable].astype(np.float32) * np.float32(1.0 / 255.0)
+        x2 = x * x
+        est[i] = float(np.mean(x2 * x2 * x2, dtype=np.float64)) ** (1.0 / WB_P)
+    if not np.all(est > 0.0):
+        return None
+    g = 1.0 / est
+    g = np.clip(g / g.mean(), WB_GAIN_MIN, WB_GAIN_MAX)
+    return float(g[0]), float(g[1]), float(g[2])
+
+
+def apply_gains(crop_bgr: np.ndarray, gains: tuple[float, float, float]) -> np.ndarray:
+    """The crop under neutral light: each channel scaled by its gain, 8-bit."""
+    g = np.asarray(gains, dtype=np.float32).reshape(1, 1, 3)
+    return np.clip(np.rint(crop_bgr.astype(np.float32) * g), 0, 255).astype(np.uint8)
+
+
+
+
+# ---------------------------------------------------------------- head + beard
+#
+# Two more readings for the review queue, and like the torso ADVISORY: they
+# may set a question aside, never answer one.  Run f0bfc5's review pair #1
+# was a maroon turban and a black beard against a peach turban and a white
+# beard, and the torso could not say so (a white shirt against a pink check
+# agreed at 0.42 in some pair of reads).  Measured on the 45 identities of
+# that queue's first 32 pairs (<= 24 reads each, SCRFD landmarks re-detected
+# offline, scratchpad head-eval/):
+#
+# HEAD.  Headwear and hair colour above the eyes.  An identity's own reads
+# agree at a median 0.87 (min 0.63); one person split across a time gap at
+# a best cross of 0.83-0.99 (9 splits); pair #1 at 0.36.  Four choices, each
+# against the first draft, each measured:
+#
+# * CHROMA, not saturation, decides "chromatic": OpenCV's S is (max-min)/max
+#   and explodes in the dark — black hair (V 13-22) read S 40-93 and a random
+#   hue.  Chroma C = max - min >= 20 keeps 97-100% of the maroon, peach and
+#   sky-blue turbans' pixels and 0-7% of black or grey hair's.  A pale pink
+#   turban (S ~40, C ~27) is pink rather than "white".
+# * Skin-window pixels count a QUARTER, as on the torso: the peach turban of
+#   pair #1 sits wholly inside the window (Cr ~154, Cb ~112, S ~95); masked,
+#   it vanished and the descriptor read its creases and the wall.
+# * No shadow floor: black hair is signal, not shadow (V 13-22 on this
+#   camera, under the torso's floor of 30).
+# * The region's top is clipped to the PERSON box's top when one is given:
+#   0.6 face heights above a bare head is wall, and without the clip one
+#   identity's own reads fell to 0.48 and a same-person split to 0.76.
+#
+# BEARD.  [skin, dark, grey, white] fractions of the chin, each pixel judged
+# RELATIVE TO THE SAME FACE'S CHEEKS: absolute cuts failed on this dim hall —
+# the white beard of pair #1 read 78% "dark" at V < 70 and most shaven men
+# 50-92%.  Against the cheek: DARK under 0.4 of its brightness (the seven
+# full beards' median reads 47-75% dark, 21 shaven or moustached men 3-48%),
+# PALE when the saturation is under half the cheek's (a white beard is
+# desaturated hair — pair #1's elder reads 59% pale and 0% dark — while a
+# shaded chin is skin that kept its saturation), WHITE when a pale pixel is
+# at least 0.9 of the cheek's brightness.
+
+#: The head descriptor's wire length: 24 hue + 3 brightness + 13 reserved.
+HEAD_DIM = 40
+#: 24 hue bins of 15 degrees, SOFT-assigned and wrapping: a turban red
+#: (H 0) and orange (H 12.6) share no bin, and H 179 is red like H 0.
+HEAD_H_BINS = 24
+#: Achromatic pixels by brightness: black / grey / white hair.
+HEAD_V_BINS = 3
+HEAD_RESERVED = HEAD_DIM - HEAD_H_BINS - HEAD_V_BINS  # 13
+#: Chromatic from this chroma (max - min channel, 8-bit) up.
+HEAD_CHROMA_MIN = 20
+#: Weight of a skin-window pixel (1.0 everywhere else).
+HEAD_SKIN_WEIGHT = 0.25
+#: The region starts this many face heights ABOVE the face box's top edge
+#: (a turban rises well above the box a face detector draws)...
+HEAD_ABOVE_FACE_HEIGHTS = 0.6
+#: ...but not above the person box's top, less this many face heights.
+HEAD_PERSON_TOP_MARGIN = 0.05
+#: ...and ends this many inter-eye distances above the eye line: the brow
+#: and the eyes themselves are not headwear.
+HEAD_EYE_MARGIN_IED = 0.15
+#: Horizontally the face box widened by this fraction of its width a side.
+HEAD_SIDE_FRAC = 0.15
+#: A head window under this many pixels either way, or with fewer lit
+#: pixels than HEAD_MIN_PX, is not measured.
+HEAD_MIN_SIDE_PX = 8
+HEAD_MIN_PX = 60
+
+#: The beard window: nose tip down to the face box's bottom, between the
+#: mouth corners widened by this many inter-eye distances a side.
+BEARD_SIDE_IED = 0.25
+BEARD_MIN_SIDE_PX = 6
+BEARD_MIN_PX = 40
+#: The reference skin: the band from this many IED under the eye line down
+#: to the nose tip, across the eyes widened BEARD_CHEEK_SIDE_IED a side —
+#: under-eye and upper cheek, skin on every face, bearded or not.
+BEARD_CHEEK_TOP_IED = 0.25
+BEARD_CHEEK_SIDE_IED = 0.2
+BEARD_CHEEK_MIN_PX = 20
+#: A cheek darker than this (median max channel) is too dark to judge by.
+BEARD_REF_V_MIN = 20
+#: Pixel classes relative to the cheek: DARK under this fraction of its
+#: brightness...
+BEARD_DARK_REL_V = 0.4
+#: ...PALE (grey or white hair) under this fraction of its saturation...
+BEARD_PALE_REL_S = 0.5
+#: ...and a pale pixel is WHITE from this fraction of its brightness up.
+BEARD_WHITE_REL_V = 0.9
+#: The nose tip at or below the mouth line: the head is fully down (or the
+#: landmarks are not a face) and the chin is out of sight.
+BEARD_MAX_NOSE_DROP = 1.0
+
+
+def _eyes(landmarks) -> tuple[float, float] | None:
+    """``(eye_line_y, ied)`` from the first two landmarks (the eyes), or None."""
+    try:
+        (rx, ry), (lx, ly) = landmarks[0][:2], landmarks[1][:2]
+        rx, ry, lx, ly = float(rx), float(ry), float(lx), float(ly)
+    except (TypeError, ValueError, IndexError):
+        return None
+    ied = float(np.hypot(lx - rx, ly - ry))
+    if not np.isfinite(ied) or ied <= 0.0:
+        return None
+    return (ry + ly) / 2.0, ied
+
+
+def _window(x0, x1, y0, y1, img_w: int, img_h: int, min_side: int):
+    """An integer window clamped to the image, or None under ``min_side``."""
+    ix0, ix1 = max(int(round(x0)), 0), min(int(round(x1)), img_w)
+    iy0, iy1 = max(int(round(y0)), 0), min(int(round(y1)), img_h)
+    if (ix1 - ix0) < min_side or (iy1 - iy0) < min_side:
+        return None
+    return ix0, ix1, iy0, iy1
+
+
+def head_region(
+    face_box: dict, landmarks, img_w: int, img_h: int, person_box: dict | None = None
+):
+    """The head window ``(x0, x1, y0, y1)``, or None.
+
+    From HEAD_ABOVE_FACE_HEIGHTS above the face box's top (clipped to the
+    person box's top when that is lower) down to HEAD_EYE_MARGIN_IED above
+    the eye line; the face box widened HEAD_SIDE_FRAC a side.
+    """
+    eyes = _eyes(landmarks)
+    if eyes is None:
+        return None
+    eye_y, ied = eyes
+    fx, fy = float(face_box.get("x", 0.0)), float(face_box.get("y", 0.0))
+    fw, fh = float(face_box.get("w", 0.0)), float(face_box.get("h", 0.0))
+    if fw <= 0 or fh <= 0:
+        return None
+    top = fy - HEAD_ABOVE_FACE_HEIGHTS * fh
+    if person_box is not None:
+        person_top = float(person_box.get("y", 0.0)) - HEAD_PERSON_TOP_MARGIN * fh
+        if top < person_top < fy:
+            top = person_top
+    return _window(
+        fx - HEAD_SIDE_FRAC * fw, fx + fw + HEAD_SIDE_FRAC * fw,
+        top, eye_y - HEAD_EYE_MARGIN_IED * ied, img_w, img_h, HEAD_MIN_SIDE_PX,
+    )
+
+
+def beard_region(face_box: dict, landmarks, img_w: int, img_h: int):
+    """The beard window ``(x0, x1, y0, y1)``: nose tip to box bottom, or None."""
+    eyes = _eyes(landmarks)
+    if eyes is None:
+        return None
+    try:
+        nose_y = float(landmarks[2][1])
+        mouth_x = (float(landmarks[3][0]), float(landmarks[4][0]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    fy, fh = float(face_box.get("y", 0.0)), float(face_box.get("h", 0.0))
+    if fh <= 0:
+        return None
+    ied = eyes[1]
+    return _window(
+        min(mouth_x) - BEARD_SIDE_IED * ied, max(mouth_x) + BEARD_SIDE_IED * ied,
+        nose_y, fy + fh, img_w, img_h, BEARD_MIN_SIDE_PX,
+    )
+
+
+def cheek_region(landmarks, img_w: int, img_h: int):
+    """The reference-skin window under the eyes, or None."""
+    eyes = _eyes(landmarks)
+    if eyes is None:
+        return None
+    eye_y, ied = eyes
+    try:
+        xs = (float(landmarks[0][0]), float(landmarks[1][0]))
+        nose_y = float(landmarks[2][1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return _window(
+        min(xs) - BEARD_CHEEK_SIDE_IED * ied, max(xs) + BEARD_CHEEK_SIDE_IED * ied,
+        eye_y + BEARD_CHEEK_TOP_IED * ied, nose_y, img_w, img_h, 2,
+    )
+
+
+def nose_drop(landmarks) -> float | None:
+    """Where the nose tip sits between the eye line (0) and the mouth line (1)."""
+    eyes = _eyes(landmarks)
+    if eyes is None:
+        return None
+    try:
+        nose_y = float(landmarks[2][1])
+        mouth_y = (float(landmarks[3][1]) + float(landmarks[4][1])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        return None
+    span = mouth_y - eyes[0]
+    return None if span <= 0 else (nose_y - eyes[0]) / span
+
+
+def _max3(img: np.ndarray) -> np.ndarray:
+    """Per-pixel max over the 3 channels — numpy's reduce over an axis of
+    length 3 cost 70% of the head and beard time; this is 6x faster."""
+    return np.maximum(np.maximum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
+def _min3(img: np.ndarray) -> np.ndarray:
+    """Per-pixel min over the 3 channels (see :func:`_max3`)."""
+    return np.minimum(np.minimum(img[:, :, 0], img[:, :, 1]), img[:, :, 2])
+
+
+def _skin_window(crop_bgr: np.ndarray, sat: np.ndarray) -> np.ndarray:
+    """The torso's skin window: YCrCb, capped at SKIN_S_MAX saturation."""
+    ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+    return (
+        (cr >= SKIN_CR[0]) & (cr <= SKIN_CR[1])
+        & (cb >= SKIN_CB[0]) & (cb <= SKIN_CB[1])
+        & (sat < SKIN_S_MAX)
+    )
+
+
+def _soft_hue(hue: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """HEAD_H_BINS hue histogram, triangular assignment, WRAPPING at red."""
+    pos = hue.astype(np.float64) * HEAD_H_BINS / 180.0 - 0.5
+    lo = np.floor(pos).astype(np.int64)
+    frac = pos - lo
+    out = np.bincount(lo % HEAD_H_BINS, weights=(1.0 - frac) * weights, minlength=HEAD_H_BINS)
+    out += np.bincount((lo + 1) % HEAD_H_BINS, weights=frac * weights, minlength=HEAD_H_BINS)
+    return out
+
+
+def _soft_v(v: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """HEAD_V_BINS brightness histogram over 0..V_MAX, triangular, clamped."""
+    width = (V_MAX + 1) / HEAD_V_BINS
+    pos = v.astype(np.float64) / width - 0.5
+    lo = np.floor(pos).astype(np.int64)
+    frac = pos - lo
+    out = np.zeros(HEAD_V_BINS, dtype=np.float64)
+    for offset, share in ((0, 1.0 - frac), (1, frac)):
+        out += np.bincount(
+            np.clip(lo + offset, 0, HEAD_V_BINS - 1), weights=share * weights,
+            minlength=HEAD_V_BINS,
+        )
+    return out
+
+
+def head_descriptor(
+    image_bgr: np.ndarray,
+    face_box: dict,
+    landmarks,
+    gains: tuple[float, float, float] | None = None,
+    person_box: dict | None = None,
+) -> list[float] | None:
+    """The 40-float head descriptor — headwear or hair colour — or None.
+
+    Region (:func:`head_region`): 0.6 face heights above the face box (or
+    the person box's top, when lower) down to the eye line less 0.15 IED;
+    the box widened 0.15 of its width a side; clamped to the image.  Every
+    lit (not blown) pixel votes, skin-window pixels at HEAD_SKIN_WEIGHT:
+    those with chroma >= HEAD_CHROMA_MIN into 24 soft, wrapping hue bins
+    (0..23), the rest into 3 soft brightness bins (24..26: black, grey,
+    white); 27..39 are reserved zeros; the whole sums to 1.  ``gains``
+    (:func:`frame_gains`) are applied first, as for the torso.
+
+    None — never a zero vector — without two eye landmarks, for a window
+    under HEAD_MIN_SIDE_PX, or with fewer than HEAD_MIN_PX lit pixels.
+    """
+    img_h, img_w = image_bgr.shape[:2]
+    win = head_region(face_box, landmarks, img_w, img_h, person_box)
+    if win is None:
+        return None
+    x0, x1, y0, y1 = win
+    crop = image_bgr[y0:y1, x0:x1]
+    colour = crop if gains is None else apply_gains(crop, gains)
+    lit = _max3(crop) <= V_MAX
+    if int(lit.sum()) < HEAD_MIN_PX:
+        return None
+    hsv = cv2.cvtColor(colour, cv2.COLOR_BGR2HSV)
+    weight = np.where(lit, np.where(_skin_window(colour, hsv[:, :, 1]), HEAD_SKIN_WEIGHT, 1.0), 0.0)
+    chromatic = (_max3(colour).astype(np.int16) - _min3(colour)) >= HEAD_CHROMA_MIN
+    out = np.zeros(HEAD_DIM, dtype=np.float64)
+    sel = lit & chromatic
+    if sel.any():
+        out[:HEAD_H_BINS] = _soft_hue(hsv[:, :, 0][sel], weight[sel])
+    sel = lit & ~chromatic
+    if sel.any():
+        out[HEAD_H_BINS:HEAD_H_BINS + HEAD_V_BINS] = _soft_v(hsv[:, :, 2][sel], weight[sel])
+    total = float(out.sum())
+    if total <= 0.0:
+        return None
+    return (out / total).tolist()
+
+
+def beard_descriptor(
+    image_bgr: np.ndarray,
+    face_box: dict,
+    landmarks,
+    gains: tuple[float, float, float] | None = None,
+) -> list[float] | None:
+    """``[skinFrac, darkFrac, greyFrac, whiteFrac]`` of the chin, or None.
+
+    Region (:func:`beard_region`): nose tip down to the face box's bottom,
+    between the mouth corners widened 0.25 IED a side.  Each lit pixel is
+    judged against the SAME face's cheeks (:func:`cheek_region`, median
+    brightness and saturation): DARK under BEARD_DARK_REL_V of the cheek's
+    brightness; otherwise PALE under BEARD_PALE_REL_S of its saturation —
+    WHITE from BEARD_WHITE_REL_V of its brightness up, GREY below; the rest
+    SKIN.  The four fractions sum to 1.
+
+    None without eye/nose/mouth landmarks, with the nose at or below the
+    mouth line (the chin is out of sight), for a window under
+    BEARD_MIN_SIDE_PX or BEARD_MIN_PX lit pixels, or when the cheeks are
+    too few or too dark to judge by.
+    """
+    drop = nose_drop(landmarks)
+    if drop is None or drop >= BEARD_MAX_NOSE_DROP:
+        return None
+    img_h, img_w = image_bgr.shape[:2]
+    win = beard_region(face_box, landmarks, img_w, img_h)
+    cheek = cheek_region(landmarks, img_w, img_h)
+    if win is None or cheek is None:
+        return None
+
+    def read(w):
+        crop = image_bgr[w[2]:w[3], w[0]:w[1]]
+        lit = _max3(crop) <= V_MAX
+        colour = crop if gains is None else apply_gains(crop, gains)
+        v = _max3(colour).astype(np.int16)
+        return v[lit].astype(np.float64), (v - _min3(colour))[lit].astype(np.float64)
+
+    cv, cc = read(cheek)
+    if cv.size < BEARD_CHEEK_MIN_PX:
+        return None
+    v_ref = float(np.median(cv))
+    s_ref = float(np.median(cc / np.maximum(cv, 1.0)))
+    if v_ref < BEARD_REF_V_MIN or s_ref <= 0.0:
+        return None
+    v, c = read(win)
+    if v.size < BEARD_MIN_PX:
+        return None
+    dark = v < BEARD_DARK_REL_V * v_ref
+    pale = ~dark & (c / np.maximum(v, 1.0) < BEARD_PALE_REL_S * s_ref)
+    white = pale & (v >= BEARD_WHITE_REL_V * v_ref)
+    n = float(v.size)
+    return [
+        float((~dark & ~pale).sum()) / n,
+        float(dark.sum()) / n,
+        float((pale & ~white).sum()) / n,
+        float(white.sum()) / n,
+    ]
