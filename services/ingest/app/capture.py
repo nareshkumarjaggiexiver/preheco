@@ -121,6 +121,7 @@ class CaptureWorker(threading.Thread):
         self._ff: FfmpegSource | None = None
         if self.levers.decoder != "cpu":
             self._ff = self._start_decoder()
+        self._start_error = self.decoder["error"]
         # LEVER MODE — see _run_levered. Decided once, here: a worker never
         # switches loops mid-stream. A hardware decoder that fell back to cpu
         # with no other lever armed IS today's worker, so it runs today's loop.
@@ -147,6 +148,14 @@ class CaptureWorker(threading.Thread):
             "captured": 0, "published": 0, "skipped": 0,
             "dropped": 0, "served": 0, "backlogMax": 0,
         }
+        # A LIVE source's reconnect record (see _note_down / _note_up):
+        # reopenings, and reopenings that failed. Served on /health in lever
+        # mode only, so OFF keeps today's /health exactly.
+        self._live = {"reconnects": 0, "reconnectFailures": 0}
+        self._down_since_fail = 0  # failed reopenings since the source was last up
+        # The start-up fallback reason (a hardware decoder that fell back to
+        # cpu) survives a reconnect: _note_up restores it, never clears it.
+        self._start_error: str | None = None
         if self.levered and is_file:
             self._probe_fps()  # the gate's footage clock needs it even unpaced
         self._cap = self._open() if self._ff is None else None
@@ -232,6 +241,9 @@ class CaptureWorker(threading.Thread):
             "resumes": self.resumes,
             "interrupted": self.interrupted,
         }
+        if not self.is_file and self.levered:
+            with self._lock:
+                out["live"] = dict(self._live)
         if self.levered:
             out["counters"] = {
                 **counts,
@@ -424,8 +436,10 @@ class CaptureWorker(threading.Thread):
                         return
                     try:
                         self._reopen_source()
-                    except CaptureError:
+                    except CaptureError as exc:
+                        self._note_down(exc)
                         continue
+                    self._note_up()
                     if self._gate is not None:
                         self._gate.reset()  # a new stream: compare with nothing old
                     continue
@@ -495,6 +509,36 @@ class CaptureWorker(threading.Thread):
             self._ff = self._new_ffmpeg()
         except DecoderError as exc:
             raise CaptureError(str(exc)) from exc
+
+    def _note_down(self, exc: Exception) -> None:
+        """A live source's reopening failed: say so on /health, and once on stderr.
+
+        Without this a camera whose decoder cannot restart (VRAM pressure while
+        TensorRT builds, a driver reset) stayed dark for the rest of the run
+        with ``device`` still reading active=nvdec, error=null and nothing
+        logged — 40 failed restarts measured, the DecoderError that named the
+        cause thrown away — and the runner said only ``source-stalled``.
+        """
+        reason = f"live source down, reconnecting: {exc}"
+        with self._lock:
+            self._live["reconnectFailures"] += 1
+            self._down_since_fail += 1
+            first = self._down_since_fail == 1
+            self.decoder["error"] = reason
+        if first:
+            sys.stderr.write(f"[heco-device] ingest {self.decoder['active']}: {reason}\n")
+
+    def _note_up(self) -> None:
+        """A live source reopened: count it, and clear what _note_down said."""
+        with self._lock:
+            self._live["reconnects"] += 1
+            failed, self._down_since_fail = self._down_since_fail, 0
+            self.decoder["error"] = self._start_error
+        if failed:
+            sys.stderr.write(
+                f"[heco-device] ingest {self.decoder['active']}: live source back "
+                f"after {failed} failed reconnect(s)\n"
+            )
 
     def _admit(self, seq: int, t0: float, frame: RawFrame) -> None:
         """Gate one decoded frame, then publish it into the store or skip it."""

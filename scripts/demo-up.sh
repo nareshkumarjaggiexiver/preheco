@@ -165,7 +165,10 @@ dev = d.get("device") or {}
 if port.endswith("01"):
     # INGEST's device block is the DECODER (L6): requested vs what the open
     # capture decodes with (null until a source is open), and why not.
-    err = f"   <-- FELL BACK: {dev['error']}" if dev.get("error") else ""
+    err = dev.get("error") or ""
+    if err:
+        down = err.startswith("live source down")
+        err = f"   <-- {'SOURCE DOWN' if down else 'FELL BACK'}: {err}"
     print(f"  :{port} ingest decoder {dev.get('requested')} -> {dev.get('active')}{err}")
     raise SystemExit
 active = (dev.get("active") or ["?"])[0]
