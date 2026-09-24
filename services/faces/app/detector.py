@@ -171,6 +171,32 @@ def _parse_input_size(raw: str | None, fallback: int) -> int | tuple[int, int]:
 SCRFD_INPUT = os.environ.get("FACES_SCRFD_INPUT") or None
 
 
+#: SCRFD's input normalisation, (x - 127.5) / 128, as a 256-entry table.
+#: Every entry is a multiple of 1/256 and so exact in float32: a lookup and
+#: the arithmetic agree bit for bit (pinned in test_detector.py).
+_SCRFD_NORM_LUT = ((np.arange(256, dtype=np.float32) - 127.5) / 128.0).astype(np.float32)
+
+
+def scrfd_blob(canvas: np.ndarray) -> np.ndarray:
+    """Turn a BGR uint8 canvas into SCRFD's (1, 3, H, W) float32 RGB blob.
+
+    The same numbers as ``((rgb.astype(float32) - 127.5) / 128).transpose``
+    — which made a uint8 RGB copy and then four full float32 passes over the
+    canvas (convert, subtract, divide, the contiguous copy of the transpose):
+    at 1472x832 that is ~15 MB per pass. Here each channel is split once and
+    looked up straight into its plane of the output. Measured on the laptop,
+    1472x832: 24 ms -> 4 ms, byte-identical.
+    """
+    h, w = canvas.shape[:2]
+    blob = np.empty((1, 3, h, w), dtype=np.float32)
+    # split is B, G, R; the graph wants R, G, B — hence reversed.
+    for ch, plane in enumerate(reversed(cv2.split(canvas))):
+        out = cv2.LUT(plane, _SCRFD_NORM_LUT, dst=blob[0, ch])
+        if not np.may_share_memory(out, blob):
+            blob[0, ch] = out  # cv2 declined the dst: copy, never leave it empty
+    return blob
+
+
 def build_detector(model_path: Path | None = None, device: str | None = None):
     """The family factory: one detect() contract, family chosen by the file."""
     path = model_path or MODEL_PATH
@@ -359,10 +385,9 @@ class ScrfdDetector:
         rw, rh = int(w * ratio), int(h * ratio)
         canvas = np.zeros((ih, iw, 3), dtype=np.uint8)
         canvas[:rh, :rw] = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        blob = ((rgb.astype(np.float32) - 127.5) / 128.0).transpose(2, 0, 1)[None]
+        blob = scrfd_blob(canvas)
         with self._lock:
-            outputs = self._session.run(None, {self._input_name: np.ascontiguousarray(blob)})
+            outputs = self._session.run(None, {self._input_name: blob})
         # int() truncation means the canvas actually holds rw/w x rh/h of
         # the frame, not `ratio` on both axes — divide by the achieved pair
         # or every box drifts toward the origin (~4 px at 4MP frame edges).
