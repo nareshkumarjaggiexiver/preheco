@@ -26,7 +26,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from heco_common.ort import announce_device, is_trt, providers_for, trt_truth
+from heco_common.ort import (
+    announce_device,
+    distinct_input_dims,
+    is_trt,
+    providers_for,
+    trt_truth,
+)
 
 from . import scrfd
 
@@ -322,8 +328,15 @@ class ScrfdDetector:
         self.input_size = input_size if isinstance(input_size, tuple) else (input_size, input_size)
         self.score_min = SCRFD_SCORE_MIN if score_min is None else float(score_min)
         providers, provider_options = providers_for(device)
+        model: str | bytes = str(model_path)
+        if is_trt(device):
+            # The InsightFace exports name BOTH spatial dims "?", which
+            # TensorRT reads as one dimension: a 1472x832 input then fails
+            # the engine build and ORT drops to CUDA. Renamed apart in
+            # memory; the file on the read-only mount is untouched.
+            model = distinct_input_dims(model_path.read_bytes()) or model
         self._session = ort.InferenceSession(
-            str(model_path), providers=providers, provider_options=provider_options
+            model, providers=providers, provider_options=provider_options
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())

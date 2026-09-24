@@ -213,3 +213,21 @@ def test_trt_truth_is_absent_off_trt(fake_ort):
     assert set(_device_block(det)) == {"requested", "active", "family", "scoreMin"}
     det.device_requested = "TRT"
     assert _device_block(det)["trt"] is None, "asked for TRT, did not get it: null, shown"
+
+
+def test_trt_loads_the_dims_renamed_graph_and_other_devices_the_file(fake_ort, monkeypatch):
+    """Under TRT the session gets the in-memory graph with H and W renamed
+    apart (TensorRT otherwise fails 1472x832 and ORT drops to CUDA); every
+    other device keeps loading the file by path, exactly as before."""
+    seen = []
+    mod = sys.modules["onnxruntime"]
+    monkeypatch.setattr(mod, "InferenceSession",
+                        lambda model, **k: seen.append(model) or fake_ort["session"])
+    monkeypatch.setattr(d, "distinct_input_dims", lambda raw: b"renamed-graph")
+    d.ScrfdDetector(fake_ort["weight"], 640, "CPU")
+    d.ScrfdDetector(fake_ort["weight"], 640, "CUDA")
+    d.ScrfdDetector(fake_ort["weight"], 640, "TRT")
+    assert seen == [str(fake_ort["weight"]), str(fake_ort["weight"]), b"renamed-graph"]
+    monkeypatch.setattr(d, "distinct_input_dims", lambda raw: None)
+    d.ScrfdDetector(fake_ort["weight"], 640, "TRT")
+    assert seen[-1] == str(fake_ort["weight"]), "nothing to rename: the file, as ever"
