@@ -167,6 +167,55 @@ def apply_detection_zones(boxes: list, frame: dict, zones: list[dict], obs) -> l
     return trackable
 
 
+#: Where a person box's FACE is taken to be, for the face-search cadence: the
+#: box's horizontal centre, this fraction of its height below its top.  A
+#: standing adult's face centre sits ~0.07 of the box down; 0.15 errs toward
+#: the body — toward "this face could still be counted".
+HEAD_POINT_FRAC = 0.15
+
+
+def cadence_bodies(boxes: list, frame: dict, zones: list[dict]) -> list:
+    """The person boxes a whole-frame face-search cadence must account for.
+
+    Every box, except one a detections-mode zone drops (its body centre in
+    the zone) whose HEAD POINT is inside a zone too — then no face on it can
+    be counted (:func:`apply_face_zones` excludes a face by its own centre,
+    in any zone) and a box that never forms a track must not hold the search
+    open all night (a wall TV).  A zoned box whose head point is outside
+    every zone is KEPT: it has no track, so it keeps the search running.
+
+    Verified on the cadence as it was (the zoned box always dropped): a
+    guest whose body centre stood in a detections zone and whose face did
+    not was countable with the cadence off (unique 2) and never searched
+    with it on — unique 1, "face search skipped: 1 settled" on the ledger
+    with two bodies in frame.  Pure: nothing stamped, nothing counted; a
+    frame without a size drops nothing, like the filters above.
+    """
+    dz = [z for z in zones if z.get("mode") == "detections"]
+    if not dz or not boxes:
+        return list(boxes)
+    w = frame.get("w")
+    h = frame.get("h")
+    if not w or not h:
+        return list(boxes)
+    w, h = float(w), float(h)
+
+    def inside(x: float, y: float, polys: list[dict]) -> bool:
+        return any(
+            point_in_polygon(x, y, [[p[0] * w, p[1] * h] for p in z["points"]])
+            for z in polys
+        )
+
+    out = []
+    for b in boxes:
+        bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+        bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
+        cx = bx + bw / 2.0
+        if not inside(cx, by + bh / 2.0, dz) or not inside(cx, by + HEAD_POINT_FRAC * bh, zones):
+            out.append(b)
+    return out
+
+
 def mark_person_zones(boxes: list, frame: dict, zones: list[dict], obs) -> None:
     """Stamp person boxes whose centre sits inside an operator zone.
 
