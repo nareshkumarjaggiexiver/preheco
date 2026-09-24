@@ -62,6 +62,8 @@ an independent loop-based reference (`generate_decode_golden.py`).
 | `PERSONS_NMS_IOU` | `0.45` | NMS IoU threshold |
 | `PERSONS_INPUT_SIZE` | `416` | square network input (letterboxed) |
 | `PERSONS_MODEL` | `models/yolox_nano.onnx` | weights path (e.g. a tiny swap) |
+| `HECO_DEVICE` | `CPU` | ORT providers: `CPU`, `CUDA`, `TRT` (TensorRT fp16, then CUDA, then CPU; YOLOX-s 640 7.1 -> 3.3 ms on the 4060, boxes IoU >= 0.995 vs fp32), anything else = an OpenVINO device. `/health` serves `device.active` — and `device.trt` when TRT was asked — as the truth |
+| `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |
 
 ## CPU latency — measured on this machine
 

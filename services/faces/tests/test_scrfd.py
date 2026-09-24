@@ -102,3 +102,57 @@ def test_nms_keeps_the_best_of_overlapping_detections():
 
 def test_below_threshold_is_empty_not_an_error():
     assert select_faces(_tensors(), (640, 640), (1.0, 1.0), 0.5, 0.4) == []
+
+
+def _legacy_select(outputs, input_hw, scale, score_min, nms_iou):
+    """select_faces as it was: decode EVERY anchor, then mask."""
+    from app.scrfd import nms
+
+    all_scores, all_xyxy, all_lm = [], [], []
+    for si, stride in enumerate(STRIDES):
+        scores, xyxy, lm = decode_stride(
+            outputs[si], outputs[si + 3], outputs[si + 6], stride, input_hw)
+        mask = scores >= score_min
+        if mask.any():
+            all_scores.append(scores[mask])
+            all_xyxy.append(xyxy[mask])
+            all_lm.append(lm[mask])
+    if not all_scores:
+        return []
+    sx, sy = scale
+    scores = np.concatenate(all_scores)
+    xyxy = np.concatenate(all_xyxy)
+    xyxy[:, 0::2] /= sx
+    xyxy[:, 1::2] /= sy
+    lm = np.concatenate(all_lm)
+    lm[..., 0] /= sx
+    lm[..., 1] /= sy
+    keep = nms(xyxy, scores, nms_iou)
+    return [(float(scores[i]), xyxy[i].tobytes(), lm[i].tobytes()) for i in keep]
+
+
+def test_decoding_only_kept_anchors_is_the_same_answer_bit_for_bit():
+    """The frame-shaped input has 50,232 anchors and a few dozen pass the
+    score: decoding just those must change nothing — same faces, same order,
+    same coordinates to the last bit, at several thresholds."""
+    rng = np.random.default_rng(17)
+    hw = (832, 1472)
+    outs = [rng.standard_normal(t.shape).astype(np.float32) * 20.0 for t in _tensors(hw)]
+    for si in range(3):
+        outs[si] = (rng.random(outs[si].shape, dtype=np.float32) ** 60).astype(np.float32)
+    for thr in (0.3, 0.5, 0.7, 0.99):
+        want = _legacy_select([o.copy() for o in outs], hw, (0.3833, 0.3852), thr, 0.3)
+        got = select_faces([o.copy() for o in outs], hw, (0.3833, 0.3852), thr, 0.3)
+        assert len(got) == len(want)
+        for face, (score, _xyxy, _lm) in zip(got, want, strict=True):
+            assert face["conf"] == round(score, 4)
+    # and at the array level, before rounding:
+    from app.scrfd import _decode_kept
+
+    for si, stride in enumerate(STRIDES):
+        s_all, x_all, l_all = decode_stride(outs[si], outs[si + 3], outs[si + 6], stride, hw)
+        mask = s_all >= 0.5
+        s_k, x_k, l_k = _decode_kept(outs[si], outs[si + 3], outs[si + 6], stride, hw, 0.5)
+        assert s_k.tobytes() == s_all[mask].tobytes()
+        assert x_k.tobytes() == x_all[mask].tobytes()
+        assert l_k.tobytes() == l_all[mask].tobytes()

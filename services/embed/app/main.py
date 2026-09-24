@@ -22,12 +22,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
+from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .attributes import ATTR_MODEL_EXPLICIT, ATTR_MODEL_PATH, AttributeModel, build_attributes
 from .codec import b64_to_bgr
-from .recognizer import DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
+from .recognizer import BATCH, BATCH_MAX, DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
 
 log = logging.getLogger("embed")
 
@@ -139,7 +140,12 @@ def _get_attributes() -> AttributeModel | None:
         if _attr_error is not None and attempt_stat == _attr_failed_stat:
             return None  # same broken file — stay cheap
         try:
-            _attributes = build_attributes(ATTR_MODEL_PATH, DEVICE)
+            # Batching reaches the attribute pass only when switched on; off,
+            # this is exactly the call it always was.
+            _attributes = (
+                build_attributes(ATTR_MODEL_PATH, DEVICE, BATCH, BATCH_MAX)
+                if BATCH else build_attributes(ATTR_MODEL_PATH, DEVICE)
+            )
             _attr_error = None
             _attr_failed_stat = None
         except Exception as exc:  # noqa: BLE001 — surfaced in /health, see above
@@ -185,13 +191,38 @@ def health() -> dict:
         # Family, device truth AND dimension: the runner cross-checks dim
         # against the deployment's HECO_EMBEDDING_DIM story, and the family
         # says which alignment produced these vectors.
-        "device": {
-            "requested": emb.device_requested,
-            "active": emb.providers_active,
-            "family": emb.family,
-            "dim": emb.dim,
-        } if emb else None,
+        "device": _device_block(emb) if emb else None,
+        # EMBED_BATCH as asked and as it runs (a static-batch graph cannot).
+        "knobs": _knobs(emb) if emb else None,
     }
+
+
+def _knobs(emb) -> dict:
+    """Build the /health knobs block: each switch as asked AND as it actually runs."""
+    return {
+        "batch": {
+            "requested": bool(getattr(emb, "batch_requested", False)),
+            "active": bool(getattr(emb, "batch_active", False)),
+            "max": BATCH_MAX,
+        },
+    }
+
+
+def _device_block(emb) -> dict:
+    """Build the /health device truth; `trt` rides along only when TRT was asked.
+
+    Keyed on the REQUEST, not on success: a TensorRT that failed to load
+    answers "trt": null beside an `active` list without it.
+    """
+    block = {
+        "requested": emb.device_requested,
+        "active": emb.providers_active,
+        "family": emb.family,
+        "dim": emb.dim,
+    }
+    if is_trt(emb.device_requested):
+        block["trt"] = getattr(emb, "trt", None)
+    return block
 
 
 @app.post("/embed")

@@ -98,6 +98,20 @@ gets measured on pilot footage.
 | `FACES_FLOOR_PX` | `56` | POC embedding floor ("sub-canon" lower bound) |
 | `FACES_SHARPNESS_NORM_PX` | `64` | square every crop is resized to before the Laplacian |
 | `FACES_MODEL` | `models/face_detection_yunet_2023mar.onnx` | weights path |
+| `FACES_SCRFD_INPUT` | `640` | scrfd network input, `640` or frame-shaped `1472x832` (a 4K whole frame then resolves 42 px faces instead of 96 px) |
+| `HECO_DEVICE` | `CPU` | ORT providers for the scrfd family: `CUDA`, `TRT` (TensorRT fp16, then CUDA, then CPU; SCRFD-10G 1472x832 20.0 -> 5.4 ms on the 4060, boxes IoU >= 0.991, landmarks within 0.22 px vs fp32). yunet is cv2 and ignores it |
+| `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |
+
+### Switching a stack to SCRFD-2.5G (the live profile)
+
+Weights: `scrfd_2.5g_kps.onnx` = InsightFace `buffalo_m.zip` (release v0.7) member `det_2.5g.onnx`, sha256 `041f73f4…eaee0af9` (full pins in `models-restricted.lock`); already in `services/faces/models/` of both .94 deploy trees. It is ~2.5x cheaper than SCRFD-10G (1472x832 CUDA 8.2 vs 20.4 ms) but kept 14 of 10G's 17 faces on the bench frames at scoreMin 0.7 — on TensorRT prefer 10G. To switch, with no count running on that stack:
+
+1. Console: pick the install's `… live (SCRFD-2.5G + ArcFace-R50)` profile and **Switch models** — or
+   `curl -X POST http://localhost:5173/api/pipeline/installs/<pipelineId>/apply-profile -H 'content-type: application/json' -d '{"profileId":"<profile id>"}'` — or on the box
+   `curl -X POST http://localhost:7100/models/apply -H 'content-type: application/json' -d '{"stages":{"faces":"scrfd_2.5g_kps.onnx"}}'` (7200 camera B, 7300 shm).
+2. Check `GET /models` on the runner says `"faces": "scrfd_2.5g_kps.onnx"`.
+3. Start the run with that profile (the runner refuses a profile its live models do not match).
+4. The choice persists across restarts (`services/faces/state/selected`); switch back the same way with the GPU-max profile or `{"faces":"scrfd_10g_kps.onnx"}`.
 
 ## CPU latency — measured on this machine
 
