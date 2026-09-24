@@ -45,6 +45,13 @@ export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
 # The measured feature-norm floor, same as demo-up.sh: on the Sharon re-run
 # it removes exactly p00047 (a half face behind a pillar) and no real guest.
 export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
+# The half-face floors the camera stacks run (demo-up.sh says why): the
+# half-balance floor, missing here until 2026-09-25, and the measured pose
+# gate as the box default (landmarks, frontality 0.55, eye span 0.30).
+export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
+export HECO_QUALITY_REQUIRE_LANDMARKS=${HECO_QUALITY_REQUIRE_LANDMARKS:-1}
+export HECO_QUALITY_MIN_FRONTALITY=${HECO_QUALITY_MIN_FRONTALITY:-0.55}
+export HECO_QUALITY_MIN_EYE_SPAN=${HECO_QUALITY_MIN_EYE_SPAN:-0.30}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF, as demo-up.sh starts the camera stacks (fixed
 # chandelier light; see there) — so a comparison against them compares the
