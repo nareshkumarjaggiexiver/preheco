@@ -83,3 +83,35 @@ def test_the_smallest_gate_passing_face_clears_the_variance_floor():
     m = similarity_transform(src, ARCFACE_TEMPLATE)
     mapped = src @ m[:, :2].T + m[:, 2]
     assert np.allclose(mapped, ARCFACE_TEMPLATE, atol=1e-3)
+
+
+# ---------------------------------------------------------- half balance
+
+
+def _aligned(left_v: int, right_v: int) -> np.ndarray:
+    """A 112x112 aligned face whose two halves (split at x = 56) read the
+    given brightness."""
+    img = np.zeros((112, 112, 3), np.uint8)
+    img[:, :56] = left_v
+    img[:, 56:] = right_v
+    return img
+
+
+def test_half_balance_reads_an_even_face_near_one_and_a_half_dark_face_low():
+    """The measured scale: an evenly lit face ~1, a dark bar over one half low
+    (run f0bfc5's railing face read 0.27; the lowest genuine face 0.42)."""
+    from app.align import half_balance
+    assert half_balance(_aligned(150, 150)) == pytest.approx(1.0)
+    assert half_balance(_aligned(160, 40)) == pytest.approx(0.25)
+    assert half_balance(_aligned(40, 160)) == pytest.approx(0.25), "either side"
+
+
+def test_half_balance_is_none_when_a_half_is_off_the_picture():
+    """warpAffine's exact-black border is not a shadow: a face at the frame
+    edge cannot be judged, and None — never 0 — must reach the gate."""
+    from app.align import half_balance
+    img = _aligned(150, 150)
+    img[:, 60:] = 0  # the right half outside the source frame
+    assert half_balance(img) is None
+    assert half_balance(None) is None
+    assert half_balance(np.zeros((50, 50, 3), np.uint8)) is None

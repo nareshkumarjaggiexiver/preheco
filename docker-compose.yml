@@ -362,6 +362,10 @@ services:
       # face behind a pillar; every landmark gate passed both. Dropped faces
       # count as gatedBy "featnorm". Default 0 = off, like every other floor.
       HECO_QUALITY_MIN_FEAT_NORM: ${HECO_QUALITY_MIN_FEAT_NORM-}
+      # Half-balance floor (runner Settings.quality_min_balance): drops a face
+      # with one half hidden or dark — the railing-across-the-face case the
+      # norm floor cannot see. 0 = off; demo-up.sh arms 0.33 (measured).
+      HECO_QUALITY_MIN_BALANCE: ${HECO_QUALITY_MIN_BALANCE-}
       # Track heal (see services/runner/README.md): window 20 s, cosine floor
       # 0.45 — above the 0.377 measured impostor ceiling; tonight's heal
       # evidence was 0.69. Unset renders as "" which env_float reads as
