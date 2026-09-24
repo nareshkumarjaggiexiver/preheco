@@ -99,7 +99,11 @@ class ApplyModelRequest(BaseModel):
 class DetectRequest(BaseModel):
     """POST /detect body: a base64 JPEG frame plus an optional threshold."""
 
-    imageB64: str = Field(min_length=1)
+    #: Empty is legal ONLY with a resolvable frameRef — the pixels come from
+    #: the shared transport instead. The handler refuses (400) when neither
+    #: yields a frame, which says WHICH half failed; a min_length here would
+    #: refuse the ref-only request before anything could look at the ref.
+    imageB64: str = ""
     #: Shared-transport handle for the same frame. Optional and advisory:
     #: when it resolves the pixels come from tmpfs with no codec at all,
     #: and when it does not the imageB64 beside it is decoded as always.

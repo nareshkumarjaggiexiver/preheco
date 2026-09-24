@@ -13,6 +13,19 @@ and end the run (there is no explicit EOF flag on the real service).
 
 import json
 import logging
+import threading
+
+
+class _OneArgLog:
+    """RunLog's shape: ONE message, no %-args.
+
+    The suite used logging.getLogger, which accepts %-style arguments and so
+    happily passed code that RunLog raises TypeError on — found live, not in
+    the tests that were meant to cover it.
+    """
+
+    def __init__(self): self.lines = []
+    def info(self, message): self.lines.append(message)
 from types import SimpleNamespace
 
 import httpx
@@ -1337,7 +1350,7 @@ def test_ref_only_needs_proof_not_just_configuration(monkeypatch):
 
     loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
     loop.client = _Client()
-    loop.log = logging.getLogger("test")
+    loop.log = _OneArgLog()
     loop.s = SimpleNamespace(
         frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
         faces_url="http://f", embed_url="http://e",
@@ -1366,7 +1379,73 @@ def test_ref_only_declines_when_ingest_offers_no_ref(monkeypatch):
 
     loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
     loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
-    loop.log = logging.getLogger("test")
+    loop.log = _OneArgLog()
+    loop._stop = threading.Event()
+    loop.s = SimpleNamespace(frames_ref_only=True, ingest_url="http://i")
+    loop._post = lambda url, payload: {}
+    # It polls for a couple of seconds first — a source that never offers a
+    # ref is a real answer, just not an instant one.
+    assert loop._negotiate_ref_only() is False
+
+
+def test_ref_only_waits_for_the_first_frame_instead_of_reading_503_as_refusal():
+    """REGRESSION (2026-09-24). The probe runs right after the source opens,
+    and a source that has not decoded its first frame yet answers 503. Taking
+    that as "no shared transport" silently kept the JPEGs on a stack that was
+    configured correctly and writing refs the whole time — the optimisation
+    was off and nothing said so."""
+    from app import loop as loop_mod
+
+    calls = {"n": 0}
+
+    class _Resp:
+        content = b"{}"
+        def json(self):
+            calls["n"] += 1
+            # the first two polls are the 'no frame captured yet' shape
+            if calls["n"] <= 2:
+                return {"detail": "no frame captured yet — retry"}
+            return {"frameRef": "f9_8x8.bgr"}
+
+    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
+    loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
+    loop.log = _OneArgLog()
+    loop._stop = threading.Event()
+    loop.s = SimpleNamespace(
+        frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
+        faces_url="http://f", embed_url="http://e",
+    )
+    loop._post = lambda url, payload: {}
+    assert loop._negotiate_ref_only() is True
+    assert calls["n"] >= 3, "it polled past the not-yet answers"
+
+
+def test_ref_only_probe_gives_up_rather_than_blocking_a_stopped_run():
+    """A run stopped during the probe must not sit in the retry loop."""
+    from app import loop as loop_mod
+
+    class _Resp:
+        content = b"{}"
+        def json(self): return {}
+
+    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
+    loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
+    loop.log = _OneArgLog()
+    loop._stop = threading.Event()
+    loop._stop.set()
     loop.s = SimpleNamespace(frames_ref_only=True, ingest_url="http://i")
     loop._post = lambda url, payload: {}
     assert loop._negotiate_ref_only() is False
+
+
+def test_a_ref_only_frame_is_not_mistaken_for_the_end_of_the_source():
+    """REGRESSION (2026-09-24). 'No imageB64' meant end-of-source, which is
+    right when that is the only carrier — and wrong the moment a frame can
+    arrive as a ref instead. Every ref-only run ended at frame zero, state
+    'ended', error None: a complete count of nobody, reported as success."""
+    frame_ref_only = {"seq": 1, "frameRef": "f1_8x8.bgr", "imageB64": "", "ended": False}
+    frame_truly_empty = {"seq": 1, "frameRef": None, "imageB64": "", "ended": False}
+    ended = lambda b: bool(b.get("ended")) or not (b.get("imageB64") or b.get("frameRef"))
+    assert ended(frame_ref_only) is False, "a ref IS pixels"
+    assert ended(frame_truly_empty) is True, "neither carrier is genuinely empty"
+    assert ended({"seq": 1, "imageB64": "abc", "ended": True}) is True, "ended still wins"

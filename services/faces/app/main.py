@@ -118,7 +118,11 @@ class WithinBox(BaseModel):
 class DetectRequest(BaseModel):
     """POST /detect body: a base64 JPEG frame, optionally scoped to boxes."""
 
-    imageB64: str = Field(min_length=1)
+    #: Empty is legal ONLY with a resolvable frameRef — the pixels come from
+    #: the shared transport instead. The handler refuses (400) when neither
+    #: yields a frame, which says WHICH half failed; a min_length here would
+    #: refuse the ref-only request before anything could look at the ref.
+    imageB64: str = ""
     #: See persons.DetectRequest.frameRef — same contract, same fallback.
     frameRef: str | None = None
     within: list[WithinBox] | None = None
