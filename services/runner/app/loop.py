@@ -763,7 +763,7 @@ class RunLoop:
         # declared in GateThresholds.
         self._gate_armed: tuple[str, ...] = self.gate.armed + (
             ("featnorm",) if float(settings.quality_min_feat_norm) > 0 else ()
-        )
+        ) + (("balance",) if float(settings.quality_min_balance) > 0 else ())
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
@@ -1112,6 +1112,9 @@ class RunLoop:
             # gate, counted apart because it is the one reason a face can be
             # embedded and still not matched.
             "gatedByFeatNorm": 0,
+            # ...and because one half of the face was hidden or dark (see
+            # _gate_balance): the railing-across-the-face gate.
+            "gatedByBalance": 0,
             "gatedUnmeasured": 0,
             # RE-VERIFY SAVING: person crops NOT searched for a face this run
             # because the track already held an identity and had been verified
@@ -2114,6 +2117,11 @@ class RunLoop:
         # The runner's own floor, recorded beside the library's: a run gated
         # on feature norm must say so months later, the same as any other.
         cfg["qualityMinFeatNorm"] = float(self.s.quality_min_feat_norm)
+        # Recorded only when armed: a run from before this gate and a run
+        # with it off stay byte-identical (the pinned replays hold them to
+        # that), and gateArmed already says which floors ran.
+        if float(self.s.quality_min_balance) > 0:
+            cfg["qualityMinBalance"] = float(self.s.quality_min_balance)
         return cfg
 
     def _models_config(self) -> dict:
@@ -2319,6 +2327,11 @@ class RunLoop:
         # feature's norm, and {gender, genderP, age} per face — the last two
         # None throughout from an embed service that predates them.
         embeddings, norms, attrs = parse_embed_reply(embedded)
+        balances = embedded.get("balance") if isinstance(embedded, dict) else None
+        for i, face in enumerate(kept[: len(embeddings)]):
+            b = balances[i] if isinstance(balances, list) and i < len(balances) else None
+            if isinstance(b, (int, float)):
+                face["balance"] = float(b)  # absent, not None, when unmeasured
         # HOW MANY FACE CROPS ACTUALLY REACHED THE EMBEDDER — a funnel rung
         # nothing else reports. The stage's own counter counts FRAMES, and the
         # gate-survivor count is what was OFFERED, not what came back: the
@@ -2337,6 +2350,12 @@ class RunLoop:
         # because its signal is the embedder's own (see _gate_feat_norm).
         # Everything index-parallel leaves together: face, vector, norm, attrs.
         kept, embeddings, norms, attrs = self._gate_feat_norm(
+            kept, embeddings, norms, attrs
+        )
+        # HALF-BALANCE FLOOR — the second post-embedder gate (_gate_balance).
+        # The reading rides on each face dict, set here from the reply before
+        # any face leaves, so it can never be read off the wrong face.
+        kept, embeddings, norms, attrs = self._gate_balance(
             kept, embeddings, norms, attrs
         )
         # The sweep's raw material (doc 15 M3): kept-face order IS embedding
@@ -3461,6 +3480,7 @@ class RunLoop:
         "frontality": "gatedByFrontality",
         "sharpness": "gatedBySharpness",
         "featnorm": "gatedByFeatNorm",
+        "balance": "gatedByBalance",
     }
 
     def _reverify_within(self, within: list[dict], tracks: list[dict]) -> list[dict]:
@@ -3589,6 +3609,54 @@ class RunLoop:
         if dropped or unmeasured:
             with self._lock:
                 self._status["gatedByFeatNorm"] += dropped
+                self._status["gatedUnmeasured"] += unmeasured
+        return out_faces, out_emb, out_norms, out_attrs
+
+    def _gate_balance(
+        self, kept: list[dict], embeddings: list, norms: list, attrs: list
+    ) -> tuple[list[dict], list, list, list]:
+        """Drop faces seen unevenly: one half hidden or dark (the railing gate).
+
+        The feature-norm floor catches a face mostly hidden (p00047, half
+        behind a pillar, 17.7); it does not catch a dark bar ACROSS a face —
+        p00002 behind a railing reads 23.7, a typical clear face, and every
+        geometric floor passes her too. The embedder's half-balance reading
+        does: 0.27 for her against 0.42 for the lowest genuine face measured.
+
+        Same discipline as :meth:`_gate_feat_norm`: face, vector, norm and
+        attributes leave together or not at all; a face without a reading
+        (off the frame edge, an older embed service) is kept and counted
+        ``gatedUnmeasured``; stamped ``gateReason`` "balance" and counted
+        ``gatedByBalance``.
+        """
+        floor = float(self.s.quality_min_balance)
+        if floor <= 0.0 or not embeddings:
+            return kept, embeddings, norms, attrs
+        out_faces: list[dict] = []
+        out_emb: list = []
+        out_norms: list = []
+        out_attrs: list = []
+        dropped = unmeasured = 0
+        for i, face in enumerate(kept):
+            if i >= len(embeddings):
+                out_faces.append(face)  # no vector to judge; dropped downstream as before
+                continue
+            balance = face.get("balance")
+            if balance is None:
+                if not face.get("gateUnmeasured"):
+                    unmeasured += 1
+                face["gateUnmeasured"] = list(face.get("gateUnmeasured") or []) + ["balance"]
+            elif float(balance) < floor:
+                face["gateReason"] = "balance"
+                dropped += 1
+                continue
+            out_faces.append(face)
+            out_emb.append(embeddings[i])
+            out_norms.append(norms[i])
+            out_attrs.append(attrs[i])
+        if dropped or unmeasured:
+            with self._lock:
+                self._status["gatedByBalance"] += dropped
                 self._status["gatedUnmeasured"] += unmeasured
         return out_faces, out_emb, out_norms, out_attrs
 

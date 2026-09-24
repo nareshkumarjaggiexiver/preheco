@@ -88,6 +88,10 @@ export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
 # floor would have erased read 22+). 2.8% of templates dropped, all from
 # identities that keep better ones. 0 turns it off.
 export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
+# Half-balance floor, measured on run f0bfc5's sightings: p00002 — a girl with
+# a dark railing across her face, which the norm floor passes (23.7) — reads
+# 0.27; the lowest genuine face 0.42, the 5th percentile 0.51. 0 turns it off.
+export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
@@ -130,7 +134,7 @@ knobs() {
        HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
        HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
        HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N -- "$@"
-  show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM \
+  show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
        HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
        HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S -- "$@"
   show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
@@ -189,7 +193,8 @@ PY
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
   echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
   echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · HEAD_CLASH 0.45 · BEARD_MIN_N 3 ·'
-  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script). 0 turns a signal off.'
+  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
+  echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
   echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
   echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
