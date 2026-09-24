@@ -624,7 +624,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             "clothes": {"selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0},
             "head": {
                 "a": None, "b": None, "sim": None, "selfA": None, "selfB": None,
-                "nA": 0, "nB": 0,
+                "nA": 0, "nB": 0, "wearA": None, "wearB": None,
             },
             "beard": {"a": None, "b": None, "nA": 0, "nB": 0},
             "light": {"a": None, "b": None, "shift": None, "held": []},

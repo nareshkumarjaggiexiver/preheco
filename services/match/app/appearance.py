@@ -124,9 +124,15 @@ def best_intersection(
 #: The v3 torso length; v2 rows (48) never count in the review's clothing
 #: evidence — a v2 partition is not the colour-below-the-neck v3 reads.
 TORSO_DIM = APPEARANCE_DIM
-#: The head descriptor: 24 soft hue bins, 3 soft brightness bins, 13 reserved.
+#: The head descriptor: 24 soft hue bins, 3 soft brightness bins — the
+#: HISTOGRAM, bins 0..26, the only part heads are compared on — then the
+#: headwear share (27) and its flag (28, 1.0 = measured; a runner before
+#: 2026-09-25 sends zeros), then 11 reserved (heco_counting.appearance).
 HEAD_DIM = 40
 HEAD_H_BINS = 24
+HEAD_BINS = 27
+HEAD_WEAR_SLOT = 27
+HEAD_WEAR_FLAG = 28
 #: The beard reading: [skinFrac, darkFrac, greyFrac, whiteFrac].
 BEARD_DIM = 4
 #: The skin reading: [log(R/G), log(B/G)] of the cheek window — evidence
