@@ -38,6 +38,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
+import cv2
 from fastapi import FastAPI, HTTPException
 from heco_common.config import env_int
 from heco_common.gate_auth import install_bearer_gate
@@ -47,7 +48,7 @@ from pydantic import Field
 
 from . import __version__
 from .capture import CaptureError, CaptureWorker
-from .config import levers_from_env
+from .config import cv_threads_from_env, levers_from_env
 
 
 class OpenIngest(OpenSource):
@@ -99,7 +100,10 @@ state = _State()
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Ensure the capture thread and device are released on shutdown."""
+    """Size OpenCV's pool (INGEST_CV_THREADS) and release capture on shutdown."""
+    threads = cv_threads_from_env()
+    if threads is not None:
+        cv2.setNumThreads(threads)
     yield
     state.swap(None)
 
@@ -282,10 +286,13 @@ def health() -> dict:
     requested = None
     try:
         knobs = levers_from_env().knobs()
+        knobs["cvThreads"] = cv_threads_from_env()
         body["knobs"], requested = knobs, knobs["decoder"]
     except ValueError as exc:
         body["ok"] = False
         body["knobs"] = {"error": str(exc)}
+    # What the pool actually is, whoever set it.
+    body["cvThreadsActive"] = cv2.getNumThreads()
     worker = state.worker
     body["capture"] = worker.describe() if worker is not None else None
     body["device"] = (
