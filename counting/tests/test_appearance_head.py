@@ -34,8 +34,9 @@ def face(turban=None, chin=None, skin=SKIN, h=220, w=200) -> np.ndarray:
 
 
 def inter(a, b) -> float:
-    """Histogram intersection of two descriptors."""
-    return float(np.minimum(np.asarray(a), np.asarray(b)).sum())
+    """Histogram intersection of two descriptors — over the histogram (0..26),
+    as the match service compares heads; 27/28 are the headwear share."""
+    return float(np.minimum(np.asarray(a)[:27], np.asarray(b)[:27]).sum())
 
 
 def hue_of(bgr) -> int:
@@ -46,12 +47,28 @@ def hue_of(bgr) -> int:
 # ------------------------------------------------------------------ head
 
 
-def test_head_is_40_floats_summing_to_one_with_13_reserved_zeros():
-    """The wire shape the match service validates."""
+def test_head_is_40_floats_a_histogram_the_headwear_share_and_reserved_zeros():
+    """The wire shape the match service validates: bins 0..26 sum to 1, 27 is
+    the headwear share, 28 its flag, 29..39 reserved."""
     d = ap.head_descriptor(face(TURBAN_RED), FACE, LANDMARKS)
     assert d is not None and len(d) == ap.HEAD_DIM == 40
-    assert sum(d) == pytest.approx(1.0) and min(d) >= 0.0
-    assert not any(d[27:]), "bins 27..39 are reserved"
+    assert sum(d[:27]) == pytest.approx(1.0) and min(d) >= 0.0
+    assert 0.0 <= d[ap.HEAD_WEAR_SLOT] <= 1.0 and d[ap.HEAD_WEAR_FLAG] == 1.0
+    assert not any(d[29:]), "bins 29..39 are reserved"
+
+
+def test_the_headwear_share_leaves_skin_out():
+    """A turban is cloth outside the skin window: most of the window. A bald
+    scalp is chromatic too — its skin — and read 0.91 "headwear" on f0bfc5's
+    p00062; outside the skin window it is nearly nothing. So is a skin-toned
+    turban (the peach one): it reads bare, which only keeps a pair asked."""
+    turban = ap.head_descriptor(face(TURBAN_RED), FACE, LANDMARKS)
+    assert sum(turban[:24]) > 0.9 and turban[ap.HEAD_WEAR_SLOT] > 0.3
+    scalp = ap.head_descriptor(face(), FACE, LANDMARKS)  # skin to the top
+    assert sum(scalp[:24]) > 0.9, "the histogram still reads the scalp's colour"
+    assert scalp[ap.HEAD_WEAR_SLOT] < 0.05
+    peach = ap.head_descriptor(face((120, 160, 225)), FACE, LANDMARKS)
+    assert peach[ap.HEAD_WEAR_SLOT] < 0.05
 
 
 def test_a_red_turban_and_an_orange_one_are_different_heads():
