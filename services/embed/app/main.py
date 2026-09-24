@@ -26,6 +26,7 @@ from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .align import align_face, half_balance
 from .attributes import ATTR_MODEL_EXPLICIT, ATTR_MODEL_PATH, AttributeModel, build_attributes
 from .codec import b64_to_bgr
 from .recognizer import BATCH, BATCH_MAX, DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
@@ -247,4 +248,16 @@ def embed(req: EmbedRequest) -> dict:
         "norms": norms,
         "attributes": attributes,
         "attrMs": attr_ms,
+        # Index-parallel, like norms: how evenly each face's two halves were
+        # seen (align.half_balance). Measured on the same ArcFace-template
+        # crop whichever family embeds, so the number means one thing.
+        "balance": [_balance(img, f.model_dump()) for f in req.faces],
     }
+
+
+def _balance(img, face: dict) -> float | None:
+    """One face's half-balance, or None when it cannot be measured."""
+    try:
+        return half_balance(align_face(img, face.get("landmarks")))
+    except Exception:  # noqa: BLE001 — a reading, never a reason to fail /embed
+        return None
