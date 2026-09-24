@@ -211,3 +211,31 @@ def test_keepalives_hold_a_still_room_open_past_the_stall_window(repeat, overlap
     assert final["endReason"] == "source-stalled"
     assert final["state"] == "failed"
     assert final["framesSkippedNoMotion"] == (fake.n - 1) * 14
+
+
+def test_a_runs_gate_and_buffer_overrides_reach_ingest_open_and_absent_adds_nothing():
+    """source.motionGate / source.bufferS are ingest /open's per-run overrides.
+
+    The runner's Source model is the only way that dict reaches ingest, so an
+    undeclared field would be dropped by validation and the run would count
+    without the gate it asked for.  Absent must add no key at all: the OFF
+    run opens ingest with the body it always sent.
+    """
+    from app.main import RunRequest
+
+    on = RunRequest.model_validate({
+        "eventId": "ev-1",
+        "source": {"url": "rtsp://cam/1", "motionGate": True, "bufferS": 10},
+    }).model_dump(exclude_none=True)
+    assert on["source"] == {
+        "url": "rtsp://cam/1", "loop": False, "isFile": False, "lockstep": False,
+        "motionGate": True, "bufferS": 10.0,
+    }
+    off = RunRequest.model_validate(RUN).model_dump(exclude_none=True)
+    assert "motionGate" not in off["source"] and "bufferS" not in off["source"]
+    with pytest.raises(ValueError):
+        RunRequest.model_validate({"eventId": "e", "source": {"path": "/x", "bufferS": -1}})
+
+    fake = Queued()
+    make_loop(fake, {**RUN, "source": {**RUN["source"], "motionGate": False}}).run()
+    assert fake.opened["motionGate"] is False, "forwarded verbatim to ingest /open"
