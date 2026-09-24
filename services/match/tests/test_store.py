@@ -279,6 +279,7 @@ def test_reset_closes_the_store_before_deleting_the_file(tmp_path):
 
 
 def test_a_new_store_is_stamped_with_this_process_embedder(tmp_path):
+    """A fresh file is stamped with this process's embedder id, durably."""
     from app import store as store_mod
     from app.store import VectorStore
 
@@ -316,7 +317,6 @@ def test_a_same_dim_different_embedder_refuses_loudly(tmp_path, monkeypatch):
     embedder with the SAME dimension passes every dim check — this guard is
     the only thing between that and a confidently wrong bill."""
     import pytest
-
     from app import store as store_mod
     from app.store import EmbedderMismatchError, VectorStore
 
