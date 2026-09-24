@@ -294,6 +294,36 @@ def test_a_live_decoder_that_exits_is_restarted(monkeypatch):
     assert [w.take().seq for _ in range(5)] == [1, 2, 3, 4, 5]
 
 
+def test_a_live_decoder_that_cannot_restart_says_so(monkeypatch, capfd):
+    """A camera drop whose restarts all fail is not invisible: /health's device
+    error carries the DecoderError that names the cause, stderr says so ONCE,
+    and the failures are counted — then all of it clears, with one line, when
+    the camera is back. (Before: 40 failed restarts, device still read
+    active=nvdec error=null, and nothing was logged.)"""
+    monkeypatch.setenv("FAKE_FRAMES", "3")
+    w = CaptureWorker("rtsp://cam/1", is_file=False,
+                      levers=Levers(decoder="nvdec", buffer_s=30.0))
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "fail")  # every restart from now fails
+    w.start()
+    try:
+        deadline = time.monotonic() + 10
+        while w.describe()["live"]["reconnectFailures"] < 2:
+            assert time.monotonic() < deadline, "the failed restarts were not counted"
+            time.sleep(0.05)
+        assert "live source down" in w.decoder["error"]
+        assert "Cannot load libnvcuvid.so.1" in w.decoder["error"], "the cause was dropped"
+        assert w.decoder["active"] == "nvdec"
+        monkeypatch.setenv("FAKE_FFMPEG_MODE", "ok")  # the camera is back
+        while w.describe()["live"]["reconnects"] < 1 or w.decoder["error"] is not None:
+            assert time.monotonic() < deadline, "the recovery was not seen"
+            time.sleep(0.05)
+    finally:
+        w.stop()
+    err = capfd.readouterr().err
+    assert err.count("live source down") == 1, err
+    assert err.count("live source back after") == 1, err
+
+
 # ------------------------------------------------------- the real binary
 
 
