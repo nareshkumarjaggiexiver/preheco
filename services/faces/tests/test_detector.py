@@ -201,3 +201,15 @@ def test_detect_feeds_the_session_the_legacy_blob(fake_ort):
     legacy = np.ascontiguousarray(
         ((rgb.astype(np.float32) - 127.5) / 128.0).transpose(2, 0, 1)[None])
     assert seen["blob"].tobytes() == legacy.tobytes()
+
+
+def test_trt_truth_is_absent_off_trt(fake_ort):
+    """Off TensorRT the detector carries trt=None and /health's device block
+    (main._device_block) keeps today's four keys exactly."""
+    from app.main import _device_block
+
+    det = d.ScrfdDetector(fake_ort["weight"], 640, "CPU")
+    assert det.trt is None
+    assert set(_device_block(det)) == {"requested", "active", "family", "scoreMin"}
+    det.device_requested = "TRT"
+    assert _device_block(det)["trt"] is None, "asked for TRT, did not get it: null, shown"

@@ -35,7 +35,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import (
+    announce_device,
+    is_trt,
+    providers_for,
+    trt_batch_profile,
+)
 
 #: The default weight location — beside the embedder's, gitignored, never
 #: committed (InsightFace weights are restricted-tier: see the README).
@@ -180,7 +185,8 @@ class AttributeModel:
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("embed-attributes", self.device_requested, self.providers_active)
+        if not is_trt(device):
+            announce_device("embed-attributes", self.device_requested, self.providers_active)
         inp = self._session.get_inputs()[0]
         self._input_name = inp.name
         itype = inp.type
@@ -216,6 +222,24 @@ class AttributeModel:
             )
         self.batch_max = int(batch_max)
         self.batch_active = bool(batch) and not isinstance(shape[0], int)
+        sample = (3, INPUT_SIZE, INPUT_SIZE) if self._nchw else (INPUT_SIZE, INPUT_SIZE, 3)
+        if is_trt(device) and self.batch_active and (
+            "TensorrtExecutionProvider" in self.providers_active
+        ):
+            # Same reason as the embedder: an explicit 1..max profile, or
+            # every new batch size rebuilds the engine inside a request.
+            providers, provider_options = providers_for(
+                device, trt_batch_profile(inp.name, sample, self.batch_max))
+            self._session = ort.InferenceSession(
+                str(model_path), options, providers=providers, provider_options=provider_options
+            )
+            self.providers_active = list(self._session.get_providers())
+        if is_trt(device):
+            # Build (or load) the TensorRT engine at load, not in a request —
+            # and read the truth after it (a failed build drops ORT to CUDA).
+            self._session.run(None, {self._input_name: np.zeros((1, *sample), self._np_dtype)})
+            self.providers_active = list(self._session.get_providers())
+            announce_device("embed-attributes", self.device_requested, self.providers_active)
 
     def blob(self, img: np.ndarray, box) -> np.ndarray:
         """Build the exact tensor fed to the graph: RGB, 0..255, graph dtype and layout."""

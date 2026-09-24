@@ -22,6 +22,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
+from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -190,12 +191,7 @@ def health() -> dict:
         # Family, device truth AND dimension: the runner cross-checks dim
         # against the deployment's HECO_EMBEDDING_DIM story, and the family
         # says which alignment produced these vectors.
-        "device": {
-            "requested": emb.device_requested,
-            "active": emb.providers_active,
-            "family": emb.family,
-            "dim": emb.dim,
-        } if emb else None,
+        "device": _device_block(emb) if emb else None,
         # EMBED_BATCH as asked and as it runs (a static-batch graph cannot).
         "knobs": _knobs(emb) if emb else None,
     }
@@ -210,6 +206,23 @@ def _knobs(emb) -> dict:
             "max": BATCH_MAX,
         },
     }
+
+
+def _device_block(emb) -> dict:
+    """Build the /health device truth; `trt` rides along only when TRT was asked.
+
+    Keyed on the REQUEST, not on success: a TensorRT that failed to load
+    answers "trt": null beside an `active` list without it.
+    """
+    block = {
+        "requested": emb.device_requested,
+        "active": emb.providers_active,
+        "family": emb.family,
+        "dim": emb.dim,
+    }
+    if is_trt(emb.device_requested):
+        block["trt"] = getattr(emb, "trt", None)
+    return block
 
 
 @app.post("/embed")

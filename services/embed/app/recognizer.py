@@ -52,7 +52,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import (
+    announce_device,
+    is_trt,
+    providers_for,
+    trt_batch_profile,
+    trt_truth,
+)
 
 from .align import TEMPLATE_SIZE, align_face
 from .attributes import AttributeModel
@@ -236,7 +242,8 @@ class ArcFaceEmbedder(_Embedder):
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("embed", self.device_requested, self.providers_active)
+        if not is_trt(device):
+            announce_device("embed", self.device_requested, self.providers_active)
         inp = self._session.get_inputs()[0]
         self._input_name = inp.name
         # The graph's input DTYPE read from the graph, like the layout below:
@@ -287,6 +294,37 @@ class ArcFaceEmbedder(_Embedder):
         # keeps the per-face loop, and /health's knobs block says so.
         self.batch_requested = BATCH if batch is None else bool(batch)
         self.batch_active = self.batch_requested and not isinstance(shape[0], int)
+        if is_trt(device) and self.batch_active and "TensorrtExecutionProvider" in (
+            self.providers_active
+        ):
+            # TensorRT builds an engine per input-shape RANGE: without an
+            # explicit 1..BATCH_MAX profile every new batch size seen in a
+            # live count would rebuild the engine (tens of seconds, inside a
+            # request). Rebuilt here with the profile, once, at load.
+            sample = (3, TEMPLATE_SIZE, TEMPLATE_SIZE) if self._nchw else (
+                TEMPLATE_SIZE, TEMPLATE_SIZE, 3)
+            providers, provider_options = providers_for(
+                device, trt_batch_profile(inp.name, sample, BATCH_MAX))
+            self._session = ort.InferenceSession(
+                str(model_path), providers=providers, provider_options=provider_options
+            )
+            self.providers_active = list(self._session.get_providers())
+        self.trt = None
+        # TensorRT builds (or deserialises) its engine at the first run of a
+        # shape: pay it HERE, inside the load /health waits on, never in the
+        # first /embed of a live count (the runner's stage timeout is 30 s).
+        if is_trt(device):
+            zeros = np.zeros(
+                (1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE) if self._nchw
+                else (1, TEMPLATE_SIZE, TEMPLATE_SIZE, 3),
+                dtype=self._np_dtype,
+            )
+            self._session.run(None, {self._input_name: zeros})
+            # After, not before: a failed engine build inside run() makes
+            # ORT rebuild the session on CUDA without raising.
+            self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
+            announce_device("embed", self.device_requested, self.providers_active)
 
     def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
         """Our alignment, the normalised RGB blob, one session run."""
