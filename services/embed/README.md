@@ -74,7 +74,10 @@ make run      # uvicorn on :7105
 - `GET /health` → `{ok, model, version, error, device, attrModel, attrError}`.
   `attrModel` is the loaded gender/age file's name or `null`; `attrError`
   is set when a file NAMED by `EMBED_ATTR_MODEL` will not load (`ok` stays
-  true — embedding works, the loss is just not silent).
+  true — embedding works, the loss is just not silent). Under
+  `HECO_DEVICE=TRT`, `device.attributes {requested, active, trt}` is the
+  gender/age pass's OWN device truth: it builds its own engine and can fall
+  back to CUDA or CPU on its own.
 - `POST /embed` `{imageB64, faces: [{box, landmarks, conf?}]}` →
   `{embeddings: [[128 floats]], alignMs, norms: [float],
   attributes: [{gender, genderP, age}] | null, attrMs: float | null}` —

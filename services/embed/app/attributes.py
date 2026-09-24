@@ -40,6 +40,7 @@ from heco_common.ort import (
     is_trt,
     providers_for,
     trt_batch_profile,
+    trt_truth,
 )
 
 #: The default weight location — beside the embedder's, gitignored, never
@@ -235,11 +236,16 @@ class AttributeModel:
                 str(model_path), options, providers=providers, provider_options=provider_options
             )
             self.providers_active = list(self._session.get_providers())
+        #: TensorRT's own read-back (trt_truth) — None off TRT and whenever
+        #: the engine did not come up; embed /health serves it beside the
+        #: embedder's under device.attributes.
+        self.trt = None
         if is_trt(device):
             # Build (or load) the TensorRT engine at load, not in a request —
             # and read the truth after it (a failed build drops ORT to CUDA).
             self._session.run(None, {self._input_name: np.zeros((1, *sample), self._np_dtype)})
             self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
             announce_device("embed-attributes", self.device_requested, self.providers_active)
 
     def blob(self, img: np.ndarray, box) -> np.ndarray:
