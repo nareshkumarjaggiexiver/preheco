@@ -64,7 +64,8 @@ OPEN_TIMEOUT_S = 15.0
 #: 23.2 s — against the runner's 45 s HECO_SOURCE_STALL_S. The two are
 #: coupled: 2 x this + ~3 s of reconnect must stay well under that window.
 #: An ffmpeg 4.x (-stimeout) never exits at all — the laptop's 4.4.2 emitted
-#: one stale frame per timeout, forever.
+#: one stale frame per timeout, forever — which INGEST_LIVE_TIMEOUT_S's read
+#: watchdog (FfmpegSource read_timeout_s) catches whatever the version.
 RTSP_TIMEOUT_US = 5_000_000
 #: http(s) read timeout, microseconds: -reconnect* reacts to errors and EOF,
 #: not to a source that goes silent with its connection open — measured on
@@ -112,10 +113,20 @@ def ffmpeg_version() -> tuple[int, int]:
 
 
 def build_command(
-    source: str, decoder: str, *, loop: bool = False, rtsp_tcp: bool = True
+    source: str, decoder: str, *, loop: bool = False, rtsp_tcp: bool = True,
+    live_timeout_s: float | None = None,
 ) -> list[str]:
-    """The ffmpeg argv that decodes ``source`` to NV12 frames on stdout."""
+    """The ffmpeg argv that decodes ``source`` to NV12 frames on stdout.
+
+    ``live_timeout_s`` (INGEST_LIVE_TIMEOUT_S, a live source only) moves
+    ffmpeg's own socket timeouts to TWICE it, so the worker's read watchdog
+    at ``live_timeout_s`` always fires first and one rule, not two, decides
+    when a live source is dead.
+    """
     version = ffmpeg_version()
+    rtsp_us, http_us = RTSP_TIMEOUT_US, HTTP_RW_TIMEOUT_US
+    if live_timeout_s:
+        rtsp_us = http_us = int(2 * live_timeout_s * 1_000_000)
     cmd = [*FFMPEG, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info"]
     if decoder == "nvdec":
         cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
@@ -130,10 +141,10 @@ def build_command(
             cmd += ["-rtsp_transport", "tcp"]
         # A silent camera is a dead one: ffmpeg exits after 2 x this (see
         # RTSP_TIMEOUT_US), and the worker reconnects.
-        cmd += ["-timeout" if version >= (5, 0) else "-stimeout", str(RTSP_TIMEOUT_US)]
+        cmd += ["-timeout" if version >= (5, 0) else "-stimeout", str(rtsp_us)]
     elif scheme in ("http", "https"):
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-        cmd += ["-rw_timeout", str(HTTP_RW_TIMEOUT_US)]
+        cmd += ["-rw_timeout", str(http_us)]
     if loop:
         cmd += ["-stream_loop", "-1"]
     cmd += ["-i", source, "-map", "0:v:0", "-an", "-sn", "-dn"]
@@ -161,14 +172,24 @@ class FfmpegSource:
         rtsp_tcp: bool = True,
         open_timeout_s: float | None = None,
         abort: threading.Event | None = None,
+        read_timeout_s: float | None = None,
     ) -> None:
         """Start the decoder and wait for its first frame.
 
         ``abort`` (the worker's stop event) ends that wait early, so stopping
         a worker that is mid-reconnect does not sit out the whole timeout.
+        ``read_timeout_s`` (INGEST_LIVE_TIMEOUT_S, live sources): after the
+        first frame, a read that waits this long for a byte means the stream
+        or the decoder is dead — ffmpeg is killed, :attr:`stalled` is set and
+        read() returns None, so the worker reconnects. None = wait forever,
+        today's behaviour.
         """
         self.decoder = decoder
-        self.cmd = build_command(source, decoder, loop=loop, rtsp_tcp=rtsp_tcp)
+        self.cmd = build_command(
+            source, decoder, loop=loop, rtsp_tcp=rtsp_tcp, live_timeout_s=read_timeout_s
+        )
+        #: True once a read timed out (read_timeout_s): the worker counts it.
+        self.stalled = False
         self.w: int | None = None
         self.h: int | None = None
         self.frame_bytes = 0
@@ -227,6 +248,9 @@ class FfmpegSource:
         finally:
             opened.set()
         self._first: RawFrame | None = first
+        if read_timeout_s:
+            # Only now: the first frame had OPEN_TIMEOUT_S and its watchdog.
+            self._sock.settimeout(read_timeout_s)
 
     # ------------------------------------------------------------- public
 
@@ -295,6 +319,13 @@ class FfmpegSource:
         while got < self.frame_bytes:
             try:
                 n = self._sock.recv_into(view[got:])
+            except TimeoutError:
+                # read_timeout_s passed without a byte: the camera went silent
+                # or the decoder hung. ffmpeg would sit on it (4.x forever),
+                # so kill it now rather than wait for it to exit.
+                self.stalled = True
+                self._kill()
+                n = 0
             except (OSError, ValueError):  # closed under us by close()
                 n = 0
             if not n:
