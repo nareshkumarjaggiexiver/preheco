@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from heco_common.ort import announce_device, providers_for
+from heco_common.ort import announce_device, is_trt, providers_for, trt_truth
 
 from .postprocess import decode_predictions, select_persons, select_persons_rtdetr
 from .preprocess import letterbox, rtdetr_blob
@@ -212,7 +212,11 @@ class PersonDetector:
         )
         self.device_requested = (device or "CPU").upper()
         self.providers_active = list(self._session.get_providers())
-        announce_device("persons", self.device_requested, self.providers_active)
+        #: What TensorRT really runs with (fp16, cache, workspace) — None
+        #: when it is not in the session. Set after the warm-up below.
+        self.trt = None
+        if not is_trt(device):
+            announce_device("persons", self.device_requested, self.providers_active)
         # THE GRAPH IS THE GROUND TRUTH. A static export knows its own input
         # size and arity; configuration that disagrees would load cleanly and
         # then fail every /detect while /health reported healthy. Reconcile
@@ -238,6 +242,19 @@ class PersonDetector:
             )
         self._input_name = inputs[0].name
         self._lock = threading.Lock()
+        # TensorRT builds (or deserialises) an engine the first time a shape
+        # runs. Pay that HERE, inside the load /health waits on, rather than
+        # inside the first /detect of a live count — the runner's stage
+        # timeout is 30 s and a cold engine build can take longer. TRT only:
+        # every other device keeps today's load exactly.
+        if is_trt(device):
+            self.detect(np.zeros((*self.input_size, 3), dtype=np.uint8))
+            # Read the truth AFTER the first run: a TensorRT engine that
+            # fails to build there makes ORT rebuild the session on CUDA
+            # without raising, and /health must not keep claiming TensorRT.
+            self.providers_active = list(self._session.get_providers())
+            self.trt = trt_truth(self._session)
+            announce_device("persons", self.device_requested, self.providers_active)
 
     def detect(
         self,

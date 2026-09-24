@@ -30,6 +30,7 @@ def test_importing_the_library_pulls_in_no_transport_or_framework():
         "importlib.import_module('heco_counting.ports');"
         "importlib.import_module('heco_counting.association');"
         "importlib.import_module('heco_counting.appearance');"
+        "importlib.import_module('heco_counting.face_search');"
         f"bad=[m for m in {FORBIDDEN!r} if m in sys.modules];"
         "print(','.join(bad))"
     )

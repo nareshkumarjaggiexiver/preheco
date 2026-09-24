@@ -254,3 +254,31 @@ def test_crop_matches_cv2_warp_with_the_documented_matrix():
     box = {"x": 250.0, "y": 150.0, "w": 60.0, "h": 90.0}  # hangs off the edge
     expected = cv2.warpAffine(img, attribute_transform(box), (96, 96), borderValue=0.0)
     np.testing.assert_array_equal(crop_face(img, box), expected)
+
+
+# ------------------------------------------------- EMBED_BATCH
+
+def test_predict_many_batches_a_dynamic_graph_and_matches_predict(tmp_path):
+    """Batching on a dynamic-batch graph: one run per request, the same
+    answers predict() gives one box at a time, in order."""
+    path = write_reduce_mean_model(tmp_path, "tiny_dyn.onnx", FLOAT, ("N", 3, 96, 96))
+    single = AttributeModel(path, "CPU")
+    batched = AttributeModel(path, "CPU", batch=True, batch_max=2)
+    assert single.batch_active is False and batched.batch_active is True
+    img = np.random.default_rng(5).integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
+    boxes = [{"x": 40.0 * i + 20, "y": 30.0 + 10 * i, "w": 60.0, "h": 80.0} for i in range(5)]
+    runs = []
+    real = batched._session.run
+    batched._session = type("S", (), {
+        "run": lambda self, n, f: runs.append(next(iter(f.values())).shape) or real(n, f)})()
+    assert batched.predict_many(img, boxes) == [single.predict(img, b) for b in boxes]
+    assert runs == [(2, 3, 96, 96), (2, 3, 96, 96), (1, 3, 96, 96)]
+
+
+def test_predict_many_off_or_static_is_the_per_box_loop(tmp_path):
+    static = AttributeModel(
+        write_reduce_mean_model(tmp_path, "tiny_static.onnx", FLOAT, (1, 3, 96, 96)), "CPU",
+        batch=True)
+    assert static.batch_active is False, "a batch-1 export cannot batch"
+    img, box = _painted_frame((45, 20, 10))
+    assert static.predict_many(img, [box, box]) == [static.predict(img, box)] * 2

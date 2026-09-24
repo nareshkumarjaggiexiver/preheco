@@ -10,6 +10,7 @@ import threading
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
+from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -122,12 +123,25 @@ def health() -> dict:
         # The device TRUTH, not the request: both ORT accelerator EPs fall
         # back to CPU silently, so /health serves the session's ACTIVE
         # provider list — the benchmark-honesty line, queryable.
-        "device": {
-            "requested": det.device_requested,
-            "active": det.providers_active,
-            "family": det.family,
-        } if det else None,
+        "device": _device_block(det) if det else None,
     }
+
+
+def _device_block(det: PersonDetector) -> dict:
+    """Build the /health device truth; `trt` rides along only when TRT was asked.
+
+    Keyed on the REQUEST, not on success: a TensorRT that failed to load
+    answers "trt": null beside an `active` list without it — the fallback is
+    shown, never hidden. Other devices keep today's block byte-for-byte.
+    """
+    block = {
+        "requested": det.device_requested,
+        "active": det.providers_active,
+        "family": det.family,
+    }
+    if is_trt(det.device_requested):
+        block["trt"] = det.trt
+    return block
 
 
 @app.post("/detect")

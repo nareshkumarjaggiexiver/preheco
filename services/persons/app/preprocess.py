@@ -29,8 +29,10 @@ def letterbox(img: np.ndarray, input_size: tuple[int, int]) -> tuple[np.ndarray,
     rh = int(img.shape[0] * ratio)
     resized = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_LINEAR)
     padded[:rh, :rw] = resized
-    blob = padded.transpose(2, 0, 1).astype(np.float32)
-    return np.ascontiguousarray(blob), ratio
+    # ONE float pass, not two: astype on the transposed view keeps its HWC
+    # memory order (order='K'), so the old ascontiguousarray then copied the
+    # whole 4.9 MB blob a second time. Same values, same layout.
+    return np.ascontiguousarray(padded.transpose(2, 0, 1), dtype=np.float32), ratio
 
 
 def rtdetr_blob(img: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:

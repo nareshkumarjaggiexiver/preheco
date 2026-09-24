@@ -211,6 +211,80 @@ carries information.
   watch the advisory signal live. Both counters land in the run status, the
   end-of-run notes and the structured results, beside `healedSplits`.
 
+## v5: the throughput levers (2026-09-24)
+
+One 4K camera through the CUDA box measured ~200 ms a frame with every
+stage serial in this loop, against a camera delivering one every 67 ms.
+Four levers, **every one OFF by default, and off is the loop exactly as it
+ran** — pinned call for call, body for body, ledger for ledger by
+`tests/test_call_sequence_pinned.py`, whose fixture was captured before any
+lever existed. Each is plumbed through `docker-compose.yml`, shown in
+`GET /health` → `knobs`, stamped into the run's config when on
+(`levers`, `faceRegion`), and counted where it skips work.
+
+- **Stage overlap** (`HECO_PIPELINE_OVERLAP`). One worker thread fetches
+  frame k+1 and runs its detection — persons, and the face search when it
+  needs no tracks (the whole frame, or the region) — while the loop thread
+  decides frame k: track, gate, embed, match, verdicts, ledger, taps. At most
+  one frame ahead (mutation-checked); every piece of state stays on the loop
+  thread in frame order; a worker failure is carried back and raised at the
+  point the inline call stood, so the run settles exactly as before; every
+  exit path joins the worker before anything is released. `detectWaitMs`
+  (count board) says which half is the bottleneck.
+- **Parallel detect** (`HECO_PARALLEL_DETECT`). Persons and the whole-frame
+  (or region) face search for one frame go out side by side, with or
+  without the overlap. Inert on the crop path, which needs this frame's
+  tracks first (pinned).
+- **Face-search cadence** (`HECO_FACE_CADENCE`,
+  `HECO_FACE_CADENCE_MAX_GAP_S`). A frame's face search is skipped only when
+  there is at least one person box, EVERY box is covered one-to-one (IoU ≥
+  0.5, a maximum matching) by a SETTLED track — an identity lock whose last
+  comfortable face match is younger than `HECO_FACE_REVERIFY_INTERVAL_S` —
+  and less than the max gap (1.0 s of footage) has passed since the last
+  search that ran (`heco_counting.face_search`). Newcomers, stale locks,
+  unconfirmed bodies, empty frames: searched. Skipped frames still track and
+  still assert track presence; each is counted (`faceDetectSkippedSettled`)
+  and on the ledger. **It skips nothing while the re-verify interval is 0**
+  (said at run start); pair it with 2-3 s. Under the overlap the worker rules
+  from the evidence the loop held when the previous frame was handed over,
+  taken on the loop thread, so the ruling repeats run to run.
+- **Face search region** (`POST /runs {faceRegion: {x, y, w, h}}`,
+  normalised, inside the frame, ≥ 5% a side). The face search runs only
+  there, as one crop at native resolution (`within=[region px]`), whatever
+  `HECO_FACES_WHOLE_FRAME` says; persons and the tracker still see the whole
+  frame. A 1920x1080 region through SCRFD's 1472x832 input is letterboxed at
+  0.767 against the whole 4K frame's 0.383 — 2.00x. Measured through the
+  real faces app on the Sharon bench clip: 12/9/13 faces against 8/2/8
+  whole-frame, 13 of 15 whole-frame faces inside the region found again —
+  **not a superset**: two real, low-quality guests SCRFD scored at 0.383 and
+  not at 0.767. A frame with no pixel size searches as if no region were
+  set, counted as `faceRegionUnplaced`. `pipeline.json` declares
+  `capabilities.faceRegion`.
+
+And the consumer half of ingest's lever: the frame wire's `captured`,
+`skipped`, `dropped` and `backlog` (the motion gate and the bounded live
+buffer) land as `framesCaptured`, `framesSkippedNoMotion`,
+`framesDroppedLive` and `ingestBacklogMax` in the status, results and notes,
+and `motion`/`backlog` are charted on the ingest board. A FIFO source is
+handed over once per frame and in order, a keepalive holds a still room open
+past the stall window, and an ingest that sends none of it leaves the run
+record exactly as before — the planner's results door refuses a null, so an
+unmeasured counter is absent, never 0.
+
+The synthetic latency harness (`python -m tests.latency_harness`; stage
+sleeps persons 30, faces 70, embed 20, match 5 ms):
+
+| arm | whole frame | crops |
+| --- | --- | --- |
+| serial | 7.8 fps (128 ms) | 7.8 fps (128 ms) |
+| parallel detect | 10.1 fps (99 ms) | 7.8 fps (inert) |
+| overlap | 9.8 fps (102 ms) | 10.2 fps (98 ms) |
+| overlap + parallel detect | 14.0 fps (72 ms) | 10.2 fps (98 ms) |
+
+`scripts/bench-live.py` runs a clip through the console's own start API and
+reports processed and footage fps against camera rate, the count, and every
+lever counter from the settled run record.
+
 ## v1: staff, taps, feedback, enrol
 
 - **Staff whitelist.** A run carrying a `siteId` sends it on every `/match`, so
@@ -289,9 +363,9 @@ carries information.
 
 | method | path | body | returns |
 | --- | --- | --- | --- |
-| GET | `/health` | — | `{ok, model, version}` |
-| POST | `/runs` | `{eventId, placementId?, source:{url\|path}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}]}` — zone points normalized 0..1, ≥3 per polygon, 422 otherwise | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, coPresenceSplits, trackPresenceSplits, sameFrameSplits, gatedByFeatNorm, appearanceRefused, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error) |
+| GET | `/health` | — | `{ok, model, version, build, pipeline, host, knobs}` — `knobs`: the throughput levers as this process resolved them |
+| POST | `/runs` | `{eventId, placementId?, source:{url\|path, loop?, isFile?, lockstep?, motionGate?, bufferS?}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}], faceRegion?:{x, y, w, h}}` — zone points normalized 0..1, ≥3 per polygon; `faceRegion` normalized, inside the frame, ≥ 5% a side; 422 otherwise; `source.motionGate` / `source.bufferS` go to ingest `/open` as its per-run L1 overrides (absent = the ingest env's own setting) | `{runId, state}` |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, coPresenceSplits, trackPresenceSplits, sameFrameSplits, gatedByFeatNorm, appearanceRefused, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error; and the levers' framesCaptured, framesSkippedNoMotion, framesDroppedLive, ingestBacklogMax, faceDetectSkippedSettled, faceRegionUnplaced — null when not measured) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -343,6 +417,17 @@ the fold; agreeing frames heal exactly as before; knob 0 disables), and the
 match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
 `feedback`) are unit-tested directly.
 
+The throughput levers (v5) are held to a fixture captured BEFORE they
+existed (`tests/fixtures/call_sequence_pinned.json`): with every lever off,
+four scenarios replay the same stage calls, bodies, ledger, status and run
+record exactly, and with the overlap and parallel detect on, the same
+per-host calls, ledger and record. `test_overlap.py` pins frame order, the
+one-frame-ahead bound, worker failures, the drain on stop, and the harness
+speedups; `test_face_search_loop.py` the cadence (skips only when settled,
+the max gap, track presence on skipped frames, the overlap's fixed ruling)
+and the region; `test_ingest_levers.py` a FIFO, keepalive-gated ingest; and
+`test_bench_live.py` the bench script against a fake console.
+
 ## Tune
 
 | env | default | meaning |
@@ -372,6 +457,11 @@ match-side enrolment veto's visibility. The pure helpers (`taps`, `annotate`,
 | `HECO_PRESENCE_SPLIT` | `1` | Track-presence co-presence (2026-09-24): a track bound to an identity by a comfortable face match (≥ `HECO_TRACK_LOCK_MIN_COSINE`, the face sitting where a head sits in the track box, the track uncontested at IoU ≥ 0.4) stands in for the face on a faceless body, and the pair goes through the same `/split` door (`trackPresenceSplits` +1). Run f0bfc5: 48 pairs proven distinct against 25 from faces alone, and the back-turned girl of review pair #5 retired. A bound track whose box holds any keyed face's centre says nothing; a staff verdict unbinds. **0 = off** |
 | `HECO_QUALITY_MIN_FEAT_NORM` | `0` (off) | Post-embed floor on the raw ArcFace feature norm (the L2 length before unit-normalisation): a face under it is dropped as `gatedBy featnorm` (`gatedByFeatNorm` +1). The one gate that sees an occluder — a railing across a face passes every geometric floor and embeds short. A reply without `norms` gates nothing |
 | `HECO_COPRESENCE_SPLIT` | `1` | Co-presence: every unordered pair of distinct non-staff identities matched in ONE frame is asserted to the gallery as a `cannot_link` via `POST /split` (`coPresenceSplits` +1, once per pair per run). Two faces at different positions in one frame are two different people — the only CERTAIN identity signal here, and run 05b3b7 had it and ignored it while raising two false banners at 0.316/0.360 (clothing 0.94/0.57) against a 0.363 threshold. Silences the wrong banner AND stops a heal or lock fold erasing one of the two. **0 = off**; the residual is a hand-held phone showing its owner's face (one person asserted as two — an over-count, which is visible) |
+| `HECO_PIPELINE_OVERLAP` | `0` (off) | Detect one frame ahead on a worker thread while the loop decides the previous one (see v5). Off = today's loop, pinned |
+| `HECO_PARALLEL_DETECT` | `0` (off) | Persons and the whole-frame/region face search for one frame issued side by side; inert on crops |
+| `HECO_FACE_CADENCE` | `0` (off) | Skip a frame's face search when every person box is a settled, recently verified guest (`faceDetectSkippedSettled`); needs `HECO_FACE_REVERIFY_INTERVAL_S` > 0 |
+| `HECO_FACE_CADENCE_MAX_GAP_S` | `1.0` | Longest stretch of FOOTAGE time the cadence may go without a face search |
+| `HECO_FACE_REVERIFY_INTERVAL_S` | `0` (off) | Seconds a track already holding an identity goes between face verifications: the crop path's re-verify saving (`faceSearchesSkipped`), and the cadence's "settled" window |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |

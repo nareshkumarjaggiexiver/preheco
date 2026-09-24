@@ -70,6 +70,13 @@ Storage
                   height against that fit needs more than the five views a
                   template cap keeps.  Re-keyed by :meth:`merge`, deleted by
                   :meth:`remove`, so a row always names a live identity.
+                  Since 2026-09-24 (night) the row also carries the
+                  sighting's APPEARANCE — the torso descriptor, the head
+                  descriptor (40 floats) and the beard reading (4) — so the
+                  review queue judges an identity's clothing, headwear and
+                  beard on every sighting it had, not on the five its
+                  template cap kept (:func:`app.gallery.review_duplicates`).
+                  NULL = not measured.
 * ``cannot_link`` "these are two different people" constraints, stored
                   order-independent.  Written by an operator's *false-match*
                   correction and by the runner asserting CO-PRESENCE (two faces
@@ -140,7 +147,10 @@ CREATE TABLE IF NOT EXISTS body_sightings (
     y_bottom   REAL NOT NULL,
     frame_h    INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    face_w     REAL
+    face_w     REAL,
+    appearance BLOB,
+    head       BLOB,
+    beard      BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_body_sightings_key ON body_sightings(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
@@ -176,9 +186,13 @@ _VECTOR_COLUMNS_ADDED = (
     ("age", "REAL"),          # ... estimated age in years
     ("feat_norm", "REAL"),    # ... L2 norm of the raw embedding feature
 )
-#: Same for ``body_sightings``, which shipped without ``face_w`` for a day.
+#: Same for ``body_sightings``, which shipped without ``face_w`` for a day
+#: and without the sighting's appearance readings until that night.
 _BODY_COLUMNS_ADDED = (
     ("face_w", "REAL"),       # 2026-09-24 evening: the sighting's face width px
+    ("appearance", "BLOB"),   # 2026-09-24 night: torso descriptor, float32[48|64]
+    ("head", "BLOB"),         # ... head descriptor, float32[40]
+    ("beard", "BLOB"),        # ... beard reading, float32[4]
 )
 
 
@@ -198,6 +212,22 @@ class BodySighting(NamedTuple):
     frame_h: int
     face_w: float | None = None
     created_at: str | None = None
+
+
+class SightingEvidence(NamedTuple):
+    """One body-log row's appearance readings, for the review queue.
+
+    ``created_at`` is the write time (ISO text); ``appearance`` (the torso
+    descriptor, 48 or 64 long), ``head`` (40) and ``beard`` (4) are float32
+    arrays, each None when that sighting did not carry it — absent is not
+    zero.  A row with none of the three is never returned.
+    """
+
+    key: str
+    created_at: str
+    appearance: np.ndarray | None
+    head: np.ndarray | None = None
+    beard: np.ndarray | None = None
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -710,6 +740,29 @@ class VectorStore:
         ).fetchone()
         return int(row[0])
 
+    def sighting_evidence(self) -> list[SightingEvidence]:
+        """Every body-log row that carries an appearance reading, oldest first.
+
+        The review queue's clothing, headwear and beard evidence, per
+        SIGHTING, where the template column keeps at most the cap's five —
+        and on run f0bfc5 those sat inside two seconds for 20 of 44
+        identities (median span 2.0 s).  Rows with none of the three are
+        skipped in SQL; a NULL column comes back as None, never as zeros.
+        """
+        rows = self.conn.execute(
+            "SELECT key, created_at, appearance, head, beard FROM body_sightings"
+            " WHERE appearance IS NOT NULL OR head IS NOT NULL OR beard IS NOT NULL"
+            " ORDER BY id ASC"
+        ).fetchall()
+
+        def arr(blob):
+            return None if blob is None else np.frombuffer(blob, dtype=np.float32)
+
+        return [
+            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b))
+            for k, ts, a, h, b in rows
+        ]
+
     def count_for(self, key: str) -> int:
         """How many templates a single key owns.
 
@@ -844,6 +897,9 @@ class VectorStore:
     def add_body_sighting(
         self, key: str, h: float, w: float, y_bottom: float, frame_h: int,
         face_w: float | None = None,
+        appearance: list[float] | np.ndarray | None = None,
+        head: list[float] | np.ndarray | None = None,
+        beard: list[float] | np.ndarray | None = None,
     ) -> int:
         """Record one sighting's containing PERSON box under ``key``; its rowid.
 
@@ -863,13 +919,26 @@ class VectorStore:
         never touches a verdict.  The rowid comes back so the runner's
         same-frame guard can retract the row if the sighting turns out to
         belong to a different body (:meth:`forget_body_sighting`).
+
+        ``appearance``, ``head`` and ``beard`` are the sighting's readings
+        (torso descriptor, head descriptor, beard fractions), stored as
+        float32 BLOBs; None stores NULL.  They ride on this row (the torso
+        also on any template the call wrote) because a template is written
+        on a handful of calls and the review queue judges an identity's
+        appearance across all of them — and on this row the same-frame
+        guard's retraction takes them too.
         """
+        def blob(v):
+            return None if v is None else np.asarray(v, dtype=np.float32).tobytes()
+
         cur = self.conn.execute(
-            "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w,"
+            " appearance, head, beard)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key, float(h), float(w), float(y_bottom), int(frame_h), _now(),
                 None if face_w is None else float(face_w),
+                blob(appearance), blob(head), blob(beard),
             ),
         )
         return int(cur.lastrowid)

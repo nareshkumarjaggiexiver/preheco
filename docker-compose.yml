@@ -77,6 +77,30 @@ services:
       # camera's own size, which is the default. Face pixels scale with it —
       # see services/ingest/README.md for the numbers before choosing.
       INGEST_MAX_WIDTH: ${INGEST_MAX_WIDTH-}
+      # The README's older tunables. They had no passthrough, so setting them
+      # in .env changed nothing inside the container. Empty = their defaults.
+      INGEST_RTSP_TCP: ${INGEST_RTSP_TCP-}
+      INGEST_FILE_PACE: ${INGEST_FILE_PACE-}
+      INGEST_JPEG_QUALITY: ${INGEST_JPEG_QUALITY-}
+      # L1 — the motion gate and the bounded live buffer (README "Levers").
+      # All empty = off = today's newest-frame slot, byte for byte; a run may
+      # still arm them per-run with /open's motionGate / bufferS. GET /health
+      # shows what the container actually received under `knobs`.
+      INGEST_MOTION_GATE: ${INGEST_MOTION_GATE-}
+      INGEST_MOTION_MIN_FRAC: ${INGEST_MOTION_MIN_FRAC-}
+      INGEST_MOTION_PIXEL_THR: ${INGEST_MOTION_PIXEL_THR-}
+      INGEST_MOTION_KEEPALIVE_S: ${INGEST_MOTION_KEEPALIVE_S-}
+      INGEST_BUFFER_S: ${INGEST_BUFFER_S-}
+      INGEST_BUFFER_MB: ${INGEST_BUFFER_MB-}
+      # L6 — cpu (empty) | nvdec | vaapi | ffmpeg. The hardware decoders need
+      # the ffmpeg image and the devices from docker-compose.hwdec.yml; asked
+      # for without them, the worker falls back to cpu and /health `device`
+      # says so.
+      INGEST_DECODER: ${INGEST_DECODER-}
+      # OpenCV's pool size, process-wide. Empty = OpenCV's default (a thread
+      # per core). 1 cut the NVDEC + gate path from 45.4 to 30.1 ms of CPU per
+      # 4K frame on the .94 box — see app/config.py cv_threads_from_env.
+      INGEST_CV_THREADS: ${INGEST_CV_THREADS-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.
@@ -201,6 +225,14 @@ services:
       # models/genderage.onnx when that file is mounted and OFF when it is
       # not — an absent model reports attributes as null, never as a guess.
       EMBED_ATTR_MODEL: ${EMBED_ATTR_MODEL-}
+      # EMBED_BATCH=1: all of a request's faces through ONE session.run
+      # (arcface family, dynamic-batch graphs; the attribute pass too)
+      # instead of one run per face. Measured on the 4060, 5.5 faces per
+      # 4K frame: embed 23.3 -> 11.6 ms and attributes 6.1 -> 1.7 ms per
+      # frame on CUDA (8.6 -> 3.7 and 2.9 -> 0.9 on TRT), cosine to the
+      # per-face vectors >= 0.999999. Unset = off = today's per-face loop.
+      # /health knobs.batch shows it as asked AND as the graph allows.
+      EMBED_BATCH: ${EMBED_BATCH-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 
@@ -270,13 +302,27 @@ services:
       HECO_REVIEW_STATURE_GAP: ${HECO_REVIEW_STATURE_GAP-}
       HECO_REVIEW_STATURE_MIN_N: ${HECO_REVIEW_STATURE_MIN_N-}
       HECO_STATURE_ADULT_M: ${HECO_STATURE_ADULT_M-}
-      # Clothing set-aside (v3 torsos): the best cross agreement under which a
-      # pair is set aside when both people's own reads are plentiful (MIN_N,
-      # from 2+ seconds) and self-consistent (SELF_MIN). Defaults 0.35 / 3 /
-      # 0.6, measured on the Sharon re-run c84098; CLASH=0 turns it off.
+      # CLOTHING SET-ASIDE (0.13.0). A pair is set aside when each identity's
+      # own v3 torso reads (body log - its templates' in a pre-0.13.0 gallery -
+      # >= MIN_N over 2 s) agree at >= SELF_MIN and the best cross reading is
+      # still < CLASH. Defaults 0.35 / 3 / 0.6. c84098 (templates): a person
+      # against themselves never under 0.52, the operator's different-people
+      # pairs 0.10-0.25. f0bfc5 (body log): own reads 0.90 median, one person
+      # split in time 0.77-0.97, different people 0.10-0.97 (white shirts
+      # agree); 0.35 set aside #3/#6/#7/#23 and no same-person split.
+      # CLASH=0 turns it off.
       HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
       HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
       HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
+      # HEAD AND BEARD SET-ASIDES (0.14.0), read per sighting beside the torso.
+      # HEAD_CLASH: two HEADWEAR identities (turban against turban; a covered
+      # head is never set against a bare one - dupattas and rumals come and
+      # go in one wedding) whose best cross head reading is under it. f0bfc5:
+      # maroon vs peach turban 0.36, one person split in time 0.83-0.99;
+      # default 0.45, 0 = off. BEARD_MIN_N: reads each side needs before
+      # none-vs-beard or dark-vs-white sets a pair aside; default 3, 0 = off.
+      HECO_REVIEW_HEAD_CLASH: ${HECO_REVIEW_HEAD_CLASH-}
+      HECO_REVIEW_BEARD_MIN_N: ${HECO_REVIEW_BEARD_MIN_N-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -387,6 +433,44 @@ services:
       # and can be read out with `docker cp`.
       HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
       HECO_FACES_WHOLE_FRAME: ${HECO_FACES_WHOLE_FRAME-}
+      # WHITE BALANCE for the colour descriptors (0|1, default 0 = off). On,
+      # each frame's illuminant is estimated once (shades-of-grey, ~2.4 ms
+      # at 4K) and torso colour is read under neutral light. Run f0bfc5's
+      # camera AWB already held the warm hall neutral (gains within 2%), so
+      # it changed nothing there; a venue with coloured stage light is where
+      # to try it. Reported on runner /health as knobs.HECO_APPEARANCE_WB.
+      HECO_APPEARANCE_WB: ${HECO_APPEARANCE_WB-}
+      # STAGE OVERLAP (lever L3; 1 = on, default off). One worker thread
+      # fetches frame k+1 and runs its detection (persons, and the face search
+      # when it needs no tracks: HECO_FACES_WHOLE_FRAME) while the loop decides
+      # frame k — track, gate, embed, match, verdicts — so the stateless half
+      # of the ~200 ms/frame 4K chain hides behind the stateful half. At most
+      # one frame ahead; every decision stays on the loop thread in frame
+      # order. Off is the loop exactly as it ran (pinned call for call).
+      # GET /health `knobs` shows what the container actually resolved.
+      HECO_PIPELINE_OVERLAP: ${HECO_PIPELINE_OVERLAP-}
+      # PARALLEL DETECT (lever L3; 1 = on, default off). With the whole-frame
+      # face search, persons and faces /detect for the same frame go out side
+      # by side instead of one after the other — with or without the overlap.
+      # Persons measured 31-43 ms through its HTTP service against 8.6 ms of
+      # model time, so what this hides is mostly transport. No effect on the
+      # crop path, which needs this frame's tracks before it can search.
+      HECO_PARALLEL_DETECT: ${HECO_PARALLEL_DETECT-}
+      # FACE-SEARCH CADENCE (lever L4; 1 = on, default off). A frame's face
+      # search is skipped when every person box is covered one-to-one (IoU >=
+      # 0.5) by a SETTLED track — identity lock, face-verified within
+      # HECO_FACE_REVERIFY_INTERVAL_S — and less than
+      # HECO_FACE_CADENCE_MAX_GAP_S (default 1.0 s of footage) has passed since
+      # the last search. Newcomers, stale locks and empty frames are always
+      # searched; skipped frames still track and still assert track presence,
+      # and are counted as faceDetectSkippedSettled. SKIPS NOTHING while
+      # HECO_FACE_REVERIFY_INTERVAL_S is 0 (its default) — set 2-3 s with it.
+      HECO_FACE_CADENCE: ${HECO_FACE_CADENCE-}
+      HECO_FACE_CADENCE_MAX_GAP_S: ${HECO_FACE_CADENCE_MAX_GAP_S-}
+      # Seconds a track that already holds an identity goes between face
+      # verifications: the crop path's re-verify saving, and the cadence's
+      # "settled" window. 0 (default) = verify every frame.
+      HECO_FACE_REVERIFY_INTERVAL_S: ${HECO_FACE_REVERIFY_INTERVAL_S-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
