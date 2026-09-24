@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # CUDA-capable persons image — the accelerator variant, IN the repo.
 #
 # The iGPU work proved the pattern (same source, device chosen by env, the
@@ -34,15 +35,20 @@ USER root
 # nvidia-cuda-runtime, nvidia-cufft, nvidia-curand — they land under
 # site-packages/nvidia/cu13/lib) while cuDNN keeps it (nvidia-cudnn-cu13,
 # under nvidia/cudnn/lib).
-RUN pip uninstall -y onnxruntime \
-    && pip install --no-cache-dir \
-        onnxruntime-gpu \
-        nvidia-cuda-runtime \
-        nvidia-cublas \
-        nvidia-cudnn-cu13 \
-        nvidia-cufft \
-        nvidia-curand
-
-# ORT dlopens the CUDA userspace at session creation; the pip wheels land
-# under site-packages/nvidia/*/lib and are not on the default search path.
+# PINNED to the set the .94 box ran green on 2026-09-24 (onnxruntime-gpu 1.30.0
+# listing TensorRT/CUDA/CPU providers, cu13 userspace). Unpinned, every code
+# change re-resolved these, so a routine redeploy could pull a different
+# runtime than the one last proven — the night before an event is when that
+# surfaces. The pip cache mount keeps the ~2 GB of wheels on the build host:
+# this layer re-runs on EVERY code change (it sits on top of the service
+# image), and six downloads per deploy was the whole rebuild time.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall -y onnxruntime \
+    && pip install \
+        onnxruntime-gpu==1.30.0 \
+        nvidia-cuda-runtime==13.4.92 \
+        nvidia-cublas==13.8.0.4 \
+        nvidia-cudnn-cu13==9.26.0.51 \
+        nvidia-cufft==12.4.0.43 \
+        nvidia-curand==10.4.4.72
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
