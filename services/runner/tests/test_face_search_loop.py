@@ -385,3 +385,97 @@ def test_the_manifest_declares_the_region():
     from app import main
 
     assert main._manifest()["capabilities"]["faceRegion"] is True
+
+
+# ------------------------------------ the cadence against zones and the crops
+
+
+class IdScene(Scene):
+    """A scene whose gallery knows WHO each face is (by its box x, carried as
+    the embedding), so a verdict does not depend on how many /match calls a
+    lever skipped — the count is only right if every guest was searched."""
+
+    def __init__(self, frames, who: dict):
+        super().__init__(frames, [])
+        self.who, self.seen = who, set()
+        self.face_bodies: list[dict] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Faces recorded; embed carries the face's x; match knows its owner."""
+        host, path = request.url.host, request.url.path
+        if host == "faces" and path == "/detect":
+            self.face_bodies.append(json.loads(request.content))
+        if host == "embed" and path == "/embed":
+            faces = json.loads(request.content)["faces"]
+            return httpx.Response(200, json={
+                "embeddings": [[float(f["box"]["x"])] * 128 for f in faces]})
+        if host == "match" and path == "/match":
+            body = json.loads(request.content)
+            self.match_bodies.append(body)
+            key = self.who[int(body["embedding"][0])]
+            new = key not in self.seen
+            self.seen.add(key)
+            self.guest_n += new
+            return httpx.Response(200, json={
+                "personKey": key, "isNew": new, "cosine": None if new else 0.8,
+                "subCanon": False, "isStaff": False, "staffId": None,
+                "templateN": 1, "templateAdded": False, "galleryN": self.guest_n})
+        return super().handler(request)
+
+
+#: A detections zone over the lower half of B's box: B's BODY centre (130, 70)
+#: is inside it, B's FACE centre (132, 45) is not — so B's face is countable.
+TV_UNDER_B = {"label": "tv", "mode": "detections",
+              "points": [[0.70, 0.50], [0.95, 0.50], [0.95, 0.90], [0.70, 0.90]]}
+#: ...and one over B's head too: then no face on that body can count.
+TV_OVER_B = {"label": "tv", "mode": "detections",
+             "points": [[0.60, 0.10], [0.99, 0.10], [0.99, 0.95], [0.60, 0.95]]}
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_a_guest_in_front_of_a_detections_zone_holds_the_search_open(overlap):
+    """A settles alone; then B joins, body centre in a detections zone, face
+    not. The zone drops B's box before the tracker, so B never settles — and
+    must therefore keep the whole-frame search running until B is counted.
+
+    Verified on the cadence as it was: unique 1 (B never searched, the ledger
+    saying "face search skipped: 1 settled" with two bodies in frame), where
+    the cadence off counted 2.
+    """
+    from tests.test_presence import FB, B
+
+    frames = [{"boxes": [A], "faces": [FA]}] * 4 + [{"boxes": [A, B], "faces": [FA, FB]}] * 5
+    who = {FA["x"]: "p00001", FB["x"]: "p00002"}
+    cadence = {"face_cadence": True, "face_reverify_interval_s": 3.0,
+               "face_cadence_max_gap_s": 1.0}
+    for zone, unique in ((TV_UNDER_B, 2), (TV_OVER_B, 1)):
+        fake = IdScene(frames, who)
+        final = make_loop(fake, {**RUN, "exclusionZones": [zone]}, faces_whole_frame=True,
+                          frame_prefetch=False, pipeline_overlap=overlap, **cadence).run()
+        assert final["unique"] == unique, (zone["points"], final)
+        searched = searched_frames(fake)
+        if unique == 2:
+            assert 4 in searched, "B's first frame was searched"
+        else:
+            # B's head is in the zone too: its face would be excluded, so the
+            # TV does not keep the search running.
+            assert searched[-1] < 8, searched
+
+
+def test_under_the_cadence_a_crop_search_is_a_full_pass():
+    """Crop path: the re-verify gate emptied the cadence's max-gap searches.
+
+    One still, settled guest, re-verify interval 2 s, max gap 0.25 s, 30
+    frames 0.1 s apart. The gate dropped her crop from every search inside
+    the interval, so "searches" went out with within=[] — nobody searched —
+    and each still reset the gap clock: her face was really searched at 0,
+    1, 4 and 25 only. Now every search the cadence lets through carries her
+    crop, and there is one every 0.3 s.
+    """
+    fake = IdScene([{"boxes": [A], "faces": [FA]}] * 30, {FA["x"]: "p00001"})
+    final = make_loop(fake, RUN, frame_prefetch=False, face_cadence=True,
+                      face_reverify_interval_s=2.0, face_cadence_max_gap_s=0.25).run()
+    assert fake.face_bodies, "nothing searched at all"
+    assert all(b["within"] for b in fake.face_bodies), "a cadence search searched nobody"
+    assert searched_frames(fake) == [0, 1, *range(4, 30, 3)]
+    assert final["unique"] == 1

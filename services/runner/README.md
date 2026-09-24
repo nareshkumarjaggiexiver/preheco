@@ -240,12 +240,21 @@ lever existed. Each is plumbed through `docker-compose.yml`, shown in
   there is at least one person box, EVERY box is covered one-to-one (IoU ≥
   0.5, a maximum matching) by a SETTLED track — an identity lock whose last
   comfortable face match is younger than `HECO_FACE_REVERIFY_INTERVAL_S` —
-  and less than the max gap (1.0 s of footage) has passed since the last
-  search that ran (`heco_counting.face_search`). Newcomers, stale locks,
-  unconfirmed bodies, empty frames: searched. Skipped frames still track and
-  still assert track presence; each is counted (`faceDetectSkippedSettled`)
-  and on the ledger. **It skips nothing while the re-verify interval is 0**
-  (said at run start); pair it with 2-3 s. Under the overlap the worker rules
+  and less than the max gap (1.0 s) has passed since the last search that
+  ran (`heco_counting.face_search`). Newcomers, stale locks, unconfirmed
+  bodies, empty frames — and a body a detections zone drops whose face
+  could still count (its head point outside every zone,
+  `heco_counting.zones.cadence_bodies`) — are searched. On crops a search
+  the cadence lets through is a full pass: the re-verify gate does not
+  apply under it (it emptied the max-gap searches). Skipped frames still
+  track and still assert track presence; each is counted
+  (`faceDetectSkippedSettled`) and on the ledger. **It skips nothing while
+  the re-verify interval is 0** (said at run start); pair it with 2-3 s.
+  **Its clock is the frame's `tMs`** — ingest's time since /open: footage
+  time on a live camera, PROCESSING time on a lockstep file replay (f0bfc5
+  ended at tMs 1,348,133 on a 1,005 s clip), so a replay faster than real
+  time skips more footage per gap than a camera would (at 20 fps lockstep
+  1.0 s is ~1.33 s of footage). Bench the cadence paced. Under the overlap the worker rules
   from the evidence the loop held when the previous frame was handed over,
   taken on the loop thread, so the ruling repeats run to run.
 - **Face search region** (`POST /runs {faceRegion: {x, y, w, h}}`,
@@ -460,7 +469,7 @@ and the region; `test_ingest_levers.py` a FIFO, keepalive-gated ingest; and
 | `HECO_PIPELINE_OVERLAP` | `0` (off) | Detect one frame ahead on a worker thread while the loop decides the previous one (see v5). Off = today's loop, pinned |
 | `HECO_PARALLEL_DETECT` | `0` (off) | Persons and the whole-frame/region face search for one frame issued side by side; inert on crops |
 | `HECO_FACE_CADENCE` | `0` (off) | Skip a frame's face search when every person box is a settled, recently verified guest (`faceDetectSkippedSettled`); needs `HECO_FACE_REVERIFY_INTERVAL_S` > 0 |
-| `HECO_FACE_CADENCE_MAX_GAP_S` | `1.0` | Longest stretch of FOOTAGE time the cadence may go without a face search |
+| `HECO_FACE_CADENCE_MAX_GAP_S` | `1.0` | Longest stretch of frame time (tMs: footage on a live camera, processing time on a lockstep replay) the cadence may go without a face search |
 | `HECO_FACE_REVERIFY_INTERVAL_S` | `0` (off) | Seconds a track already holding an identity goes between face verifications: the crop path's re-verify saving (`faceSearchesSkipped`), and the cadence's "settled" window |
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
