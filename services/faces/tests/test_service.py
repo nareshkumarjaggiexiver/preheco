@@ -221,7 +221,10 @@ def test_apply_model_refuses_traversal_and_uninstalled_files():
     client = TestClient(m.app)
     for bad in ["../x.onnx", ".selected", "a/b.onnx"]:
         assert client.post("/model", json={"file": bad}).status_code == 400, bad
-    r = client.post("/model", json={"file": "scrfd_2.5g_kps.onnx"})
+    # A name no box will ever hold: scrfd_2.5g_kps.onnx is a real, fetched
+    # weight on the CUDA box and in dev checkouts now, and a present file
+    # answers 400/200, not 404 — the test must not depend on what is fetched.
+    r = client.post("/model", json={"file": "scrfd_never_installed_kps.onnx"})
     assert r.status_code == 404
     assert "models-restricted" in r.json()["detail"]
 
