@@ -181,6 +181,27 @@ def test_a_decoder_that_cannot_start_falls_back_to_cpu_loudly(monkeypatch, synth
         w.stop()
 
 
+def test_the_fallback_reason_survives_a_live_reconnect(monkeypatch, synthetic):
+    """A camera whose GPU decoder fell back to cpu, then dropped and came back:
+    the reconnect clears only what the drop said, never why it runs on cpu."""
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "fail")
+    opened = synthetic(lambda i: textured(), n_frames=3, fps=10.0, period_s=0.01)
+    w = CaptureWorker("rtsp://cam/1", is_file=False,
+                      levers=Levers(decoder="nvdec", buffer_s=30.0))
+    reason = w.decoder["error"]
+    assert w.decoder["active"] == "cpu" and "libnvcuvid" in reason
+    w.start()
+    try:
+        deadline = time.monotonic() + 10
+        while w.describe()["live"]["reconnects"] < 1:
+            assert time.monotonic() < deadline, "the stream was never reopened"
+            time.sleep(0.02)
+    finally:
+        w.stop()
+    assert len(opened) >= 2
+    assert w.decoder["error"] == reason, "the reconnect erased the fallback reason"
+
+
 def test_a_missing_binary_falls_back_too(monkeypatch, synthetic):
     """No ffmpeg in the image at all: same loud fallback, not a dead ingest."""
     monkeypatch.setattr(fs, "FFMPEG", ["/nonexistent/ffmpeg"])
