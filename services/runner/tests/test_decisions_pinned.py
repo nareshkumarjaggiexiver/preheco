@@ -410,6 +410,71 @@ def test_the_port_binds_the_run_id_and_no_method_can_change_it():
         )
 
 
+def test_a_422_on_the_descriptor_degrades_to_torso_not_measured_and_is_counted():
+    """VERSION SKEW: a match service one release behind refuses the 64-float v3.
+
+    The per-face /match call has no other handler and a 422 there fails the
+    whole run on its first descriptor-bearing face.  The descriptor is
+    advisory, so the port re-asks WITHOUT it — the same path an unmeasurable
+    torso takes — counts it (appearanceRefused), and every other 4xx is
+    still the gallery's answer.
+    """
+    import logging
+
+    from app.loop import MatchClient, StageError
+
+    class OldMatch(Recorder):
+        """Refuses only a body that carries `appearance`, like match 0.11.0."""
+
+        def __init__(self):
+            super().__init__()
+            self.bumps = []
+            self.log = logging.getLogger("test")
+
+        def _post(self, url, body):
+            self.sent.append((url, dict(body)))
+            if "appearance" in body:
+                raise StageError(
+                    "appearance must be exactly 48 floats (v2, ...) — got 64", 422
+                )
+            return {"personKey": "p00001", "isNew": True, "cosine": None}
+
+        def _bump(self, key, by=1):
+            self.bumps.append(key)
+
+    rec = OldMatch()
+    port = MatchClient(rec, "prun-1")
+    verdict = port.match(embedding=[0.1], quality=60.0, appearance=[1.0 / 64] * 64)
+    assert verdict["personKey"] == "p00001"
+    assert [("appearance" in b) for _, b in rec.sent] == [True, False], "asked twice, then bare"
+    assert rec.bumps == ["appearanceRefused"]
+    # A 422 about anything else is not retried.
+    class Refuses(OldMatch):
+        def _post(self, url, body):
+            self.sent.append((url, body))
+            raise StageError("unknown run", 422)
+
+    from heco_counting.ports import MatchRefused
+    with pytest.raises(MatchRefused):
+        MatchClient(Refuses(), "prun-1").match(embedding=[0.1], quality=60.0)
+
+
+def test_forget_template_sends_whichever_rowids_it_was_handed():
+    """A hit that enrolled nothing still logged a body row; bodyId alone is a valid ask."""
+    from app.loop import MatchClient
+
+    rec = Recorder()
+    port = MatchClient(rec, "prun-1")
+    port.forget_template(template_id=13, body_id=7)
+    port.forget_template(body_id=8)
+    port.forget_template(template_id=14)
+    assert [b for _, b in rec.sent] == [
+        {"runId": "prun-1", "templateId": 13, "bodyId": 7},
+        {"runId": "prun-1", "bodyId": 8},
+        {"runId": "prun-1", "templateId": 14},
+    ]
+
+
 def test_the_port_translates_a_stage_error_into_MatchRefused_keeping_the_status():
     """The 4xx/5xx distinction is a DECISION INPUT, so it must survive the seam.
 

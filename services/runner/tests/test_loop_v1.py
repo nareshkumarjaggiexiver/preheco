@@ -19,7 +19,7 @@ from app.loop import RunLoop, TokenAuth, auth_for, httpx_file_transport, httpx_t
 from heco_common.auth import TokenProvider
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.planner import PlannerClient
-from heco_counting.appearance import intersection, torso_descriptor
+from heco_counting.appearance import APPEARANCE_DIM, intersection, torso_descriptor
 
 
 def real_jpeg_b64() -> str:
@@ -56,6 +56,11 @@ class V1Fake:
         self.feedback_items = list(feedback_items or [])
         self.match_script = list(match_script or [])
         self.frame_i = 0
+        # /track calls served, for a track age that does not depend on how far
+        # ahead the prefetcher has pulled `frame_i` — the golden replay test
+        # compares two arms byte for byte, and a tap field read off a racing
+        # counter made it flake.  Sequential on the loop thread, so exact.
+        self.track_calls = 0
         self.guest_n = 0
         self.guest_calls = 0
         self.calls: list[str] = []
@@ -314,7 +319,8 @@ class V1Fake:
             if path in ("/reset", "/release"):
                 return httpx.Response(200, json={"ok": True})
             if path == "/track":
-                tracks = [{"id": n + 1, "box": b, "ageFrames": self.frame_i, "hits": 1}
+                self.track_calls += 1
+                tracks = [{"id": n + 1, "box": b, "ageFrames": self.track_calls, "hits": 1}
                           for n, b in enumerate(body["boxes"])]
                 return httpx.Response(200, json={"tracks": tracks})
         if host == "faces" and path == "/detect":
@@ -1175,30 +1181,37 @@ def solid_jpeg_b64(bgr, w=160, h=240) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def split_image(left_bgr, right_bgr, split_x=40, w=160, h=240) -> np.ndarray:
-    """A two-colour frame: the torso crop (x 19..61) is half one, half the other.
+def split_image(left_bgr, right_bgr, split_x=36, w=160, h=240) -> np.ndarray:
+    """A two-colour frame: the torso band (x 19..61) is 40% one colour.
 
-    This is the MID-RANGE clothing reading the three bands exist for — 0.4762
-    against the solid version of ``left_bgr``, which the old hard 0.50 floor
-    would have called a tracker swap and vetoed.
+    This is the MID-RANGE clothing reading the three bands exist for — 0.4387
+    against the solid version of ``left_bgr`` under the v3 descriptor (the
+    v2 half/half split at x=40 measured 0.4762; v3 weights colour 0.9 and
+    reads texture and edges too, which plain cloth agrees on, so the band
+    needs a little less shared colour to land mid-range; at the first cut's
+    0.7 colour weight the split sat at x=30).  The old hard 0.50 floor
+    would have called it a tracker swap and vetoed.
     """
     img = np.full((h, w, 3), left_bgr, dtype=np.uint8)
     img[:, split_x:] = right_bgr
     return img
 
 
-def split_jpeg_b64(left_bgr, right_bgr, split_x=40, w=160, h=240) -> str:
+def split_jpeg_b64(left_bgr, right_bgr, split_x=36, w=160, h=240) -> str:
     """The same, JPEG-encoded for the fake ingest to serve."""
     ok, buf = cv2.imencode(".jpg", split_image(left_bgr, right_bgr, split_x, w, h))
     assert ok
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def test_torso_descriptor_is_48_floats_l1_normalized():
-    """The wire contract: 48 floats summing to 1 (v2 partition inside)."""
+def test_torso_descriptor_is_the_wire_width_and_l1_normalized():
+    """The wire contract the RUNNER relies on: APPEARANCE_DIM floats summing
+    to 1, so histogram intersection stays 0..1 and the bands mean something.
+    The width and the partition inside are the library's to declare and pin
+    (counting/tests/test_appearance.py); nothing here assumes a number."""
     d = torso_descriptor(solid_image(RED_BGR), FACE_BOX, PERSON_BOX)
     assert d is not None
-    assert len(d) == 48
+    assert len(d) == APPEARANCE_DIM
     assert sum(d) == pytest.approx(1.0)
 
 
@@ -1276,14 +1289,15 @@ class TorsoFrames(V1Fake):
 
 
 def test_loop_sends_appearance_on_match_when_computable():
-    """A decodable frame + a containing person box -> /match carries the 48."""
+    """A decodable frame + a containing person box -> /match carries the
+    descriptor, at whatever width the library declares."""
     fake = TorsoFrames(images=[solid_jpeg_b64(RED_BGR)])
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     make_loop(fake, request).run()
     assert fake.match_bodies, "the face must reach /match"
     for body in fake.match_bodies:
         desc = body.get("appearance")
-        assert desc is not None and len(desc) == 48
+        assert desc is not None and len(desc) == APPEARANCE_DIM
         assert sum(desc) == pytest.approx(1.0)
 
 
@@ -1733,55 +1747,54 @@ def test_the_mint_ledger_rides_every_match_tap():
     )
 
 
-def test_v2_a_light_shirt_is_stable_across_exposure_drift():
-    """THE MEASURED v1 FAILURE, killed: same white shirt, sims 0.48..0.88.
+def test_one_shirt_under_exposure_drift_never_reads_as_a_clash():
+    """THE MEASURED v1 FAILURE, kept dead: same white shirt, sims 0.48..0.88.
 
     A light shirt is nearly desaturated, and the hue of a desaturated pixel
-    is noise — v1 binned that noise by hue, so the same shirt scattered
-    differently every frame; v1's V-mask (<=240) also DISCARDED the shirt's
-    brightest pixels.  v2 bins achromatic pixels by brightness in ~37-unit-
-    wide bins, so two sightings of one shirt under auto-exposure drift agree
-    near-perfectly.
+    is noise — v1 binned that noise by hue, so one shirt scattered
+    differently every frame and a real guest's fold could be vetoed on the
+    camera's auto-exposure.  What the RUNNER needs is stated against its own
+    bands: two sightings of one shirt 13 V-units apart must read as
+    corroboration (>= heal_appearance_unsure), never as a clash.  Which bins
+    carry that reading is the descriptor's internal business, pinned in
+    counting/tests/test_appearance.py; v3 measures this pair at 0.898.
     """
     shirt_a = solid_image((205, 205, 205))  # light grey shirt, V=205
     shirt_b = solid_image((218, 218, 218))  # same shirt, exposure drifted +13
     da = torso_descriptor(shirt_a, FACE_BOX, PERSON_BOX)
     db = torso_descriptor(shirt_b, FACE_BOX, PERSON_BOX)
     assert da is not None and db is not None, (
-        "v1 masked V>240 and could return None on bright cloth; v2 must measure it"
+        "v1 masked V>240 and could return None on bright cloth; the descriptor must measure it"
     )
-    assert intersection(da, db) > 0.8, (
-        "one shirt, one story, whatever the exposure (soft binning: a 13-unit "
-        "V drift moves a little mass between bins, never all of it — hard "
-        "binning scored this exact pair 0.0 on the adjacent-bin cliff)"
+    assert intersection(da, db) >= Settings().heal_appearance_unsure, (
+        "one shirt, one story, whatever the exposure"
     )
-    # Structural proof the hue-noise path is CLOSED: a desaturated crop puts
-    # NO mass in the chromatic bins, so hue cannot scatter it by construction.
-    assert sum(da[:36]) == 0.0
-    assert sum(da[36:39]) > 0.99
-    assert sum(da[39:]) == 0.0, "reserved bins stay empty"
 
 
-def test_v2_white_and_dark_clothes_still_clash():
-    """The split must not cost discrimination among achromatic clothes:
-    a white shirt and a charcoal kurta are both desaturated and must still
-    disagree — they live in far-apart brightness bins."""
+def test_cloth_of_a_different_colour_still_clashes_under_the_runners_floor():
+    """Discrimination survives: what the CLASH floor separates, it separates.
+
+    White vs charcoal (both desaturated, far-apart brightness) and a red
+    kurta vs a white shirt must each read under heal_appearance_clash, while
+    the same red cloth dim vs lit must read as corroboration — the chromatic
+    reading deliberately ignores brightness.  Under v3 two plain cloths of
+    disjoint colour read exactly 0.10: colour (0.9) disagrees entirely and
+    the texture and edge parts (0.07 + 0.03) agree, because plain cloth has
+    no texture to disagree on.  That is 0.25 under the 0.35 floor — a clear
+    clash by the runner's definition, and stated here so a change to either
+    the weights or the floor fails a test that names both.
+    """
+    clash = Settings().heal_appearance_clash
     white = torso_descriptor(solid_image((230, 230, 230)), FACE_BOX, PERSON_BOX)
     charcoal = torso_descriptor(solid_image((60, 60, 60)), FACE_BOX, PERSON_BOX)
-    assert white is not None and charcoal is not None
-    assert intersection(white, charcoal) < 0.05
-
-
-def test_v2_chromatic_vs_achromatic_clash_and_chromatic_stability():
-    """A red kurta vs a white shirt: disjoint partitions, near-zero overlap —
-    and the red kurta stays stable across brightness (chromatic bins still
-    deliberately ignore V, the v1 property worth keeping)."""
     red_dim = torso_descriptor(solid_image((0, 0, 160)), FACE_BOX, PERSON_BOX)
     red_lit = torso_descriptor(solid_image((40, 40, 235)), FACE_BOX, PERSON_BOX)
-    white = torso_descriptor(solid_image((230, 230, 230)), FACE_BOX, PERSON_BOX)
-    assert red_dim is not None and red_lit is not None and white is not None
-    assert intersection(red_dim, red_lit) > 0.9, "same red cloth, dim vs lit"
-    assert intersection(red_dim, white) < 0.05, "cloth with colour vs cloth without"
+    assert None not in (white, charcoal, red_dim, red_lit)
+    assert intersection(white, charcoal) < clash, "white shirt vs charcoal kurta"
+    assert intersection(red_dim, white) < clash, "cloth with colour vs cloth without"
+    assert intersection(red_dim, red_lit) >= Settings().heal_appearance_unsure, (
+        "same red cloth, dim vs lit"
+    )
 
 
 def test_a_healed_mint_leaves_the_ledger_too():
@@ -2029,14 +2042,14 @@ def test_distinct_tracks_counts_ids_not_sightings():
 
 
 def descriptor_pair(sim: float) -> tuple[list[float], list[float]]:
-    """Two 48-float descriptors whose histogram intersection is exactly ``sim``.
+    """Two wire-width descriptors whose histogram intersection is exactly ``sim``.
 
     Shared mass ``sim`` in bin 0, the remainder parked in bins the other side
     leaves empty — so the intersection is ``sim`` to the float, which is what
     the 0.4991 boundary case needs (a JPEG cannot be aimed that precisely).
     """
-    a = [0.0] * 48
-    b = [0.0] * 48
+    a = [0.0] * APPEARANCE_DIM
+    b = [0.0] * APPEARANCE_DIM
     a[0] = b[0] = sim
     a[1] = 1.0 - sim
     b[2] = 1.0 - sim
@@ -2099,10 +2112,11 @@ def test_an_absent_descriptor_neither_vetoes_nor_counts():
 def test_the_uncertain_band_heals_end_to_end_where_the_old_cliff_refused():
     """A real fold through the whole loop on a reading the 0.50 floor rejected.
 
-    The mint frame wears RED and the healing frame is half RED / half BLUE —
-    torso intersection 0.4762, measured, i.e. inside [0.35, 0.55) and BELOW
-    the old 0.50 cliff.  The heal must fold (unique back to 1) and count the
-    weak corroboration, not veto it.
+    The mint frame wears RED and the healing frame is 40% RED, the rest
+    BLUE — torso intersection 0.4387, measured on the v3 descriptor (0.4762
+    on v2's half/half split), i.e. inside [0.35, 0.55) and BELOW the old 0.50
+    cliff.  The heal must fold (unique back to 1) and count the weak
+    corroboration, not veto it.
     """
     red = solid_jpeg_b64(RED_BGR)
     half = split_jpeg_b64(RED_BGR, BLUE_BGR)
@@ -2118,7 +2132,7 @@ def test_the_uncertain_band_heals_end_to_end_where_the_old_cliff_refused():
     request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
     final = make_loop(fake, request).run()
 
-    assert final["healedSplits"] == 1, "0.4762 must no longer veto a correct fold"
+    assert final["healedSplits"] == 1, "a mid-band reading must no longer veto a correct fold"
     assert final["unique"] == 1
     assert final["healVetoedByAppearance"] == 0
     assert final["healUncertainAppearance"] == 1
@@ -2768,6 +2782,22 @@ def test_the_split_retracts_the_template_it_proved_wrong():
     assert fake.forgets == [{"runId": "prun-1", "templateId": 13}]
 
 
+def test_the_split_retracts_the_body_row_even_when_nothing_was_enrolled():
+    """The loser's box was logged under the wrong key on the very /match call
+    that revealed the conflict; a hit that enrolled no template still logged
+    it.  It comes back out by bodyId, so a stranger's height does not sit in
+    the other man's stature evidence — and the re-ask logs it under the
+    right key."""
+    logged = list(FA8FC3_SCRIPT)
+    logged[1] = {**logged[1], "bodyId": 41}
+    fake = TwoMen(n_frames=1, match_script=logged)
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert final["sameFrameSplits"] == 1
+    assert fake.forgets == [{"runId": "prun-1", "bodyId": 41}]
+
+
 def test_two_faces_in_ONE_body_are_never_split():
     """A man and the phone showing his own face are one guest, not two.
 
@@ -2865,6 +2895,14 @@ def test_the_split_rides_the_tap_with_its_evidence():
 # face far enough down the box that its torso crop lands on his legs rather
 # than his shirt, and those genuinely clash.  Then the ONLY thing standing
 # between this pipeline and an invented guest is "same body".
+#
+# GEOMETRY, under the v3 band (face bottom + 0.5 face heights down to face
+# bottom + 3.0, capped at the box): his own face (bottom 90) reads rows
+# 125..300, the phone face (bottom 270) reads rows 305..390.  The shirt /
+# trousers boundary sits at 302 — between the two bands — so the crops read
+# plain red against plain blue: 0.10 on v3, under the 0.35 clash floor.  (The
+# v2 boundary at 268 left a fifth of the first band blue and v3 read the pair
+# at 0.42, which would have let the sibling test pass vacuously.)
 
 MAN_WITH_PHONE_BOX = {"x": 20, "y": 10, "w": 90, "h": 380, "conf": 0.9}
 MAN_WITH_PHONE_FACES = [
@@ -2879,14 +2917,14 @@ MAN_WITH_PHONE_FACES = [
 ]
 
 
-def banded_image(top_bgr, bottom_bgr, split_y=268, w=320, h=400) -> np.ndarray:
+def banded_image(top_bgr, bottom_bgr, split_y=302, w=320, h=400) -> np.ndarray:
     """Shirt above, trousers below — one body whose two crops disagree."""
     img = np.full((h, w, 3), top_bgr, dtype=np.uint8)
     img[split_y:, :] = bottom_bgr
     return img
 
 
-def banded_jpeg_b64(top_bgr, bottom_bgr, split_y=268, w=320, h=400) -> str:
+def banded_jpeg_b64(top_bgr, bottom_bgr, split_y=302, w=320, h=400) -> str:
     """The same, JPEG-encoded for the fake ingest to serve."""
     ok, buf = cv2.imencode(".jpg", banded_image(top_bgr, bottom_bgr, split_y, w, h))
     assert ok
