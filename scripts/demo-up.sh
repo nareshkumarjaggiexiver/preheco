@@ -56,6 +56,13 @@ export HECO_EMBEDDING_DIM=512
 export HECO_EMBEDDER_ID=arcface-w600k-r50
 export HECO_MATCH_NEARMISS_FLOOR=0
 export HECO_REVIEW_FLOOR=${HECO_REVIEW_FLOOR:-0.28}
+# Raw ArcFace feature-norm floor, measured on the Sharon re-run c84098: at 18
+# exactly one identity loses every template — p00047, a girl half hidden
+# behind a pillar, the half-face the operator asked to be ignored — and no
+# real guest does (the two single-sighting guests a 0.77 detector-confidence
+# floor would have erased read 22+). 2.8% of templates dropped, all from
+# identities that keep better ones. 0 turns it off.
+export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
@@ -72,7 +79,8 @@ knobs() {
   if env=$(docker compose "$@" exec -T match printenv 2>/dev/null); then
     for k in HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
              HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
-             HECO_STATURE_ADULT_M; do
+             HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
+             HECO_REVIEW_CLOTHES_SELF_MIN; do
       v=$(printf '%s\n' "$env" | sed -n "s/^$k=//p")
       printf '%s=%s ' "${k#HECO_}" "${v:-·}"
     done
@@ -128,7 +136,8 @@ PY
   knobs B -p heco-pipeline-b "${B[@]}"
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
   echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
-  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 (off). 0 turns a signal off.'
+  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 ·'
+  echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script). 0 turns a signal off.'
 }
 
 case "${1:-both}" in
