@@ -483,11 +483,17 @@ services:
       # search is skipped when every person box is covered one-to-one (IoU >=
       # 0.5) by a SETTLED track — identity lock, face-verified within
       # HECO_FACE_REVERIFY_INTERVAL_S — and less than
-      # HECO_FACE_CADENCE_MAX_GAP_S (default 1.0 s of footage) has passed since
-      # the last search. Newcomers, stale locks and empty frames are always
-      # searched; skipped frames still track and still assert track presence,
-      # and are counted as faceDetectSkippedSettled. SKIPS NOTHING while
+      # HECO_FACE_CADENCE_MAX_GAP_S (default 1.0 s) has passed since the last
+      # search. Newcomers, stale locks, empty frames and a body a detections
+      # zone drops whose face could still count are always searched; skipped
+      # frames still track and still assert track presence, and are counted
+      # as faceDetectSkippedSettled; on crops a search it lets through is a
+      # full pass (the re-verify gate does not apply). SKIPS NOTHING while
       # HECO_FACE_REVERIFY_INTERVAL_S is 0 (its default) — set 2-3 s with it.
+      # Its seconds are the frame's tMs: footage time on a live camera, but
+      # PROCESSING time on a lockstep file replay (ingest stamps wall time
+      # since /open) — a replay faster than real time skips more footage per
+      # gap than a camera would. Bench it paced.
       HECO_FACE_CADENCE: ${HECO_FACE_CADENCE-}
       HECO_FACE_CADENCE_MAX_GAP_S: ${HECO_FACE_CADENCE_MAX_GAP_S-}
       # Seconds a track that already holds an identity goes between face

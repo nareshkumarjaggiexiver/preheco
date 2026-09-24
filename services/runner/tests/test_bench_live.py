@@ -137,7 +137,7 @@ def test_the_bench_sends_the_launchers_body_and_reports_the_levers(console):
     assert "unique 74   frames 1500   wall 120.0 s" in text
     # 1500 processed in 120 s = 12.5 fps; 1815 footage frames = 15.1 fps.
     assert "processed 12.50 fps   footage 15.12 fps   camera 15 fps" in text
-    assert "kept camera rate: True" in text
+    assert "kept camera rate: True (dropped —)" in text
     assert "faceDetectSkippedSettled: 900" in text
     assert "framesDroppedLive: —" in text, "absent is shown as absent, not zero"
     assert "count.detectWaitMs: mean 4.0 ms" in text
@@ -164,6 +164,27 @@ def test_the_bench_json_summary_and_a_failed_run(console):
     assert summary["status"] == "failed" and summary["keptCameraRate"] is True
     assert summary["counters"]["framesSkippedNoMotion"] == 315
     assert fake.started[0]["lockstep"] is False
+
+
+def test_a_paced_run_that_dropped_frames_did_not_keep_camera_rate():
+    """Paced, ingest decodes at camera rate whatever the runner manages, so
+    footage fps reads 15.0 for a run that processed 300 of 900 frames in
+    60 s and dropped 600: the verdict must be False, the drop shown beside
+    it. Nothing dropped still reads True; an absent count is not a drop."""
+    bench = load_bench()
+    record = {"id": "prun-1", "status": "ended",
+              "startedAt": "2026-09-25T10:00:00Z", "endedAt": "2026-09-25T10:01:00Z",
+              "results": {"frames": 300, "framesCaptured": 900, "framesDroppedLive": 600}}
+    s = bench.summarise(record, 15.0)
+    assert (s["fps"], s["footageFps"]) == (5.0, 15.0)
+    assert s["keptCameraRate"] is False and s["framesDroppedLive"] == 600
+    out = io.StringIO()
+    bench.print_report(s, out)
+    assert "kept camera rate: False (dropped 600)" in out.getvalue()
+    record["results"] = {"frames": 900, "framesCaptured": 900, "framesDroppedLive": 0}
+    assert bench.summarise(record, 15.0)["keptCameraRate"] is True
+    record["results"] = {"frames": 900}
+    assert bench.summarise(record, 15.0)["keptCameraRate"] is True
 
 
 def test_the_bench_uploads_a_clip_as_a_streamed_multipart_body(console, tmp_path):
