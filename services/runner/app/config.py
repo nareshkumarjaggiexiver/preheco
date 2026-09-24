@@ -75,6 +75,13 @@ class Settings:
     # measurements are somebody else's camera, mount and lighting, and the
     # console's quality profile exists so an operator can arm them and watch
     # what the gate starts rejecting before committing a live count to it.
+    # Detector confidence floor (face["conf"]). 0 = unarmed, and unarmed is
+    # the default because the right value belongs to the DETECTOR FAMILY:
+    # yunet operates at 0.8, scrfd at InsightFace's permissive 0.5. It is the
+    # only gate signal not derived from the detector's own landmarks, which is
+    # why it is the only one that can refuse a confident hallucination — see
+    # heco_counting.gate.REASONS.
+    quality_min_conf: float = 0.0
     quality_min_ied_px: float = 0.0
     quality_min_frontality: float = 0.0
     quality_min_sharpness: float = 0.0
@@ -431,6 +438,7 @@ def from_env() -> Settings:
         token_cache_path=os.environ.get("HECO_TOKEN_CACHE", s.token_cache_path),
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),
+        quality_min_conf=env_float("HECO_QUALITY_MIN_CONF", s.quality_min_conf),
         quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),
         quality_min_frontality=env_float("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality),
         quality_min_sharpness=env_float("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness),

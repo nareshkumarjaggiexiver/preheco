@@ -888,6 +888,7 @@ class RunLoop:
             # ``gatedUnmeasured`` says how many faces passed an armed floor
             # only because nobody could measure them.
             "gatedByWidth": 0,
+            "gatedByConf": 0,
             "gatedByIed": 0,
             "gatedByFrontality": 0,
             "gatedBySharpness": 0,
@@ -2387,6 +2388,7 @@ class RunLoop:
 
     _GATE_COUNTER = {
         "width": "gatedByWidth",
+        "conf": "gatedByConf",
         "landmarks": "gatedByLandmarks",
         "ied": "gatedByIed",
         "eyespan": "gatedByEyeSpan",

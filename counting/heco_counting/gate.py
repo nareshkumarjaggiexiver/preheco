@@ -45,7 +45,15 @@ from dataclasses import dataclass
 #: that asks "is this a face at all?" rather than "is this face good enough?".
 #: A detection on a striped shirt should be reported as not-a-face, not as a
 #: badly-posed one — the two send an operator looking in different places.
-REASONS = ("width", "landmarks", "ied", "eyespan", "frontality", "sharpness")
+#: ``conf`` sits beside ``landmarks`` as the other "is this a face at all?"
+#: test, and it is the only signal here the DETECTOR did not derive from its
+#: own landmarks. That independence is the whole point: when scrfd invents a
+#: face on the back of a head it invents five plausible landmarks with it, so
+#: frontality, eye-span and IED all confirm the invention and every geometric
+#: floor agrees. Measured live 2026-09-24 — a woman walking away became a
+#: counted guest whose best photograph was her hair. The detector's own
+#: confidence is the one number that dissents.
+REASONS = ("width", "conf", "landmarks", "ied", "eyespan", "frontality", "sharpness")
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,12 @@ class GateThresholds:
     """
 
     min_px: float = 56.0
+    #: Detector confidence floor, read from the face's own ``conf``. 0.0 = not
+    #: armed, and unarmed is the default because the right value is a property
+    #: of the FAMILY: yunet's operating point is 0.8 and scrfd's is
+    #: InsightFace's permissive 0.5, so one number cannot serve both. Arm it
+    #: per run when the detector is scrfd.
+    min_conf: float = 0.0
     min_ied_px: float = 0.0
     min_frontality: float = 0.0
     min_sharpness: float = 0.0
@@ -72,6 +86,7 @@ class GateThresholds:
         """Read every floor off a runner Settings snapshot."""
         return cls(
             min_px=float(s.quality_min_px),
+            min_conf=float(getattr(s, "quality_min_conf", 0.0) or 0.0),
             min_ied_px=float(s.quality_min_ied_px),
             min_frontality=float(s.quality_min_frontality),
             min_sharpness=float(s.quality_min_sharpness),
@@ -89,6 +104,7 @@ class GateThresholds:
         floors = tuple(
             name
             for name, floor in (
+                ("conf", self.min_conf),
                 ("ied", self.min_ied_px),
                 ("eyespan", self.min_eye_span),
                 ("frontality", self.min_frontality),
@@ -144,6 +160,17 @@ def gate_face(face: dict, t: GateThresholds) -> Verdict:
         return Verdict("width")
 
     unmeasured: list[str] = []
+    # The detector's own confidence, before anything derived from its
+    # landmarks — see the REASONS note. This is the only test here that can
+    # disagree with a confident hallucination, so it is asked first among the
+    # is-it-a-face questions. Absence rule unchanged: unknown never rejects.
+    if t.min_conf > 0.0:
+        conf = _signal(face, "conf")
+        if conf is None:
+            unmeasured.append("conf")
+        elif conf < t.min_conf:
+            return Verdict("conf")
+
     # Is it a face at all?  Tested before the quality floors so a detection on
     # clothing is reported as such rather than as a badly-posed face.  Same
     # absence rule as every other signal: a face whose landmarks could not be
