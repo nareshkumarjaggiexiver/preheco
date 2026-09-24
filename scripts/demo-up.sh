@@ -140,7 +140,7 @@ knobs() {
        HECO_FACE_CADENCE_MAX_GAP_S HECO_FACE_REVERIFY_INTERVAL_S -- "$@"
   show "$name" ingest INGEST_MOTION_GATE INGEST_MOTION_MIN_FRAC INGEST_MOTION_PIXEL_THR \
        INGEST_MOTION_KEEPALIVE_S INGEST_BUFFER_S INGEST_BUFFER_MB INGEST_DECODER \
-       INGEST_CV_THREADS -- "$@"
+       INGEST_CV_THREADS INGEST_LIVE_TIMEOUT_S -- "$@"
   show "$name" faces HECO_DEVICE FACES_MODEL FACES_SCRFD_INPUT HECO_TRT_CACHE -- "$@"
   show "$name" embed HECO_DEVICE EMBED_BATCH HECO_TRT_CACHE -- "$@"
 }
@@ -165,7 +165,10 @@ dev = d.get("device") or {}
 if port.endswith("01"):
     # INGEST's device block is the DECODER (L6): requested vs what the open
     # capture decodes with (null until a source is open), and why not.
-    err = f"   <-- FELL BACK: {dev['error']}" if dev.get("error") else ""
+    err = dev.get("error") or ""
+    if err:
+        down = err.startswith("live source down")
+        err = f"   <-- {'SOURCE DOWN' if down else 'FELL BACK'}: {err}"
     print(f"  :{port} ingest decoder {dev.get('requested')} -> {dev.get('active')}{err}")
     raise SystemExit
 active = (dev.get("active") or ["?"])[0]
@@ -178,6 +181,10 @@ print(f"  :{port} {d.get('model','?'):34s} ok={str(d.get('ok')):5s} "
       f"{requested} -> {active}{flag}")
 if dev.get("trt"):
     print(f"        tensorrt: {dev['trt']}")
+if dev.get("attributes"):  # embed under TRT: the gender/age pass's own truth
+    att = dev["attributes"]
+    print(f"        attribute pass: {att.get('requested')} -> {(att.get('active') or ['?'])[0]}"
+          f"   tensorrt: {att.get('trt')}")
 # The attribute head is the embed service's second model and its own truth:
 # absent, every review pair reads "not measured" for gender and age and the
 # gender/age exclusions never fire. Say so here rather than in a queue.
@@ -199,6 +206,7 @@ PY
   echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'
   echo '    (MAX_GAP_S 1.0; skips nothing while FACE_REVERIFY_INTERVAL_S is 0) · INGEST_MOTION_GATE 0 (MIN_FRAC 0.002,'
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
+  echo '    INGEST_LIVE_TIMEOUT_S 0 (OpenCV 30 s / ffmpeg own timeouts; 10 recommended for live cameras) ·'
   echo '    EMBED_BATCH 0 · FACES_SCRFD_INPUT 640 · TensorRT only with HECO_TRT=1 (device truth above).'
 }
 

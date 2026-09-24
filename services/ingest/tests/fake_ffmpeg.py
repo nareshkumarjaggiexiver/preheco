@@ -7,7 +7,9 @@ Driven by the environment (the worker's subprocess inherits it):
   frames | ``hang``: says nothing, sleeps until killed | ``die``: FAKE_FRAMES
   frames then exit 1 (a decoder dying mid-file) | ``noisy``: like ok, with
   ~2 MB of warnings on stderr before and between frames | ``forever``: frames
-  until killed, FAKE_PERIOD seconds apart (a live camera).
+  until killed, FAKE_PERIOD seconds apart (a live camera) | ``stall``:
+  FAKE_FRAMES frames, then silence until killed (a camera gone quiet with its
+  connection open, or a hung decoder).
 * ``FAKE_FRAMES`` (10), ``FAKE_W`` (64), ``FAKE_H`` (48), ``FAKE_PERIOD`` (0),
   ``FAKE_STATIC`` (0: a bright square moves 8 px a frame; 1: nothing moves).
 * ``FAKE_ARGV_LOG`` — append this invocation's argv, one line, to that file.
@@ -83,4 +85,6 @@ try:
             time.sleep(period)
 except BrokenPipeError:
     sys.exit(0)
+if mode == "stall":
+    time.sleep(3600)
 sys.exit(1 if mode == "die" else 0)
