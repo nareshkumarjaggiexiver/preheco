@@ -262,6 +262,72 @@ def review_floor() -> float:
     return _env_f("HECO_REVIEW_FLOOR", 0.15)
 
 
+# --------------------------------- the review queue's exclusion signals (v4)
+#
+# Run f0bfc5 (2026-09-23, a Punjab wedding hall seen from an overview camera,
+# 74 guests counted) flooded the review queue with 500 pairs.  The top of that
+# queue, read by eye:
+#
+#     #1 a red-turbaned man with a black beard vs an orange-turbaned man with a
+#        WHITE beard                                       face 0.357
+#     #3 a man in a blue shirt vs an ELDERLY WOMAN in glasses      face 0.345
+#     #5 a girl in a yellow top vs a woman in a dark green dress   face 0.338
+#
+# Every one of those is a question no operator should have been asked: the
+# pipeline had, or could have had, evidence that settles it — sex, age, and
+# how tall the body is.  None of that evidence may MERGE anyone (the standing
+# rule: nothing is minted, merged or counted on anything but the face and a
+# human click).  But a pair the evidence says CANNOT be one person may be set
+# aside from the queue, and the count of pairs set aside is reported so a
+# flood that was silenced is never mistaken for a flood that never happened.
+#
+# Each signal is one knob, and each knob's zero is its off switch.
+
+# Gender: an identity's templates each carry the attribute model's reported
+# sex and its probability; the identity's belief is the template-mean of
+# P(male).  A pair is set aside only when BOTH identities are confident at or
+# above this bar AND they disagree.  0.8 is reasoned, not calibrated: the
+# buffalo_l genderage head is strong on frontal adult faces and unsure on
+# children, head-down and turned-away views, and unsure is exactly the state
+# in which it must not vote.  One side confident and the other not is NOT a
+# disagreement; it is one opinion.  0 turns the signal off.
+DEFAULT_REVIEW_GENDER_MIN_P = 0.8
+
+# Age: a CHILD (median template age at or below CHILD_MAX) against an ADULT
+# (at or above ADULT_MIN) is set aside.  The 12/20 gap is the point: the
+# attribute model's age error on a 40 px face is several years each way, so
+# the two bands are kept far enough apart that a 15-year-old read as 11 and
+# again as 19 lands in the dead zone between them and is still asked about.
+# Either knob at 0 turns the signal off.
+DEFAULT_REVIEW_AGE_CHILD_MAX = 12.0
+DEFAULT_REVIEW_AGE_ADULT_MIN = 20.0
+
+# Stature: each standing person box in the run is fitted, box height against
+# box bottom-y (the camera's perspective: further from the lens = higher in
+# frame = smaller), and an identity's stature is the median of its own boxes'
+# heights over what that fit predicts — 1.0 is "an average standing adult at
+# that spot".  Run f0bfc5's fit: h = 0.602 * y_bottom + 300 px over 1268
+# standing sightings, with p00009 (a child) at 0.73 against adults at 1.03-
+# 1.04.  Two identities whose ratios differ by this much or more are set
+# aside.  0.2 is 35 cm on a 1.75 m anchor — wider than any adult-to-adult
+# spread the fit produced (0.98-1.08), narrower than adult-to-child.  0 turns
+# the signal off.
+DEFAULT_REVIEW_STATURE_GAP = 0.2
+
+# ...and how many standing sightings an identity needs before its ratio is
+# trusted at all.  A single box mid-stride, half behind a pillar or caught by
+# the tracker's bounding-box lag can be 30% off; the median over eight is
+# not.  Under this an identity's stature is null — not measured, never 0.
+DEFAULT_REVIEW_STATURE_MIN_N = 8
+
+# The height a stature ratio of 1.0 means, in metres.  The user's instruction
+# for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
+# it is the anchor for every stature estimate and the planner's default
+# person height.  It converts ratios to metres for a human to read; the
+# exclusion test above is on the RATIO, so this number never moves it.
+DEFAULT_ADULT_HEIGHT_M = 1.75
+
+
 def appearance_clash() -> float:
     """Torso-intersection floor for the enrolment veto (below = clash).
 
@@ -272,6 +338,48 @@ def appearance_clash() -> float:
     (the compose ``${VAR-}`` rendering), like every knob in this service.
     """
     return _env_f("HECO_MATCH_APPEARANCE_CLASH", DEFAULT_APPEARANCE_CLASH)
+
+
+def review_gender_min_p() -> float:
+    """Gender confidence BOTH sides need before a disagreement sets a pair
+    aside (env HECO_REVIEW_GENDER_MIN_P; 0 = off).  Empty means unset."""
+    return _env_f("HECO_REVIEW_GENDER_MIN_P", DEFAULT_REVIEW_GENDER_MIN_P)
+
+
+def review_age_child_max() -> float:
+    """Median age at or below which an identity reads as a child
+    (env HECO_REVIEW_AGE_CHILD_MAX; 0 = the age signal is off)."""
+    return _env_f("HECO_REVIEW_AGE_CHILD_MAX", DEFAULT_REVIEW_AGE_CHILD_MAX)
+
+
+def review_age_adult_min() -> float:
+    """Median age at or above which an identity reads as an adult
+    (env HECO_REVIEW_AGE_ADULT_MIN; 0 = the age signal is off)."""
+    return _env_f("HECO_REVIEW_AGE_ADULT_MIN", DEFAULT_REVIEW_AGE_ADULT_MIN)
+
+
+def review_stature_gap() -> float:
+    """Stature-ratio gap at or beyond which a pair is set aside
+    (env HECO_REVIEW_STATURE_GAP; 0 = off).  A ratio, not metres."""
+    return _env_f("HECO_REVIEW_STATURE_GAP", DEFAULT_REVIEW_STATURE_GAP)
+
+
+def review_stature_min_n() -> int:
+    """Standing sightings an identity needs before its stature is trusted
+    (env HECO_REVIEW_STATURE_MIN_N).  Clamped to at least 1."""
+    return max(1, int(_env_f("HECO_REVIEW_STATURE_MIN_N", DEFAULT_REVIEW_STATURE_MIN_N)))
+
+
+def adult_height_m() -> float:
+    """Metres a stature ratio of 1.0 stands for (env HECO_STATURE_ADULT_M).
+
+    Default 1.75 — the North Indian adult average this deployment is anchored
+    on.  Display only: the stature exclusion compares ratios.  The name is the
+    one docker-compose.yml passes through and demo-up.sh reads back; the first
+    cut read HECO_REVIEW_ADULT_M here, so the operator-facing knob printed as
+    set and changed nothing.
+    """
+    return _env_f("HECO_STATURE_ADULT_M", DEFAULT_ADULT_HEIGHT_M)
 
 
 def data_dir() -> Path:

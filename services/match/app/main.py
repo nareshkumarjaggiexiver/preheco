@@ -6,10 +6,14 @@ surface the runner drives from the feedback loop.
 Endpoints:
     GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
-    POST /match  {runId, embedding, quality?, siteId?, appearance?}
+    POST /match  {runId, embedding, quality?, siteId?, appearance?,
+                  attributes?, featNorm?, body?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
             templateN, templateAdded, appearanceSim, appearanceVetoed, templateId,
             nearMiss: {key, cosine, appearanceSim, basis} | null}
+    POST /review/duplicates {runId, limit?}
+        -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
+            considered, returned, dropped, excluded: {gender, age, stature}}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -31,12 +35,14 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config, gallery, staff
+from .appearance import APPEARANCE_DIMS
 from .store import EmbedderMismatchError, close_all_stores
 
 
@@ -54,7 +60,10 @@ def _env_s(name: str, default: float) -> float:
 #: rider — the constraint is now the gallery's single record of "known
 #: different" and governs merge refusal, the overlap banner and this one.  No
 #: field changed shape; some riders simply stop being emitted.
-VERSION = "0.11.0"
+#: 0.12.0 (2026-09-24): /match accepts a 64-float (v3) torso descriptor beside
+#: the 48-float one, plus optional attributes / featNorm / body; the review
+#: queue gains a per-pair `why` and an `excluded` count.  Additive only.
+VERSION = "0.12.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -138,6 +147,36 @@ class ResetRequest(BaseModel):
     runId: str
 
 
+class FaceAttributes(BaseModel):
+    """What the embed service's attribute head read off ONE face.
+
+    ``gender`` is the reported sex, ``genderP`` the probability OF THAT
+    REPORTED SEX (so a value near 0.5 is "unsure", never "female"), ``age``
+    in years.  Stored per template and aggregated per identity by the review
+    queue; never consulted by a verdict.
+    """
+
+    gender: Literal["M", "F"]
+    genderP: float = Field(ge=0.0, le=1.0)
+    age: float = Field(ge=0.0)
+
+
+class PersonBox(BaseModel):
+    """The sighting's containing PERSON box, in raw detector pixels.
+
+    ``h``/``w`` the box size, ``yBottom`` the y of its bottom edge, ``frameH``
+    the frame height it was measured in — enough to tell a standing body
+    from a seated one and to place it on the camera's perspective line.  The
+    stature estimate needs every standing box in the run, so this is logged
+    on every guest call, not only when a template is written.
+    """
+
+    h: float = Field(gt=0.0)
+    w: float = Field(gt=0.0)
+    yBottom: float
+    frameH: int = Field(gt=0)
+
+
 class MatchRequest(BaseModel):
     """Body of POST /match — one embedding to resolve against the run gallery.
 
@@ -145,10 +184,18 @@ class MatchRequest(BaseModel):
     store for that site is checked before the guest gallery.
 
     ``appearance`` is the sighting's optional torso-appearance descriptor:
-    exactly 48 floats (the wire contract's L1-normalised 12×4 Hue×Saturation
-    histogram).  Omitted/null means the runner could not measure one (no
-    person box, tiny crop, old footage) — which disables every appearance
-    behaviour for this call rather than acting as a zero histogram.
+    exactly 48 floats (v2: 12×3 Hue×Saturation chromatic bins plus 3
+    brightness bins, L1-normalised) or exactly 64 (v3: colour below the neck
+    on non-skin pixels, texture, edge density — see :mod:`app.appearance`).  Omitted/null means the
+    runner could not measure one (no person box, tiny crop, old footage) —
+    which disables every appearance behaviour for this call rather than
+    acting as a zero histogram.
+
+    ``attributes``, ``featNorm`` and ``body`` (2026-09-24) are recorded and
+    never judged here: the embed service's sex/age reading of this face,
+    the raw feature's L2 norm, and the sighting's containing PERSON box.
+    They feed only the duplicate review queue's ``why`` and its exclusions.
+    Each is optional and ``null`` means not measured.
     """
 
     runId: str
@@ -161,22 +208,30 @@ class MatchRequest(BaseModel):
     # one body cannot be in two places, so the weaker sighting is re-asked
     # with that key off the table.  Empty/absent changes nothing.
     excludeKeys: list[str] | None = None
+    attributes: FaceAttributes | None = None
+    featNorm: float | None = None
+    body: PersonBox | None = None
 
     @field_validator("appearance")
     @classmethod
-    def _appearance_is_48_floats(cls, v: list[float] | None) -> list[float] | None:
+    def _appearance_is_48_or_64_floats(cls, v: list[float] | None) -> list[float] | None:
         """Reject any present-but-wrong-length descriptor with a readable 422.
 
-        A truncated or padded histogram is a wire bug in the caller, and
-        silently comparing it would raise deep inside the store (or worse,
-        veto on garbage); the 422 names the contract instead.
+        A truncated or padded histogram is a wire bug in the caller; the 422
+        names the contract instead of letting garbage into the gallery.  Both
+        generations are legal on the wire — a v3 runner and a retained v2
+        gallery coexist for a day — and a v2-against-v3 comparison is simply
+        "not measured" downstream (:func:`app.appearance.intersection`).
         """
-        if v is not None and len(v) != 48:
+        if v is not None and len(v) not in APPEARANCE_DIMS:
             raise ValueError(
-                "appearance must be exactly 48 floats"
-                f" (12 hue x 4 saturation bins, L1-normalised); got {len(v)}"
+                "appearance must be exactly 48 floats (v2: 12 hue x 3 saturation"
+                " + 3 brightness bins) or 64 floats (v3, colour + texture + edge"
+                f" + reserved), L1-normalised; got {len(v)}"
             )
         return v
+
+
 
 
 class EnrolSample(BaseModel):
@@ -231,10 +286,25 @@ class ReviewDuplicatesRequest(BaseModel):
 
 
 class ForgetTemplateRequest(BaseModel):
-    """Body of POST /template/forget — retract one wrongly-enrolled template."""
+    """Body of POST /template/forget — retract one wrongly-enrolled template.
+
+    ``templateId`` is the ``/match`` reply's template rowid, ``bodyId`` its
+    body-sighting rowid (2026-09-24 evening); either alone is a valid ask
+    and both together is the usual one.  A hit that enrolled nothing still
+    logged its box, so a caller that has only a ``bodyId`` must be able to
+    retract it.
+    """
 
     runId: str
-    templateId: int
+    templateId: int | None = None
+    bodyId: int | None = None
+
+    @model_validator(mode="after")
+    def _names_something_to_forget(self) -> "ForgetTemplateRequest":
+        """An ask that names neither row is a caller bug, said at the boundary."""
+        if self.templateId is None and self.bodyId is None:
+            raise ValueError("templateId or bodyId is required")
+        return self
 
 
 class MarkStaffRequest(BaseModel):
@@ -294,6 +364,18 @@ def health() -> dict:
         # bar produced them.  weakFloor 0 = the clothing band was off.
         "nearMissWeakFloor": config.nearmiss_weak_floor(),
         "nearMissClothes": config.nearmiss_clothes(),
+        # ...and the review queue's floor and its three exclusion signals: a
+        # queue of 12 pairs under one policy and 500 under another is the
+        # difference between a usable console and a flood, so the policy
+        # must be readable next to the count it produced.  0 = that signal
+        # is off.
+        "reviewFloor": config.review_floor(),
+        "reviewGenderMinP": config.review_gender_min_p(),
+        "reviewAgeChildMax": config.review_age_child_max(),
+        "reviewAgeAdultMin": config.review_age_adult_min(),
+        "reviewStatureGap": config.review_stature_gap(),
+        "reviewStatureMinN": config.review_stature_min_n(),
+        "adultM": config.adult_height_m(),
     }
 
 
@@ -387,6 +469,9 @@ def match(body: MatchRequest) -> dict:
             nearmiss_weak_floor=config.nearmiss_weak_floor(),
             nearmiss_clothes=config.nearmiss_clothes(),
             exclude_keys=set(body.excludeKeys or ()),
+            attributes=None if body.attributes is None else body.attributes.model_dump(),
+            feat_norm=body.featNorm,
+            body=None if body.body is None else body.body.model_dump(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -408,6 +493,11 @@ def match(body: MatchRequest) -> dict:
         # nothing / minted.  Only use: hand it back to POST /template/forget
         # if the caller later PROVES the enrolment was wrong.
         "templateId": r.template_id,
+        # Rowid of the body_sightings row this call logged, or null when the
+        # call carried no usable body.  Same use as templateId: hand it back
+        # to POST /template/forget when the sighting is proven to be a
+        # different body, so its box leaves this identity's stature evidence.
+        "bodyId": r.body_id,
         # Only ever non-null on a MINT that near-missed an existing guest —
         # a one-click-merge suggestion for the operator, never behaviour
         # (see gallery._near_miss: impostors measured face 0.377 / clothes
@@ -526,6 +616,18 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
     co-presence or from the operator's own false-match click — never appear.
     Clothing orders the queue; it is not allowed to remove anyone from it.
 
+    Since 2026-09-24 each pair also carries ``why`` — both identities' sex
+    (with confidence), median age and stature ratio, null wherever nothing
+    was measured — and pairs those signals say cannot be one person are set
+    aside before the cap, counted in ``excluded: {gender, age, stature}``.
+    Run f0bfc5 put a man against an elderly woman at #3 of 500; the evidence
+    to not ask was already in the gallery.  Setting aside writes nothing (no
+    cannot_link row: that stays a human's or co-presence's word) and merges
+    nothing.  Stature ``a``/``b`` are ratios against the run's own
+    perspective fit; ``adultM`` (1.75 m, the North Indian adult average this
+    deployment is anchored on) converts them, and ``aM``/``bM`` are that
+    product ready to print.
+
     Read-only: no template is written, no key is merged, `galleryN` is
     untouched.  Acting on a row is the operator's existing one-click /merge.
     """
@@ -540,6 +642,12 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             # the gallery.
             floor=config.review_floor(),
             limit=body.limit,
+            gender_min_p=config.review_gender_min_p(),
+            age_child_max=config.review_age_child_max(),
+            age_adult_min=config.review_age_adult_min(),
+            stature_gap=config.review_stature_gap(),
+            stature_min_n=config.review_stature_min_n(),
+            adult_m=config.adult_height_m(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -561,16 +669,30 @@ def forget_template(body: ForgetTemplateRequest) -> dict:
     may be its key's last template, which is refused so no identity is left
     existing-but-unmatchable.  ``galleryN`` is unchanged either way — this
     removes a VIEW of somebody, never somebody.
+
+    ``bodyId`` (optional) names the body-sighting row the same /match call
+    logged; it is deleted whatever happens to the template (a body log has
+    no last-row rule) and ``bodyForgotten`` says whether a row went.  The
+    box was logged under a key the caller has since proven wrong, and the
+    caller's re-ask logs it again under the right one.
     """
     try:
-        forgotten = gallery.forget_template(
-            config.data_dir(), body.runId, body.templateId
-        )
+        forgotten = False
+        if body.templateId is not None:
+            forgotten = gallery.forget_template(
+                config.data_dir(), body.runId, body.templateId
+            )
+        body_forgotten = False
+        if body.bodyId is not None:
+            body_forgotten = gallery.forget_body_sighting(
+                config.data_dir(), body.runId, body.bodyId
+            )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {
         "ok": True,
         "forgotten": forgotten,
+        "bodyForgotten": body_forgotten,
         "galleryN": gallery.count(config.data_dir(), body.runId),
     }
 

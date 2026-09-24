@@ -51,6 +51,25 @@ Storage
                   photographs"; it is NOT used on the enrolment path any more,
                   because quality is face width and face width is distance —
                   see :meth:`prune_redundant` for the measurement.
+                  Since 2026-09-24 a template also carries what the embed
+                  service's attribute head read off THAT face — ``gender``,
+                  ``gender_p``, ``age`` — and ``feat_norm``, the L2 norm of
+                  the raw ArcFace feature (a quality proxy: blurred, occluded
+                  and turned-away faces embed short).  All nullable; NULL is
+                  "not measured", never a value.
+* ``body_sightings`` one row per guest /match call that carried the
+                  sighting's containing PERSON box: ``h``, ``w``, ``y_bottom``
+                  and ``frame_h`` in raw detector pixels, plus ``face_w`` (the
+                  call's ``quality``, the face box width) so a box that is
+                  only a head-and-shoulders can be told from a standing body
+                  by its height in face widths.  NOT a template and
+                  not pruned with them — it is the raw material for the
+                  review queue's stature estimate (:func:`app.gallery.
+                  stature_ratios`), which needs every standing box in the run
+                  to fit the camera's perspective, and a person's median box
+                  height against that fit needs more than the five views a
+                  template cap keeps.  Re-keyed by :meth:`merge`, deleted by
+                  :meth:`remove`, so a row always names a live identity.
 * ``cannot_link`` "these are two different people" constraints, stored
                   order-independent.  Written by an operator's *false-match*
                   correction and by the runner asserting CO-PRESENCE (two faces
@@ -84,14 +103,19 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 #: SQLite schema for one store file.  ``IF NOT EXISTS`` makes open idempotent.
 #: ``appearance`` (2026-08-06) is the optional torso-appearance descriptor
-#: captured WITH the face template (float32[48] BLOB, NULL when the runner
-#: could not measure one) — last in the column list so a freshly created table
-#: matches the column order ALTER produces on an older file (see __init__).
+#: captured WITH the face template (float32[48] or float32[64] BLOB — v2 or
+#: v3, see :mod:`app.appearance`; NULL when the runner could not measure one).
+#: ``gender``/``gender_p``/``age``/``feat_norm`` (2026-09-24) are the embed
+#: service's per-face attribute readings and raw-feature norm, NULL when not
+#: measured.  The nullable columns sit LAST, in the order they were added, so a
+#: freshly created table matches the column order the ALTERs in __init__
+#: produce on an older file.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vectors (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,9 +125,24 @@ CREATE TABLE IF NOT EXISTS vectors (
     quality    REAL,
     sub_canon  INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    appearance BLOB
+    appearance BLOB,
+    gender     TEXT,
+    gender_p   REAL,
+    age        REAL,
+    feat_norm  REAL
 );
 CREATE INDEX IF NOT EXISTS idx_vectors_key ON vectors(key);
+CREATE TABLE IF NOT EXISTS body_sightings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    key        TEXT NOT NULL,
+    h          REAL NOT NULL,
+    w          REAL NOT NULL,
+    y_bottom   REAL NOT NULL,
+    frame_h    INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    face_w     REAL
+);
+CREATE INDEX IF NOT EXISTS idx_body_sightings_key ON body_sightings(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
     a TEXT NOT NULL,
     b TEXT NOT NULL,
@@ -123,6 +162,42 @@ CREATE TABLE IF NOT EXISTS store_meta (
     v TEXT NOT NULL
 );
 """
+
+
+#: Nullable columns ``vectors`` has gained since it first shipped, in the
+#: order they were added, with their types — the in-place migration list.  A
+#: file from before any of them opens, gets the missing ones ALTERed in, and
+#: its old rows read NULL for each: "not measured", which every reader treats
+#: as absent (never zero, never a default sex or age).
+_VECTOR_COLUMNS_ADDED = (
+    ("appearance", "BLOB"),   # 2026-08-06 torso descriptor
+    ("gender", "TEXT"),       # 2026-09-24 attribute head: "M" | "F"
+    ("gender_p", "REAL"),     # ... probability of that reported sex, 0..1
+    ("age", "REAL"),          # ... estimated age in years
+    ("feat_norm", "REAL"),    # ... L2 norm of the raw embedding feature
+)
+#: Same for ``body_sightings``, which shipped without ``face_w`` for a day.
+_BODY_COLUMNS_ADDED = (
+    ("face_w", "REAL"),       # 2026-09-24 evening: the sighting's face width px
+)
+
+
+class BodySighting(NamedTuple):
+    """One row of ``body_sightings``: a sighting's containing person box.
+
+    ``face_w`` and ``created_at`` ride along for the stature reader — the
+    first to reject a head-and-shoulders box, the second to count how many
+    distinct MOMENTS an identity was seen standing (eight consecutive frames
+    are half a second of one pose, not eight measurements).
+    """
+
+    key: str
+    h: float
+    w: float
+    y_bottom: float
+    frame_h: int
+    face_w: float | None = None
+    created_at: str | None = None
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -218,16 +293,25 @@ class VectorStore:
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(_SCHEMA)
-        # Migrate OLDER files in place (2026-08-06): ``CREATE TABLE IF NOT
-        # EXISTS`` never touches an existing table, so a gallery or staff store
-        # created before the torso-appearance column existed opens without it.
-        # ADD COLUMN is the entire migration — the new column defaults to NULL,
-        # and NULL is precisely what "no descriptor" means everywhere in the
-        # tie-breaker (absent is not zero, the codebase-wide convention), so a
-        # pre-existing file keeps working and no veto can ever fire on its rows.
+        # Migrate OLDER files in place (2026-08-06, extended 2026-09-24):
+        # ``CREATE TABLE IF NOT EXISTS`` never touches an existing table, so a
+        # gallery or staff store created before a column existed opens without
+        # it.  ADD COLUMN is the entire migration — each new column defaults to
+        # NULL, and NULL is precisely what "not measured" means everywhere
+        # (absent is not zero, the codebase-wide convention), so a pre-existing
+        # file keeps working, no veto fires on its rows, and no review
+        # exclusion can read a sex or an age into a template that never had
+        # one.  ``body_sightings`` is created whole by CREATE IF NOT EXISTS
+        # (an empty table is "nothing measured") and gets the same ADD COLUMN
+        # treatment for a column it shipped without.
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(vectors)")}
-        if "appearance" not in cols:
-            self.conn.execute("ALTER TABLE vectors ADD COLUMN appearance BLOB")
+        for name, sql_type in _VECTOR_COLUMNS_ADDED:
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE vectors ADD COLUMN {name} {sql_type}")
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(body_sightings)")}
+        for name, sql_type in _BODY_COLUMNS_ADDED:
+            if name not in cols:
+                self.conn.execute(f"ALTER TABLE body_sightings ADD COLUMN {name} {sql_type}")
         # THE EMBEDDER GUARD (doc 15 M3). Every store knows WHOSE vectors it
         # holds, stamped at first open and checked at every open after:
         #   * a new or legacy-unstamped file ADOPTS this process's embedder —
@@ -547,6 +631,69 @@ class VectorStore:
         ).fetchall()
         return [np.frombuffer(r[0], dtype=np.float32) for r in rows]
 
+    def attributes_for(self, key: str) -> list[tuple[str | None, float | None, float | None]]:
+        """Each template's ``(gender, gender_p, age)`` for one key, NULLs kept.
+
+        The raw material for the review queue's per-identity sex and age
+        (:func:`app.gallery.identity_gender`, :func:`app.gallery.identity_age`).
+        Rows are returned even when every field is NULL — a template written
+        by a runner with no attribute model, or before the columns existed —
+        so a caller can see how many views it is judging from; it is the
+        caller's job to aggregate over the non-NULL ones and answer None
+        when there are none.  Never a default sex, never age 0.
+        """
+        rows = self.conn.execute(
+            "SELECT gender, gender_p, age FROM vectors WHERE key = ? ORDER BY id ASC",
+            (key,),
+        ).fetchall()
+        return [
+            (
+                None if g is None else str(g),
+                None if p is None else float(p),
+                None if a is None else float(a),
+            )
+            for g, p, a in rows
+        ]
+
+    def feat_norms_for(self, key: str) -> list[float]:
+        """Every recorded raw-feature norm for one key's templates (NULLs skipped)."""
+        rows = self.conn.execute(
+            "SELECT feat_norm FROM vectors WHERE key = ? AND feat_norm IS NOT NULL"
+            " ORDER BY id ASC",
+            (key,),
+        ).fetchall()
+        return [float(r[0]) for r in rows]
+
+    def body_sightings(self) -> list[BodySighting]:
+        """Every body sighting in the store, oldest first.
+
+        ALL of them, not one key's: the stature estimate first fits the
+        camera's perspective — box height against box bottom-y — over every
+        standing box the run produced, and only then reads one identity's
+        boxes against that fit.  At POC scale this is a few thousand small
+        rows, read once per review call, which is an operator's click and
+        not the frame loop.  ``face_w`` is None on rows written before the
+        column existed; ``created_at`` is the ISO timestamp of the write.
+        """
+        rows = self.conn.execute(
+            "SELECT key, h, w, y_bottom, frame_h, face_w, created_at"
+            " FROM body_sightings ORDER BY id ASC"
+        ).fetchall()
+        return [
+            BodySighting(
+                str(k), float(h), float(w), float(yb), int(fh),
+                None if fw is None else float(fw), str(ts),
+            )
+            for k, h, w, yb, fh, fw, ts in rows
+        ]
+
+    def body_sightings_count(self, key: str) -> int:
+        """How many body sightings one key has accumulated."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM body_sightings WHERE key = ?", (key,)
+        ).fetchone()
+        return int(row[0])
+
     def count_for(self, key: str) -> int:
         """How many templates a single key owns.
 
@@ -604,6 +751,8 @@ class VectorStore:
         quality: float | None = None,
         sub_canon: bool = False,
         appearance: list[float] | np.ndarray | None = None,
+        attributes: dict | None = None,
+        feat_norm: float | None = None,
     ) -> int:
         """Store one template under an explicit key; returns its rowid.
 
@@ -613,7 +762,8 @@ class VectorStore:
         caller.  Callers with nothing to retract simply ignore it.
 
         ``appearance`` is the sighting's optional torso-appearance descriptor
-        (the wire contract's 48-float L1-normalised Hue×Saturation histogram),
+        (48 floats for v2 — 12×3 Hue×Saturation bins plus 3 brightness bins —
+        or 64 for v3, both L1-normalised; see :mod:`app.appearance`),
         stored as a float32 BLOB beside the face vector — beside, not inside:
         it never joins the resident scan matrix, because the cosine scan
         answers WHO and clothing must have no voice in that answer (the
@@ -623,14 +773,38 @@ class VectorStore:
         ``None`` stores NULL, which every reader treats as "not measured",
         never as a zero histogram.  Staff enrolment always passes ``None``:
         the staff store deliberately has no appearance handling.
+
+        ``attributes`` is the embed service's reading of THIS face —
+        ``{"gender": "M"|"F", "genderP": 0..1, "age": years}`` — and
+        ``feat_norm`` the L2 norm of its raw feature before normalisation.
+        Stored per template, beside the vector, for the same reason as the
+        descriptor and with the same discipline: they never enter the scan
+        matrix and never touch a verdict.  Their one reader is the review
+        queue, which uses them to set aside pairs that cannot be one person
+        (a man and a woman, a child and an adult).  ``None`` for either, or
+        a missing field, stores NULL — a runner without an attribute model
+        writes rows the review queue reads as "not measured".
         """
         v = as_unit(embedding)
         blob = None if appearance is None else np.asarray(appearance, dtype=np.float32).tobytes()
+        gender = gender_p = age = None
+        if attributes:
+            g = attributes.get("gender")
+            gender = None if g is None else str(g)
+            gp = attributes.get("genderP")
+            gender_p = None if gp is None else float(gp)
+            a = attributes.get("age")
+            age = None if a is None else float(a)
+        norm = None if feat_norm is None else float(feat_norm)
         self._index()  # load BEFORE the insert, or the load would see it twice
         cur = self.conn.execute(
-            "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at, appearance)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (key, v.tobytes(), v.size, quality, int(sub_canon), _now(), blob),
+            "INSERT INTO vectors (key, vec, dim, quality, sub_canon, created_at, appearance,"
+            " gender, gender_p, age, feat_norm)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                key, v.tobytes(), v.size, quality, int(sub_canon), _now(), blob,
+                gender, gender_p, age, norm,
+            ),
         )
         row_id = int(cur.lastrowid)
         self._append_row(key, v, row_id)
@@ -643,11 +817,61 @@ class VectorStore:
         sub_canon: bool = False,
         prefix: str = "p",
         appearance: list[float] | np.ndarray | None = None,
+        attributes: dict | None = None,
+        feat_norm: float | None = None,
     ) -> str:
         """Mint a fresh monotonic key, store the template under it, return it."""
         key = self.mint_key(prefix)
-        self.add(key, embedding, quality, sub_canon, appearance)
+        self.add(key, embedding, quality, sub_canon, appearance, attributes, feat_norm)
         return key
+
+    def add_body_sighting(
+        self, key: str, h: float, w: float, y_bottom: float, frame_h: int,
+        face_w: float | None = None,
+    ) -> int:
+        """Record one sighting's containing PERSON box under ``key``; its rowid.
+
+        Written on EVERY guest /match call that carried a body, matched or
+        minted, enrolled or not — this is a sighting log, not a template.
+        The review queue's stature estimate needs the run's whole population
+        of standing boxes to fit the camera's perspective, and one identity's
+        median over many boxes to be robust against a single mid-stride or
+        half-occluded frame; five capped templates would give it neither.
+        Raw detector pixels, so the fit is in the geometry the detector saw.
+        ``face_w`` is the face box width of the sighting (the /match call's
+        ``quality``), kept so the stature reader can reject a box that is
+        only a head-and-shoulders: run f0bfc5's p00052 had 15 consecutive
+        boxes 4.2 face widths tall (a waist-up crop through an occlusion)
+        against her 11-face-width standing boxes, and the median over those
+        frames read 0.59 of adult height.  Never enters the scan matrix;
+        never touches a verdict.  The rowid comes back so the runner's
+        same-frame guard can retract the row if the sighting turns out to
+        belong to a different body (:meth:`forget_body_sighting`).
+        """
+        cur = self.conn.execute(
+            "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                key, float(h), float(w), float(y_bottom), int(frame_h), _now(),
+                None if face_w is None else float(face_w),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def forget_body_sighting(self, row_id: int) -> bool:
+        """Delete ONE body sighting by rowid; True if a row went.
+
+        The undo half of :meth:`add_body_sighting`, for the same caller as
+        :meth:`forget_template`: a sighting is logged under the key /match
+        resolved BEFORE the runner can see that two bodies in one frame
+        landed on that key.  The loser's box would otherwise stay in the
+        wrong identity's stature evidence, and its re-ask logs the same box
+        again under the corrected key.  No last-row refusal here — a body
+        log is not a template and an identity with no boxes is simply "not
+        measured".
+        """
+        cur = self.conn.execute("DELETE FROM body_sightings WHERE id = ?", (row_id,))
+        return cur.rowcount > 0
 
     def add_manual(self, note: str | None = None, prefix: str = "m") -> str:
         """Record one operator-attested person with no template; return its key.
@@ -892,6 +1116,12 @@ class VectorStore:
         if self.count_for(keep) == 0 or self.count_for(drop) == 0:
             return False
         self.conn.execute("UPDATE vectors SET key = ? WHERE key = ?", (keep, drop))
+        # The attribute columns ride with their rows.  Body sightings are
+        # re-keyed the same way: the operator has said these were one person,
+        # so every box either key produced is now that person's stature
+        # evidence — the sighting log must never name a key that no longer
+        # exists, or the survivor's stature would be read off half its data.
+        self.conn.execute("UPDATE body_sightings SET key = ? WHERE key = ?", (keep, drop))
         # Carry the retired key's constraints forward onto the survivor.
         self.conn.execute(
             "UPDATE OR IGNORE cannot_link SET a = ? WHERE a = ?", (keep, drop)
@@ -911,12 +1141,13 @@ class VectorStore:
         (distinct count −1) and its returned templates are re-added to the site
         staff store under a staff id.  Returns an empty list for an unknown key.
 
-        Appearance descriptors are DELIBERATELY not in the returned tuples:
-        the only caller re-homes these rows into the staff store, and staff
-        flows carry no appearance handling anywhere (staff identity is
-        operator-attested, never inferred from clothing), so the descriptor
-        dies with the gallery row instead of leaking into a persistent
-        per-site file.
+        Appearance descriptors are DELIBERATELY not in the returned tuples —
+        nor are the attribute readings or the body sightings: the only caller
+        re-homes these rows into the staff store, and staff flows carry no
+        appearance, attribute or stature handling anywhere (staff identity is
+        operator-attested, never inferred from clothing, sex, age or height),
+        so all of it dies with the gallery row instead of leaking into a
+        persistent per-site file.
         """
         self._index()  # load BEFORE the delete, so the index still has the rows
         rows = self.conn.execute(
@@ -925,6 +1156,10 @@ class VectorStore:
         if rows:
             self.conn.execute("DELETE FROM vectors WHERE key = ?", (key,))
             self.conn.execute("DELETE FROM cannot_link WHERE a = ? OR b = ?", (key, key))
+            # The person's box log goes with them: a retired key must not
+            # keep feeding the stature fit under a name nothing else holds,
+            # and the staff store the rows re-home to keeps no such log.
+            self.conn.execute("DELETE FROM body_sightings WHERE key = ?", (key,))
             self._drop_rows(key)
         return [(bytes(v), q, int(sc)) for v, q, sc in rows]
 
