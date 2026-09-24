@@ -15,6 +15,19 @@ Two families behind one embed() shape:
 
 Embeddings are returned raw (not L2-normalised); the match service computes
 cosine similarity, which is scale-invariant, so normalisation is its choice.
+The raw vector's L2 NORM rides beside it ("norms", index-parallel): for
+both families the feature magnitude tracks crop quality — a blurred,
+occluded or averted face embeds short — and the runner can floor on it
+(HECO_QUALITY_MIN_FEAT_NORM) once the vector is normalised away. Both
+families expose a raw vector: cv2's SFace `feature` is unnormalised too
+(its `match` normalises internally), so the norm is meaningful there as
+well.
+
+The optional ATTRIBUTE PASS (attributes.py — gender + age) runs in the same
+loop under the same lock, one extra session run per face: at the < 10
+faces a frame this service sees, batching would buy nothing and the lock
+already serialises the embedder, so a second lock would only add a place
+to deadlock.
 
 DELIBERATELY NO HOT-SWAP HERE. persons and faces gained POST /model; embed
 did not, and it must not: an embedder change renames the per-site staff
@@ -34,6 +47,7 @@ import numpy as np
 from heco_common.ort import announce_device, providers_for
 
 from .align import TEMPLATE_SIZE, align_face
+from .attributes import AttributeModel
 from .face_row import face_to_row, validate_landmarks
 
 #: Default model location — populated by `make models`, never committed.
@@ -75,7 +89,60 @@ def build_embedder(model_path: Path | None = None, device: str | None = None):
     return FaceEmbedder(path)
 
 
-class FaceEmbedder:
+class _Embedder:
+    """The loop both families share: one lock, request order, norms, attributes.
+
+    A family supplies `_feature(img, face)` — the raw vector for one face —
+    and inherits the two public shapes: `embed()` (the day-one contract,
+    embeddings + alignMs) and `embed_faces()` (the same loop also answering
+    norms and, given an AttributeModel, gender/age per face).
+    """
+
+    family = "unknown"
+    _lock: threading.Lock
+
+    def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
+        raise NotImplementedError
+
+    def embed(self, img: np.ndarray, faces: list[dict]) -> tuple[list[list[float]], float]:
+        """Align + embed every face; `(embeddings, align_ms)`, order preserved."""
+        embeddings, _norms, _attrs, align_ms, _attr_ms = self.embed_faces(img, faces)
+        return embeddings, align_ms
+
+    def embed_faces(
+        self, img: np.ndarray, faces: list[dict], attributes: AttributeModel | None = None
+    ) -> tuple[list[list[float]], list[float], list[dict | None] | None, float, float | None]:
+        """Run the full /embed loop: `(embeddings, norms, attributes, align_ms, attr_ms)`.
+
+        Every list is index-parallel to `faces`. `attributes` is None (not
+        an empty list) when no model was given — absent is not zero, and
+        the wire answer "attributes": null must mean "not measured", never
+        "no faces". `align_ms` stays the align+embed time alone, as the
+        contract always defined it; the attribute pass is timed apart
+        (`attr_ms`, None when off) so the new cost is visible on its own
+        and the old number keeps meaning what it meant.
+        """
+        t0 = time.perf_counter()
+        embeddings: list[list[float]] = []
+        norms: list[float] = []
+        attrs: list[dict | None] = []
+        attr_s = 0.0
+        with self._lock:
+            for face in faces:
+                feat = np.asarray(self._feature(img, face)).ravel()
+                embeddings.append([float(v) for v in feat])
+                norms.append(float(np.linalg.norm(feat.astype(np.float64))))
+                if attributes is not None:
+                    ta = time.perf_counter()
+                    attrs.append(attributes.predict(img, face.get("box")))
+                    attr_s += time.perf_counter() - ta
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        align_ms = round(total_ms - attr_s * 1000.0, 2)
+        attr_ms = round(attr_s * 1000.0, 2) if attributes is not None else None
+        return embeddings, norms, (attrs if attributes is not None else None), align_ms, attr_ms
+
+
+class FaceEmbedder(_Embedder):
     """The sface family: owns one FaceRecognizerSF; a lock serialises calls."""
 
     family = "sface"
@@ -95,26 +162,13 @@ class FaceEmbedder:
         self._rec = cv2.FaceRecognizerSF.create(str(model_path), "")
         self._lock = threading.Lock()
 
-    def embed(self, img: np.ndarray, faces: list[dict]) -> tuple[list[list[float]], float]:
-        """Align + embed every face against `img` (BGR frame).
-
-        Returns `(embeddings, align_ms)`: one 128-float list per input face,
-        order preserved; `align_ms` is the wall time of the full align+embed
-        loop (the contract's alignMs).
-        """
-        t0 = time.perf_counter()
-        embeddings: list[list[float]] = []
-        with self._lock:
-            for face in faces:
-                row = face_to_row(face)
-                aligned = self._rec.alignCrop(img, row)
-                feat = self._rec.feature(aligned)
-                embeddings.append([float(v) for v in np.asarray(feat).ravel()])
-        align_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return embeddings, align_ms
+    def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
+        """cv2's alignCrop (its 112 template, the five landmarks) then `feature`."""
+        aligned = self._rec.alignCrop(img, face_to_row(face))
+        return np.asarray(self._rec.feature(aligned))
 
 
-class ArcFaceEmbedder:
+class ArcFaceEmbedder(_Embedder):
     """The arcface family: our alignment + a generic ORT session.
 
     Same embed() contract as FaceEmbedder — one raw embedding per face, in
@@ -194,27 +248,20 @@ class ArcFaceEmbedder:
         self.dim = int(out_shape[-1]) if isinstance(out_shape[-1], int) else None
         self._lock = threading.Lock()
 
-    def embed(self, img: np.ndarray, faces: list[dict]) -> tuple[list[list[float]], float]:
-        """Align (our transform) + embed every face; order preserved."""
-        t0 = time.perf_counter()
-        embeddings: list[list[float]] = []
-        with self._lock:
-            for face in faces:
-                # Same landmark guard as the sface path (face_to_row):
-                # np.reshape would happily re-pair ANY nesting totalling ten
-                # floats into wrong (x, y) points and embed the garbage crop
-                # with 200 OK — malformed landmarks must be the same
-                # ValueError -> 400 on both families.
-                aligned = align_face(img, validate_landmarks(face))
-                rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
-                blob = (rgb.astype(np.float32) - 127.5) / 127.5
-                # Cast to the graph's declared dtype (validated at init):
-                # ORT refuses a float32 blob on a float16 graph at run().
-                blob = blob.astype(self._np_dtype, copy=False)
-                blob = blob.transpose(2, 0, 1)[None] if self._nchw else blob[None]
-                feat = self._session.run(
-                    None, {self._input_name: np.ascontiguousarray(blob)}
-                )[0]
-                embeddings.append([float(v) for v in np.asarray(feat).ravel()])
-        align_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return embeddings, align_ms
+    def _feature(self, img: np.ndarray, face: dict) -> np.ndarray:
+        """Our alignment, the normalised RGB blob, one session run."""
+        # Same landmark guard as the sface path (face_to_row):
+        # np.reshape would happily re-pair ANY nesting totalling ten
+        # floats into wrong (x, y) points and embed the garbage crop
+        # with 200 OK — malformed landmarks must be the same
+        # ValueError -> 400 on both families.
+        aligned = align_face(img, validate_landmarks(face))
+        rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+        blob = (rgb.astype(np.float32) - 127.5) / 127.5
+        # Cast to the graph's declared dtype (validated at init):
+        # ORT refuses a float32 blob on a float16 graph at run().
+        blob = blob.astype(self._np_dtype, copy=False)
+        blob = blob.transpose(2, 0, 1)[None] if self._nchw else blob[None]
+        return np.asarray(
+            self._session.run(None, {self._input_name: np.ascontiguousarray(blob)})[0]
+        )
