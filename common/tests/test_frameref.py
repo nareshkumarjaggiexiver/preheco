@@ -184,3 +184,18 @@ def test_a_full_directory_can_recover(shared, monkeypatch):
     # and the sweep ran anyway, so the next write has room
     assert fr.write_frame(_img(10, 10), 100) is not None
     assert len(list(shared.glob("f*.bgr"))) <= 4
+
+
+def test_clear_unlinks_only_what_this_module_wrote(tmp_path):
+    """A run boundary empties the mount of frames — and of nothing else."""
+    import numpy as np
+    from heco_common import frameref
+
+    img = np.zeros((4, 4, 3), np.uint8)
+    for n in range(1, 4):
+        assert frameref.write_frame(img, n, tmp_path)
+    (tmp_path / ".f9_4x4.bgr.part").write_bytes(b"half")   # a write in flight
+    (tmp_path / "notes.txt").write_text("not ours")
+    assert frameref.clear(tmp_path) == 4
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt"]
+    assert frameref.clear(tmp_path / "missing") == 0, "no mount: nothing to do"
