@@ -62,19 +62,30 @@ def test_health_ok():
 
 
 @requires_model
-def test_embed_returns_128_floats_per_face():
+def test_embed_returns_128_floats_per_face(monkeypatch):
+    """The day-one shape plus the additive fields: `norms` index-parallel
+    to the embeddings (the raw SFace feature's L2 norm, always > 0), and
+    `attributes`/`attrMs` null as a whole while no attribute model is
+    configured — null, not [], because absent is not zero."""
+    import app.main as app_main
+
+    _attributes_off(monkeypatch, app_main)
     r = TestClient(app).post(
         "/embed", json={"imageB64": _b64(_frame()), "faces": [_face(), _face(cx=160.0)]}
     )
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"embeddings", "alignMs"}
+    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs"}
     assert len(body["embeddings"]) == 2
-    for emb in body["embeddings"]:
+    for emb, norm in zip(body["embeddings"], body["norms"], strict=True):
         assert len(emb) == 128
         assert all(isinstance(v, float) for v in emb)
         assert any(v != 0.0 for v in emb)
+        assert norm == pytest.approx(float(np.linalg.norm(emb)), rel=1e-6)
+        assert norm > 0.0
     assert body["alignMs"] > 0
+    assert body["attributes"] is None
+    assert body["attrMs"] is None
 
 
 @requires_model
@@ -110,11 +121,27 @@ def test_embed_rejects_malformed_landmarks():
 def _reset_loader(monkeypatch, app_main, path):
     """Point the lazy loader at `path` with a clean slate (monkeypatch
     restores the real globals afterwards, so the model-backed tests above
-    are untouched whichever order pytest runs them in)."""
+    are untouched whichever order pytest runs them in). The attribute pass
+    is switched OFF unless a test arms it — a genderage.onnx in models/
+    must not change what these tests see."""
     monkeypatch.setattr(app_main, "MODEL_PATH", path)
     monkeypatch.setattr(app_main, "_embedder", None)
     monkeypatch.setattr(app_main, "_load_error", None)
     monkeypatch.setattr(app_main, "_failed_stat", None)
+    _attributes_off(monkeypatch, app_main)
+
+
+def _attributes_off(monkeypatch, app_main):
+    """EMBED_ATTR_MODEL=off, as the loader would resolve it, with a clean slate."""
+    _attributes_at(monkeypatch, app_main, None, explicit=True)
+
+
+def _attributes_at(monkeypatch, app_main, path, explicit):
+    monkeypatch.setattr(app_main, "ATTR_MODEL_PATH", path)
+    monkeypatch.setattr(app_main, "ATTR_MODEL_EXPLICIT", explicit)
+    monkeypatch.setattr(app_main, "_attributes", None)
+    monkeypatch.setattr(app_main, "_attr_error", None)
+    monkeypatch.setattr(app_main, "_attr_failed_stat", None)
 
 
 def test_health_reports_the_error_and_recovers_when_weights_appear(tmp_path, monkeypatch):
@@ -233,6 +260,136 @@ def test_arcface_family_serves_the_contract_end_to_end(tmp_path, monkeypatch):
     r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [degenerate]})
     assert r.status_code == 400
     assert "degenerate landmarks" in r.json()["detail"]
+
+
+def test_embed_serves_norms_and_attributes_beside_the_embeddings(tmp_path, monkeypatch):
+    """The additive contract on the wire, against two tiny graphs: the
+    arcface Flatten (whose embedding IS the fed blob, so the norm is
+    checkable to the digit) and the ReduceMean genderage stand-in (whose
+    answer is the crop's RGB means, so gender/age follow the paint)."""
+    from tiny_onnx import FLOAT, write_model, write_reduce_mean_model
+
+    import app.main as app_main
+    from app.attributes import AttributeModel
+    from app.recognizer import ArcFaceEmbedder
+
+    path = write_model(tmp_path, "tiny_arcface_nchw.onnx", FLOAT, (1, 3, 112, 112))
+    attr_path = write_reduce_mean_model(tmp_path, "tiny_genderage.onnx", FLOAT, (1, 3, 96, 96))
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", lambda: ArcFaceEmbedder(path, "CPU"))
+    _attributes_at(monkeypatch, app_main, attr_path, explicit=True)
+    monkeypatch.setattr(
+        app_main, "build_attributes", lambda p, d: AttributeModel(p, "CPU")
+    )
+    client = TestClient(app_main.app)
+
+    health = client.get("/health").json()
+    assert health["ok"] is True
+    assert health["attrModel"] == "tiny_genderage.onnx"
+    assert health["attrError"] is None
+
+    # Paint the frame so the attribute crop reads [R, G, B] = [10, 20, 45]:
+    # G > R is "M", B is age 4500 — nonsense years, exact arithmetic.
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    img[:] = (45, 20, 10)
+    faces = [_face(), _face(cx=160.0)]
+    r = client.post("/embed", json={"imageB64": _b64(img), "faces": faces})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"embeddings", "alignMs", "norms", "attributes", "attrMs"}
+    assert len(body["embeddings"]) == len(body["norms"]) == len(body["attributes"]) == 2
+    for emb, norm in zip(body["embeddings"], body["norms"], strict=True):
+        assert norm == pytest.approx(float(np.linalg.norm(np.asarray(emb, np.float64))), rel=1e-6)
+    for attr in body["attributes"]:
+        assert set(attr) == {"gender", "genderP", "age"}
+        assert attr["gender"] == "M"
+        assert 0.99 < attr["genderP"] <= 1.0
+        assert attr["age"] == pytest.approx(4500.0, rel=1e-3)
+    assert body["attrMs"] >= 0.0
+    assert body["alignMs"] >= 0.0
+
+    # No faces: every list empty, attributes an empty LIST (the pass is on).
+    r = client.post("/embed", json={"imageB64": _b64(img), "faces": []})
+    assert r.json()["attributes"] == [] and r.json()["norms"] == []
+
+    # A malformed box is the same 400 as malformed landmarks, on this path too.
+    bad = _face()
+    bad["box"] = {"x": 1.0, "y": 2.0}
+    r = client.post("/embed", json={"imageB64": _b64(img), "faces": [bad]})
+    assert r.status_code == 400
+    assert "x, y, w, h" in r.json()["detail"]
+
+
+def test_a_named_attribute_model_that_will_not_load_is_served_not_swallowed(
+    tmp_path, monkeypatch
+):
+    """EMBED_ATTR_MODEL names a file that is absent: embedding still works
+    (ok:true — the count must not stop for an advisory signal) but /health
+    carries attrError and /embed answers attributes:null; when the file
+    appears the next probe loads it, exactly like the embedder's retry."""
+    from tiny_onnx import FLOAT, write_model, write_reduce_mean_model
+
+    import app.main as app_main
+    from app.attributes import AttributeModel
+    from app.recognizer import ArcFaceEmbedder
+
+    path = write_model(tmp_path, "tiny_arcface_nchw.onnx", FLOAT, (1, 3, 112, 112))
+    attr_path = tmp_path / "named_genderage.onnx"
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", lambda: ArcFaceEmbedder(path, "CPU"))
+    _attributes_at(monkeypatch, app_main, attr_path, explicit=True)
+    calls = []
+
+    def build(p, d):
+        calls.append(1)
+        return AttributeModel(p, "CPU")
+
+    monkeypatch.setattr(app_main, "build_attributes", build)
+    client = TestClient(app_main.app)
+
+    health = client.get("/health").json()
+    assert health["ok"] is True
+    assert health["attrModel"] is None
+    assert "FileNotFoundError" in health["attrError"]
+    assert client.get("/health").json()["attrModel"] is None
+    assert len(calls) == 1, "same absent file — memoized, no load storm"
+
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [_face()]})
+    assert r.status_code == 200
+    assert r.json()["attributes"] is None and r.json()["attrMs"] is None
+    assert len(r.json()["norms"]) == 1
+
+    write_reduce_mean_model(tmp_path, "named_genderage.onnx", FLOAT, (1, 3, 96, 96))
+    health = client.get("/health").json()
+    assert health["attrModel"] == "named_genderage.onnx"
+    assert health["attrError"] is None
+    assert len(calls) == 2, "changed file state — exactly one retry"
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [_face()]})
+    assert len(r.json()["attributes"]) == 1
+
+
+def test_the_default_attribute_file_being_absent_is_off_not_an_error(tmp_path, monkeypatch):
+    from tiny_onnx import FLOAT, write_model
+
+    import app.main as app_main
+    from app.recognizer import ArcFaceEmbedder
+
+    path = write_model(tmp_path, "tiny_arcface_nchw.onnx", FLOAT, (1, 3, 112, 112))
+    _reset_loader(monkeypatch, app_main, path)
+    monkeypatch.setattr(app_main, "build_embedder", lambda: ArcFaceEmbedder(path, "CPU"))
+    _attributes_at(monkeypatch, app_main, tmp_path / "genderage.onnx", explicit=False)
+    calls = []
+    monkeypatch.setattr(app_main, "build_attributes", lambda p, d: calls.append(1))
+    client = TestClient(app_main.app)
+
+    health = client.get("/health").json()
+    assert health["ok"] is True
+    assert health["attrModel"] is None
+    assert health["attrError"] is None
+    assert calls == [], "an absent default file is never even attempted"
+    r = client.post("/embed", json={"imageB64": _b64(_frame()), "faces": [_face()]})
+    assert r.status_code == 200
+    assert r.json()["attributes"] is None
 
 
 def test_an_init_refused_model_is_unhealthy_with_the_reason(tmp_path, monkeypatch):
