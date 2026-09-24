@@ -42,13 +42,33 @@
 # optimisation for one machine and a hard failure everywhere else.
 #
 # Rollback is total: drop the -f and the CPU stack returns untouched.
+# !reset ON `build` IS LOAD-BEARING, and was learned the hard way.
+#
+# These three services name an `image:` that is BUILT SEPARATELY, from
+# docker/persons-cuda.Dockerfile, FROM the plain image. They inherit a
+# `build:` block from the base compose file, and compose tags a built service
+# with its `image:` value — so `docker compose -f … -f docker-compose.gpumax.yml
+# build` rebuilds the ORDINARY CPU service and tags it `heco-persons:cuda`,
+# silently destroying the GPU image with a CPU one wearing its name.
+#
+# Measured, 2026-09-24: every stage came up `CUDA -> CPUExecutionProvider`
+# with onnxruntime reporting only `AzureExecutionProvider, CPUExecutionProvider`
+# — a CPU-only wheel in an image called cuda. The running containers kept
+# working because they were created before the clobber, so the fault was
+# invisible until something recreated them, which on a demo morning is
+# exactly when it would have surfaced.
+#
+# With `build: !reset null` compose refuses to build these services at all and
+# says so, which is the correct answer: they are not built from here.
 services:
   persons:
     image: heco-persons:cuda
+    build: !reset null
     gpus: all
 
   faces:
     image: heco-faces:cuda
+    build: !reset null
     gpus: all
     environment:
       # NEITHER of these reaches faces from the base compose — it was written
@@ -75,6 +95,7 @@ services:
 
   embed:
     image: heco-embed:cuda
+    build: !reset null
     gpus: all
     environment:
       HECO_DEVICE: ${HECO_DEVICE-}
