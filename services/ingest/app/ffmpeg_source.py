@@ -8,6 +8,16 @@ layout, 1.5 bytes a pixel), the motion gate reads its Y plane for free, and the
 BGR conversion (cv2, ~7 ms single-threaded at 4K) is paid only for a frame a
 consumer actually takes (app.frames.RawFrame).
 
+The frames cross on a Unix SOCKETPAIR, not a pipe. Measured on the .94 box,
+300 4K NV12 frames from NVDEC: through a pipe, 31 fps at most and 43.6 ms of
+CPU per frame (22.1 in the reader, 21.5 in ffmpeg); through a socketpair,
+217 fps and 21.6 ms. The pipe was not slow by nature: Linux charges pipe
+buffers to the uid that creates them, container root is host uid 0, and the
+box's other root processes had used up uid 0's soft budget
+(fs.pipe-user-pages-soft), so every new root pipe got 8 KB and a 12 MB frame
+crossed in ~1,500 round trips. F_SETPIPE_SZ is refused (EPERM) in that state.
+Socket buffers are not in that accounting at all.
+
 Three rules keep the subprocess honest:
 
 * **No silent software decode.** NVDEC and VA-API frames stay on the GPU
@@ -25,8 +35,8 @@ Three rules keep the subprocess honest:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -46,9 +56,9 @@ VAAPI_DEVICE = "/dev/dri/renderD128"
 #: declared dead. A 4K RTSP camera needs a connection, a keyframe (up to one
 #: GOP, 1 s here) and a CUDA context — seconds, not tens of them.
 OPEN_TIMEOUT_S = 15.0
-#: Linux fcntl: grow the pipe to 1 MiB so a 12 MB NV12 frame crosses in ~12
-#: reads instead of ~190 at the default 64 KiB.
-_F_SETPIPE_SZ = 1031
+#: Socket buffer asked for on each end, so a 12 MB frame crosses in a few
+#: wake-ups. The kernel caps it at net.core.[rw]mem_max, which only costs speed.
+_SOCK_BUF = 4 << 20
 #: The output stream line ffmpeg prints once the first frame reaches the muxer:
 #: "Stream #0:0: Video: rawvideo (NV12 / 0x3231564E), nv12(tv, ...), 3840x2160, ..."
 _GEOM = re.compile(r"Video: rawvideo\b.*?[ ,](\d{2,5})x(\d{2,5})[ ,\[]")
@@ -147,20 +157,26 @@ class FfmpegSource:
         self._tail: deque[str] = deque(maxlen=25)
         self._geom_evt = threading.Event()
         self._timed_out = False
+        self._sock, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with contextlib.suppress(OSError):
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCK_BUF)
+            child.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCK_BUF)
         try:
             self._proc = subprocess.Popen(
                 self.cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
+                stdout=child.fileno(),
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 close_fds=True,
             )
         except OSError as exc:
+            self._sock.close()
             raise DecoderError(f"could not start {FFMPEG[0]}: {exc}") from exc
-        # Capped by /proc/sys/fs/pipe-max-size where that is lower: slower, still correct.
-        with contextlib.suppress(OSError):
-            fcntl.fcntl(self._proc.stdout.fileno(), _F_SETPIPE_SZ, 1 << 20)
+        finally:
+            # The child holds its own copy now. Ours must go, or EOF never
+            # arrives when ffmpeg exits.
+            child.close()
         self._stderr = threading.Thread(
             target=self._drain_stderr, name="ingest-ffmpeg-stderr", daemon=True
         )
@@ -215,15 +231,18 @@ class FfmpegSource:
     def interrupt(self) -> None:
         """Kill the decoder from ANOTHER thread; a blocked read() returns None."""
         self._kill()
+        with contextlib.suppress(OSError):
+            self._sock.shutdown(socket.SHUT_RD)  # wakes the reader even mid-recv
 
     def close(self) -> None:
-        """Kill (if still running), reap, and close the pipes. Idempotent."""
+        """Kill (if still running), reap, and close the transport. Idempotent."""
         self._kill()
         with contextlib.suppress(subprocess.TimeoutExpired):  # SIGKILL: belt and braces
             self.returncode = self._proc.wait(timeout=5)
-        for pipe in (self._proc.stdout, self._proc.stderr):
-            with contextlib.suppress(OSError):
-                pipe.close()
+        with contextlib.suppress(OSError):
+            self._sock.close()
+        with contextlib.suppress(OSError):
+            self._proc.stderr.close()
         self._stderr.join(timeout=2)
 
     def tail(self) -> str:
@@ -256,7 +275,7 @@ class FfmpegSource:
         got = 0
         while got < self.frame_bytes:
             try:
-                n = self._proc.stdout.readinto(view[got:])
+                n = self._sock.recv_into(view[got:])
             except (OSError, ValueError):  # closed under us by close()
                 n = 0
             if not n:
@@ -266,7 +285,7 @@ class FfmpegSource:
         return RawFrame("nv12", buf, self.w, self.h)
 
     def _reap(self) -> None:
-        """stdout hit EOF: ffmpeg is exiting — collect its exit code."""
+        """The socket hit EOF: ffmpeg is exiting — collect its exit code."""
         try:
             self.returncode = self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
