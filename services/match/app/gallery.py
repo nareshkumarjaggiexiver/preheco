@@ -1369,6 +1369,8 @@ def review_duplicates(
     beard_min_n: int = 0,
     beard_pale: bool = False,
     light_tol: float = 0.0,
+    clothes_well_seen_n: int = 0,
+    clothes_well_seen_clash: float = 0.0,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1420,6 +1422,19 @@ def review_duplicates(
       unmeasured torsos still appear, because absent is not zero.  A v2
       (48-d) torso against a v3 (64-d) one is not comparable and reads as
       unmeasured, not as 0.
+    * **A well-seen pair's clothing is held to its word (2026-09-25).**
+      The best-cross test is charitable by design, and right to be for an
+      identity seen a few times (one person's first three reads against
+      their last three scored as low as 0.506 on run e5bae3).  When BOTH
+      identities have at least ``clothes_well_seen_n`` reads — same span
+      and self-agreement bars — the clash is ``clothes_well_seen_clash``
+      instead: on e5bae3, 27 identities with 16+ reads scored their early
+      half against their late half at 0.887 and up, while the queue asked
+      about a white shirt against a blue one (0.374) and a black kurta
+      against a light check (0.496); 0.55 sets both aside.  Galleries
+      whose identities carry fewer reads (f0bfc5, c84098, 8b8b87) are
+      unchanged, and ``clothes_clash <= 0`` still turns clothing off.
+
     * **Sex, age and stature may SET A PAIR ASIDE (v4, 2026-09-24)** — after
       the band test and before the cap, so an excluded pair neither costs a
       slot nor counts as dropped.  Run f0bfc5 flooded the queue with 500
@@ -1582,7 +1597,14 @@ def review_duplicates(
             gender_min_p, age_child_max, age_adult_min, stature_gap,
         )
         colour = []
-        if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
+        if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min) or (
+            clothes_clash > 0
+            and clothes_well_seen_n > 0
+            and clothes_apart(
+                ta, tb, cross, clothes_well_seen_clash,
+                max(clothes_well_seen_n, clothes_min_n), clothes_self_min,
+            )
+        ):
             colour.append("clothes")
         if head_apart(ha, hb, head_sim, head_clash):
             colour.append("head")

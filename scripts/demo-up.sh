@@ -40,6 +40,8 @@
 # THE REVIEW EXCLUSIONS (gender, age, stature, clothes, head, beard) and the
 # track-presence split are NOT exported here: their defaults live in the
 # services (match config.py, runner config.py) and are on out of the box.
+# One exception, the light guard (HECO_REVIEW_LIGHT_TOL, below): this
+# deployment turns it OFF.
 # `status` prints what the running containers actually hold, so an operator
 # can see a knob that was set — or one that was not — without reading a
 # compose file.
@@ -94,6 +96,14 @@ export HECO_QUALITY_MIN_FEAT_NORM=${HECO_QUALITY_MIN_FEAT_NORM:-18}
 # 0.27; the lowest genuine face 0.42, the 5th percentile 0.51. 0 turns it off.
 export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
+# The review's light guard OFF (match default 0.07). It holds back a colour
+# set-aside when two identities' face skin says they were read under
+# different light — and on f0bfc5's replay it also sent 21 of 31 correct
+# colour set-asides back to the queue, the wrong pairs the operator keeps
+# reporting. The operator's venues are lit by fixed chandeliers ("it is
+# fixed light", 2026-09-25), so the guard costs here and buys nothing. A
+# venue with stage washes or a videographer's lamp: HECO_REVIEW_LIGHT_TOL=0.07.
+export HECO_REVIEW_LIGHT_TOL=${HECO_REVIEW_LIGHT_TOL:-0}
 
 A=(-f docker-compose.yml -f docker-compose.gpumax.yml)
 B=("${A[@]}" -f docker-compose.camB.yml)
@@ -134,7 +144,8 @@ knobs() {
   show "$name" match HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
        HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
        HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
-       HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
+       HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_CLOTHES_WELL_SEEN_N \
+       HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
        HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL -- "$@"
   show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
        HECO_APPEARANCE_WB HECO_PIPELINE_OVERLAP HECO_PARALLEL_DETECT HECO_FACE_CADENCE \
@@ -201,8 +212,9 @@ PY
   knobs B -p heco-pipeline-b "${B[@]}"
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
   echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
-  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · HEAD_CLASH 0.45 · BEARD_MIN_N 3 ·'
-  echo '    BEARD_PALE 0 · LIGHT_TOL 0.07 (a colour set-aside held back when two identities were read under different light) ·'
+  echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · CLOTHES_WELL_SEEN_N 8 / _CLASH 0.55 (both'
+  echo '    sides with 8+ reads are held to 0.55) · HEAD_CLASH 0.45 · BEARD_MIN_N 3 · BEARD_PALE 0 ·'
+  echo '    LIGHT_TOL 0.07 in the service (0 from this script: fixed chandelier light — the guard is off) ·'
   echo '    PRESENCE_SPLIT 1 · COPRESENCE_SPLIT 1 · QUALITY_MIN_FEAT_NORM 0 in the service (18 from this script) ·'
   echo '    QUALITY_MIN_BALANCE 0 in the service (0.33 from this script). 0 turns a signal off.'
   echo '    levers, all OFF by default: APPEARANCE_WB 0 · PIPELINE_OVERLAP 0 · PARALLEL_DETECT 0 · FACE_CADENCE 0'

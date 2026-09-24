@@ -1871,4 +1871,37 @@ on one person.
   question over a guest hidden in the collapsed list.
 - Rollout: match first. A match ≤ 0.14.0 drops `skin` (unknown field); a
   runner before this sends none and the guard never acts (today's rule).
+- Deployment note (2026-09-25): the operator's venues are lit by fixed
+  chandeliers ("it is fixed light"), so `scripts/demo-up.sh` starts the
+  camera stacks with `HECO_REVIEW_LIGHT_TOL=0` unless the caller sets it —
+  the guard's cost (two thirds of the true colour set-asides asked again)
+  buys nothing where the light does not change.
+
+### The well-seen clothing tier (match 0.15.1, 2026-09-25)
+
+The clothing rule's best cross is charitable on purpose: one agreeing pair
+of reads out of hundreds keeps a pair asked. That is right for an identity
+seen a few times and too kind to the well seen, where the best of hundreds
+of cross pairs finds a lucky one. On run e5bae3 (the Sharon 10-minute clip)
+the operator's queue held a white shirt against a blue one (best cross
+0.374, 29 and 31 reads) and a black kurta against a light check (0.496, 17
+and 37).
+
+- `POST /review/duplicates`: when BOTH identities have at least
+  **`HECO_REVIEW_CLOTHES_WELL_SEEN_N`** (8; 0 = the tier off) v3 torso
+  reads — the same two-second span and `HECO_REVIEW_CLOTHES_SELF_MIN`
+  self-agreement bars — the clash is **`HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH`**
+  (0.55) instead of `HECO_REVIEW_CLOTHES_CLASH`. `HECO_REVIEW_CLOTHES_CLASH=0`
+  still turns clothing off, tier and all. The reason is `clothes`, as
+  before; the light guard holds it back like any colour reason. `/health`
+  gains `reviewClothesWellSeenN`, `reviewClothesWellSeenClash`. No wire
+  shape changes.
+- Measured on e5bae3 (49 identities, 1,880 body-log torsos): 27 identities
+  with 16+ reads scored their early half against their late half at a best
+  cross of 0.887 and up (median 0.97); f0bfc5's nine same-person splits
+  read 0.77–0.97. The first three reads against the last three went as low
+  as 0.506 — why the tier waits for eight. 0.55 sets aside the two pairs
+  above; a cream shirt against a light stripe (0.736: colour cannot see a
+  stripe) is still asked. Replayed offline on f0bfc5, c84098, 8b8b87 and
+  b5367d: no pair moved (their identities carry fewer reads).
 
