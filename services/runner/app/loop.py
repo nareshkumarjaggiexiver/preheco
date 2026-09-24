@@ -61,6 +61,7 @@ import contextlib
 import json
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from urllib.parse import urlsplit
@@ -681,6 +682,30 @@ def _clean_attributes(a) -> dict | None:
     return {"gender": gender, "genderP": p, "age": max(0.0, age)}
 
 
+@dataclass
+class _Detections:
+    """One frame's detector replies, fetched OFF the loop thread.
+
+    Filled by :meth:`RunLoop._detect` on the detect worker (lever L3) and
+    handed to :meth:`RunLoop._pipeline_step`, which accounts every field on
+    the loop thread in frame order — the board, the ledger's wall times, the
+    counters.  A call that FAILED carries its exception instead of a reply,
+    so the loop can raise it at the exact point the inline call would have.
+
+    ``face_decided`` says the worker settled this frame's face search: the
+    whole frame needs no tracks, so it was searched here.  False leaves the
+    search to the loop thread, after the tracker, as it always ran.
+    """
+
+    persons: dict | None = None
+    persons_ms: float = 0.0
+    persons_error: BaseException | None = None
+    face_decided: bool = False
+    faces: dict | None = None
+    faces_ms: float = 0.0
+    faces_error: BaseException | None = None
+
+
 class RunLoop:
     """Owns one run: the pipeline loop, its stats, and its lifecycle."""
 
@@ -728,6 +753,15 @@ class RunLoop:
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
+        # Set once the frame loop is over, however it ended, so a fetch still
+        # in flight on another thread (the detect worker's, the prefetcher's)
+        # gives up at once instead of polling a closed source for up to
+        # source_stall_s.  Never set while frames are being counted.
+        self._halt = threading.Event()
+        # The frame source of the current run (see _frames) — kept so every
+        # exit path, failures included, can drain its worker BEFORE any
+        # per-run state downstream is released.
+        self._frames_in = None
         # The single-slot frame prefetcher (see _next_frame_prefetched).
         self._prefetch: concurrent.futures.Future | None = None
         self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(
@@ -1147,7 +1181,10 @@ class RunLoop:
         """
         deadline = time.monotonic() + self.s.source_stall_s
         wait_start: float | None = None  # first moment the source made us wait
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        while (
+            not self._stop.is_set() and not self._halt.is_set()
+            and time.monotonic() < deadline
+        ):
             r = self.client.get(f"{self.s.ingest_url}/frame")
             if r.status_code in (204, 404, 410):
                 self._end_reason = "source-ended"  # stub-style explicit end
@@ -1173,6 +1210,10 @@ class RunLoop:
             if wait_start is None:
                 wait_start = time.monotonic()
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
+        if self._halt.is_set() and not self._stop.is_set():
+            # The run is being torn down around this fetch: nothing ended or
+            # stalled, and why the run settles is not this poll's to say.
+            return None
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
 
@@ -1280,6 +1321,154 @@ class RunLoop:
             self._prefetch = self._prefetch_pool.submit(self._next_frame)
         return frame
 
+    # ------------------------------------------------ the frame source (L3)
+
+    def _frames(self):
+        """This run's frame source: ``(frame, detections-or-None)`` pairs.
+
+        Serial unless HECO_PIPELINE_OVERLAP, and serial is the loop exactly
+        as it has always run.  Kept on ``self`` so every exit path — the
+        failure path in :meth:`run` included — can drain it before anything
+        downstream is released (:meth:`_drain_frames`).
+        """
+        self._frames_in = (
+            self._frames_overlapped() if self.s.pipeline_overlap else self._frames_serial()
+        )
+        return self._frames_in
+
+    def _frames_serial(self):
+        """One frame at a time, its detection inline — today's loop, unchanged."""
+        while not self._stop.is_set():
+            frame = self._next_frame_prefetched()
+            if frame is None:
+                return
+            yield frame, None
+
+    def _frames_overlapped(self):
+        """Frames with their detections already done, ONE frame ahead (L3).
+
+        While the loop thread decides frame k — track, gate, embed, match,
+        the verdict pass, the ledger, the taps — ONE worker thread fetches
+        frame k+1 and runs its detection.  The next job is submitted the
+        moment frame k is handed over and never earlier, so the worker is at
+        most one frame ahead, and everything stateful stays on the loop
+        thread in frame order: the worker only POSTs to stateless detectors
+        and clocks them (:meth:`_detect`).
+
+        ``detectWaitMs`` (count board) is how long the loop stood waiting on
+        the worker: near zero means the decide half is the bottleneck, large
+        means detection is — the split the overlap exists to exploit.
+
+        Draining is this generator's ``finally``: ``_halt`` tells any fetch
+        in flight to give up at once, and the worker is joined before the
+        caller settles anything, so no stage call outlives the run.
+        """
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="frame-detect"
+        )
+        try:
+            pending = pool.submit(self._fetch_and_detect)
+            while not self._stop.is_set():
+                t = time.perf_counter()
+                item = pending.result()  # a FETCH failure raises here, as it always did
+                self.board.observe("count", "detectWaitMs", (time.perf_counter() - t) * 1000.0)
+                if item is None:
+                    return
+                # Frame k+1's fetch and detection start NOW, before frame k is
+                # decided: that is the whole overlap.
+                pending = pool.submit(self._fetch_and_detect)
+                yield item
+        finally:
+            self._halt.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _fetch_and_detect(self) -> tuple[dict, "_Detections"] | None:
+        """The detect worker's job: the next frame, then its detections.
+
+        Owns the frame fetch in overlap mode (the prefetcher, when on, is
+        driven from here and only from here), and clocks a non-prefetched
+        fetch straight onto the board rather than through ``_timed``, whose
+        per-frame bookkeeping belongs to the loop thread.
+        """
+        if self.s.frame_prefetch:
+            frame = self._next_frame_prefetched()
+        else:
+            t = time.perf_counter()
+            frame = self._next_frame()
+            self.board.observe("ingest", "ingestMs", (time.perf_counter() - t) * 1000.0)
+        if frame is None or self._stop.is_set() or self._halt.is_set():
+            return None
+        return frame, self._detect(frame)
+
+    def _detect(self, frame: dict) -> _Detections:
+        """This frame's detector calls, OFF the loop thread.
+
+        Persons always; the face search too when it needs no tracks — the
+        whole frame.  A crop search is built from THIS frame's tracks, and
+        the tracker is stateful, so it waits for the loop thread exactly as
+        before.  Touches no loop state: it POSTs, clocks, and hands back
+        replies (or the exception a call raised) for :meth:`_pipeline_step`
+        to account in frame order.
+        """
+        image_b64 = frame["imageB64"]
+        det = _Detections()
+        try:
+            det.persons, det.persons_ms = _clocked(partial(self._post_persons, image_b64))
+        except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+            det.persons_error = e
+            return det
+        if self.s.faces_whole_frame:
+            det.face_decided = True
+            try:
+                det.faces, det.faces_ms = _clocked(partial(self._post_faces, image_b64, None))
+            except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+                det.faces_error = e
+        return det
+
+    def _drain_frames(self) -> None:
+        """Close the frame source — and join its detect worker — at most once."""
+        frames_in, self._frames_in = self._frames_in, None
+        if frames_in is not None:
+            frames_in.close()
+
+    def _post_persons(self, image_b64: str) -> dict:
+        """POST one frame to persons /detect (inline or from the detect worker)."""
+        return self._post(f"{self.s.persons_url}/detect", {"imageB64": image_b64})
+
+    def _post_faces(self, image_b64: str, within: list | None) -> dict:
+        """POST one frame to faces /detect; ``within`` None searches it whole."""
+        return self._post(
+            f"{self.s.faces_url}/detect", {"imageB64": image_b64, "within": within}
+        )
+
+    def _take_detected(
+        self, reply: dict | None, ms: float, error: BaseException | None,
+        stage: str, metric: str,
+    ) -> dict:
+        """Account a detector call the worker made, as if it ran here.
+
+        Raises the call's failure first — at the point the inline call would
+        have raised it, so a failed frame settles the run exactly as before.
+        Otherwise the same bookkeeping ``_timed`` does: ``_last_ms``, the
+        board, and this frame's ledger wall time.
+        """
+        if error is not None:
+            raise error
+        self._account(stage, metric, ms)
+        return reply or {}
+
+    def _levers_config(self) -> dict:
+        """The throughput levers this run ran with, for its permanent config.
+
+        Only levers that are ON appear, so a run with every lever off stamps
+        exactly the config it always has (pinned).  Absent therefore means
+        off — or a runner from before the levers, which is the same thing.
+        """
+        levers: dict = {}
+        if self.s.pipeline_overlap:
+            levers["pipelineOverlap"] = True
+        return {"levers": levers} if levers else {}
+
     def _open_source(self) -> None:
         """Claim ingest's exclusive capture slot for this run.
 
@@ -1341,6 +1530,8 @@ class RunLoop:
         except Exception as e:  # noqa: BLE001 — a run must always settle
             self.log.error(f"run failed: {type(e).__name__}: {e}")
             self._set(state="failed", error=f"{type(e).__name__}: {e}")
+            # The detect worker first: no stage call may outlive the release.
+            self._drain_frames()
             self._release_run_state()
             if self.planner.run_id is not None:
                 # Best effort: the planner may be down too; local status
@@ -1354,7 +1545,8 @@ class RunLoop:
             # The safety net for every path that did not reach the orderly
             # stop in _run: a failed run must not leave the reporter alive
             # uploading pictures of a run the operator has been told is over.
-            # Idempotent — both clear their handles as they go.
+            # Idempotent — all three clear their handles as they go.
+            self._drain_frames()
             self._stop_reporter()
             self._close_golden()
         return self.status()
@@ -1427,6 +1619,9 @@ class RunLoop:
                         {"modelProfile": req["modelProfile"]}
                         if req.get("modelProfile") else {}
                     ),
+                    # Which throughput levers produced the number — only the
+                    # ones that are ON, so an all-off run stamps what it always did.
+                    **self._levers_config(),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
                 },
             )
@@ -1482,10 +1677,10 @@ class RunLoop:
             self.reporter.begin(t0)
             self.reporter.start()
 
-        while not self._stop.is_set():
-            frame = self._next_frame_prefetched()
-            if frame is None:
-                break
+        # Frames, and — under HECO_PIPELINE_OVERLAP — their detections, done
+        # one frame ahead on the detect worker (see _frames_overlapped).
+        # Serial yields (frame, None) and is the loop exactly as it ran.
+        for frame, det in self._frames():
             self.board.frame("ingest")
             frames += 1
             t_ms = int(frame.get("tMs", (time.monotonic() - t0) * 1000.0))
@@ -1504,7 +1699,7 @@ class RunLoop:
             loop_t = time.perf_counter()
             self._timed(
                 "count", "stepMs",
-                partial(self._pipeline_step, planner_run_id, frame, t_ms),
+                partial(self._pipeline_step, planner_run_id, frame, t_ms, det),
             )
             self._set(frames=frames)
 
@@ -1541,8 +1736,11 @@ class RunLoop:
             # cost still unaccounted for rather than leaving it invisible.
             self.board.observe("count", "loopMs", (time.perf_counter() - loop_t) * 1000.0)
 
-        # Stop the reporter FIRST, so its final rounds and any owed mint
-        # keyframes land while the run is still open — and so the flush below
+        # The frame source first of all: its detect worker (if any) is joined
+        # here, so nothing below races a stage call still in flight.
+        self._drain_frames()
+        # Then the reporter, BEFORE the flush, so its final rounds and any owed
+        # mint keyframes land while the run is still open — and so the flush below
         # is genuinely the last word on this run's stats rather than racing a
         # thread that is still posting them.
         self._stop_reporter()
@@ -1742,8 +1940,17 @@ class RunLoop:
         with contextlib.suppress(Exception):
             self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
 
-    def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
-        """Run stages 2..8 for one frame, timing and measuring each."""
+    def _pipeline_step(
+        self, planner_run_id: str, frame: dict, t_ms: int, det: _Detections | None = None
+    ) -> None:
+        """Run stages 2..8 for one frame, timing and measuring each.
+
+        ``det`` holds this frame's detector replies when the detect worker
+        (HECO_PIPELINE_OVERLAP) already made those calls; None makes them
+        here, inline, exactly as always.  Either way everything they feed —
+        the board, the ledger's wall times, every counter and decision — is
+        booked HERE, on the loop thread, in frame order.
+        """
         # THIS frame's embeddings start EMPTY: a zero-kept frame never reaches
         # the embed stage, and without this reset the previous frame's vectors
         # would ride into its golden record (review finding, 2026-08-14).
@@ -1762,11 +1969,15 @@ class RunLoop:
         site_id = self.request.get("siteId")
 
         # person-detect
-        persons = self._timed(
-            "person-detect",
-            "personDetectMs",
-            lambda: self._post(f"{s.persons_url}/detect", {"imageB64": image_b64}),
-        )
+        if det is None:
+            persons = self._timed(
+                "person-detect", "personDetectMs", partial(self._post_persons, image_b64)
+            )
+        else:
+            persons = self._take_detected(
+                det.persons, det.persons_ms, det.persons_error,
+                "person-detect", "personDetectMs",
+            )
         board.frame("person-detect")
         boxes = persons.get("boxes", [])
         for b in boxes:
@@ -1794,49 +2005,7 @@ class RunLoop:
         board.observe("track", "tracksActive", float(len(tracks)))
         self._note_tracks(tracks)
 
-        # Face-detect region = every RAW person box this frame, deduped against
-        # the track boxes.
-        #
-        # The bug this replaced (finding D1): `[t["box"] for t in tracks] or
-        # boxes` searched ONLY confirmed-track boxes once any track existed.
-        # The tracker reports a track only after min_hits frames (sort.py
-        # SortLite.step), so a guest who has just walked in is a detection with
-        # no reported track — their face was never searched, and because the
-        # count is match.isNew, a face never searched is a guest never counted.
-        #
-        # Raw boxes are therefore the recall-bearing half and go FIRST. The
-        # track half is redundant while the tracker reports only misses == 0
-        # tracks, whose boxes are snapped to the matched detection
-        # (TrackState.update) and so duplicate a raw box. It is kept because
-        # that invariant is the tracker's to change: if coasting tracks are
-        # ever reported, their predicted boxes cover people the detector missed
-        # this frame, which is real recall. Boxes-first ordering means a fresh
-        # detection always wins the dedupe over a stale prediction.
-        within = dedupe_boxes(
-            list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
-        )
-        # RE-VERIFY GATE: skip the crops belonging to tracks that have already
-        # resolved to an identity and were verified recently.  Off by default.
-        # Everyone still unidentified — everyone who can change the count — is
-        # searched every frame regardless, so this only ever removes work that
-        # re-confirms a settled answer.
-        #
-        # None = look at the whole frame once, and there the re-verify saving
-        # is not consulted at all: it is a crop-path idea, there are no crops
-        # to skip, and the one inference costs the same whoever is identified.
-        # It used to run anyway and count every settled track's crop in
-        # faceSearchesSkipped while the whole frame was searched regardless —
-        # a saving the status claimed and the GPU never saw, in exactly the
-        # configuration (whole frame, interval armed) a live 4K profile runs.
-        within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
-        faces_out = self._timed(
-            "face-detect",
-            "faceDetectMs",
-            lambda: self._post(
-                f"{s.faces_url}/detect", {"imageB64": image_b64, "within": within}
-            ),
-        )
-        board.frame("face-detect")
+        faces_out = self._search_faces(image_b64, trackable, tracks, det)
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
@@ -2223,6 +2392,65 @@ class RunLoop:
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
+
+    def _search_faces(
+        self, image_b64: str, trackable: list, tracks: list, det: _Detections | None
+    ) -> dict:
+        """This frame's face search, booked on the face-detect stage.
+
+        Searched by the detect worker already when the search needed no
+        tracks (``det.face_decided``: the whole frame) — then only its reply
+        and wall time are booked here, in frame order.  Otherwise searched
+        here, after the tracker, from this frame's person and track boxes, as
+        it always has been.
+        """
+        s = self.s
+        if det is not None and det.face_decided:
+            reply = self._take_detected(
+                det.faces, det.faces_ms, det.faces_error, "face-detect", "faceDetectMs"
+            )
+            self.board.frame("face-detect")
+            return reply
+        # Face-detect region = every RAW person box this frame, deduped against
+        # the track boxes.
+        #
+        # The bug this replaced (finding D1): `[t["box"] for t in tracks] or
+        # boxes` searched ONLY confirmed-track boxes once any track existed.
+        # The tracker reports a track only after min_hits frames (sort.py
+        # SortLite.step), so a guest who has just walked in is a detection with
+        # no reported track — their face was never searched, and because the
+        # count is match.isNew, a face never searched is a guest never counted.
+        #
+        # Raw boxes are therefore the recall-bearing half and go FIRST. The
+        # track half is redundant while the tracker reports only misses == 0
+        # tracks, whose boxes are snapped to the matched detection
+        # (TrackState.update) and so duplicate a raw box. It is kept because
+        # that invariant is the tracker's to change: if coasting tracks are
+        # ever reported, their predicted boxes cover people the detector missed
+        # this frame, which is real recall. Boxes-first ordering means a fresh
+        # detection always wins the dedupe over a stale prediction.
+        within = dedupe_boxes(
+            list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
+        )
+        # RE-VERIFY GATE: skip the crops belonging to tracks that have already
+        # resolved to an identity and were verified recently.  Off by default.
+        # Everyone still unidentified — everyone who can change the count — is
+        # searched every frame regardless, so this only ever removes work that
+        # re-confirms a settled answer.
+        #
+        # None = look at the whole frame once, and there the re-verify saving
+        # is not consulted at all: it is a crop-path idea, there are no crops
+        # to skip, and the one inference costs the same whoever is identified.
+        # It used to run anyway and count every settled track's crop in
+        # faceSearchesSkipped while the whole frame was searched regardless —
+        # a saving the status claimed and the GPU never saw, in exactly the
+        # configuration (whole frame, interval armed) a live 4K profile runs.
+        within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
+        reply = self._timed(
+            "face-detect", "faceDetectMs", partial(self._post_faces, image_b64, within)
+        )
+        self.board.frame("face-detect")
+        return reply
 
     #: How many co-presence pairs one run remembers having asserted.  A pair
     #: costs one short string, so this is kilobytes, not megabytes — the cap
@@ -4542,12 +4770,22 @@ class RunLoop:
         """
         t = time.perf_counter()
         out = fn()
-        self._last_ms = (time.perf_counter() - t) * 1000.0
-        self.board.observe(stage, metric, self._last_ms)
-        ms = getattr(self, "_frame_ms", None)
-        if ms is not None:
-            ms[stage] = ms.get(stage, 0.0) + self._last_ms
+        self._account(stage, metric, (time.perf_counter() - t) * 1000.0)
         return out
+
+    def _account(self, stage: str, metric: str, ms: float) -> None:
+        """Book one stage call's wall time: board, ledger, ``_last_ms``.
+
+        Loop thread only — ``_frame_ms`` is the frame being decided, and a
+        call timed on the detect worker belongs to a LATER frame, which is
+        why the worker clocks its calls and :meth:`_take_detected` books
+        them here when that frame's turn comes.
+        """
+        self._last_ms = ms
+        self.board.observe(stage, metric, ms)
+        frame_ms = getattr(self, "_frame_ms", None)
+        if frame_ms is not None:
+            frame_ms[stage] = frame_ms.get(stage, 0.0) + ms
 
     def _event(self, text: str) -> None:
         """Note a count-changing decision against the CURRENT frame.
@@ -4622,6 +4860,13 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+
+
+def _clocked(fn) -> tuple:
+    """``(fn(), wall ms)`` — a timing that touches no shared state."""
+    t = time.perf_counter()
+    out = fn()
+    return out, (time.perf_counter() - t) * 1000.0
 
 
 def _count(v) -> bool:
