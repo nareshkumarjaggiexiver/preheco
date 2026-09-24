@@ -92,6 +92,12 @@ def write_frame(img: np.ndarray, seq: int, directory: Path | None = None) -> str
     rebuild the array — no sidecar, no second source of truth to disagree
     with the bytes.
 
+    ``seq`` names the file and orders the sweep, which retires everything
+    more than ``keep`` NUMBERS behind it — so the caller should number its
+    WRITES (ingest does), not its capture seqs: a motion gate or a slow
+    consumer puts capture seqs more than ``keep`` apart between two frames
+    that are both still in flight.
+
     Written to a dot-prefixed temp name and RENAMED into place: rename is
     atomic within a filesystem, so a consumer can never observe a partially
     written frame. The sweep then retires everything older than `keep`.
@@ -146,6 +152,31 @@ def read_frame(ref: str, directory: Path | None = None) -> np.ndarray | None:
     if len(raw) != w * h * 3:
         return None  # truncated or mid-write; the JPEG is still good
     return np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy()
+
+
+def clear(directory: Path | None = None) -> int:
+    """Unlink every frame this module wrote to the shared dir; how many went.
+
+    For the producer at a run boundary: nothing of the previous run is still
+    wanted, and a reader that already opened a frame keeps it (see _sweep).
+    Only names this module writes are touched — never anything else there.
+    """
+    directory = directory or frames_dir()
+    if directory is None:
+        return 0
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return 0
+    gone = 0
+    for entry in entries:
+        name = entry[1:-5] if entry.startswith(".") and entry.endswith(".part") else entry
+        if _NAME.match(name) is None:
+            continue
+        with contextlib.suppress(OSError):
+            (directory / entry).unlink()
+            gone += 1
+    return gone
 
 
 def _sweep(directory: Path, newest_seq: int, keep: int) -> None:

@@ -15,7 +15,12 @@
 # makes every write fail and every frame fall back to JPEG, which is the slow
 # path plus the cost of trying. 1 GB is ~40 frames of headroom. tmpfs counts
 # against the box's RAM, not its disk, and only pages actually written are
-# resident.
+# resident. The ingest levers do not change this: with a live buffer
+# (INGEST_BUFFER_S) or the motion gate a frame is written when it is TAKEN,
+# so the backlog lives in ingest's own memory (INGEST_BUFFER_MB) and tmpfs
+# holds the last KEEP frames handed out, numbered by write so a gate's seq
+# gaps cannot retire a frame still in flight; a run's frames are cleared
+# when its source is closed.
 #
 # THIS DOES NOT CHANGE THE CONTRACT. imageB64 still travels on every request
 # and every consumer still decodes it when the ref does not resolve — an
