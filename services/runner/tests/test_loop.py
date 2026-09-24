@@ -12,6 +12,8 @@ and end the run (there is no explicit EOF flag on the real service).
 """
 
 import json
+import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1308,3 +1310,63 @@ def test_a_failed_rollback_on_the_unreachable_path_reports_the_mixed_state():
     assert out["ok"] is False
     assert "mixed" in out["error"]
     assert "re-probe /health" in out["error"]
+
+
+def test_ref_only_stays_off_unless_configured():
+    """The default deployment must be byte-for-byte the old pipeline."""
+    from app import config as cfg
+    assert cfg.Settings().frames_ref_only is False
+
+
+def test_ref_only_needs_proof_not_just_configuration(monkeypatch):
+    """Configuration is a REQUEST; the probe is evidence.
+
+    With ref-only on, a stage that cannot resolve the ref is sent no pixels at
+    all — so believing the setting would mean a run that counts nobody while
+    every container reports healthy. The probe turns that into one log line
+    and a run that simply keeps its JPEGs.
+    """
+    from app import loop as loop_mod
+
+    class _Resp:
+        content = b"{}"
+        def json(self): return {"frameRef": "f1_8x8.bgr"}
+
+    class _Client:
+        def get(self, url, **kw): return _Resp()
+
+    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
+    loop.client = _Client()
+    loop.log = logging.getLogger("test")
+    loop.s = SimpleNamespace(
+        frames_ref_only=True, ingest_url="http://i", persons_url="http://p",
+        faces_url="http://f", embed_url="http://e",
+    )
+    # every stage accepts the ref -> ref-only is used
+    loop._post = lambda url, payload: {}
+    assert loop._negotiate_ref_only() is True
+
+    # ONE stage cannot read it -> the whole run keeps its JPEGs
+    def _refuse(url, payload):
+        if "://f" in url:
+            raise RuntimeError("no HECO_FRAMES_DIR mounted")
+        return {}
+    loop._post = _refuse
+    assert loop._negotiate_ref_only() is False
+
+
+def test_ref_only_declines_when_ingest_offers_no_ref(monkeypatch):
+    """No shared mount on the producer side is not an error — it is the old
+    pipeline, which is always a valid answer."""
+    from app import loop as loop_mod
+
+    class _Resp:
+        content = b"{}"
+        def json(self): return {"seq": 1}          # no frameRef
+
+    loop = loop_mod.RunLoop.__new__(loop_mod.RunLoop)
+    loop.client = SimpleNamespace(get=lambda url, **kw: _Resp())
+    loop.log = logging.getLogger("test")
+    loop.s = SimpleNamespace(frames_ref_only=True, ingest_url="http://i")
+    loop._post = lambda url, payload: {}
+    assert loop._negotiate_ref_only() is False

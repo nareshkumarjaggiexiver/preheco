@@ -614,6 +614,9 @@ class RunLoop:
             max_workers=1, thread_name_prefix="frame-prefetch"
         )
         self._lock = threading.Lock()
+        # Ref-only frames stay OFF until proven (see _negotiate_ref_only).
+        # Configuration is a request; a probe is evidence.
+        self._ref_only = False
         self._last_seq: int | None = None
         self._last_ms: float = 0.0
         # personKey -> how many templates that identity last reported holding.
@@ -989,7 +992,10 @@ class RunLoop:
         deadline = time.monotonic() + self.s.source_stall_s
         wait_start: float | None = None  # first moment the source made us wait
         while not self._stop.is_set() and time.monotonic() < deadline:
-            r = self.client.get(f"{self.s.ingest_url}/frame")
+            url = f"{self.s.ingest_url}/frame"
+            if self._ref_only:
+                url += "?jpeg=0"
+            r = self.client.get(url)
             if r.status_code in (204, 404, 410):
                 self._end_reason = "source-ended"  # stub-style explicit end
                 return None
@@ -1014,6 +1020,50 @@ class RunLoop:
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
+
+    def _negotiate_ref_only(self) -> bool:
+        """Prove every consuming stage can read a shared frame, or do not use one.
+
+        Asked once per run, before the first counted frame. The setting says
+        the operator BELIEVES the mounts are right; this establishes it, on
+        the same frame the stages would really be sent.
+
+        Why it is worth a probe rather than a try/except in the loop: with
+        ref-only on, a stage that cannot resolve the ref is sent no pixels at
+        all. Discovering that per-frame would be a run that counts nobody
+        while every container reports healthy — the exact silent-failure shape
+        this project keeps finding. One probe turns it into a line in the log
+        and a run that simply keeps its JPEGs.
+        """
+        if not self.s.frames_ref_only:
+            return False
+        try:
+            r = self.client.get(f"{self.s.ingest_url}/frame")
+            frame = r.json() if r.content else {}
+        except Exception:
+            return False
+        ref = (frame or {}).get("frameRef")
+        if not ref:
+            self.log.info("ref-only: ingest offered no frameRef — keeping JPEG frames")
+            return False
+        probes = (
+            (f"{self.s.persons_url}/detect", {"imageB64": "", "frameRef": ref}),
+            (f"{self.s.faces_url}/detect", {"imageB64": "", "frameRef": ref, "within": None}),
+            (f"{self.s.embed_url}/embed", {"imageB64": "", "frameRef": ref, "faces": []}),
+        )
+        for url, payload in probes:
+            try:
+                self._post(url, payload)
+            except Exception as exc:
+                self.log.info(
+                    "ref-only: %s cannot read %s (%s) — keeping JPEG frames for this run",
+                    url, ref, str(exc)[:120],
+                )
+                return False
+        self.log.info(
+            "ref-only: every stage read %s — dropping the JPEG encode for this run", ref
+        )
+        return True
 
     def _next_frame_prefetched(self) -> dict | None:
         """_next_frame, overlapped: hand back the frame fetched DURING the
@@ -1217,6 +1267,9 @@ class RunLoop:
         self._maybe_purge_staff()  # before the first frame is matched
         self._post(f"{self.s.tracker_url}/reset", {"runId": planner_run_id})
         self._open_source()
+        # AFTER the source is open (there is no frame to probe with before
+        # that) and BEFORE the first counted frame.
+        self._ref_only = self._negotiate_ref_only()
 
         t0 = time.monotonic()
         last_flush = t0

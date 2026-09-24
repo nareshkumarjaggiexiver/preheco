@@ -96,6 +96,18 @@ class Settings:
     # Turn it on WITH FACES_SCRFD_INPUT set large and frame-shaped, or it is
     # strictly worse than the crops: at the default 640 square, whole-frame on
     # a 4K source finds almost nothing.
+    # REF-ONLY FRAMES. Off by default. On, the runner asks ingest to skip the
+    # JPEG encode entirely (`/frame?jpeg=0`) and sends only the shared-memory
+    # ref to each stage — removing the 13.9 ms encode and the ~15 ms of
+    # base64+JSON for a 2.1 MB payload, on top of the three decodes the ref
+    # already saved.
+    #
+    # It REQUIRES that ingest and all three consuming stages mount the same
+    # HECO_FRAMES_DIR. That is why it is opt-in and why the runner PROVES it
+    # before using it (see RunLoop._negotiate_ref_only): a stage that cannot
+    # read refs and is sent no JPEG has no pixels at all, and the honest place
+    # to discover that is one probe at run start, not silently for an hour.
+    frames_ref_only: bool = False
     faces_whole_frame: bool = False
     quality_min_conf: float = 0.0
     quality_min_ied_px: float = 0.0
@@ -454,6 +466,7 @@ def from_env() -> Settings:
         token_cache_path=os.environ.get("HECO_TOKEN_CACHE", s.token_cache_path),
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),
+        frames_ref_only=env_bool("HECO_FRAMES_REF_ONLY", s.frames_ref_only),
         faces_whole_frame=env_bool("HECO_FACES_WHOLE_FRAME", s.faces_whole_frame),
         quality_min_conf=env_float("HECO_QUALITY_MIN_CONF", s.quality_min_conf),
         quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),

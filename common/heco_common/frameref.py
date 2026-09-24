@@ -44,6 +44,7 @@ correctness dependency.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from pathlib import Path
@@ -109,10 +110,8 @@ def write_frame(img: np.ndarray, seq: int, directory: Path | None = None) -> str
             fh.write(np.ascontiguousarray(img).data)
         os.replace(tmp, final)
     except OSError:
-        try:
+        with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return None
     _sweep(directory, seq, _keep())
     return name
@@ -162,7 +161,5 @@ def _sweep(directory: Path, newest_seq: int, keep: int) -> None:
         if match is None:
             continue
         if int(match.group(1)) <= cutoff:
-            try:
+            with contextlib.suppress(OSError):
                 (directory / entry).unlink()
-            except OSError:
-                pass

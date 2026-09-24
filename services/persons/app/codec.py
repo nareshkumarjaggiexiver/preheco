@@ -30,7 +30,7 @@ def b64_to_bgr(image_b64: str) -> np.ndarray:
 
 
 def frame_from(image_b64: str | None, frame_ref: str | None = None) -> np.ndarray:
-    """A frame from the shared transport if it is there, else from base64.
+    """Take a frame from the shared transport if it is there, else from base64.
 
     The ref is an OPTIMISATION and never a dependency: no mount, a retired
     frame, a producer one version behind — each falls through to the JPEG the
@@ -42,5 +42,13 @@ def frame_from(image_b64: str | None, frame_ref: str | None = None) -> np.ndarra
         if img is not None:
             return img
     if not image_b64:
-        raise ValueError("neither frameRef nor imageB64 yielded a frame")
+        # The caller declined the JPEG and the ref did not resolve. Naming
+        # both halves matters: "no mount" and "frame already retired" are
+        # different deployment mistakes and send an operator to different
+        # places.
+        raise ValueError(
+            f"frameRef {frame_ref!r} could not be read and no imageB64 was sent — "
+            "either this service has no HECO_FRAMES_DIR mounted, or the frame "
+            "was retired before it was fetched (raise HECO_FRAMES_KEEP)"
+        )
     return b64_to_bgr(image_b64)
