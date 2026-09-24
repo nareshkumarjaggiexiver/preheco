@@ -94,3 +94,50 @@ is a one-way door for the deployment shape and should be a deliberate choice.
 3. Decide the deployment shape question above.
 4. Then consider merging — the JPEG-alongside mode (1.32x) is the part that
    is already measured honestly and could land on its own.
+
+## The throughput levers on refs (merge of main, 2026-09-25)
+
+Main brought the levers of 2026-09-24 (docs/LEVERS-2026-09-25.md). Each one
+now moves the shared frame exactly as it moves the JPEG:
+
+- **Ingest (L1 gate, live buffer; L6 hardware decode).** With a lever armed
+  a frame is written to tmpfs when it is TAKEN, not when it is decoded, so a
+  live buffer's backlog stays in ingest's own memory (`INGEST_BUFFER_MB`)
+  and a frame the gate skipped or the buffer dropped never touches tmpfs.
+  Each frame is written once however often it is polled, keyed by (worker
+  generation, seq) — seq restarts at 1 on every /open, and the first cut's
+  seq-only key could hand a new run the previous run's frame. `jpeg=0` is
+  honoured in lever mode too.
+- **Refs are numbered by WRITE, not capture seq.** frameref retires frames
+  more than `HECO_FRAMES_KEEP` numbers behind the newest. Numbered by
+  capture seq, a still room under the gate (one keepalive per second, 15
+  seqs apart at 15 fps) — or any camera outrunning a slow consumer by more
+  than the keep — retired the frame the runner was still embedding: a JPEG
+  decode with the JPEG alongside, a 400 under ref-only. Numbered by write,
+  the keep means "the last N frames handed out". tmpfs is bounded at KEEP
+  frames (+1 in flight), and a run's frames are cleared when its source is
+  closed or replaced (`frameref.clear`), instead of lingering until another
+  run's writes happened to retire them.
+- **Runner (L3 overlap, parallel detect, L4 cadence, L7 region).** Every
+  persons and faces POST is built in two helpers (`_post_persons`,
+  `_post_faces`) that carry the ref beside the JPEG — the loop, the detect
+  worker, the parallel pair, the crops, the whole frame and the operator's
+  region alike; embed and enrolment use the same `_pixels(frame)`. A frame
+  with no ref sends exactly main's body (the pinned call sequence passes).
+- **The ref-only probe no longer loses frames.** It asks ONCE a frame
+  exists (the first cut polled twenty times when ingest offered no ref,
+  dequeuing twenty frames from a live buffer, or moving a lockstep reader
+  twenty frames on, that the run never counted), and its frame is handed to
+  the loop as the run's first frame.
+- **The runner reads refs too.** Its torso, head and beard descriptors (the
+  appearance veto, the heal veto, the review queue's clothing/turban/beard
+  evidence), the white balance behind them and the face cards are cut from
+  the decoded frame, and a ref-only frame had no JPEG to decode: every one
+  of them went unmeasured, silently. docker-compose.shm.yml now mounts the
+  frames read-only on the runner, the runner reads the ref when no JPEG
+  came, and the ref-only probe requires the runner to read it as well or
+  keeps the JPEGs.
+
+Still true under ref-only, and not addressed here: the console's live taps
+and a forensic run's frame uploads are cut from the JPEG, so they carry no
+picture. Run forensic benches with the JPEG alongside.
