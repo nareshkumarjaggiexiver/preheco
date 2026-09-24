@@ -55,7 +55,10 @@ change.
   settings and let gain make up the brightness. The box processed about
   99% of the frames the camera sent either way.
 - Start the run from the console on camera A. Use camera B only for a
-  second camera.
+  second camera. Leave the quality choice on **Box default**: the box now
+  drops half faces itself (landmarks, frontality 0.55, eye span 0.30), which
+  removed profiles, backs of heads and pillar-hidden faces on the Sharon
+  test clip and kept every frontal guest.
 - Watch: processed fps against the camera's fps, dropped frames, and on the
   box `./scripts/demo-up.sh status` for TensorRT and the `nvdec` decoder.
 - The run's processing fps reads `avg · min · max`. avg is over the whole
