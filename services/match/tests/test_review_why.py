@@ -491,7 +491,7 @@ def test_gender_exclusion_needs_both_sides_confident_and_a_null_never_excludes(c
     got = review(client)
     by = pairs_of(got)
     assert frozenset((kh, k_sure)) not in by, "both confident, different: set aside"
-    assert got["excluded"] == {"gender": 1, "age": 0, "stature": 0}
+    assert got["excluded"] == {"gender": 1, "age": 0, "stature": 0, "clothes": 0}
     assert got["considered"] == 6, "still examined — the count beyond the queue is not hidden"
 
     unsure = by[frozenset((kh, k_unsure))]["why"]
@@ -523,7 +523,7 @@ def test_a_lone_confident_read_on_either_side_still_asks(client, tmp_path):
     settle(tmp_path, "r", kh, hub(), "M", SURE_P, 41.0)
     ks = match(client, "r", spoke(1), attrs("F", 0.95, 43.0))["personKey"]
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0}
+    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
     (p,) = got["pairs"]
     assert {p["a"], p["b"]} == {kh, ks}
     lone = p["why"]["gender"]["pB"] if p["b"] == ks else p["why"]["gender"]["pA"]
@@ -540,7 +540,7 @@ def test_age_exclusion_is_child_against_adult_and_the_dead_zone_still_asks(clien
     by = pairs_of(got)
     assert frozenset((kh, k_child)) not in by
     assert frozenset((kh, k_teen)) in by
-    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0}
+    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}
 
 
 def test_stature_exclusion_sets_aside_a_child_sized_body_against_an_adult(client, ticking):
@@ -553,7 +553,8 @@ def test_stature_exclusion_sets_aside_a_child_sized_body_against_an_adult(client
         match(client, "r", spoke(1), body=standing_box(900.0 + 80.0 * i, 0.7))
 
     got = review(client)
-    assert got["pairs"] == [] and got["excluded"] == {"gender": 0, "age": 0, "stature": 1}
+    assert got["pairs"] == []
+    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 1, "clothes": 0}
 
     # Turn the signal off: the pair is back, and its `why` carries the ratios
     # AND the metres a human reads (ratio × the 1.75 m anchor).
@@ -590,7 +591,7 @@ def test_stature_is_null_under_min_n_and_null_never_excludes(client, ticking):
     hub_side, spoke_side = ("a", "b") if p["a"] == kh else ("b", "a")
     assert st[hub_side] == pytest.approx(1.0, abs=0.05)
     assert st[spoke_side] is None, "under HECO_REVIEW_STATURE_MIN_N: not measured"
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0}
+    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
 
 
 def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, tmp_path):
@@ -604,7 +605,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
     _write_v2_gallery(path, [("p00001", hub()), ("p00002", spoke(1)), ("p00003", spoke(2))])
 
     got = review(client, run="legacy")
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0}
+    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
     assert len(got["pairs"]) == 2, "both in-band pairs are still asked about"
     for p in got["pairs"]:
         assert p["why"] == {
@@ -613,6 +614,9 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             "stature": {
                 "a": None, "b": None, "adultM": pytest.approx(1.75), "aM": None, "bM": None,
             },
+            # v2 torsos are not clothing EVIDENCE (nA/nB count v3 reads), even
+            # though the 48-d pair still ranks by its own intersection below.
+            "clothes": {"selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0},
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
 
@@ -670,11 +674,11 @@ def test_every_exclusion_knob_at_zero_is_its_off_switch(client, monkeypatch, tmp
 
     monkeypatch.setenv("HECO_REVIEW_GENDER_MIN_P", "0")
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0}, "then age"
+    assert got["excluded"] == {"gender": 0, "age": 1, "stature": 0, "clothes": 0}, "then age"
 
     monkeypatch.setenv("HECO_REVIEW_AGE_CHILD_MAX", "0")
     got = review(client)
-    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0}
+    assert got["excluded"] == {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
     assert frozenset((kh, ks)) in pairs_of(got), "nothing left to set it aside"
 
 
@@ -783,3 +787,111 @@ def test_attribute_wire_shape_is_validated_at_the_boundary(client):
         "attributes": None, "featNorm": None, "body": None,
     })
     assert res.status_code == 200, "every side field is optional and null is not measured"
+
+
+# ------------------------------------------------- the clothing set-aside
+
+#: Two v3 torsos with no bin in common: intersection 0.  Real reads on the
+#: Sharon re-run scored 0.10-0.25 for the operator's different-people pairs
+#: and never under 0.52 for a person against themselves.
+def _torso(bins) -> list[float]:
+    """A v3 (64-float) descriptor with its mass spread evenly over ``bins``."""
+    v = np.zeros(64)
+    v[list(bins)] = 1.0
+    return [float(x) for x in v / v.sum()]
+
+
+RED, BLUE, GREEN = _torso(range(0, 3)), _torso(range(20, 23)), _torso(range(10, 13))
+
+
+def clothe(tmp_path, run, key, vec, torsos):
+    """Add one template per torso read to ``key`` (same face, so the pair's
+    band test does not move)."""
+    s = opened(tmp_path, run)
+    with s.transaction():
+        for t in torsos:
+            s.add(key, vec, quality=70.0, appearance=t)
+
+
+def _pair(client, tmp_path, a_torsos, b_torsos):
+    """Hub + one spoke in the review band, each wearing the given reads."""
+    kh = match(client, "r", hub())["personKey"]
+    ks = match(client, "r", spoke(1))["personKey"]
+    clothe(tmp_path, "r", kh, hub(), a_torsos)
+    clothe(tmp_path, "r", ks, spoke(1), b_torsos)
+    return kh, ks
+
+
+def test_a_clear_clothing_clash_sets_the_pair_aside_and_keeps_it_visible(client, tmp_path, ticking):
+    """Both sides: three reads, over three seconds, agreeing with themselves;
+    against each other: nothing.  Set aside — counted, listed with its reason,
+    written nowhere, and still mergeable."""
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE] * 3)
+    got = review(client)
+    assert got["excluded"]["clothes"] == 1
+    assert frozenset((kh, ks)) not in pairs_of(got)
+    [row] = got["setAside"]
+    assert (frozenset((row["a"], row["b"])), row["reasons"]) == (frozenset((kh, ks)), ["clothes"])
+    assert row["why"]["clothes"] == {"selfA": 1.0, "selfB": 1.0, "cross": 0.0, "nA": 3, "nB": 3}
+    s = opened(tmp_path, "r")
+    with s.reading():
+        assert s.cannot_link(kh, ks) is False, "set aside is not a recorded fact"
+    merged = client.post("/merge", json={"runId": "r", "keep": kh, "drop": ks}).json()
+    assert merged["merged"] is True
+
+
+def test_matching_clothes_still_ask(client, tmp_path, ticking):
+    """Same clothes on both: exactly the pair a human should look at."""
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [RED] * 3)
+    got = review(client)
+    assert got["excluded"]["clothes"] == 0
+    assert pairs_of(got)[frozenset((kh, ks))]["why"]["clothes"]["cross"] == pytest.approx(1.0)
+
+
+def test_too_few_reads_on_either_side_still_asks(client, tmp_path, ticking):
+    """Two reads is one opinion held twice, not a person's clothing."""
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE] * 2)
+    assert frozenset((kh, ks)) in pairs_of(review(client))
+
+
+def test_a_person_whose_own_reads_scatter_is_not_evidence(client, tmp_path, ticking):
+    """Blue, green, blue: median self-agreement 0 — lighting, a shawl, a
+    crowded torso.  Such a person's clothing cannot rule anyone out."""
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE, GREEN, BLUE])
+    got = review(client)
+    assert got["excluded"]["clothes"] == 0
+    assert pairs_of(got)[frozenset((kh, ks))]["why"]["clothes"]["selfB"] == pytest.approx(0.0)
+
+
+def test_reads_from_one_moment_are_one_read(client, tmp_path, monkeypatch):
+    """Three reads written in the same second agree trivially: still asks."""
+    monkeypatch.setattr(store, "_now", lambda: "2026-09-24T21:00:00+00:00")
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE] * 3)
+    assert frozenset((kh, ks)) in pairs_of(review(client))
+
+
+def test_v2_torsos_are_never_clothing_evidence(client, tmp_path, ticking):
+    """A 48-float read is a different histogram: counted as zero v3 reads."""
+    v2 = [1.0 / 48] * 48
+    kh, ks = _pair(client, tmp_path, [v2] * 3, [BLUE] * 3)
+    row = pairs_of(review(client))[frozenset((kh, ks))]
+    assert (row["why"]["clothes"]["nA"], row["why"]["clothes"]["cross"]) == (0, None)
+
+
+def test_clothes_clash_zero_is_the_off_switch(client, tmp_path, ticking, monkeypatch):
+    """HECO_REVIEW_CLOTHES_CLASH=0: clothing ranks again and removes nobody."""
+    kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE] * 3)
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_CLASH", "0")
+    got = review(client)
+    assert (got["excluded"]["clothes"], got["setAside"]) == (0, [])
+    assert frozenset((kh, ks)) in pairs_of(got)
+
+
+def test_health_reports_the_clothing_policy(client, monkeypatch):
+    """The queue's policy must be readable beside the count it produced."""
+    body = client.get("/health").json()
+    assert body["reviewClothesClash"] == pytest.approx(0.35)
+    assert body["reviewClothesMinN"] == 3
+    assert body["reviewClothesSelfMin"] == pytest.approx(0.6)
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_CLASH", "")
+    assert config.review_clothes_clash() == pytest.approx(0.35), "empty means unset"

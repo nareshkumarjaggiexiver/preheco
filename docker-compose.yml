@@ -270,6 +270,13 @@ services:
       HECO_REVIEW_STATURE_GAP: ${HECO_REVIEW_STATURE_GAP-}
       HECO_REVIEW_STATURE_MIN_N: ${HECO_REVIEW_STATURE_MIN_N-}
       HECO_STATURE_ADULT_M: ${HECO_STATURE_ADULT_M-}
+      # Clothing set-aside (v3 torsos): the best cross agreement under which a
+      # pair is set aside when both people's own reads are plentiful (MIN_N,
+      # from 2+ seconds) and self-consistent (SELF_MIN). Defaults 0.35 / 3 /
+      # 0.6, measured on the Sharon re-run c84098; CLASH=0 turns it off.
+      HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
+      HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
+      HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}

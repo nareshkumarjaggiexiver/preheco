@@ -1043,6 +1043,46 @@ def stature_ratios(sightings: list, min_n: int) -> dict[str, float]:
     }
 
 
+#: Torso descriptor length the clothing set-aside reads: v3 only.  A v2
+#: (48-float) read is a different histogram — comparing across generations is
+#: None by contract, and it is never evidence here.
+_CLOTHES_V3 = 64
+
+
+def identity_clothes(rows: list[tuple[str, np.ndarray]]) -> dict:
+    """One identity's v3 torso reads: how many, how consistent, over how long.
+
+    ``self`` is the median pairwise intersection among the identity's own v3
+    reads — how much this person's clothing agrees with itself across their
+    sightings — or None under two reads.  ``moments`` counts distinct write
+    seconds: five reads from one second of one crossing agree trivially and
+    prove nothing, the same reasoning as the stature reader's two-moment bar.
+    """
+    v3 = [(t, v) for t, v in rows if v.size == _CLOTHES_V3]
+    vecs = [v for _, v in v3]
+    pairwise = [float(np.minimum(a, b).sum()) for a, b in itertools.combinations(vecs, 2)]
+    return {
+        "n": len(vecs),
+        "self": float(np.median(pairwise)) if pairwise else None,
+        "moments": len({str(t)[:19] for t, _ in v3 if t}),
+        "vecs": vecs,
+    }
+
+
+def _clothes_clash(ca: dict, cb: dict, cross: float | None,
+                   clash: float, min_n: int, self_min: float) -> bool:
+    """True when BOTH identities' clothing reads are plentiful and
+    self-consistent and the best agreement between them is still under
+    ``clash``.  Every condition must hold on both sides: one consistent
+    reader against one scattered or thin one is one opinion, not a clash."""
+    if clash <= 0 or cross is None:
+        return False
+    for c in (ca, cb):
+        if c["n"] < min_n or c["moments"] < 2 or c["self"] is None or c["self"] < self_min:
+            return False
+    return cross < clash
+
+
 def _exclusion(
     gender: dict, age: dict, stature: dict,
     gender_min_p: float, age_child_max: float, age_adult_min: float, stature_gap: float,
@@ -1101,6 +1141,9 @@ def review_duplicates(
     stature_gap: float = 0.0,
     stature_min_n: int = 8,
     adult_m: float = 1.75,
+    clothes_clash: float = 0.0,
+    clothes_min_n: int = 3,
+    clothes_self_min: float = 0.6,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1127,13 +1170,19 @@ def review_duplicates(
     * **The face score must sit in ``[floor, threshold)``.** At or above the
       threshold the gallery already calls them one person and no review is
       needed; below the floor they are not similar in any measurable sense.
-    * **Clothing RANKS, it never filters.** Given 0.587-against-0.538 above,
-      a clothing bar here would be a coin toss wearing a number.  It orders
-      the queue so the likeliest pair is read first, and pairs whose torsos
-      were never measurable still appear — ranked last among themselves by
-      face score — because absent is not zero and an unmeasured guest must
-      not fall silently off a review list.  A v2 (48-d) torso against a v3
-      (64-d) one is not comparable and reads as unmeasured, not as 0.
+    * **Clothing RANKS — and, since the v3 torso, may SET ASIDE a clear
+      clash.** The 0.587-against-0.538 bench above was the v2 histogram,
+      whose band started under the chin and read mostly skin; there a
+      clothing bar was a coin toss.  v3 reads the cloth: on the Sharon
+      re-run (c84098) a person against themselves (early reads vs late)
+      never scored under 0.52, while the operator's different-people pairs
+      scored 0.10-0.25.  So a pair is set aside when BOTH identities have
+      >= ``clothes_min_n`` v3 reads from >= 2 seconds agreeing with
+      themselves >= ``clothes_self_min``, and their best cross agreement is
+      under ``clothes_clash``.  Everything short of that still only ranks;
+      unmeasured torsos still appear, because absent is not zero.  A v2
+      (48-d) torso against a v3 (64-d) one is not comparable and reads as
+      unmeasured, not as 0.
     * **Sex, age and stature may SET A PAIR ASIDE (v4, 2026-09-24)** — after
       the band test and before the cap, so an excluded pair neither costs a
       slot nor counts as dropped.  Run f0bfc5 flooded the queue with 500
@@ -1160,11 +1209,13 @@ def review_duplicates(
     how a real duplicate goes unreviewed.
     """
     store = open_store(db_path(data_dir, run_id))
-    excluded = {"gender": 0, "age": 0, "stature": 0}
+    excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0}
+    set_aside: list[dict] = []
     with store.reading():
         keys = store.keys()
         vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
         apps = {k: store.appearances_for(k) for k in keys}
+        dress = {k: identity_clothes(store.appearance_rows_for(k)) for k in keys}
         attrs = {k: store.attributes_for(k) for k in keys}
         genders = {k: identity_gender(attrs[k]) for k in keys}
         ages = {k: identity_age(attrs[k]) for k in keys}
@@ -1197,14 +1248,34 @@ def review_duplicates(
                     "bM": None if sb is None else sb * adult_m,
                 },
             }
+            da, db_ = dress[a], dress[b]
+            cross = max(
+                (float(np.minimum(x, y).sum()) for x in da["vecs"] for y in db_["vecs"]),
+                default=None,
+            )
+            why["clothes"] = {
+                "selfA": da["self"], "selfB": db_["self"], "cross": cross,
+                "nA": da["n"], "nB": db_["n"],
+            }
+            reasons = []
             reason = _exclusion(
                 why["gender"], why["age"], why["stature"],
                 gender_min_p, age_child_max, age_adult_min, stature_gap,
             )
             if reason is not None:
-                excluded[reason] += 1
+                reasons.append(reason)
+            if _clothes_clash(da, db_, cross, clothes_clash, clothes_min_n, clothes_self_min):
+                reasons.append("clothes")
+            row = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
+            if reasons:
+                # Counted once, under the first reading that ruled it out, so
+                # the counts sum to the pairs set aside; every reason rides
+                # the row.  Set aside is NOT a merge and NOT a cannot_link:
+                # the row stays in setAside for the operator to overrule.
+                excluded[reasons[0]] += 1
+                set_aside.append({**row, "reasons": reasons})
                 continue
-            candidates.append({"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why})
+            candidates.append(row)
 
     # FACE FIRST, clothes as the tiebreak — reversed on 2026-08-13, on a
     # measurement. The clothes-first order was built for run 0f5c6d, where
@@ -1227,12 +1298,18 @@ def review_duplicates(
     # a later look rather than no look at all.
     candidates.sort(key=review_order)
     kept = candidates[: max(0, limit)]
+    set_aside.sort(key=review_order)
     return {
         "pairs": kept,
         "considered": considered,
         "returned": len(kept),
         "dropped": len(candidates) - len(kept),
         "excluded": excluded,
+        # Every pair the evidence set aside, likeliest first, capped like the
+        # queue: an exclusion only takes a pair out of the ranked list — the
+        # operator can still see it, and still merge it.
+        "setAside": set_aside[: max(0, limit)],
+        "setAsideDropped": max(0, len(set_aside) - max(0, limit)),
     }
 
 
