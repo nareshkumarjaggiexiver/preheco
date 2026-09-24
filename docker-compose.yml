@@ -77,6 +77,11 @@ services:
       # camera's own size, which is the default. Face pixels scale with it —
       # see services/ingest/README.md for the numbers before choosing.
       INGEST_MAX_WIDTH: ${INGEST_MAX_WIDTH-}
+      # The README's older tunables. They had no passthrough, so setting them
+      # in .env changed nothing inside the container. Empty = their defaults.
+      INGEST_RTSP_TCP: ${INGEST_RTSP_TCP-}
+      INGEST_FILE_PACE: ${INGEST_FILE_PACE-}
+      INGEST_JPEG_QUALITY: ${INGEST_JPEG_QUALITY-}
       # L1 — the motion gate and the bounded live buffer (README "Levers").
       # All empty = off = today's newest-frame slot, byte for byte; a run may
       # still arm them per-run with /open's motionGate / bufferS. GET /health
