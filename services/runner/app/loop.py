@@ -67,6 +67,7 @@ from functools import partial
 from urllib.parse import urlsplit
 
 import httpx
+from heco_common import frameref
 from heco_common.auth import TokenProvider
 from heco_common.geometry import dedupe_boxes, iou_xywh
 from heco_common.imaging import decode_jpeg_b64
@@ -794,6 +795,9 @@ class RunLoop:
         # Ref-only frames stay OFF until proven (see _negotiate_ref_only).
         # Configuration is a request; a probe is evidence.
         self._ref_only = False
+        # The frame the ref-only probe took from ingest, handed to the loop as
+        # the run's first frame by _next_frame (None once handed over).
+        self._held_frame: dict | None = None
         self._last_seq: int | None = None
         self._last_ms: float = 0.0
         # personKey -> how many templates that identity last reported holding.
@@ -1231,20 +1235,27 @@ class RunLoop:
             not self._stop.is_set() and not self._halt.is_set()
             and time.monotonic() < deadline
         ):
-            url = f"{self.s.ingest_url}/frame"
-            if self._ref_only:
-                url += "?jpeg=0"
-            r = self.client.get(url)
-            if r.status_code in (204, 404, 410):
-                self._end_reason = "source-ended"  # stub-style explicit end
-                return None
-            if r.status_code == 503:  # no frame decoded yet — retry
-                if wait_start is None:
-                    wait_start = time.monotonic()
-                time.sleep(self.s.source_poll_s)
-                continue
-            r.raise_for_status()
-            body = r.json()
+            # The ref-only probe's frame, if it took one, is this run's first
+            # frame: it was dequeued (a live buffer, a lockstep file), and
+            # asking again would process the NEXT one and lose it.
+            held, self._held_frame = self._held_frame, None
+            if held is not None:
+                body = held
+            else:
+                url = f"{self.s.ingest_url}/frame"
+                if self._ref_only:
+                    url += "?jpeg=0"
+                r = self.client.get(url)
+                if r.status_code in (204, 404, 410):
+                    self._end_reason = "source-ended"  # stub-style explicit end
+                    return None
+                if r.status_code == 503:  # no frame decoded yet — retry
+                    if wait_start is None:
+                        wait_start = time.monotonic()
+                    time.sleep(self.s.source_poll_s)
+                    continue
+                r.raise_for_status()
+                body = r.json()
             self._note_ingest(body)
             # "No pixels" means ended — but a ref-only frame legitimately
             # carries NO imageB64, and reading that as end-of-source ended
@@ -1284,6 +1295,18 @@ class RunLoop:
         while every container reports healthy — the exact silent-failure shape
         this project keeps finding. One probe turns it into a line in the log
         and a run that simply keeps its JPEGs.
+
+        THE RUNNER IS A CONSUMER TOO. Its torso, head and beard readings (the
+        appearance veto, the heal veto and the review queue's evidence), the
+        white balance behind them and the face cards all read the decoded
+        frame, and a ref-only frame has no JPEG to decode — so the runner must
+        read the ref itself (HECO_FRAMES_DIR mounted on it as well), or every
+        one of them silently goes unmeasured for the whole run.
+
+        THE PROBE'S FRAME IS THE RUN'S FIRST FRAME. A GET /frame takes a frame
+        — with a live buffer (INGEST_BUFFER_S) it is dequeued, in lockstep the
+        reader moves on — so the probe asks once a frame exists, not twenty
+        times, and _next_frame hands that same frame to the loop.
         """
         if not self.s.frames_ref_only:
             return False
@@ -1294,22 +1317,32 @@ class RunLoop:
         # that was configured correctly and writing refs the whole time
         # (measured live, 2026-09-24). A live RTSP source can take a second or
         # two to produce its first frame, so this waits about that long.
-        ref = None
+        frame = None
         for _ in range(20):
             try:
                 r = self.client.get(f"{self.s.ingest_url}/frame")
-                frame = r.json() if r.content else {}
-            except Exception:
-                frame = {}
-            ref = (frame or {}).get("frameRef")
-            if ref:
+                body = r.json() if r.status_code == 200 and r.content else None
+            except Exception:  # noqa: BLE001 — not up yet is not a refusal
+                body = None
+            if isinstance(body, dict) and body.get("seq") is not None:
+                frame = body
                 break
             if self._stop.wait(0.1):
                 return False
+        if frame is not None:
+            self._held_frame = frame
+        ref = (frame or {}).get("frameRef")
         if not ref:
             self.log.info(
                 "ref-only: ingest offered no frameRef in 2 s — keeping JPEG frames "
                 "(is HECO_FRAMES_DIR mounted on ingest?)"
+            )
+            return False
+        if frameref.read_frame(ref) is None:
+            self.log.info(
+                f"ref-only: the runner itself cannot read {ref} — keeping JPEG frames "
+                "(mount HECO_FRAMES_DIR on the runner too: its clothing, head and beard "
+                "reads and its face cards need the pixels)"
             )
             return False
         probes = (
@@ -2464,7 +2497,14 @@ class RunLoop:
             # was invisible to every stage timer.
             td = time.perf_counter()
             try:
-                frame_img = decode_jpeg_b64(image_b64)
+                if image_b64:
+                    frame_img = decode_jpeg_b64(image_b64)
+                elif frame_ref:
+                    # REF-ONLY (HECO_FRAMES_REF_ONLY): no JPEG came, so the
+                    # pixels are the shared frame's — which the negotiation
+                    # proved this runner can read before it stopped the JPEGs.
+                    # None (retired, unreadable) is "no descriptor", as ever.
+                    frame_img = frameref.read_frame(frame_ref)
             except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
                 frame_img = None
             board.observe("count", "frameDecodeMs", (time.perf_counter() - td) * 1000.0)
