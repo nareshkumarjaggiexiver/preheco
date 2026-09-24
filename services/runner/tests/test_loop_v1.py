@@ -3766,3 +3766,38 @@ def test_a_co_presence_split_that_5xxs_is_retried_while_they_share_a_frame():
         assert len(fake.splits) > len(pairs), (
             "an undecided split must be retried while the pair share a frame"
         )
+
+
+def test_a_mint_keyframe_round_names_one_frame_in_every_payload():
+    """A new guest's keyframe is ONE frame: its time, sequence number, head
+    count, names and picture.
+
+    Run 8b8b87 filed p00002's moment with frame 552's picture and names but
+    frame 537's time: the round posted only the match payload and picture, so
+    the planner took the time and head count from the last FULL round's
+    ingest and person taps. The moment then read 1:29 while the register said
+    first seen 1:30, and the tick opened frame 537 in forensics — a frame from
+    before her face was visible.
+    """
+    fake = V1Fake(n_frames=1)
+    loop = make_loop(fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}})
+    loop.planner.create_run(event_id="ev-1")
+    ok, jpg = cv2.imencode(".jpg", solid_image(RED_BGR, w=320, h=240))
+    assert ok
+    snapshot = {
+        "image_b64": base64.b64encode(jpg.tobytes()).decode(), "seq": 552, "t_ms": 90481,
+        "w": 320, "h": 240,
+        "boxes": [{"x": 10, "y": 10, "w": 50, "h": 150}, {"x": 200, "y": 20, "w": 40, "h": 120}],
+        "tracks": [], "faces": [],
+        "verdicts": [{"personKey": "p00002", "cosine": 0.06, "isNew": True, "isStaff": False}],
+    }
+    loop._keyframe_round(snapshot)
+
+    stages = [t["stage"] for t in fake.taps]
+    assert stages == ["ingest", "person-detect", "match"], "this frame's time and bodies go first"
+    by = {t["stage"]: t["payload"] for t in fake.taps}
+    assert (by["ingest"]["tMs"], by["ingest"]["seq"]) == (90481, 552)
+    assert by["person-detect"]["count"] == 2
+    assert (by["match"]["tMs"], by["match"]["seq"], by["match"]["persons"]) == (90481, 552, 2)
+    assert [m["personKey"] for m in by["match"]["matches"]] == ["p00002"]
+    assert fake.frames_posted, "and its picture"
