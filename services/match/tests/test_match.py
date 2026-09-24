@@ -543,7 +543,7 @@ def test_health_reports_both_weak_band_knobs(client, monkeypatch):
     "which bar was this run using" is a question that will be asked.
     """
     body = client.get("/health").json()
-    assert body["version"] == "0.11.0"
+    assert body["version"] == main.VERSION
     assert body["nearMissWeakFloor"] == pytest.approx(config.DEFAULT_NEARMISS_WEAK_FLOOR)
     assert body["nearMissClothes"] == pytest.approx(config.DEFAULT_NEARMISS_CLOTHES)
     assert pytest.approx(0.15) == config.DEFAULT_NEARMISS_WEAK_FLOOR
@@ -976,7 +976,7 @@ def test_forget_template_on_an_absent_row_is_a_normal_false(client):
     alice = person_centroid()
     client.post("/match", json={"runId": "r", "embedding": sighting(alice)})
     got = client.post("/template/forget", json={"runId": "r", "templateId": 999999}).json()
-    assert got == {"ok": True, "forgotten": False, "galleryN": 1}
+    assert got == {"ok": True, "forgotten": False, "bodyForgotten": False, "galleryN": 1}
 
 
 # ------------------------- the duplicate review list (run 0f5c6d)
@@ -1181,6 +1181,7 @@ def test_review_on_an_empty_or_unknown_run_is_an_empty_queue(client):
     assert got == {
         "runId": "never-ran", "threshold": config.DEFAULT_THRESHOLD,
         "pairs": [], "considered": 0, "returned": 0, "dropped": 0,
+        "excluded": {"gender": 0, "age": 0, "stature": 0},
     }
 
 
