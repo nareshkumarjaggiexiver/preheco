@@ -371,6 +371,30 @@ DEFAULT_REVIEW_HEAD_CLASH = 0.45
 # are 0.47-0.75 dark against 0.03-0.48 for 21 shaven or moustached men.
 # BEARD_MIN_N 0 turns the signal off.
 DEFAULT_REVIEW_BEARD_MIN_N = 3
+# ...and none against a PALE beard (grey or white) only when this is on: an
+# 8% warm light read a white beard as "none" (app.appearance.beards_differ).
+DEFAULT_REVIEW_BEARD_PALE = False
+
+# THE LIGHT GUARD.  The clothes, head and beard set-asides compare colours,
+# and a duplicate is minted exactly when a face fails to match — a change of
+# light is one cause.  Replayed on run f0bfc5's crops (34 single-person
+# identities split at their time median, the late half re-read under a
+# per-channel shift): a +/-8% shift set one genuine duplicate aside, +/-15%
+# two or three, a stage wash seven or eight — and a light on one person (a
+# spotlight, a videographer's lamp) does that with HECO_APPEARANCE_WB on.
+# The face's own skin moves with the light (heco_counting.appearance
+# skin_tone): its median log(R/G), log(B/G) differ between one person's two
+# halves by 0.020 (median; p90 0.048) under one light and by 0.08-0.10 in
+# every one of those false set-asides at +/-8%, 0.11+ beyond.  So a colour
+# set-aside is HELD BACK — the pair stays in the ranked queue — when the two
+# identities' skin readings differ by more than this, on either ratio.  At
+# 0.07 it held back every false set-aside of the replay (8% to stage wash,
+# frame WB on and off) and kept 10 of the 31 true colour-only set-asides of
+# the f0bfc5 replay (different people's skin differs too: median 0.083) —
+# the trade this pipeline always makes: a question asked twice over a guest
+# hidden once.  0 turns the guard off.  Skin unmeasured on either side (a
+# runner before match 0.15.0): no guard, today's rule.
+DEFAULT_REVIEW_LIGHT_TOL = 0.07
 
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
@@ -451,6 +475,21 @@ def review_beard_min_n() -> int:
     """Beard reads each identity needs before its class may set a pair aside
     (env HECO_REVIEW_BEARD_MIN_N; 0 = off)."""
     return max(0, int(_env_f("HECO_REVIEW_BEARD_MIN_N", DEFAULT_REVIEW_BEARD_MIN_N)))
+
+
+def review_beard_pale() -> bool:
+    """May none against a PALE (grey or white) beard set a pair aside
+    (env HECO_REVIEW_BEARD_PALE, 0|1; default off — see beards_differ)?"""
+    raw = os.environ.get("HECO_REVIEW_BEARD_PALE")
+    if raw is None or not raw.strip():
+        return DEFAULT_REVIEW_BEARD_PALE
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def review_light_tol() -> float:
+    """Largest skin-reading gap at which a colour set-aside still applies
+    (env HECO_REVIEW_LIGHT_TOL; 0 = the guard is off)."""
+    return max(0.0, _env_f("HECO_REVIEW_LIGHT_TOL", DEFAULT_REVIEW_LIGHT_TOL))
 
 
 def adult_height_m() -> float:

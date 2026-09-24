@@ -36,6 +36,7 @@ from .appearance import (
     BEARD_DIM,
     HEAD_DIM,
     HEAD_H_BINS,
+    SKIN_DIM,
     TORSO_DIM,
     beard_class,
     beards_differ,
@@ -438,11 +439,13 @@ def match(
     attributes: dict | None = None,
     feat_norm: float | None = None,
     body: dict | None = None,
-    # The sighting's head descriptor (40 floats) and beard reading (4),
-    # logged on the body row beside the torso; None = not measured.  Their
-    # one reader is the review queue.
+    # The sighting's head descriptor (40 floats), beard reading (4) and skin
+    # reading (2: the light it was read under), logged on the body row
+    # beside the torso; None = not measured.  Their one reader is the review
+    # queue.
     head: list[float] | None = None,
     beard: list[float] | None = None,
+    skin: list[float] | None = None,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -605,7 +608,7 @@ def match(
                 # measurement that killed the quality rule here.
                 store.prune_redundant(hit.key, templates_per_person)
                 overlap = _overlap_after_write(store, hit.key, embedding, appearance, threshold)
-            body_id = _log_body(store, hit.key, body, quality, appearance, head, beard)
+            body_id = _log_body(store, hit.key, body, quality, appearance, head, beard, skin)
             return MatchResult(
                 hit.key,
                 False,
@@ -624,7 +627,7 @@ def match(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p",
             appearance=appearance, attributes=attributes, feat_norm=feat_norm,
         )
-        body_id = _log_body(store, key, body, quality, appearance, head, beard)
+        body_id = _log_body(store, key, body, quality, appearance, head, beard, skin)
         # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
         # BEFORE this mint wrote anything — and against the near-missed
         # identity's already-stored descriptors, the same before-the-write
@@ -659,6 +662,7 @@ def _log_body(
     appearance: list[float] | None = None,
     head: list[float] | None = None,
     beard: list[float] | None = None,
+    skin: list[float] | None = None,
 ) -> int | None:
     """Append the sighting's person box to ``key``'s body log; its rowid.
 
@@ -669,9 +673,9 @@ def _log_body(
     logging field.  ``face_w`` is the call's ``quality`` (face box width px),
     stored beside the box so the stature reader can see a head-and-shoulders
     crop for what it is; a non-positive one is stored as unknown.
-    ``appearance`` (the torso descriptor), ``head`` and ``beard`` (None when
-    unmeasured) are logged on the same row: they are the review queue's
-    per-sighting evidence.  A torso needs the person box this row records,
+    ``appearance`` (the torso descriptor), ``head``, ``beard`` and ``skin``
+    (None when unmeasured) are logged on the same row: they are the review
+    queue's per-sighting evidence.  A torso needs the person box this row records,
     so a call without a usable body had no torso to log either; its head
     and beard readings are not logged — a face outside every person box is
     rare (1 of run f0bfc5's 2,809 guest verdicts) and the row has nothing
@@ -688,7 +692,8 @@ def _log_body(
         return None
     fw = float(face_w) if face_w is not None and float(face_w) > 0 else None
     return store.add_body_sighting(
-        key, h, w, y_bottom, frame_h, fw, appearance=appearance, head=head, beard=beard
+        key, h, w, y_bottom, frame_h, fw, appearance=appearance, head=head, beard=beard,
+        skin=skin,
     )
 
 
@@ -1228,6 +1233,28 @@ def beard_reads(evidence: list) -> dict[str, IdentityReads]:
     return _reads_of(evidence, "beard", BEARD_DIM)
 
 
+def skin_medians(evidence: list) -> dict[str, np.ndarray]:
+    """Each identity's median skin reading ([log(R/G), log(B/G)]) from the body log.
+
+    Median over every read, not a spread: one read under a passing flash
+    must not move it.  An identity with no finite read is absent.
+    """
+    by_key: dict[str, list[np.ndarray]] = {}
+    for row in evidence:
+        vec = row.skin
+        if vec is None or vec.size != SKIN_DIM or not np.all(np.isfinite(vec)):
+            continue
+        by_key.setdefault(row.key, []).append(vec.astype(np.float64))
+    return {k: np.median(np.stack(v), axis=0) for k, v in by_key.items()}
+
+
+def light_shift(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
+    """The larger of the two log-ratio gaps between two skin readings, or None."""
+    if a is None or b is None:
+        return None
+    return float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+
+
 #: The head rule's own-testimony bar, as the clothing rule's defaults: three
 #: reads over two seconds whose median pairwise intersection is 0.6.  Run
 #: f0bfc5: every one of the 45 identities' own head reads agreed at 0.63 or
@@ -1274,15 +1301,16 @@ def head_apart(
 
 
 def beards_apart(
-    ba: IdentityReads | None, bb: IdentityReads | None, min_n: int
+    ba: IdentityReads | None, bb: IdentityReads | None, min_n: int, pale: bool = False
 ) -> tuple[str | None, str | None, bool]:
     """Both identities' beard classes, and whether they cannot be one face.
 
     A class (:func:`app.appearance.beard_class`) is shown whenever an
     identity has reads; it may set a pair aside only when BOTH identities
     have at least ``min_n`` reads spanning _CLOTHES_MIN_SPAN_S and their
-    confident classes differ as one face cannot (none against any beard,
-    dark against white).  ``min_n <= 0`` is off.
+    confident classes differ as one face cannot (none against a dark beard,
+    dark against white; none against grey or white only with ``pale`` —
+    :func:`app.appearance.beards_differ`).  ``min_n <= 0`` is off.
     """
     ca = None if ba is None else beard_class(ba.vectors)
     cb = None if bb is None else beard_class(bb.vectors)
@@ -1291,7 +1319,7 @@ def beards_apart(
     for r in (ba, bb):
         if r.n < min_n or r.span_s < _CLOTHES_MIN_SPAN_S:
             return ca, cb, False
-    return ca, cb, beards_differ(ca, cb)
+    return ca, cb, beards_differ(ca, cb, pale)
 
 
 def clothes_apart(
@@ -1339,6 +1367,8 @@ def review_duplicates(
     clothes_self_min: float = 0.6,
     head_clash: float = 0.0,
     beard_min_n: int = 0,
+    beard_pale: bool = False,
+    light_tol: float = 0.0,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1418,6 +1448,18 @@ def review_duplicates(
     metres for a human to read (``aM``/``bM`` carry that product ready-made),
     and the exclusion gap is on the ratio, so the anchor never moves it.
 
+    * **The light guard (2026-09-25).**  Clothes, head and beard compare
+      COLOURS, and a light that changed between two sightings of one guest
+      moves them all — replayed on f0bfc5's crops, an 8% shift set a genuine
+      duplicate aside and a stage wash seven or eight, with frame white
+      balance powerless against a light on one person.  Each sighting also
+      carries the face's skin reading (the cheek's log chromaticity), which
+      moves with the light that falls on it.  When both identities have one
+      and their medians differ by more than ``light_tol`` on either ratio,
+      the colour reasons are HELD BACK: the pair stays in the ranked queue,
+      ``why.light.held`` names what was held and ``keptByLight`` counts the
+      pairs.  Gender, age and stature are not colours and still apply.
+
     EVERY PAIR SET ASIDE STAYS INSPECTABLE.  ``setAside`` lists them —
     ``{a, b, cosine, clothes, why, reasons}``, ranked like the queue and
     capped at ``limit`` — with every signal that spoke in ``reasons`` (the
@@ -1434,11 +1476,15 @@ def review_duplicates(
     selfB, nA, nB}`` — ``a``/``b`` each side's dominant colour
     (:func:`app.appearance.head_label`), ``sim`` the best cross — and
     ``why.beard`` ``{a, b, nA, nB}`` with each side's class; null wherever
-    a side has no read.
+    a side has no read.  ``why.light`` is ``{a, b, shift, held}``: each
+    identity's median skin reading (``[log(R/G), log(B/G)]`` or null), the
+    larger gap between them (null unless both are read) and the colour
+    reasons the light guard held back (``[]`` when none).
 
     Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
     "excluded": {"gender": g, "age": a, "stature": s, "clothes": c,
-    "head": h, "beard": b}, "setAside": [...], "setAsideDropped": s}``.
+    "head": h, "beard": b}, "setAside": [...], "setAsideDropped": s,
+    "keptByLight": l}``.
     ``dropped`` (and ``setAsideDropped``, the set-aside pairs past
     ``limit``) is stated rather than swallowed: a truncated queue that looks
     complete is how a real duplicate goes unreviewed.
@@ -1479,7 +1525,9 @@ def review_duplicates(
     torsos = torso_reads(evidence, tpl_torsos)
     heads = head_reads(evidence)
     beards = beard_reads(evidence)
+    skins = skin_medians(evidence)
     candidates, set_aside = [], []
+    kept_by_light = 0
     for a, b, cosine, clothes in in_band:
         sa, sb = statures.get(a), statures.get(b)
         ta, tb = torsos.get(a), torsos.get(b)
@@ -1487,7 +1535,9 @@ def review_duplicates(
         ha, hb = heads.get(a), heads.get(b)
         head_sim = None if ha is None or hb is None else best_cross(ha.vectors, hb.vectors)
         ba, bb = beards.get(a), beards.get(b)
-        beard_a, beard_b, beard_differ = beards_apart(ba, bb, beard_min_n)
+        beard_a, beard_b, beard_differ = beards_apart(ba, bb, beard_min_n, beard_pale)
+        skin_a, skin_b = skins.get(a), skins.get(b)
+        shift = light_shift(skin_a, skin_b)
         why = {
             "gender": {
                 "a": genders[a][0], "b": genders[b][0],
@@ -1520,17 +1570,32 @@ def review_duplicates(
                 "nA": 0 if ba is None else ba.n,
                 "nB": 0 if bb is None else bb.n,
             },
+            "light": {
+                "a": None if skin_a is None else [float(x) for x in skin_a],
+                "b": None if skin_b is None else [float(x) for x in skin_b],
+                "shift": shift,
+                "held": [],
+            },
         }
         reasons = _side_reasons(
             why["gender"], why["age"], why["stature"],
             gender_min_p, age_child_max, age_adult_min, stature_gap,
         )
+        colour = []
         if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min):
-            reasons.append("clothes")
+            colour.append("clothes")
         if head_apart(ha, hb, head_sim, head_clash):
-            reasons.append("head")
+            colour.append("head")
         if beard_differ:
-            reasons.append("beard")
+            colour.append("beard")
+        if colour and light_tol > 0 and shift is not None and shift > light_tol:
+            # Read under two lights: the colours may be the light's, not two
+            # people's.  Asked, not set aside — and said so.
+            why["light"]["held"] = colour
+            colour = []
+            if not reasons:
+                kept_by_light += 1
+        reasons += colour
         entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
         if reasons:
             excluded[reasons[0]] += 1
@@ -1571,6 +1636,9 @@ def review_duplicates(
         # operator can still see it, and still merge it.
         "setAside": set_aside[: max(0, limit)],
         "setAsideDropped": max(0, len(set_aside) - max(0, limit)),
+        # Pairs a colour signal would have set aside, left in the queue
+        # because their two identities were read under different light.
+        "keptByLight": kept_by_light,
     }
 
 

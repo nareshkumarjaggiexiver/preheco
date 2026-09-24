@@ -129,6 +129,9 @@ HEAD_DIM = 40
 HEAD_H_BINS = 24
 #: The beard reading: [skinFrac, darkFrac, greyFrac, whiteFrac].
 BEARD_DIM = 4
+#: The skin reading: [log(R/G), log(B/G)] of the cheek window — evidence
+#: about the LIGHT a sighting was read under, not about the person.
+SKIN_DIM = 2
 
 #: At most this many reads per identity feed a comparison, spread evenly
 #: over its time order: an identity seen for ten minutes holds hundreds of
@@ -258,13 +261,20 @@ def beard_class(vectors: list[np.ndarray]) -> str | None:
     return best if counts[best] >= BEARD_AGREE * len(vectors) else None
 
 
-def beards_differ(a: str | None, b: str | None) -> bool:
+def beards_differ(a: str | None, b: str | None, pale: bool = False) -> bool:
     """Two confident beard classes one person cannot show in one event.
 
-    None against any beard, or dark against white.  Grey sits between both
-    and is never set against either: salt-and-pepper under warm light reads
-    grey one walk and dark the next.
+    None against a dark beard, or dark against white.  Grey sits between
+    both and is never set against either: salt-and-pepper under warm light
+    reads grey one walk and dark the next.  None against a PALE beard (grey
+    or white) only with ``pale`` (HECO_REVIEW_BEARD_PALE): the pale test
+    compares the chin's saturation with the cheek's, and a warm light moves
+    the two apart — replayed on run f0bfc5's crops, an 8% warm shift read
+    the white-bearded elder's chin as "none" and set his genuine duplicate
+    aside.  Off until that arm is measured under coloured light.
     """
     if a is None or b is None or a == b:
         return False
-    return "none" in (a, b) or {a, b} == {"dark", "white"}
+    if {a, b} == {"dark", "white"} or {a, b} == {"none", "dark"}:
+        return True
+    return pale and "none" in (a, b)

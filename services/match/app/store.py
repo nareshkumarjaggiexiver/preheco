@@ -150,7 +150,8 @@ CREATE TABLE IF NOT EXISTS body_sightings (
     face_w     REAL,
     appearance BLOB,
     head       BLOB,
-    beard      BLOB
+    beard      BLOB,
+    skin       BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_body_sightings_key ON body_sightings(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
@@ -193,6 +194,7 @@ _BODY_COLUMNS_ADDED = (
     ("appearance", "BLOB"),   # 2026-09-24 night: torso descriptor, float32[48|64]
     ("head", "BLOB"),         # ... head descriptor, float32[40]
     ("beard", "BLOB"),        # ... beard reading, float32[4]
+    ("skin", "BLOB"),         # 2026-09-25: cheek log(R/G), log(B/G), float32[2]
 )
 
 
@@ -218,9 +220,10 @@ class SightingEvidence(NamedTuple):
     """One body-log row's appearance readings, for the review queue.
 
     ``created_at`` is the write time (ISO text); ``appearance`` (the torso
-    descriptor, 48 or 64 long), ``head`` (40) and ``beard`` (4) are float32
-    arrays, each None when that sighting did not carry it — absent is not
-    zero.  A row with none of the three is never returned.
+    descriptor, 48 or 64 long), ``head`` (40), ``beard`` (4) and ``skin``
+    (2: the light the face was read under) are float32 arrays, each None
+    when that sighting did not carry it — absent is not zero.  A row with
+    none of them is never returned.
     """
 
     key: str
@@ -228,6 +231,7 @@ class SightingEvidence(NamedTuple):
     appearance: np.ndarray | None
     head: np.ndarray | None = None
     beard: np.ndarray | None = None
+    skin: np.ndarray | None = None
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -750,8 +754,9 @@ class VectorStore:
         skipped in SQL; a NULL column comes back as None, never as zeros.
         """
         rows = self.conn.execute(
-            "SELECT key, created_at, appearance, head, beard FROM body_sightings"
+            "SELECT key, created_at, appearance, head, beard, skin FROM body_sightings"
             " WHERE appearance IS NOT NULL OR head IS NOT NULL OR beard IS NOT NULL"
+            " OR skin IS NOT NULL"
             " ORDER BY id ASC"
         ).fetchall()
 
@@ -759,8 +764,8 @@ class VectorStore:
             return None if blob is None else np.frombuffer(blob, dtype=np.float32)
 
         return [
-            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b))
-            for k, ts, a, h, b in rows
+            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b), arr(sk))
+            for k, ts, a, h, b, sk in rows
         ]
 
     def count_for(self, key: str) -> int:
@@ -900,6 +905,7 @@ class VectorStore:
         appearance: list[float] | np.ndarray | None = None,
         head: list[float] | np.ndarray | None = None,
         beard: list[float] | np.ndarray | None = None,
+        skin: list[float] | np.ndarray | None = None,
     ) -> int:
         """Record one sighting's containing PERSON box under ``key``; its rowid.
 
@@ -920,9 +926,10 @@ class VectorStore:
         same-frame guard can retract the row if the sighting turns out to
         belong to a different body (:meth:`forget_body_sighting`).
 
-        ``appearance``, ``head`` and ``beard`` are the sighting's readings
-        (torso descriptor, head descriptor, beard fractions), stored as
-        float32 BLOBs; None stores NULL.  They ride on this row (the torso
+        ``appearance``, ``head``, ``beard`` and ``skin`` are the sighting's
+        readings (torso descriptor, head descriptor, beard fractions, the
+        cheek's log chromaticity), stored as float32 BLOBs; None stores
+        NULL.  They ride on this row (the torso
         also on any template the call wrote) because a template is written
         on a handful of calls and the review queue judges an identity's
         appearance across all of them — and on this row the same-frame
@@ -933,12 +940,12 @@ class VectorStore:
 
         cur = self.conn.execute(
             "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w,"
-            " appearance, head, beard)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " appearance, head, beard, skin)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key, float(h), float(w), float(y_bottom), int(frame_h), _now(),
                 None if face_w is None else float(face_w),
-                blob(appearance), blob(head), blob(beard),
+                blob(appearance), blob(head), blob(beard), blob(skin),
             ),
         )
         return int(cur.lastrowid)

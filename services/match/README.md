@@ -402,7 +402,9 @@ covered head is never set against a bare one, because a dupatta or a rumal
 comes and goes within one wedding. The beard sets a pair aside when both
 identities have `HECO_REVIEW_BEARD_MIN_N` reads over two seconds and their
 classes — the one two thirds of the reads name — cannot be one face: none
-against any beard, dark against white (grey is never set against either).
+against a dark beard, dark against white (grey is never set against either;
+none against grey or white only with `HECO_REVIEW_BEARD_PALE=1` — an 8%
+warm light read a white beard as none).
 `why.head` = `{a, b, sim, selfA, selfB, nA, nB}` (`a`/`b` the dominant
 colour: red, orange, yellow, green, blue, purple, pink, black, grey,
 white — never brown; a bald scalp reads orange), `why.beard` = `{a, b, nA,
@@ -410,6 +412,18 @@ nB}`. On f0bfc5 pair #1 — maroon turban and black beard against peach
 turban and white beard — reads head `red`/`orange` at 0.36 and beard
 `dark`/`white` and is set aside on both; nine same-person splits read head
 0.83–0.99 and no beard clash.
+
+**The light guard (0.15.0).** `/match` also takes `skin` — the face's cheek
+`[log(R/G), log(B/G)]`, the LIGHT the colours were read under — logged on
+the body row. When two identities' median skin readings differ by more than
+`HECO_REVIEW_LIGHT_TOL` (0.07) on either ratio, a clothes / head / beard
+set-aside is held back: the pair stays asked, `why.light = {a, b, shift,
+held}` says what was held, and `keptByLight` counts such pairs. Replayed on
+f0bfc5's crops, every genuine duplicate a light change set aside (±8% to a
+stage wash, WB on or off) read 0.08+ against 0.020 for one person under one
+light; different people differ too (median 0.083), so 21 of the replay's 31
+true colour-only set-asides are asked again. Gender, age and stature are
+never held.
 
 ## Run
 
@@ -473,7 +487,9 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_REVIEW_CLOTHES_CLASH` | `0.35` | Best cross-identity torso intersection under which a pair whose identities each wear one garment is set aside from the review queue. **0 disables clothing set-asides**; `why.clothes` still reports the reads. |
 | `HECO_REVIEW_CLOTHES_MIN_N` | `3` | v3 torso reads (spanning two seconds) each identity needs before its clothing counts; clamped to at least 2. |
 | `HECO_REVIEW_HEAD_CLASH` | `0.45` | Best cross head intersection under which two HEADWEAR identities (both heads at least half chromatic) that each read one head are set aside. **0 disables head set-asides.** |
-| `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-beard or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
+| `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-dark or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
+| `HECO_REVIEW_BEARD_PALE` | `0` | `1` lets none against a grey or white beard set a pair aside too (off: a warm light reads a white beard as none). |
+| `HECO_REVIEW_LIGHT_TOL` | `0.07` | The light guard: hold back a colour set-aside when the two identities' skin readings differ by more than this. **0 disables the guard.** |
 | `HECO_REVIEW_CLOTHES_SELF_MIN` | `0.6` | Median pairwise intersection an identity's own torso reads must reach — an identity whose reads disagree (two people merged, a band on a pillar) has no clothing to compare. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
