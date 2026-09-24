@@ -57,6 +57,16 @@ services:
       # and /health says so, which is the device truth earning its keep again.
       HECO_DEVICE: ${HECO_DEVICE-}
       FACES_MODEL: ${FACES_MODEL-}
+      # The scrfd operating point, and the only gate that can refuse a face
+      # the detector INVENTED. Everything the quality gate measures —
+      # frontality, eye-span, IED — is computed from the detector's own five
+      # landmarks, so a confident-looking hallucination on the back of a head
+      # passes every one of them: measured live 2026-09-24, a woman walking
+      # away became guest p00051 whose best photograph is her hair. The
+      # family default is InsightFace's permissive det_thresh 0.5; YuNet's
+      # equivalent was 0.8. Raise it and the invention stops being a face.
+      FACES_SCRFD_SCORE_MIN: ${FACES_SCRFD_SCORE_MIN-}
+      FACES_SCORE_MIN: ${FACES_SCORE_MIN-}
 
   embed:
     image: heco-embed:cuda

@@ -194,6 +194,11 @@ class QualityProfile(BaseModel):
     """
 
     minPx: float | None = Field(default=None, ge=0)
+    #: Detector confidence floor — the one signal the detector did not derive
+    #: from its own landmarks, and so the only one that can refuse a face it
+    #: invented (a scrfd detection on the back of a head carries five
+    #: plausible landmarks, and every geometric floor then agrees with it).
+    minConf: float | None = Field(default=None, ge=0, le=1)
     minIedPx: float | None = Field(default=None, ge=0)
     minFrontality: float | None = Field(default=None, ge=0, le=1)
     minSharpness: float | None = Field(default=None, ge=0)
