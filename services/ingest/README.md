@@ -181,6 +181,7 @@ python scripts/gate_replay.py /clips/D02.mp4 --ledger ledger.jsonl \
 | --- | --- | --- |
 | `INGEST_DECODER` | `cpu` | `cpu` = today's cv2.VideoCapture. `nvdec` / `vaapi` = an ffmpeg subprocess decoding on NVDEC / VA-API. `ffmpeg` = the same subprocess decoding in software. |
 | `INGEST_CV_THREADS` | unset | OpenCV's pool size, process-wide. `1` with any lever on a many-core box (below). |
+| `INGEST_LIVE_TIMEOUT_S` | unset (0) | A LIVE source, any decoder: a read that waits this long for the stream is a dead stream — its (stale) frame is dropped and the source reopened. `10` for the demo. |
 
 The subprocess writes NV12 (the decoder's own layout, 1.5 bytes a pixel) over
 a Unix socketpair. The gate reads the Y plane, a frame waits in the store as
@@ -198,6 +199,24 @@ stderr, and GET /health `device: {requested, active, error}`. Check
 `device.active` after the first /open of every deploy. A decoder that dies
 mid-file stops the source instead of reporting `ended`, so an incomplete count
 fails as a stall with its gallery kept.
+
+**A live source that goes silent.** Measured on the .94 box against a fake
+RTSP camera silent 5 s after PLAY with its TCP connection left open (a camera
+behind a dead switch port): the cv2 decoder's reads fail only after OpenCV's
+own 30 s timeouts, one stale frame per timeout, and it reconnected after ~90 s
+(first gap in new frames 60 s — past the runner's 45 s `HECO_SOURCE_STALL_S`,
+so the run settles `failed`); nvdec exited after two of ffmpeg's socket
+timeouts and had frames again at 23.2 s. ffmpeg's RTSP timeout is now 5 s
+(exit ~10 s into a silence, measured with the box's ffmpeg 7.1.5; 4.x never
+exits on it), http(s) gets a 10 s `-rw_timeout` (it had none: a stalled
+source held the worker indefinitely). `INGEST_LIVE_TIMEOUT_S=10` makes one
+rule for every decoder — a read watchdog, ffmpeg's own timeouts moved to
+twice it — and on the laptop both decoders were back 12.7 s into a stall
+(fake camera, 640x360 H.264). A reopening that FAILS is on /health too:
+`device.error` carries the reason ("live source down, reconnecting: …"),
+stderr says so once and again when the source is back, and `capture.live`
+counts `{stalls, reconnects, reconnectFailures}` (shown in lever mode, or
+with the knob set).
 
 Deploy (WSL2 box: the overlay carries the /usr/lib/wsl mount, the `video`
 driver capability, /dev/dxg and /dev/dri):

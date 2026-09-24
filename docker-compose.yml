@@ -101,6 +101,12 @@ services:
       # per core). 1 cut the NVDEC + gate path from 45.4 to 30.1 ms of CPU per
       # 4K frame on the .94 box — see app/config.py cv_threads_from_env.
       INGEST_CV_THREADS: ${INGEST_CV_THREADS-}
+      # A LIVE source on the cv2 decoder: open/read timeout, seconds, and a
+      # read that blocked that long is a dead stream — dropped and reopened.
+      # Empty = OpenCV's own 30 s, which took ~90 s to reconnect a camera that
+      # went silent (measured) against the runner's 45 s stall window; 10 is
+      # the demo value. The ffmpeg decoders time out on their own.
+      INGEST_LIVE_TIMEOUT_S: ${INGEST_LIVE_TIMEOUT_S-}
       # INBOUND AUTH (runbook step 8). HECO_REQUIRE_AUTH=1 arms the gate:
       # callers must present an heco-auth Ed25519 token, verified locally
       # against the JWKS fetched from HECO_AUTH_URL and cached in-process.
