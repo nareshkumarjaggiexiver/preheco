@@ -117,13 +117,18 @@ def best_intersection(
 #
 # Everything below reads an identity's appearance ACROSS its sightings for
 # POST /review/duplicates — never for a verdict.  An identity's reads are
-# the torso descriptors its body-log rows carry
+# the torso / head / beard readings its body-log rows carry
 # (:meth:`app.store.VectorStore.sighting_evidence`), capped and spread over
 # its time on camera (:func:`spread`).
 
 #: The v3 torso length; v2 rows (48) never count in the review's clothing
 #: evidence — a v2 partition is not the colour-below-the-neck v3 reads.
 TORSO_DIM = APPEARANCE_DIM
+#: The head descriptor: 24 soft hue bins, 3 soft brightness bins, 13 reserved.
+HEAD_DIM = 40
+HEAD_H_BINS = 24
+#: The beard reading: [skinFrac, darkFrac, greyFrac, whiteFrac].
+BEARD_DIM = 4
 
 #: At most this many reads per identity feed a comparison, spread evenly
 #: over its time order: an identity seen for ten minutes holds hundreds of
@@ -169,3 +174,97 @@ def best_cross(a: list[np.ndarray], b: list[np.ndarray]) -> float | None:
     ma = np.stack(a).astype(np.float64)
     mb = np.stack(b).astype(np.float64)
     return float(np.minimum(ma[:, None, :], mb[None, :, :]).sum(-1).max())
+
+
+#: Colour families over the head descriptor's bins: hue bin i covers
+#: OpenCV H [7.5 i, 7.5 (i+1)) — 15 degrees each — and bins 24..26 are
+#: black / grey / white.  Display only: the head rule compares histograms,
+#: never labels.  Bin 0 (0-15 degrees) is shared half-and-half by red and
+#: orange, which puts the boundary near 8 degrees: run f0bfc5's maroon
+#: turban (H 160-175) reads red and its peach one (H 0-10) orange, where a
+#: whole bin 0 in red called pair #1 "red against red".  There is no
+#: "brown": a brown is a dark orange and the descriptor bins a chromatic
+#: pixel by hue alone, so a brown turban reads orange and brown hair —
+#: dark, barely chromatic — black.  A bald scalp reads as its skin: orange.
+HEAD_FAMILIES = (
+    ("red", ((22, 1.0), (23, 1.0), (0, 0.5))),
+    ("orange", ((0, 0.5), (1, 1.0), (2, 1.0))),
+    ("yellow", ((3, 1.0), (4, 1.0))),
+    ("green", tuple((b, 1.0) for b in range(5, 11))),
+    ("blue", tuple((b, 1.0) for b in range(11, 17))),
+    ("purple", ((17, 1.0), (18, 1.0))),
+    ("pink", ((19, 1.0), (20, 1.0), (21, 1.0))),
+    ("black", ((24, 1.0),)),
+    ("grey", ((25, 1.0),)),
+    ("white", ((26, 1.0),)),
+)
+
+
+def head_label(vectors: list[np.ndarray]) -> str | None:
+    """The dominant colour family of an identity's mean head reading, or None."""
+    if not vectors:
+        return None
+    m = np.mean(np.stack(vectors).astype(np.float64), axis=0)
+    mass = {
+        name: float(sum(m[b] * w for b, w in bins)) for name, bins in HEAD_FAMILIES
+    }
+    best = max(mass, key=mass.get)
+    return best if mass[best] > 0.0 else None
+
+
+#: One beard reading's class, from its fractions (run f0bfc5, 45 identities
+#: of the queue's first 32 pairs, 1,078 reads): DARK when at least half the
+#: chin reads darker than 0.4 of the cheek (the seven full beards' median
+#: reads 0.47-0.75 dark, 21 shaven or moustached men 0.03-0.48); WHITE (or
+#: GREY) when at least half reads pale — desaturated against the cheek —
+#: with under 0.25 dark (the white-bearded elder of pair #1: 0.59 pale, 0.00
+#: dark); NONE when at most 0.2 is dark and at least 0.7 is skin.  Anything
+#: else is unsure and names no class — a moustache, stubble, a hand over the
+#: mouth.
+BEARD_DARK_MIN = 0.5
+BEARD_PALE_MIN = 0.5
+BEARD_PALE_DARK_MAX = 0.25
+BEARD_NONE_DARK_MAX = 0.2
+BEARD_NONE_SKIN_MIN = 0.7
+#: An identity's class is the one at least this share of its reads name —
+#: counting the unsure reads against it.
+BEARD_AGREE = 2.0 / 3.0
+
+
+def beard_read_class(b: np.ndarray) -> str | None:
+    """``none`` / ``dark`` / ``grey`` / ``white`` for one reading, or None (unsure)."""
+    skin, dark, grey, white = (float(x) for x in b[:BEARD_DIM])
+    if dark >= BEARD_DARK_MIN:
+        return "dark"
+    if grey + white >= BEARD_PALE_MIN and dark < BEARD_PALE_DARK_MAX:
+        return "white" if white >= grey else "grey"
+    if dark <= BEARD_NONE_DARK_MAX and skin >= BEARD_NONE_SKIN_MIN:
+        return "none"
+    return None
+
+
+def beard_class(vectors: list[np.ndarray]) -> str | None:
+    """An identity's beard: the class BEARD_AGREE of its reads name, or None."""
+    if not vectors:
+        return None
+    named = [beard_read_class(v) for v in vectors]
+    counts: dict[str, int] = {}
+    for c in named:
+        if c is not None:
+            counts[c] = counts.get(c, 0) + 1
+    if not counts:
+        return None
+    best = max(counts, key=counts.get)
+    return best if counts[best] >= BEARD_AGREE * len(vectors) else None
+
+
+def beards_differ(a: str | None, b: str | None) -> bool:
+    """Two confident beard classes one person cannot show in one event.
+
+    None against any beard, or dark against white.  Grey sits between both
+    and is never set against either: salt-and-pepper under warm light reads
+    grey one walk and dark the next.
+    """
+    if a is None or b is None or a == b:
+        return False
+    return "none" in (a, b) or {a, b} == {"dark", "white"}

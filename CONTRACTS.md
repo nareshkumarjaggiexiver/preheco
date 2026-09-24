@@ -1760,3 +1760,63 @@ pair aside — on BOTH identities' own testimony.
   garment under a warm cast sits wholly inside the skin window — and every
   one measurable again balanced.
 
+### Head and beard (counting + runner + match 0.14.0)
+
+Run f0bfc5's pair #1 — a maroon turban and black beard against a peach
+turban and white beard — was the queue's first question, and the torso
+could not settle it (a white shirt against a pink check agreed at 0.42 in
+some pair of reads).
+
+- `heco_counting.appearance.head_descriptor(image_bgr, face_box, landmarks,
+  gains=None, person_box=None) -> 40 floats | None`. Region: from 0.6 face
+  heights above the face box's top — or the person box's top less 0.05 face
+  heights, when that is lower (above it is wall) — down to the eye line
+  less 0.15 IED; the box ± 0.15 of its width; clamped to the image. Lit
+  (not blown) pixels vote, skin-window pixels at a quarter weight: chroma
+  (max − min channel) ≥ 20 into bins 0..23 (24 SOFT hue bins of 15°, that
+  WRAP at red), the rest into 24..26 (soft brightness: black, grey,
+  white); 27..39 reserved zeros; sums to 1. Deviations from the drafted
+  contract, each measured: chroma not saturation (black hair read S 40–93,
+  chroma 4–5); skin at a quarter weight, not masked (the peach turban sits
+  wholly inside the skin window); no shadow floor (black hair is V 13–22).
+  None without two eye landmarks, for a window under 8 px or under 60 lit
+  pixels.
+- `beard_descriptor(image_bgr, face_box, landmarks, gains=None) ->
+  [skinFrac, darkFrac, greyFrac, whiteFrac] | None`. Region: nose tip to
+  the face box's bottom, the mouth corners ± 0.25 IED. Each pixel judged
+  against the same face's cheek band (eye line + 0.25 IED to the nose tip):
+  DARK under 0.4 of its median brightness; else PALE under half its median
+  saturation — WHITE from 0.9 of its brightness, GREY below; else SKIN.
+  None with the nose tip at or below the mouth line, a window under 6 px or
+  40 lit pixels, or cheeks under 20 pixels or darker than 20.
+- Runner: for every kept face with landmarks on a decoded frame, `POST
+  /match` gains **`head`** and **`beard`** (each only when measured; the
+  same-frame re-ask carries them too). Timed as `headBeardMs`.
+- Match 0.14.0: `MatchRequest` accepts `head` (exactly 40 floats) and
+  `beard` (exactly 4 in 0..1) — any other shape is a 422; `body_sightings`
+  gains nullable **`head BLOB, beard BLOB`** (ADD COLUMN; legacy rows read
+  null) logged on the call's body row. The review adds, on every row,
+  **`why.head: {a, b, sim, selfA, selfB, nA, nB}`** (`a`/`b` the dominant
+  colour of each identity's mean head reading — red, orange, yellow, green,
+  blue, purple, pink, black, grey, white, or null; never brown) and
+  **`why.beard: {a, b, nA, nB}`** (`none | dark | grey | white | null`),
+  and `excluded` gains **`head`** and **`beard`** (check order gender, age,
+  stature, clothes, head, beard).
+  - head: both identities ≥ 3 head reads over ≥ 2 s with median pairwise
+    self-agreement ≥ 0.6, BOTH heads headwear (mean chromatic share ≥ 0.5),
+    and best cross < **`HECO_REVIEW_HEAD_CLASH`** (0.45; 0 = off). A
+    covered head is never set against a bare one: a dupatta over the hair
+    for the ceremony, a rumal for the Gurdwara — one guest's head is both
+    within one wedding.
+  - beard: both identities ≥ **`HECO_REVIEW_BEARD_MIN_N`** (3; 0 = off)
+    reads over ≥ 2 s; class = the one two thirds of the reads name (a read:
+    dark ≥ 0.5 → dark; pale ≥ 0.5 with dark < 0.25 → white or grey; dark ≤
+    0.2 with skin ≥ 0.7 → none; else unsure); set aside for none against
+    any beard, or dark against white.
+  - `/health` gains `reviewHeadClash`, `reviewBeardMinN`.
+- Measured on f0bfc5 (45 identities, 1,092 head and 1,078 beard reads): own
+  head reads agree at a median 0.87 (min 0.63); nine same-person splits at
+  0.83–0.99 head and no beard clash; #1 reads head red/orange at 0.36 and
+  beard dark/white and is set aside on both. White balance changes none of
+  it.
+

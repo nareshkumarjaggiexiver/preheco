@@ -500,6 +500,8 @@ class MatchClient:
         attributes: dict | None = None,
         feat_norm: float | None = None,
         body: dict | None = None,
+        head: list[float] | None = None,
+        beard: list[float] | None = None,
     ) -> dict:
         """Resolve one embedding against this run's gallery.
 
@@ -507,9 +509,12 @@ class MatchClient:
         feature's L2 length) and ``body`` ({h, w, yBottom, frameH}: the
         sighting's containing PERSON box) are the R1 riders the review queue
         reasons from — a man against a woman, a child against an adult, a
-        short guest against a tall one.  Each is sent only when known, like
-        ``appearance``: absent is not zero, and a null on the wire says
-        nothing an omitted key does not.
+        short guest against a tall one.  ``head`` (40 floats) and ``beard``
+        (4) are the face's headwear and beard readings, for the same queue —
+        a red turban against an orange one, a black beard against a white
+        one.  Each is sent only when known, like ``appearance``: absent is
+        not zero, and a null on the wire says nothing an omitted key does
+        not.
         """
         wire: dict = {
             "runId": self._run_id, "embedding": embedding, "quality": quality,
@@ -526,6 +531,10 @@ class MatchClient:
             wire["featNorm"] = feat_norm
         if body is not None:
             wire["body"] = body
+        if head is not None:
+            wire["head"] = head
+        if beard is not None:
+            wire["beard"] = beard
         try:
             return self._call("/match", wire)
         except MatchRefused as e:
@@ -1908,6 +1917,18 @@ class RunLoop:
                     frame_img, face["box"], pbox, wb_gains
                 )
                 board.observe("count", "appearanceMs", (time.perf_counter() - ta) * 1000.0)
+            # HEAD AND BEARD, for the review queue alone: read off the same
+            # frame from the face's landmarks (a face without them has
+            # neither; absent is not zero) under the same white balance.
+            head = beard = None
+            landmarks = face.get("landmarks")
+            if frame_img is not None and landmarks:
+                th = time.perf_counter()
+                head = appearance.head_descriptor(
+                    frame_img, face["box"], landmarks, wb_gains, pbox
+                )
+                beard = appearance.beard_descriptor(frame_img, face["box"], landmarks, wb_gains)
+                board.observe("count", "headBeardMs", (time.perf_counter() - th) * 1000.0)
             body = {"runId": planner_run_id, "embedding": emb, "quality": w}
             if face_desc is not None:
                 body["appearance"] = face_desc
@@ -1917,12 +1938,16 @@ class RunLoop:
             # frame height, so the match service can fit stature across the
             # whole run.  None without a box or a height — absent is not zero.
             body_box = self._body_box(pbox, frame_h)
-            extras.append({"attributes": attr, "featNorm": norm, "body": body_box})
+            extras.append({
+                "attributes": attr, "featNorm": norm, "body": body_box,
+                "head": head, "beard": beard,
+            })
             m = self._timed("match", "matchMs", partial(
                 self.match_port.match,
                 embedding=body["embedding"], quality=body["quality"],
                 appearance=body.get("appearance"), site_id=body.get("siteId"),
                 attributes=attr, feat_norm=norm, body=body_box,
+                head=head, beard=beard,
             ))
             board.frame("match")
             if m.get("cosine") is not None:
@@ -2440,8 +2465,8 @@ class RunLoop:
             body["appearance"] = desc
         if site_id:
             body["siteId"] = site_id
-        # The R1 riders the first ask carried ({attributes, featNorm, body}),
-        # each only when known — the same omit-when-absent rule as appearance.
+        # The riders the first ask carried ({attributes, featNorm, body, head,
+        # beard}), each only when known — the omit-when-absent rule again.
         for wire, value in (extra or {}).items():
             if value is not None:
                 body[wire] = value

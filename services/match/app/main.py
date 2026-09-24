@@ -7,14 +7,14 @@ Endpoints:
     GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?, appearance?,
-                  attributes?, featNorm?, body?}
+                  attributes?, featNorm?, body?, head?, beard?}
         -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
             templateN, templateAdded, appearanceSim, appearanceVetoed, templateId,
             nearMiss: {key, cosine, appearanceSim, basis} | null}
     POST /review/duplicates {runId, limit?}
         -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
             considered, returned, dropped,
-            excluded: {gender, age, stature, clothes},
+            excluded: {gender, age, stature, clothes, head, beard},
             setAside:[{a, b, cosine, clothes, why, reasons}]}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
@@ -44,7 +44,7 @@ from heco_common.gate_auth import install_bearer_gate
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config, gallery, staff
-from .appearance import APPEARANCE_DIMS
+from .appearance import APPEARANCE_DIMS, BEARD_DIM, HEAD_DIM
 from .store import EmbedderMismatchError, close_all_stores
 
 
@@ -67,7 +67,10 @@ def _env_s(name: str, default: float) -> float:
 #: queue gains a per-pair `why` and an `excluded` count.  Additive only.
 #: 0.13.0 (2026-09-24, night): the body log keeps each sighting's torso and
 #: the review may set a pair aside on clothing (`excluded.clothes`).
-VERSION = "0.13.0"
+#: 0.14.0 (same night): /match accepts optional `head` (40 floats) and
+#: `beard` (4), logged on the body row; the review adds why.head / why.beard
+#: and head / beard set-asides.  Additive only.
+VERSION = "0.14.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -200,6 +203,12 @@ class MatchRequest(BaseModel):
     the raw feature's L2 norm, and the sighting's containing PERSON box.
     They feed only the duplicate review queue's ``why`` and its exclusions.
     Each is optional and ``null`` means not measured.
+
+    ``head`` (exactly 40 floats: 24 soft hue bins, 3 brightness bins, 13
+    reserved, summing to 1) and ``beard`` (exactly 4: skin, dark, grey,
+    white fractions of the chin) are the runner's readings of this face
+    (``heco_counting.appearance``), logged on the body row for the review
+    queue alone; a wrong length is a 422 naming the contract.
     """
 
     runId: str
@@ -215,6 +224,30 @@ class MatchRequest(BaseModel):
     attributes: FaceAttributes | None = None
     featNorm: float | None = None
     body: PersonBox | None = None
+    head: list[float] | None = None
+    beard: list[float] | None = None
+
+    @field_validator("head")
+    @classmethod
+    def _head_is_40_floats(cls, v: list[float] | None) -> list[float] | None:
+        """A head descriptor is 40 floats or absent; anything else is a wire bug."""
+        if v is not None and len(v) != HEAD_DIM:
+            raise ValueError(
+                "head must be exactly 40 floats (24 hue + 3 brightness + 13"
+                f" reserved, summing to 1); got {len(v)}"
+            )
+        return v
+
+    @field_validator("beard")
+    @classmethod
+    def _beard_is_4_fractions(cls, v: list[float] | None) -> list[float] | None:
+        """A beard reading is [skin, dark, grey, white] fractions or absent."""
+        if v is not None and (len(v) != BEARD_DIM or any(x < 0.0 or x > 1.0 for x in v)):
+            raise ValueError(
+                "beard must be exactly 4 fractions in 0..1 (skin, dark, grey,"
+                f" white); got {v!r}"
+            )
+        return v
 
     @field_validator("appearance")
     @classmethod
@@ -383,6 +416,8 @@ def health() -> dict:
         "reviewClothesClash": config.review_clothes_clash(),
         "reviewClothesMinN": config.review_clothes_min_n(),
         "reviewClothesSelfMin": config.review_clothes_self_min(),
+        "reviewHeadClash": config.review_head_clash(),
+        "reviewBeardMinN": config.review_beard_min_n(),
     }
 
 
@@ -479,6 +514,8 @@ def match(body: MatchRequest) -> dict:
             attributes=None if body.attributes is None else body.attributes.model_dump(),
             feat_norm=body.featNorm,
             body=None if body.body is None else body.body.model_dump(),
+            head=body.head,
+            beard=body.beard,
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -662,6 +699,8 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             clothes_clash=config.review_clothes_clash(),
             clothes_min_n=config.review_clothes_min_n(),
             clothes_self_min=config.review_clothes_self_min(),
+            head_clash=config.review_head_clash(),
+            beard_min_n=config.review_beard_min_n(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
