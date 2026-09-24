@@ -212,6 +212,25 @@ def _fake_ort(monkeypatch, falls_back: bool, size: int = 64) -> list:
     return seen
 
 
+def test_trt_device_truth_is_read_after_the_warm_up(monkeypatch, tmp_path):
+    """A TensorRT engine that fails to build inside the warm-up run drops the
+    session to CUDA WITHOUT raising: /health must say so (active without
+    TensorRT, trt null), not keep the list ORT reported at construction."""
+    import app.model as m
+
+    monkeypatch.setenv("HECO_TRT_CACHE", str(tmp_path / "cache"))
+    weight = tmp_path / "yolox_s.onnx"
+    weight.write_bytes(b"yolox-weights")
+    _fake_ort(monkeypatch, falls_back=True)
+    det = m.PersonDetector(weight, 64, "yolox", "TRT")
+    assert det.providers_active == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert det.trt is None
+    _fake_ort(monkeypatch, falls_back=False)
+    det = m.PersonDetector(weight, 64, "yolox", "TRT")
+    assert det.providers_active == _TRT_LIST
+    assert det.trt["fp16"] is True
+
+
 def test_trt_engines_are_keyed_on_the_weights_not_the_file_name(monkeypatch, tmp_path):
     """persons loads by PATH, and the EP's engine name carries the file name
     but not the weights: re-fetched in place, the old engine answered. The
