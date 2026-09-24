@@ -87,15 +87,34 @@ def test_vaapi_loop_and_software_commands(monkeypatch):
 
 
 def test_rtsp_options_follow_the_binarys_version(monkeypatch):
-    """-timeout is the socket timeout from 5.0; in 4.x it meant LISTEN mode."""
+    """-timeout is the socket timeout from 5.0; in 4.x it meant LISTEN mode.
+
+    5 s, because ffmpeg exits only after TWO silent periods: measured on the
+    box, 5 s exited 10.2 s into a stall where 10 s took 20.4 s (and 23.2 s to
+    frames again) against the runner's 45 s stall window."""
     monkeypatch.setattr(fs, "_VERSION", (7, 1))
     new = fs.build_command("rtsp://u:p@cam/1", "nvdec")
     assert new[new.index("-rtsp_transport") + 1] == "tcp"
     assert "-timeout" in new and "-stimeout" not in new
+    assert new[new.index("-timeout") + 1] == "5000000"
     monkeypatch.setattr(fs, "_VERSION", (4, 4))
     old = fs.build_command("rtsp://u:p@cam/1", "nvdec", rtsp_tcp=False)
     assert "-stimeout" in old and "-timeout" not in old and "-rtsp_transport" not in old
+    assert old[old.index("-stimeout") + 1] == "5000000"
     assert "-vsync" in old and "-fps_mode" not in old
+
+
+def test_http_sources_get_a_read_timeout(monkeypatch):
+    """-reconnect* reacts to errors and EOF, not to a source that goes silent
+    with its connection open: measured, that held the worker 75 s and counting
+    while cv2 reconnected at +37 s. -rw_timeout makes the silence an error."""
+    monkeypatch.setattr(fs, "_VERSION", (7, 1))
+    for url in ("http://cam/live.ts", "https://cam/live.ts"):
+        cmd = fs.build_command(url, "nvdec")
+        assert cmd[cmd.index("-rw_timeout") + 1] == "10000000"
+        assert cmd.index("-rw_timeout") < cmd.index("-i"), "an input option"
+    assert "-rw_timeout" not in fs.build_command("/c.mp4", "nvdec")
+    assert "-rw_timeout" not in fs.build_command("rtsp://cam/1", "nvdec")
 
 
 # ------------------------------------------------------ frames and gate

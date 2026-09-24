@@ -56,6 +56,23 @@ VAAPI_DEVICE = "/dev/dri/renderD128"
 #: declared dead. A 4K RTSP camera needs a connection, a keyframe (up to one
 #: GOP, 1 s here) and a CUDA context — seconds, not tens of them.
 OPEN_TIMEOUT_S = 15.0
+#: RTSP socket timeout, microseconds. ffmpeg EXITS only after TWO of these
+#: without a byte (it logs "Failed reading RTSP data: Connection timed out"
+#: twice): measured on the .94 box (ffmpeg 7.1.5, a fake camera silent with
+#: its TCP left open), 5 s exited 10.2 s after the silence; the 10 s this
+#: used to be exited at 20.4 s and frames resumed through the worker at
+#: 23.2 s — against the runner's 45 s HECO_SOURCE_STALL_S. The two are
+#: coupled: 2 x this + ~3 s of reconnect must stay well under that window.
+#: An ffmpeg 4.x (-stimeout) never exits at all — the laptop's 4.4.2 emitted
+#: one stale frame per timeout, forever.
+RTSP_TIMEOUT_US = 5_000_000
+#: http(s) read timeout, microseconds: -reconnect* reacts to errors and EOF,
+#: not to a source that goes silent with its connection open — measured on
+#: the laptop, a stalled MPEG-TS source held the worker 75 s and counting
+#: (cv2 reconnected at +37 s). Past this ffmpeg's read fails and it
+#: reconnects itself (laptop: reconnected at +10.1 and +20.3 s) or exits
+#: into the worker's reconnect.
+HTTP_RW_TIMEOUT_US = 10_000_000
 #: Socket buffer asked for on each end, so a 12 MB frame crosses in a few
 #: wake-ups. The kernel caps it at net.core.[rw]mem_max, which only costs speed.
 _SOCK_BUF = 4 << 20
@@ -111,10 +128,12 @@ def build_command(
     if scheme in ("rtsp", "rtsps"):
         if rtsp_tcp:
             cmd += ["-rtsp_transport", "tcp"]
-        # 10 s without a byte is a dead camera: exit, and the worker reconnects.
-        cmd += ["-timeout" if version >= (5, 0) else "-stimeout", "10000000"]
+        # A silent camera is a dead one: ffmpeg exits after 2 x this (see
+        # RTSP_TIMEOUT_US), and the worker reconnects.
+        cmd += ["-timeout" if version >= (5, 0) else "-stimeout", str(RTSP_TIMEOUT_US)]
     elif scheme in ("http", "https"):
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        cmd += ["-rw_timeout", str(HTTP_RW_TIMEOUT_US)]
     if loop:
         cmd += ["-stream_loop", "-1"]
     cmd += ["-i", source, "-map", "0:v:0", "-an", "-sn", "-dn"]
