@@ -517,28 +517,16 @@ direct URL): copy `~/dl/genderage.onnx` into `services/embed/models/` in
 both trees once, where the compose bind mount puts it under the embed
 service's default path.
 
-**Images are rebuilt per tree, on the box.** Weights are bind-mounted, but
-code is baked, so a synced file changes nothing until:
-
-```sh
-docker compose build          # runner match ingest tracker, and the PLAIN persons/faces/embed
-docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-persons -t heco-persons:cuda .
-docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-faces   -t heco-faces:cuda   .
-docker build -f docker/persons-cuda.Dockerfile --build-arg BASE=heco-embed   -t heco-embed:cuda   .
-./scripts/demo-up.sh          # or ./scripts/shm-up.sh in the shm tree
-```
-
-The three `:cuda` images are built FROM the plain ones, so the plain build
-comes first, and `docker compose -f … -f docker-compose.gpumax.yml build`
-must never be the command (the header of that file says why: it would tag
-a CPU image `:cuda`). **Both trees build the same image tags** —
-`heco-runner`, `heco-match`, `heco-persons:cuda`, … — so whichever tree
-built last is what BOTH stacks get on their next recreate. The box carries
-`heco-*:shmcuda` and `heco-shm-base` tags from earlier hand builds; the
-committed overlays do not reference them. Rebuild the shm tree last, or
-retag, and then read the `build` id from every runner's `/health` (:7100,
-:7200, :7300 — DEPLOY.md): identical code is an identical hash, and a
-stack that missed the rebuild is the one whose hash differs.
+**Images are rebuilt per tree, on the box, under that tree's own tags.**
+Weights are bind-mounted, but code is baked, so a pulled commit changes
+nothing until `./scripts/build-images.sh` (main: `heco-*:latest` +
+`heco-{persons,faces,embed}:cuda`) or `./scripts/shm-up.sh build` (shm:
+`:shm` + `:shmcuda`) and a recreate. Until 2026-09-24 both trees built the
+SAME tags, so whichever tree built last supplied the code for all three
+stacks; the compose files now read `HECO_IMAGE_TAG` / `HECO_CUDA_TAG`
+(defaults `latest` / `cuda`, i.e. main is unchanged). Read the `build` id
+from every runner's `/health` (:7100, :7200, :7300 — DEPLOY.md) after a
+recreate: a stack that missed its rebuild is the one whose hash differs.
 
 **Rollout order, per tree: match first.** Rebuild and restart `match`
 (`/health` must say `"version": "0.12.0"`) BEFORE the runner/counting image
