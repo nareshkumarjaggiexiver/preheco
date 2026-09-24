@@ -1561,6 +1561,11 @@ class RunLoop:
         # searched every frame regardless, so this only ever removes work that
         # re-confirms a settled answer.
         within = self._reverify_within(within, tracks)
+        # None = look at the whole frame once. The re-verify saving above is
+        # a crop-path idea and simply does not apply: there are no crops to
+        # skip, and the one inference costs the same whoever is identified.
+        if s.faces_whole_frame:
+            within = None
         faces_out = self._timed(
             "face-detect",
             "faceDetectMs",
