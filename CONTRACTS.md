@@ -1754,8 +1754,9 @@ pair aside — on BOTH identities' own testimony.
   as delivered. `gains=None` is the descriptor as before, byte for byte.
 - Runner env **`HECO_APPEARANCE_WB`** (0|1, default 0): estimate once per
   decoded frame and pass to every descriptor read off it (`wbMs` timed on
-  the count stage). `GET {runner}/health` gains **`knobs:
-  {appearanceWb}`**.
+  the count stage). `GET {runner}/health` shows it as
+  **`knobs.HECO_APPEARANCE_WB`**, in the one knobs block the throughput
+  levers use (keyed by env name).
 - Default OFF, on a measurement: run f0bfc5's camera AWB already holds the
   warm hall neutral (gains 1.006 / 0.985 / 1.009 B/G/R median, every frame
   within 2%), and balancing moved no clothing number that matters (within

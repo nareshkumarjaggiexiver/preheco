@@ -4,7 +4,7 @@ White balance (HECO_APPEARANCE_WB) is off by default, and off is today's
 loop exactly: frame_gains is never called and the torso descriptor is read
 without gains.  On, the frame's gains are estimated ONCE per decoded frame
 and handed to every descriptor read off it.  The knob reaches GET /health
-as knobs.appearanceWb.
+as knobs.HECO_APPEARANCE_WB.
 
 Head and beard ride /match for every kept face that has landmarks, and ride
 the same-frame re-ask too, so a re-resolved sighting is not logged blind.
@@ -86,11 +86,11 @@ def test_wb_reaches_health_as_a_knob(monkeypatch):
     from app import main
 
     with TestClient(main.app) as client:
-        assert client.get("/health").json()["knobs"] == {"appearanceWb": False}
+        assert client.get("/health").json()["knobs"]["HECO_APPEARANCE_WB"] is False
         monkeypatch.setattr(
             main.manager, "settings", Settings(appearance_wb=True), raising=False
         )
-        assert client.get("/health").json()["knobs"]["appearanceWb"] is True
+        assert client.get("/health").json()["knobs"]["HECO_APPEARANCE_WB"] is True
 
 
 # ------------------------------------------------------------ head + beard
