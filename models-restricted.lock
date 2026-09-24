@@ -25,3 +25,13 @@
 #    contract (family "rtdetr", MODEL_SPECS).
 #  - ultralytics RT-DETR / RF-DETR-large — AGPL-3.0 / PML respectively;
 #    grant "contact" — enter here the day a vendor conversation starts.)
+#
+# SCRFD weights the .94 box runs — provenance, not rows: InsightFace ships
+# them only INSIDE its model-pack zips, so there is no single-file URL for
+# `make models` to fetch and verify. Extract the member, then check it:
+#  - scrfd_10g_kps.onnx  = buffalo_l.zip member det_10g.onnx
+#      sha256 5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91
+#  - scrfd_2.5g_kps.onnx = buffalo_m.zip member det_2.5g.onnx
+#      sha256 041f73f47371333d1d17a6fee6c8ab4e6aecabefe398ff32cca4e2d5eaee0af9
+#    buffalo_m.zip: https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_m.zip
+#      sha256 d98264bd8f2dc75cbc2ddce2a14e636e02bb857b3051c234b737bf3b614edca9
