@@ -192,7 +192,7 @@ def health() -> dict:
         # Family, device truth AND dimension: the runner cross-checks dim
         # against the deployment's HECO_EMBEDDING_DIM story, and the family
         # says which alignment produced these vectors.
-        "device": _device_block(emb) if emb else None,
+        "device": _device_block(emb, attrs) if emb else None,
         # EMBED_BATCH as asked and as it runs (a static-batch graph cannot).
         "knobs": _knobs(emb) if emb else None,
     }
@@ -209,11 +209,16 @@ def _knobs(emb) -> dict:
     }
 
 
-def _device_block(emb) -> dict:
+def _device_block(emb, attrs=None) -> dict:
     """Build the /health device truth; `trt` rides along only when TRT was asked.
 
     Keyed on the REQUEST, not on success: a TensorRT that failed to load
     answers "trt": null beside an `active` list without it.
+
+    ``attributes`` rides with it, for the genderage pass when it is loaded:
+    under TRT that pass builds an engine of its own (20-35 s cold, measured)
+    and can fall back to CUDA or CPU on its own, which until now left only a
+    stderr line. Off TRT the block keeps its four keys exactly.
     """
     block = {
         "requested": emb.device_requested,
@@ -223,6 +228,12 @@ def _device_block(emb) -> dict:
     }
     if is_trt(emb.device_requested):
         block["trt"] = getattr(emb, "trt", None)
+        if attrs is not None:
+            block["attributes"] = {
+                "requested": attrs.device_requested,
+                "active": list(attrs.providers_active),
+                "trt": getattr(attrs, "trt", None),
+            }
     return block
 
 
