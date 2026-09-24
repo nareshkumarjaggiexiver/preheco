@@ -370,6 +370,40 @@ def review_stature_min_n() -> int:
     return max(1, int(_env_f("HECO_REVIEW_STATURE_MIN_N", DEFAULT_REVIEW_STATURE_MIN_N)))
 
 
+#: The clothing set-aside (2026-09-24 night), measured on run c84098 — the
+#: Sharon wedding re-run whose gallery holds v3 torsos for 69 identities.
+#: Splitting each of 60 identities' own reads into an early and a late half
+#: and scoring the halves against each other (a person against themselves,
+#: exactly what a missed duplicate is) gave a best cross agreement of at least
+#: 0.52 (p5 0.71, median 0.93); the operator's different-people pairs read
+#: 0.10 (man / woman), 0.13, 0.15, 0.16, 0.24 (red / orange turban) and 0.25.
+#: 0.35 sits 0.17 under the worst same-person split.
+DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
+#: Reads each identity needs, from at least two different seconds, and how
+#: much they must agree with each other: a person whose own clothing reads
+#: scatter (lighting, a shawl on and off, a crowded torso) is not evidence.
+DEFAULT_REVIEW_CLOTHES_MIN_N = 3
+DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
+
+
+def review_clothes_clash() -> float:
+    """Best cross torso agreement under which a pair is set aside
+    (env HECO_REVIEW_CLOTHES_CLASH; 0 = off)."""
+    return _env_f("HECO_REVIEW_CLOTHES_CLASH", DEFAULT_REVIEW_CLOTHES_CLASH)
+
+
+def review_clothes_min_n() -> int:
+    """v3 torso reads each identity needs before its clothing can set a pair
+    aside (env HECO_REVIEW_CLOTHES_MIN_N).  Clamped to at least 2."""
+    return max(2, int(_env_f("HECO_REVIEW_CLOTHES_MIN_N", DEFAULT_REVIEW_CLOTHES_MIN_N)))
+
+
+def review_clothes_self_min() -> float:
+    """How much an identity's own torso reads must agree (median pairwise)
+    before they count (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
+    return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
+
+
 def adult_height_m() -> float:
     """Metres a stature ratio of 1.0 stands for (env HECO_STATURE_ADULT_M).
 

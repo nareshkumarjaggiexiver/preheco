@@ -631,6 +631,22 @@ class VectorStore:
         ).fetchall()
         return [np.frombuffer(r[0], dtype=np.float32) for r in rows]
 
+    def appearance_rows_for(self, key: str) -> list[tuple[str, np.ndarray]]:
+        """Every stored torso descriptor for one key WITH its write time.
+
+        :meth:`appearances_for` without the timestamp is enough to compare two
+        sightings; the review queue's clothing set-aside also has to know the
+        reads were taken at different moments, because five reads from one
+        second of one crossing agree with each other trivially and prove
+        nothing about how consistently this person's clothing reads.
+        """
+        rows = self.conn.execute(
+            "SELECT created_at, appearance FROM vectors"
+            " WHERE key = ? AND appearance IS NOT NULL ORDER BY id ASC",
+            (key,),
+        ).fetchall()
+        return [(r[0], np.frombuffer(r[1], dtype=np.float32)) for r in rows]
+
     def attributes_for(self, key: str) -> list[tuple[str | None, float | None, float | None]]:
         """Each template's ``(gender, gender_p, age)`` for one key, NULLs kept.
 
