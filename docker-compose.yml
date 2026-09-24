@@ -313,6 +313,7 @@ services:
       # into the state volume by default so a capture survives the container
       # and can be read out with `docker cp`.
       HECO_GOLDEN_PATH: ${HECO_GOLDEN_PATH-}
+      HECO_FACES_WHOLE_FRAME: ${HECO_FACES_WHOLE_FRAME-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101

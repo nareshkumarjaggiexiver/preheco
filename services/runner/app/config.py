@@ -81,6 +81,22 @@ class Settings:
     # only gate signal not derived from the detector's own landmarks, which is
     # why it is the only one that can refuse a confident hallucination — see
     # heco_counting.gate.REASONS.
+    # WHOLE-FRAME FACE DETECTION. Off by default, which keeps the per-person
+    # crop path that has always run. On, the runner stops sending `within` and
+    # the faces service sees the frame once.
+    #
+    # The crops exist because letterboxing 4K into a 640 square leaves a 67 px
+    # face ~11 network px, under what stride-8 anchors resolve — so the crops
+    # were buying RESOLUTION, at one inference per person. Measured on the
+    # 4060: seven crops cost 59.5 ms; the same frame at a 1472x832 input costs
+    # 20.5 ms and leaves that face 25.7 net px. Same model, same weights, 2.9x
+    # less work, and it no longer depends on the person detector having found
+    # somebody to crop.
+    #
+    # Turn it on WITH FACES_SCRFD_INPUT set large and frame-shaped, or it is
+    # strictly worse than the crops: at the default 640 square, whole-frame on
+    # a 4K source finds almost nothing.
+    faces_whole_frame: bool = False
     quality_min_conf: float = 0.0
     quality_min_ied_px: float = 0.0
     quality_min_frontality: float = 0.0
@@ -438,6 +454,7 @@ def from_env() -> Settings:
         token_cache_path=os.environ.get("HECO_TOKEN_CACHE", s.token_cache_path),
         quality_min_px=env_float("HECO_QUALITY_MIN_PX", s.quality_min_px),
         quality_canon_px=env_float("HECO_QUALITY_CANON_PX", s.quality_canon_px),
+        faces_whole_frame=env_bool("HECO_FACES_WHOLE_FRAME", s.faces_whole_frame),
         quality_min_conf=env_float("HECO_QUALITY_MIN_CONF", s.quality_min_conf),
         quality_min_ied_px=env_float("HECO_QUALITY_MIN_IED_PX", s.quality_min_ied_px),
         quality_min_frontality=env_float("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality),
