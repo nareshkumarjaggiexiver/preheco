@@ -320,6 +320,26 @@ DEFAULT_REVIEW_STATURE_GAP = 0.2
 # not.  Under this an identity's stature is null — not measured, never 0.
 DEFAULT_REVIEW_STATURE_MIN_N = 8
 
+# Clothing: the torso descriptor RANKS the queue, and since 2026-09-24
+# (night) it may also set a pair aside — on both identities' own testimony.
+# Each identity needs at least CLOTHES_MIN_N v3 torso reads in its body log,
+# spanning two seconds, whose median pairwise intersection is at least
+# CLOTHES_SELF_MIN (its clothing reads as ONE garment); then the pair is set
+# aside when the best intersection any read of one reaches against any read
+# of the other is under CLOTHES_CLASH.  Run f0bfc5, 45 identities of the
+# queue's first 32 pairs: own reads agree at a median 0.90 (p10 0.70; the
+# two identities under 0.6 were each two people merged), one person split
+# across a gap of seconds to minutes still agreed at a best cross of 0.77 to
+# 0.97 (nine splits).  The queue's different-people pairs spread 0.10-0.97:
+# two white shirts agree, so clothing can only speak for pairs dressed
+# differently — 11 of the 32 sat under 0.43, and of those the four whose
+# identities both had the reads are set aside at 0.35: #3 (blue shirt vs
+# cream suit, 0.10), #6 (0.16), #7 (0.13), #23 (0.26); no same-person split
+# came within 0.42 of it.  CLOTHES_CLASH 0 turns the signal off.
+DEFAULT_REVIEW_CLOTHES_CLASH = 0.35
+DEFAULT_REVIEW_CLOTHES_MIN_N = 3
+DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
+
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
 # it is the anchor for every stature estimate and the planner's default
@@ -368,6 +388,25 @@ def review_stature_min_n() -> int:
     """Standing sightings an identity needs before its stature is trusted
     (env HECO_REVIEW_STATURE_MIN_N).  Clamped to at least 1."""
     return max(1, int(_env_f("HECO_REVIEW_STATURE_MIN_N", DEFAULT_REVIEW_STATURE_MIN_N)))
+
+
+def review_clothes_clash() -> float:
+    """Best cross-torso intersection under which a pair whose identities each
+    wear ONE garment is set aside (env HECO_REVIEW_CLOTHES_CLASH; 0 = off)."""
+    return _env_f("HECO_REVIEW_CLOTHES_CLASH", DEFAULT_REVIEW_CLOTHES_CLASH)
+
+
+def review_clothes_min_n() -> int:
+    """v3 torso reads each identity needs before its clothing counts
+    (env HECO_REVIEW_CLOTHES_MIN_N).  Clamped to at least 2: one read has no
+    self-agreement to trust."""
+    return max(2, int(_env_f("HECO_REVIEW_CLOTHES_MIN_N", DEFAULT_REVIEW_CLOTHES_MIN_N)))
+
+
+def review_clothes_self_min() -> float:
+    """Median pairwise intersection an identity's own torso reads must reach
+    (env HECO_REVIEW_CLOTHES_SELF_MIN)."""
+    return _env_f("HECO_REVIEW_CLOTHES_SELF_MIN", DEFAULT_REVIEW_CLOTHES_SELF_MIN)
 
 
 def adult_height_m() -> float:

@@ -1685,3 +1685,34 @@ Match before runner, per tree: a 0.11.0 match refuses the 64-float
 descriptor (the runner degrades to "torso not measured" and counts
 `appearanceRefused`); a new match accepts a 48-float runner.
 
+## v4 addition — the review queue sets aside on clothes (match 0.13.0, 2026-09-24 night)
+
+The user's ask: "cosine for cloths is not good; keep cloth colour, pattern
+style and compare". Clothing keeps ranking the queue and may now also set a
+pair aside — on BOTH identities' own testimony.
+
+- Storage: `body_sightings` gains nullable **`appearance BLOB`** (migrated
+  in place by ADD COLUMN): the torso descriptor of that /match call, logged
+  on the call's body row. The review reads an identity's torsos from here —
+  every sighting — not from its (at most five) templates; a same-frame
+  `bodyId` retraction takes the torso with the row. A call without a usable
+  `body` logs no row (it had no person box, so it had no torso either).
+- `POST /review/duplicates`: `excluded` gains **`clothes`**. A pair is set
+  aside when each identity has ≥ `HECO_REVIEW_CLOTHES_MIN_N` (3, clamped ≥ 2)
+  **v3** torso reads spanning ≥ 2 s of write time, whose median pairwise
+  intersection is ≥ `HECO_REVIEW_CLOTHES_SELF_MIN` (0.6), and the best
+  intersection of any read of one with any read of the other is <
+  `HECO_REVIEW_CLOTHES_CLASH` (0.35; 0 = off, and off never reads the body
+  log). v2 (48-float) rows never count; at most 24 reads per identity,
+  spread evenly over its time on camera. Checked after gender, age and
+  stature, so a pair is still counted under exactly one reason.
+- Set aside writes nothing — no `cannot_link`, no merge; the operator's
+  `/merge` of the pair still works. `/health` reports
+  `reviewClothesClash`, `reviewClothesMinN`, `reviewClothesSelfMin`.
+- Measured on run f0bfc5 (45 identities of the first 32 pairs, ≤ 24 reads
+  each, re-read offline from the video): own reads agree at a median 0.90
+  (p10 0.70; the two identities under 0.6 were each two people merged); one
+  person split across a time gap agrees at a best cross of 0.77–0.97 (9
+  splits); the queue's different-people pairs anywhere from 0.10 to 0.97
+  (two white shirts agree). 0.35 sets aside #3, #6, #7, #23 and no split.
+

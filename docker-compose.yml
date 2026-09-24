@@ -270,6 +270,15 @@ services:
       HECO_REVIEW_STATURE_GAP: ${HECO_REVIEW_STATURE_GAP-}
       HECO_REVIEW_STATURE_MIN_N: ${HECO_REVIEW_STATURE_MIN_N-}
       HECO_STATURE_ADULT_M: ${HECO_STATURE_ADULT_M-}
+      # CLOTHING SET-ASIDE (0.13.0). A pair is set aside when each identity's
+      # own torso reads (body log, >= MIN_N over 2 s) agree at >= SELF_MIN and
+      # the best cross reading is still < CLASH. Run f0bfc5: own reads 0.90
+      # median, one person split in time 0.77-0.97, different people
+      # 0.10-0.97 (white shirts agree); 0.35 set aside #3/#6/#7/#23 and no
+      # same-person split. CLASH=0 turns it off.
+      HECO_REVIEW_CLOTHES_CLASH: ${HECO_REVIEW_CLOTHES_CLASH-}
+      HECO_REVIEW_CLOTHES_MIN_N: ${HECO_REVIEW_CLOTHES_MIN_N-}
+      HECO_REVIEW_CLOTHES_SELF_MIN: ${HECO_REVIEW_CLOTHES_SELF_MIN-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}

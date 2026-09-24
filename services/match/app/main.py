@@ -13,7 +13,8 @@ Endpoints:
             nearMiss: {key, cosine, appearanceSim, basis} | null}
     POST /review/duplicates {runId, limit?}
         -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
-            considered, returned, dropped, excluded: {gender, age, stature}}
+            considered, returned, dropped,
+            excluded: {gender, age, stature, clothes}}
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -63,7 +64,9 @@ def _env_s(name: str, default: float) -> float:
 #: 0.12.0 (2026-09-24): /match accepts a 64-float (v3) torso descriptor beside
 #: the 48-float one, plus optional attributes / featNorm / body; the review
 #: queue gains a per-pair `why` and an `excluded` count.  Additive only.
-VERSION = "0.12.0"
+#: 0.13.0 (2026-09-24, night): the body log keeps each sighting's torso and
+#: the review may set a pair aside on clothing (`excluded.clothes`).
+VERSION = "0.13.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -376,6 +379,9 @@ def health() -> dict:
         "reviewStatureGap": config.review_stature_gap(),
         "reviewStatureMinN": config.review_stature_min_n(),
         "adultM": config.adult_height_m(),
+        "reviewClothesClash": config.review_clothes_clash(),
+        "reviewClothesMinN": config.review_clothes_min_n(),
+        "reviewClothesSelfMin": config.review_clothes_self_min(),
     }
 
 
@@ -648,6 +654,9 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             stature_gap=config.review_stature_gap(),
             stature_min_n=config.review_stature_min_n(),
             adult_m=config.adult_height_m(),
+            clothes_clash=config.review_clothes_clash(),
+            clothes_min_n=config.review_clothes_min_n(),
+            clothes_self_min=config.review_clothes_self_min(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e

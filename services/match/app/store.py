@@ -70,6 +70,12 @@ Storage
                   height against that fit needs more than the five views a
                   template cap keeps.  Re-keyed by :meth:`merge`, deleted by
                   :meth:`remove`, so a row always names a live identity.
+                  Since 2026-09-24 (night) the row also carries the
+                  sighting's torso descriptor, so the review queue judges an
+                  identity's clothing on every sighting it had, not on the
+                  five its template cap kept
+                  (:func:`app.gallery.review_duplicates`).  NULL = not
+                  measured.
 * ``cannot_link`` "these are two different people" constraints, stored
                   order-independent.  Written by an operator's *false-match*
                   correction and by the runner asserting CO-PRESENCE (two faces
@@ -140,7 +146,8 @@ CREATE TABLE IF NOT EXISTS body_sightings (
     y_bottom   REAL NOT NULL,
     frame_h    INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    face_w     REAL
+    face_w     REAL,
+    appearance BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_body_sightings_key ON body_sightings(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
@@ -176,9 +183,11 @@ _VECTOR_COLUMNS_ADDED = (
     ("age", "REAL"),          # ... estimated age in years
     ("feat_norm", "REAL"),    # ... L2 norm of the raw embedding feature
 )
-#: Same for ``body_sightings``, which shipped without ``face_w`` for a day.
+#: Same for ``body_sightings``, which shipped without ``face_w`` for a day
+#: and without the sighting's torso descriptor until that night.
 _BODY_COLUMNS_ADDED = (
     ("face_w", "REAL"),       # 2026-09-24 evening: the sighting's face width px
+    ("appearance", "BLOB"),   # 2026-09-24 night: torso descriptor, float32[48|64]
 )
 
 
@@ -198,6 +207,19 @@ class BodySighting(NamedTuple):
     frame_h: int
     face_w: float | None = None
     created_at: str | None = None
+
+
+class SightingEvidence(NamedTuple):
+    """One body-log row's appearance reading, for the review queue.
+
+    ``created_at`` is the write time (ISO text); ``appearance`` the torso
+    descriptor as a float32 array (48 or 64 long) — rows without one are
+    never returned, so it is never None here.
+    """
+
+    key: str
+    created_at: str
+    appearance: np.ndarray
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -694,6 +716,24 @@ class VectorStore:
         ).fetchone()
         return int(row[0])
 
+    def sighting_evidence(self) -> list[SightingEvidence]:
+        """Every body-log row that carries a torso descriptor, oldest first.
+
+        The review queue's clothing evidence, per SIGHTING, where the
+        template column keeps at most the cap's five — and on run f0bfc5
+        those sat inside two seconds for 20 of 44 identities (median span
+        2.0 s).  Rows without a descriptor are skipped in SQL, never read
+        as zeros.
+        """
+        rows = self.conn.execute(
+            "SELECT key, created_at, appearance FROM body_sightings"
+            " WHERE appearance IS NOT NULL ORDER BY id ASC"
+        ).fetchall()
+        return [
+            SightingEvidence(str(k), str(ts), np.frombuffer(a, dtype=np.float32))
+            for k, ts, a in rows
+        ]
+
     def count_for(self, key: str) -> int:
         """How many templates a single key owns.
 
@@ -828,6 +868,7 @@ class VectorStore:
     def add_body_sighting(
         self, key: str, h: float, w: float, y_bottom: float, frame_h: int,
         face_w: float | None = None,
+        appearance: list[float] | np.ndarray | None = None,
     ) -> int:
         """Record one sighting's containing PERSON box under ``key``; its rowid.
 
@@ -847,13 +888,22 @@ class VectorStore:
         never touches a verdict.  The rowid comes back so the runner's
         same-frame guard can retract the row if the sighting turns out to
         belong to a different body (:meth:`forget_body_sighting`).
+
+        ``appearance`` is the sighting's torso descriptor, stored as a
+        float32 BLOB; None stores NULL.  It rides on this row as well as on
+        any template the call wrote, because a template is written on a
+        handful of calls and the review queue judges an identity's clothing
+        across all of them — and on this row the same-frame guard's
+        retraction takes it too.
         """
+        blob = None if appearance is None else np.asarray(appearance, dtype=np.float32).tobytes()
         cur = self.conn.execute(
-            "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w,"
+            " appearance)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key, float(h), float(w), float(y_bottom), int(frame_h), _now(),
-                None if face_w is None else float(face_w),
+                None if face_w is None else float(face_w), blob,
             ),
         )
         return int(cur.lastrowid)
