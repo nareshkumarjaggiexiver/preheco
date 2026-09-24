@@ -260,6 +260,72 @@ def test_clash_zero_is_off_and_the_evidence_is_still_shown(client, ticking, monk
     assert on["setAside"][0]["why"] == pair["why"], "the evidence does not depend on the knob"
 
 
+# ------------------------------------------------------------- the well-seen tier
+#
+# Run e5bae3 (2026-09-25): a white shirt against a blue one agreed at 0.374 in
+# its best pair of reads, a black kurta against a light check at 0.496 — both
+# identities seen 17-37 times, both asked, while 27 well-seen identities
+# scored their own early half against their late half at 0.887 and up.
+
+#: 0.35 in bin 0 (red) and 0.55 in bin 24 (blue): agrees with RED at exactly
+#: 0.45 — over the 0.35 clash, under the well-seen 0.55.
+MOSTLY_BLUE = torso({0: 7.0, 24: 11.0})
+#: 0.5 red and 0.4 blue: agrees with RED at 0.60 — over the well-seen clash.
+MOSTLY_RED = torso({0: 5.0, 24: 4.0})
+
+
+def test_the_tier_fixtures_agree_with_red_where_the_tests_say():
+    """The fixtures' arithmetic, pinned so the tests below mean what they say."""
+    assert best_cross([np.asarray(RED)], [np.asarray(MOSTLY_BLUE)]) == pytest.approx(0.45)
+    assert best_cross([np.asarray(RED)], [np.asarray(MOSTLY_RED)]) == pytest.approx(0.60)
+
+
+def test_a_well_seen_pair_that_half_agrees_is_set_aside(client, ticking):
+    """Eight reads each over eight seconds, best cross 0.45: set aside."""
+    kh = sightings(client, "r", hub(), [RED] * 8)
+    ks = sightings(client, "r", spoke(1), [MOSTLY_BLUE] * 8)
+    got = review(client)
+    assert not in_queue(got, kh, ks)
+    assert got["excluded"]["clothes"] == 1
+    (row,) = got["setAside"]
+    assert row["reasons"] == ["clothes"]
+    assert row["why"]["clothes"]["cross"] == pytest.approx(0.45)
+
+
+def test_one_thinly_seen_side_keeps_the_charitable_clash(client, ticking):
+    """Seven reads on one side: the 0.35 rule alone speaks, and 0.45 is asked."""
+    kh = sightings(client, "r", hub(), [RED] * 8)
+    ks = sightings(client, "r", spoke(1), [MOSTLY_BLUE] * 7)
+    got = review(client)
+    assert in_queue(got, kh, ks) and got["excluded"]["clothes"] == 0
+
+
+def test_a_well_seen_pair_over_the_clash_is_asked(client, ticking):
+    """Mostly red against red, 0.60: a garment that may be the same, asked."""
+    kh = sightings(client, "r", hub(), [RED] * 8)
+    ks = sightings(client, "r", spoke(1), [MOSTLY_RED] * 8)
+    got = review(client)
+    assert in_queue(got, kh, ks) and got["excluded"]["clothes"] == 0
+
+
+def test_well_seen_but_self_disagreeing_has_no_clothing(client, ticking):
+    """Eight reads that disagree with each other are no testimony either."""
+    kh = sightings(client, "r", hub(), [RED, BLUE] * 4)
+    ks = sightings(client, "r", spoke(1), [torso({12: 1.0})] * 8)
+    assert in_queue(review(client), kh, ks)
+
+
+@pytest.mark.parametrize("knob", ["HECO_REVIEW_CLOTHES_WELL_SEEN_N", "HECO_REVIEW_CLOTHES_CLASH"])
+def test_the_tier_turns_off(client, ticking, monkeypatch, knob):
+    """WELL_SEEN_N=0 turns the tier off; CLOTHES_CLASH=0 turns clothing off, tier and all."""
+    kh = sightings(client, "r", hub(), [RED] * 8)
+    ks = sightings(client, "r", spoke(1), [MOSTLY_BLUE] * 8)
+    assert not in_queue(review(client), kh, ks)
+    monkeypatch.setenv(knob, "0")
+    got = review(client)
+    assert in_queue(got, kh, ks) and got["excluded"]["clothes"] == 0
+
+
 # ------------------------------------------------------------- setAside
 
 
@@ -348,6 +414,8 @@ def test_health_reports_the_clothing_policy_and_min_n_is_at_least_two(client, mo
     assert body["reviewClothesClash"] == pytest.approx(config.DEFAULT_REVIEW_CLOTHES_CLASH)
     assert body["reviewClothesMinN"] == 3
     assert body["reviewClothesSelfMin"] == pytest.approx(0.6)
+    assert body["reviewClothesWellSeenN"] == 8
+    assert body["reviewClothesWellSeenClash"] == pytest.approx(0.55)
     for name in (
         "HECO_REVIEW_CLOTHES_CLASH", "HECO_REVIEW_CLOTHES_MIN_N", "HECO_REVIEW_CLOTHES_SELF_MIN",
     ):

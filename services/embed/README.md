@@ -74,7 +74,10 @@ make run      # uvicorn on :7105
 - `GET /health` → `{ok, model, version, error, device, attrModel, attrError}`.
   `attrModel` is the loaded gender/age file's name or `null`; `attrError`
   is set when a file NAMED by `EMBED_ATTR_MODEL` will not load (`ok` stays
-  true — embedding works, the loss is just not silent).
+  true — embedding works, the loss is just not silent). Under
+  `HECO_DEVICE=TRT`, `device.attributes {requested, active, trt}` is the
+  gender/age pass's OWN device truth: it builds its own engine and can fall
+  back to CUDA or CPU on its own.
 - `POST /embed` `{imageB64, faces: [{box, landmarks, conf?}]}` →
   `{embeddings: [[128 floats]], alignMs, norms: [float],
   attributes: [{gender, genderP, age}] | null, attrMs: float | null}` —
@@ -101,7 +104,7 @@ model-dependent tests fully exercise the real graph with synthetic frames
 | --- | --- | --- |
 | `EMBED_MODEL` | `models/face_recognition_sface_2021dec.onnx` | weights path |
 | `EMBED_ATTR_MODEL` | `models/genderage.onnx` if present, else off | gender/age weights path; `off` disables the pass even when the default file exists |
-| `HECO_DEVICE` | `CPU` | ORT providers for the arcface family and the attribute pass (`CUDA`, `TRT`, `GPU`, …); the sface family is cv2 and ignores it. `TRT` = TensorRT fp16 then CUDA then CPU: ArcFace-R50 cosine >= 0.9999 vs fp32, no gender flips |
+| `HECO_DEVICE` | `CPU` | ORT providers for the arcface family and the attribute pass (`CUDA`, `TRT`, `GPU`, …); the sface family is cv2 and ignores it. `TRT` = TensorRT fp16 then CUDA then CPU: ArcFace-R50 vs fp32 on 40 frames (208 faces) cosine min 0.9997 (0.9999 for faces >= 56 px), feature norm within 1.1%, no gender flips, age within 0.17 y |
 | `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |
 | `EMBED_BATCH` | off | `1` runs a request's faces through ONE session.run (dynamic-batch graphs; the attribute pass too), chunks of 16. 5.5 faces per 4K frame on the 4060: embed 23.3 -> 11.6 ms, attributes 6.1 -> 1.7 ms on CUDA; cosine to per-face >= 0.999999. `/health` `knobs.batch` shows requested vs active |
 

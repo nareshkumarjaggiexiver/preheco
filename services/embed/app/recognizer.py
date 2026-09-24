@@ -236,7 +236,10 @@ class ArcFaceEmbedder(_Embedder):
         import onnxruntime as ort  # deferred, like every family loader
 
         self.model_name = model_path.name
-        providers, provider_options = providers_for(device)
+        # `model` keys a TensorRT engine on the weights' content (ignored off
+        # TRT): an in-place re-fetch under the old name otherwise ran the OLD
+        # engine (heco_common.ort.model_key).
+        providers, provider_options = providers_for(device, model=model_path)
         self._session = ort.InferenceSession(
             str(model_path), providers=providers, provider_options=provider_options
         )
@@ -304,7 +307,7 @@ class ArcFaceEmbedder(_Embedder):
             sample = (3, TEMPLATE_SIZE, TEMPLATE_SIZE) if self._nchw else (
                 TEMPLATE_SIZE, TEMPLATE_SIZE, 3)
             providers, provider_options = providers_for(
-                device, trt_batch_profile(inp.name, sample, BATCH_MAX))
+                device, trt_batch_profile(inp.name, sample, BATCH_MAX), model=model_path)
             self._session = ort.InferenceSession(
                 str(model_path), providers=providers, provider_options=provider_options
             )

@@ -29,6 +29,19 @@ L6 — hardware decode:
   the test-suite can run anywhere an ffmpeg binary exists. A decoder that
   cannot start falls back to ``cpu`` loudly (stderr and /health ``device``).
 
+Live sources:
+
+* ``INGEST_LIVE_TIMEOUT_S`` (default 0 = off: OpenCV's own 30 s open and
+  read timeouts, and a reconnect only when ``read()`` finally fails) — for a
+  LIVE source on the cv2 decoder, open and read with this timeout, and treat
+  any read that blocked for it as a dead stream: the frame it returned is
+  discarded (it is stale, flushed out of the decoder) and the source is
+  released and reopened. Measured on the .94 box against a fake RTSP camera
+  that goes silent with its TCP connection left open: today's loop saw
+  OpenCV's timeout fire at +35, +65 and +95 s, served one stale frame, and
+  opened the second session only at +98 s — a 60 s gap in new frames, past
+  the runner's 45 s stall window, so the run settled ``failed``.
+
 Process-wide:
 
 * ``INGEST_CV_THREADS`` (default unset = OpenCV's own choice, one per core)
@@ -54,6 +67,7 @@ ENV_KNOBS = (
     "INGEST_BUFFER_MB",
     "INGEST_DECODER",
     "INGEST_CV_THREADS",
+    "INGEST_LIVE_TIMEOUT_S",
 )
 
 #: The accepted INGEST_DECODER values; ``cpu`` is today's path.
@@ -75,10 +89,15 @@ class Levers:
     buffer_s: float = 0.0
     buffer_mb: int = 2048
     decoder: str = "cpu"
+    live_timeout_s: float = 0.0
 
     @property
     def armed(self) -> bool:
-        """True when any lever leaves today's capture loop."""
+        """True when any lever leaves today's capture loop.
+
+        ``live_timeout_s`` is not one: it changes how a live cv2 source is
+        opened and read inside whichever loop runs, not which loop.
+        """
         return self.motion_gate or self.buffer_s > 0 or self.decoder != "cpu"
 
     def knobs(self) -> dict:
@@ -92,6 +111,7 @@ class Levers:
             "bufferS": d["buffer_s"],
             "bufferMb": d["buffer_mb"],
             "decoder": d["decoder"],
+            "liveTimeoutS": d["live_timeout_s"],
         }
 
 
@@ -111,6 +131,7 @@ def levers_from_env(
     cap_mb = env_int("INGEST_BUFFER_MB", 2048)
     # "" is unset (compose renders an unchosen knob as the empty string).
     decoder = (env_str("INGEST_DECODER", "") or "cpu").strip().lower()
+    live_timeout = env_float("INGEST_LIVE_TIMEOUT_S", 0.0)
     if not 0.0 <= min_frac <= 1.0:
         raise ValueError(f"INGEST_MOTION_MIN_FRAC must be in [0, 1], got {min_frac}")
     if pixel_thr <= 0:
@@ -123,6 +144,8 @@ def levers_from_env(
         raise ValueError(f"INGEST_BUFFER_MB must be >= 1, got {cap_mb}")
     if decoder not in DECODERS:
         raise ValueError(f"INGEST_DECODER must be one of {'|'.join(DECODERS)}, got {decoder!r}")
+    if live_timeout < 0:
+        raise ValueError(f"INGEST_LIVE_TIMEOUT_S must be >= 0, got {live_timeout}")
     return Levers(
         motion_gate=gate,
         motion_min_frac=min_frac,
@@ -131,6 +154,7 @@ def levers_from_env(
         buffer_s=buf,
         buffer_mb=cap_mb,
         decoder=decoder,
+        live_timeout_s=live_timeout,
     )
 
 

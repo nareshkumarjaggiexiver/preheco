@@ -524,3 +524,132 @@ def test_cv_threads_is_left_alone_unless_set(monkeypatch):
         body = c.get("/health").json()
     assert calls == [1] and body["knobs"]["cvThreads"] == 1
     assert isinstance(body["cvThreadsActive"], int)
+
+
+# ------------------------------------------- INGEST_LIVE_TIMEOUT_S (cv2 live)
+
+
+class _Camera:
+    """A cv2.VideoCapture stand-in for a LIVE camera that goes silent once.
+
+    Every capture opened is recorded with the arguments it was opened with.
+    On the FIRST session, read/grab number ``stall_at`` blocks ``stall_s`` —
+    OpenCV waiting out its read timeout on a stream that stopped sending —
+    and then hands back a STALE frame (value 7), as the measured cv2 path
+    did once per timeout. Fresh frames carry their session number.
+    """
+
+    opened: list = []
+
+    def __init__(self, *args, stall_at=3, stall_s=0.5):
+        self.args, self.i, self.stall_at, self.stall_s = args, 0, stall_at, stall_s
+        self.session = len(_Camera.opened) + 1
+        _Camera.opened.append(self)
+
+    def isOpened(self):  # noqa: N802 — mirrors cv2's API
+        """Always open."""
+        return True
+
+    def get(self, prop):
+        """Only FPS is asked for."""
+        return 10.0
+
+    def set(self, *_a):
+        """Nothing to seek."""
+        return True
+
+    def release(self):
+        """Nothing to free."""
+
+    def read(self):
+        """One frame; the first session stalls once."""
+        self.i += 1
+        if self.session == 1 and self.i == self.stall_at:
+            time.sleep(self.stall_s)
+            return True, np.full((24, 32, 3), 7, np.uint8)
+        time.sleep(0.01)
+        return True, np.full((24, 32, 3), 100 + self.session, np.uint8)
+
+    def grab(self):
+        """Decode without retrieving: same timing as read."""
+        return self.read()[0]
+
+
+@pytest.fixture
+def camera(monkeypatch):
+    """Patch cv2.VideoCapture with _Camera; returns the list of captures opened."""
+    import cv2
+
+    _Camera.opened = []
+    monkeypatch.setattr(cv2, "VideoCapture", _Camera)
+    return _Camera.opened
+
+
+def _wait(cond, budget_s=5.0):
+    deadline = time.monotonic() + budget_s
+    while not cond():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.01)
+
+
+def test_live_timeout_off_is_todays_open_and_read(camera):
+    """OFF: the camera is opened with the source alone, a read that blocks is
+    just a slow frame (no reconnect), and /health grows no `live` block."""
+    w = CaptureWorker(source="rtsp://cam/1", is_file=False)
+    w.start()
+    try:
+        _wait(lambda: camera[0].i >= 6)
+        assert camera[0].args == ("rtsp://cam/1",)
+        assert len(camera) == 1, "OFF reconnected on a slow read"
+        assert "live" not in w.describe()
+    finally:
+        w.stop()
+
+
+@pytest.mark.parametrize("levers", [Levers(live_timeout_s=0.3),
+                                    Levers(live_timeout_s=0.3, buffer_s=30.0)])
+def test_live_timeout_drops_the_stale_frame_and_reconnects(camera, levers):
+    """ON, in today's loop and in lever mode: the capture is opened on FFmpeg
+    with the timeout for both open and read; the read that blocked for it is
+    a dead stream — its stale frame is never served, the camera is reopened,
+    and /health counts the stall and the reconnect."""
+    import cv2
+
+    w = CaptureWorker(source="rtsp://cam/1", is_file=False, levers=levers)
+    w.start()
+    try:
+        _wait(lambda: len(camera) >= 2 and camera[1].i >= 3)
+        assert camera[0].args == ("rtsp://cam/1", cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 300, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 300])
+        assert w.describe()["live"] == {"stalls": 1, "reconnects": 1, "reconnectFailures": 0}
+        if w.levered:
+            served = []
+            while (got := w.take()) is not None and (not served or got.seq != served[-1]):
+                served.append(got.seq)
+                assert int(got.image[0, 0, 0]) != 7, "a stale frame was served"
+            assert served, "nothing was served"
+    finally:
+        w.stop()
+    assert w.decoder["error"] is None
+
+
+def test_live_timeout_leaves_files_alone(camera):
+    """A recording is read as ever: opened with the path alone, never
+    'stalled' however long a read takes (a slow disk is not a dead camera)."""
+    w = CaptureWorker(source="/clip.mp4", is_file=True, levers=Levers(live_timeout_s=0.3))
+    assert camera[-1].args == ("/clip.mp4",)
+    assert "live" not in w.describe()
+    w.stop()
+
+
+def test_live_timeout_is_a_knob(monkeypatch):
+    """Read from the env, empty-safe, refused when negative, on /health."""
+    monkeypatch.setenv("INGEST_LIVE_TIMEOUT_S", "")
+    assert levers_from_env().live_timeout_s == 0.0
+    monkeypatch.setenv("INGEST_LIVE_TIMEOUT_S", "10")
+    assert levers_from_env().live_timeout_s == 10.0
+    assert levers_from_env().knobs()["liveTimeoutS"] == 10.0
+    assert levers_from_env().armed is False, "it changes how a loop reads, not which loop"
+    monkeypatch.setenv("INGEST_LIVE_TIMEOUT_S", "-1")
+    with pytest.raises(ValueError, match="INGEST_LIVE_TIMEOUT_S"):
+        levers_from_env()

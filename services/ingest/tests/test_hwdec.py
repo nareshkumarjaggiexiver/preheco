@@ -87,15 +87,45 @@ def test_vaapi_loop_and_software_commands(monkeypatch):
 
 
 def test_rtsp_options_follow_the_binarys_version(monkeypatch):
-    """-timeout is the socket timeout from 5.0; in 4.x it meant LISTEN mode."""
+    """-timeout is the socket timeout from 5.0; in 4.x it meant LISTEN mode.
+
+    5 s, because ffmpeg exits only after TWO silent periods: measured on the
+    box, 5 s exited 10.2 s into a stall where 10 s took 20.4 s (and 23.2 s to
+    frames again) against the runner's 45 s stall window."""
     monkeypatch.setattr(fs, "_VERSION", (7, 1))
     new = fs.build_command("rtsp://u:p@cam/1", "nvdec")
     assert new[new.index("-rtsp_transport") + 1] == "tcp"
     assert "-timeout" in new and "-stimeout" not in new
+    assert new[new.index("-timeout") + 1] == "5000000"
     monkeypatch.setattr(fs, "_VERSION", (4, 4))
     old = fs.build_command("rtsp://u:p@cam/1", "nvdec", rtsp_tcp=False)
     assert "-stimeout" in old and "-timeout" not in old and "-rtsp_transport" not in old
+    assert old[old.index("-stimeout") + 1] == "5000000"
     assert "-vsync" in old and "-fps_mode" not in old
+
+
+def test_http_sources_get_a_read_timeout(monkeypatch):
+    """-reconnect* reacts to errors and EOF, not to a source that goes silent
+    with its connection open: measured, that held the worker 75 s and counting
+    while cv2 reconnected at +37 s. -rw_timeout makes the silence an error."""
+    monkeypatch.setattr(fs, "_VERSION", (7, 1))
+    for url in ("http://cam/live.ts", "https://cam/live.ts"):
+        cmd = fs.build_command(url, "nvdec")
+        assert cmd[cmd.index("-rw_timeout") + 1] == "10000000"
+        assert cmd.index("-rw_timeout") < cmd.index("-i"), "an input option"
+    assert "-rw_timeout" not in fs.build_command("/c.mp4", "nvdec")
+    assert "-rw_timeout" not in fs.build_command("rtsp://cam/1", "nvdec")
+
+
+def test_live_timeout_moves_ffmpegs_own_timeouts_past_the_watchdog(monkeypatch):
+    """With INGEST_LIVE_TIMEOUT_S the worker's read watchdog decides; ffmpeg's
+    socket timeouts go to twice it so they never fire first (a 4.x ffmpeg
+    never exits on them at all — one stale frame per timeout, forever)."""
+    monkeypatch.setattr(fs, "_VERSION", (7, 1))
+    rtsp = fs.build_command("rtsp://cam/1", "nvdec", live_timeout_s=10.0)
+    assert rtsp[rtsp.index("-timeout") + 1] == "20000000"
+    http = fs.build_command("http://cam/live.ts", "nvdec", live_timeout_s=10.0)
+    assert http[http.index("-rw_timeout") + 1] == "20000000"
 
 
 # ------------------------------------------------------ frames and gate
@@ -273,6 +303,68 @@ def test_a_live_decoder_that_exits_is_restarted(monkeypatch):
     assert w.decoder["active"] == "nvdec"
     assert reaped(first_pid)
     assert [w.take().seq for _ in range(5)] == [1, 2, 3, 4, 5]
+
+
+def test_a_live_decoder_that_cannot_restart_says_so(monkeypatch, capfd):
+    """A camera drop whose restarts all fail is not invisible: /health's device
+    error carries the DecoderError that names the cause, stderr says so ONCE,
+    and the failures are counted — then all of it clears, with one line, when
+    the camera is back. (Before: 40 failed restarts, device still read
+    active=nvdec error=null, and nothing was logged.)"""
+    monkeypatch.setenv("FAKE_FRAMES", "3")
+    w = CaptureWorker("rtsp://cam/1", is_file=False,
+                      levers=Levers(decoder="nvdec", buffer_s=30.0))
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "fail")  # every restart from now fails
+    w.start()
+    try:
+        deadline = time.monotonic() + 10
+        while w.describe()["live"]["reconnectFailures"] < 2:
+            assert time.monotonic() < deadline, "the failed restarts were not counted"
+            time.sleep(0.05)
+        assert "live source down" in w.decoder["error"]
+        assert "Cannot load libnvcuvid.so.1" in w.decoder["error"], "the cause was dropped"
+        assert w.decoder["active"] == "nvdec"
+        monkeypatch.setenv("FAKE_FFMPEG_MODE", "ok")  # the camera is back
+        while w.describe()["live"]["reconnects"] < 1 or w.decoder["error"] is not None:
+            assert time.monotonic() < deadline, "the recovery was not seen"
+            time.sleep(0.05)
+    finally:
+        w.stop()
+    err = capfd.readouterr().err
+    assert err.count("live source down") == 1, err
+    assert err.count("live source back after") == 1, err
+
+
+@pytest.mark.parametrize("timeout", [0.0, 0.5])
+def test_a_silent_live_decoder_is_restarted_only_with_the_live_timeout(monkeypatch, timeout):
+    """A decoder that goes quiet WITHOUT exiting (a camera silent with its
+    connection open, a hung NVDEC) blocked the worker for good: nothing ends
+    the read. With INGEST_LIVE_TIMEOUT_S the read times out, ffmpeg is killed
+    and reaped, the stall is counted, and a new decoder carries on. Off, the
+    worker waits exactly as it always has."""
+    monkeypatch.setenv("FAKE_FRAMES", "3")
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "stall")
+    w = CaptureWorker("rtsp://cam/1", is_file=False,
+                      levers=Levers(decoder="nvdec", buffer_s=30.0, live_timeout_s=timeout))
+    first_pid = w._ff.pid
+    w.start()
+    try:
+        if timeout:
+            deadline = time.monotonic() + 10
+            while w.describe()["counters"]["captured"] < 6:
+                assert time.monotonic() < deadline, "the silent decoder was never replaced"
+                time.sleep(0.05)
+            live = w.describe()["live"]
+            assert live["stalls"] >= 1 and live["reconnects"] >= 1
+            assert reaped(first_pid)
+        else:
+            time.sleep(1.5)
+            assert w.describe()["counters"]["captured"] == 3
+            assert w.describe()["live"]["stalls"] == 0
+            assert w._ff.pid == first_pid, "OFF restarted a decoder that had not exited"
+    finally:
+        w.stop()
+    assert reaped(first_pid)
 
 
 # ------------------------------------------------------- the real binary

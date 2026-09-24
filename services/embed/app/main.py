@@ -26,6 +26,7 @@ from heco_common.ort import is_trt
 from pydantic import BaseModel
 
 from . import __version__
+from .align import align_face, half_balance
 from .attributes import ATTR_MODEL_EXPLICIT, ATTR_MODEL_PATH, AttributeModel, build_attributes
 from .codec import frame_from
 from .recognizer import BATCH, BATCH_MAX, DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
@@ -197,7 +198,7 @@ def health() -> dict:
         # Family, device truth AND dimension: the runner cross-checks dim
         # against the deployment's HECO_EMBEDDING_DIM story, and the family
         # says which alignment produced these vectors.
-        "device": _device_block(emb) if emb else None,
+        "device": _device_block(emb, attrs) if emb else None,
         # EMBED_BATCH as asked and as it runs (a static-batch graph cannot).
         "knobs": _knobs(emb) if emb else None,
     }
@@ -214,11 +215,16 @@ def _knobs(emb) -> dict:
     }
 
 
-def _device_block(emb) -> dict:
+def _device_block(emb, attrs=None) -> dict:
     """Build the /health device truth; `trt` rides along only when TRT was asked.
 
     Keyed on the REQUEST, not on success: a TensorRT that failed to load
     answers "trt": null beside an `active` list without it.
+
+    ``attributes`` rides with it, for the genderage pass when it is loaded:
+    under TRT that pass builds an engine of its own (20-35 s cold, measured)
+    and can fall back to CUDA or CPU on its own, which until now left only a
+    stderr line. Off TRT the block keeps its four keys exactly.
     """
     block = {
         "requested": emb.device_requested,
@@ -228,6 +234,12 @@ def _device_block(emb) -> dict:
     }
     if is_trt(emb.device_requested):
         block["trt"] = getattr(emb, "trt", None)
+        if attrs is not None:
+            block["attributes"] = {
+                "requested": attrs.device_requested,
+                "active": list(attrs.providers_active),
+                "trt": getattr(attrs, "trt", None),
+            }
     return block
 
 
@@ -253,4 +265,16 @@ def embed(req: EmbedRequest) -> dict:
         "norms": norms,
         "attributes": attributes,
         "attrMs": attr_ms,
+        # Index-parallel, like norms: how evenly each face's two halves were
+        # seen (align.half_balance). Measured on the same ArcFace-template
+        # crop whichever family embeds, so the number means one thing.
+        "balance": [_balance(img, f.model_dump()) for f in req.faces],
     }
+
+
+def _balance(img, face: dict) -> float | None:
+    """One face's half-balance, or None when it cannot be measured."""
+    try:
+        return half_balance(align_face(img, face.get("landmarks")))
+    except Exception:  # noqa: BLE001 — a reading, never a reason to fail /embed
+        return None
