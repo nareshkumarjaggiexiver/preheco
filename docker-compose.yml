@@ -193,6 +193,14 @@ services:
       # The three travel together: model, its id, its dimension.
       EMBED_MODEL: ${EMBED_MODEL-}
       HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
+      # The attribute head (gender + age per face, InsightFace buffalo_l
+      # genderage.onnx) rides beside the embedder and answers a question the
+      # embedder cannot: run f0bfc5's review queue paired a man in a blue
+      # shirt with an elderly woman at face 0.345, and nothing in the
+      # pipeline knew either fact. Unset = the service's default, which is
+      # models/genderage.onnx when that file is mounted and OFF when it is
+      # not — an absent model reports attributes as null, never as a guess.
+      EMBED_ATTR_MODEL: ${EMBED_ATTR_MODEL-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 
@@ -236,6 +244,32 @@ services:
       # reading that queue saw children paired with adults and turbaned men
       # with women, none of which the gallery was actually merging.
       HECO_REVIEW_FLOOR: ${HECO_REVIEW_FLOOR-}
+      # REVIEW EXCLUSIONS — three facts a face cosine cannot see, each one an
+      # independent reason to set a pair aside instead of asking a human.
+      # Run f0bfc5 (74 guests, 500 queued pairs at the unplumbed 0.15 floor)
+      # put a man against an elderly woman at #3, a small girl against a
+      # woman at #5, and two men 13 cm apart in stature at #4. A pair is set
+      # aside only when BOTH sides are measured and confident — one opinion
+      # is not a disagreement — and every exclusion is counted in the reply
+      # ("excluded": {gender, age, stature}) so a quiet queue can be told
+      # apart from a silenced one. 0 on any knob turns that signal off.
+      #   GENDER_MIN_P    both identities' template-weighted gender confidence
+      #                   at or above this AND they disagree (default 0.8)
+      #   AGE_CHILD_MAX / AGE_ADULT_MIN   one median age at or below 12, the
+      #                   other at or above 20; the gap is the model's error
+      #   STATURE_GAP     |ratio a - ratio b| at or above 0.2 — 35 cm on the
+      #                   1.75 m anchor, wider than any measured adult-adult
+      #                   spread (0.98-1.08), narrower than adult-child (0.73)
+      #   STATURE_MIN_N   standing sightings before a stature is trusted (8)
+      #   HECO_STATURE_ADULT_M   metres a stature ratio of 1.0 means: 1.75,
+      #                   the North Indian adult average. Display only — the
+      #                   exclusion compares ratios, so this never moves it.
+      HECO_REVIEW_GENDER_MIN_P: ${HECO_REVIEW_GENDER_MIN_P-}
+      HECO_REVIEW_AGE_CHILD_MAX: ${HECO_REVIEW_AGE_CHILD_MAX-}
+      HECO_REVIEW_AGE_ADULT_MIN: ${HECO_REVIEW_AGE_ADULT_MIN-}
+      HECO_REVIEW_STATURE_GAP: ${HECO_REVIEW_STATURE_GAP-}
+      HECO_REVIEW_STATURE_MIN_N: ${HECO_REVIEW_STATURE_MIN_N-}
+      HECO_STATURE_ADULT_M: ${HECO_STATURE_ADULT_M-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -267,6 +301,14 @@ services:
       HECO_QUALITY_MIN_IED_PX: ${HECO_QUALITY_MIN_IED_PX-}
       HECO_QUALITY_MIN_FRONTALITY: ${HECO_QUALITY_MIN_FRONTALITY-}
       HECO_QUALITY_MIN_SHARPNESS: ${HECO_QUALITY_MIN_SHARPNESS-}
+      # A floor on the L2 norm of the RAW ArcFace feature, applied AFTER the
+      # embedder has run (the only gate that can): the norm is the one
+      # quality signal the recogniser itself emits, and it collapses on a
+      # face the detector found but the embedder cannot read — run f0bfc5's
+      # p00002 is a girl with a railing across her face, and p00047 half a
+      # face behind a pillar; every landmark gate passed both. Dropped faces
+      # count as gatedBy "featnorm". Default 0 = off, like every other floor.
+      HECO_QUALITY_MIN_FEAT_NORM: ${HECO_QUALITY_MIN_FEAT_NORM-}
       # Track heal (see services/runner/README.md): window 20 s, cosine floor
       # 0.45 — above the 0.377 measured impostor ceiling; tonight's heal
       # evidence was 0.69. Unset renders as "" which env_float reads as
@@ -310,6 +352,21 @@ services:
       # OVER-counts, which is visible and mergeable, where a wrong fold
       # UNDER-counts silently. Fixed mirrors/screens are exclusion-zone work.
       HECO_COPRESENCE_SPLIT: ${HECO_COPRESENCE_SPLIT-}
+      # TRACK-PRESENCE co-presence (1 = on, the default; 0 = off). The split
+      # above only fires between identities whose FACES matched in one frame,
+      # so a guest who has turned her back is never asserted co-present with
+      # anyone: run f0bfc5 queued p00048 against p00052 at face 0.338 while
+      # p00048 stood back-turned in the SAME frame as p00052's face. This
+      # binds a track to an identity once a face on it matched at or above
+      # the lock cosine, keeps the binding while the tracker reports the id
+      # and the track is not contested (IoU >= 0.4 with another track), and
+      # counts the bound body as present even in frames where it shows no
+      # face. Replayed over that run's 15,076-frame ledger: 48 cannot_link
+      # pairs against 25 from faces alone, and the p00048/p00052 pair is
+      # asserted at frame 9283. The residual is the same as the face split's:
+      # a phone showing its owner's face is two bodies, and OVER-counts
+      # visibly.
+      HECO_PRESENCE_SPLIT: ${HECO_PRESENCE_SPLIT-}
       HECO_TAP_DUTY_FACTOR: ${HECO_TAP_DUTY_FACTOR-}
       # Reporting scheduler. Default (unset) is the async plane in
       # app.reporting; 0 puts tap rounds and flushes back on the counting loop,

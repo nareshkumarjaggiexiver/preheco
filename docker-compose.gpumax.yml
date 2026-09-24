@@ -100,6 +100,13 @@ services:
     environment:
       HECO_DEVICE: ${HECO_DEVICE-}
       EMBED_MODEL: ${EMBED_MODEL-}
+      # The attribute head (gender + age) beside the embedder — the base
+      # compose carries the same passthrough and the story behind it. Named
+      # here as well because this overlay is where the demo's embed env is
+      # read from, and a knob that reaches one file and not the other is the
+      # HECO_DEVICE bug of 2026-09-24 over again. Unset = models/genderage.onnx
+      # if mounted, else off (attributes null, never guessed).
+      EMBED_ATTR_MODEL: ${EMBED_ATTR_MODEL-}
       HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
       HECO_EMBEDDER_ID: ${HECO_EMBEDDER_ID-}
 
