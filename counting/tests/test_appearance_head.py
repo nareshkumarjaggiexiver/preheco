@@ -190,3 +190,51 @@ def test_beard_is_none_when_the_chin_cannot_be_seen():
     assert ap.beard_descriptor(img, FACE, head_down) is None, "nose below the mouth"
     dark = np.full((220, 200, 3), 8, np.uint8)
     assert ap.beard_descriptor(dark, FACE, LANDMARKS) is None, "cheeks too dark to judge"
+
+
+def test_the_beard_is_not_read_off_a_steeply_bowed_head():
+    """Nose 0.8 of the way to the mouth line or further: no reading.
+
+    Run f0bfc5: reads with a nose drop of 0.85-1.0 named a conflicting beard
+    class 6.9% of the time (a white collar in the window read "white" on a
+    shaven man) against 0-1.2% below 0.85.
+    """
+    img = face(chin=(20, 20, 25))
+    bowed = [[70, 95], [110, 95], [90, 130], [76, 138], [104, 138]]
+    assert 0.8 <= ap.nose_drop(bowed) < 1.0
+    assert ap.beard_descriptor(img, FACE, bowed) is None
+    level = [[70, 95], [110, 95], [90, 125], [76, 138], [104, 138]]
+    assert ap.nose_drop(level) < 0.8
+    assert ap.beard_descriptor(img, FACE, level) is not None
+
+
+# ------------------------------------------------------------------ skin
+
+
+def test_skin_tone_is_the_cheeks_log_chromaticity():
+    """Two floats, log(R/G) and log(B/G) of the cheek window."""
+    s = ap.skin_tone(face(), LANDMARKS)
+    b, g, r = SKIN
+    assert s == pytest.approx([np.log(r / g), np.log(b / g)], abs=1e-6)
+    assert len(s) == ap.SKIN_DIM
+
+
+def test_a_light_on_the_face_moves_the_skin_reading_by_its_own_log():
+    """A per-channel light is an additive shift of the log ratios — the same
+    whatever the skin — which is what makes one tolerance mean one light."""
+    for skin in (SKIN, (60, 90, 150)):
+        plain = ap.skin_tone(face(skin=skin), LANDMARKS)
+        gains = (0.9, 1.0, 1.1)
+        warm = face(skin=tuple(int(round(c * m)) for c, m in zip(skin, gains, strict=True)))
+        lit = ap.skin_tone(warm, LANDMARKS)
+        assert lit[0] - plain[0] == pytest.approx(np.log(1.1), abs=0.02)
+        assert lit[1] - plain[1] == pytest.approx(np.log(0.9), abs=0.02)
+
+
+def test_skin_tone_reads_under_the_gains_and_is_none_when_unmeasurable():
+    """Gains apply first; no landmarks or a black face read nothing."""
+    img = face()
+    assert ap.skin_tone(img, LANDMARKS, (1.0, 1.0, 1.0)) == ap.skin_tone(img, LANDMARKS)
+    assert ap.skin_tone(img, LANDMARKS, (1.2, 1.0, 0.8)) != ap.skin_tone(img, LANDMARKS)
+    assert ap.skin_tone(img, None) is None
+    assert ap.skin_tone(np.full((220, 200, 3), 20, np.uint8), LANDMARKS) is None
