@@ -17,6 +17,7 @@
       "staff": "venue"
     },
     "exclusionZones": true,
+    "faceRegion": true,
     "forensicFrames": true,
     "staffEnrolment": true,
     "qualityProfiles": true,

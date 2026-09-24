@@ -61,6 +61,7 @@ import contextlib
 import json
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from urllib.parse import urlsplit
@@ -72,7 +73,7 @@ from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
 from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
 from heco_common.schemas import Sample
-from heco_counting import appearance, association, gate, zones
+from heco_counting import appearance, association, face_search, gate, zones
 from heco_counting import config as counting_config
 from heco_counting.ports import MatchRefused
 
@@ -690,6 +691,35 @@ def _clean_attributes(a) -> dict | None:
     return {"gender": gender, "genderP": p, "age": max(0.0, age)}
 
 
+@dataclass
+class _Detections:
+    """One frame's detector replies, fetched OFF the loop thread.
+
+    Filled by :meth:`RunLoop._detect` on the detect worker (lever L3) and
+    handed to :meth:`RunLoop._pipeline_step`, which accounts every field on
+    the loop thread in frame order — the board, the ledger's wall times, the
+    counters.  A call that FAILED carries its exception instead of a reply,
+    so the loop can raise it at the exact point the inline call would have.
+
+    ``face_decided`` says the worker settled this frame's face search: the
+    whole frame (or the operator's region) needs no tracks, so it was
+    searched here — or, under the cadence (L4), ruled unnecessary:
+    ``face_skipped``.  False leaves the search to the loop thread, after the
+    tracker, as it always ran.  ``region_unplaced``: a region was set and
+    this frame carried no size to place it by (counted on the loop thread).
+    """
+
+    persons: dict | None = None
+    persons_ms: float = 0.0
+    persons_error: BaseException | None = None
+    face_decided: bool = False
+    face_skipped: bool = False
+    region_unplaced: bool = False
+    faces: dict | None = None
+    faces_ms: float = 0.0
+    faces_error: BaseException | None = None
+
+
 class RunLoop:
     """Owns one run: the pipeline loop, its stats, and its lifecycle."""
 
@@ -737,6 +767,24 @@ class RunLoop:
         self.board = StatsBoard()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
+        # Set once the frame loop is over, however it ended, so a fetch still
+        # in flight on another thread (the detect worker's, the prefetcher's)
+        # gives up at once instead of polling a closed source for up to
+        # source_stall_s.  Never set while frames are being counted.
+        self._halt = threading.Event()
+        # The frame source of the current run (see _frames) — kept so every
+        # exit path, failures included, can drain its worker BEFORE any
+        # per-run state downstream is released.
+        self._frames_in = None
+        # The second detector thread HECO_PARALLEL_DETECT issues faces on,
+        # created on first use and shut down with the frame source.
+        self._face_pool_ex: concurrent.futures.ThreadPoolExecutor | None = None
+        # FACE-SEARCH CADENCE state (L4): the frame time of the last face
+        # search that actually ran (read and written under _lock — the detect
+        # worker decides whole-frame searches, the loop thread crop ones), and
+        # the latest tracker output, which is what "settled" is measured on.
+        self._last_face_search_s: float | None = None
+        self._cadence_tracks: list = []
         # The single-slot frame prefetcher (see _next_frame_prefetched).
         self._prefetch: concurrent.futures.Future | None = None
         self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(
@@ -780,6 +828,15 @@ class RunLoop:
         # Operator-drawn no-count polygons, validated at the API edge
         # (app.main.ExclusionZone): [{label, points: [[x,y] normalized 0..1]}].
         self.zones: list[dict] = list(request.get("exclusionZones") or [])
+        # FACE SEARCH REGION (L7): the operator's rectangle, normalised 0..1
+        # (validated at the API edge, app.main.FaceRegion), or None.  Faces are
+        # searched only inside it; persons and the tracker still see the frame.
+        # Count runs only: an enrolment walk-through keeps its own search.
+        self._face_region: dict | None = (
+            dict(request["faceRegion"])
+            if request.get("faceRegion") and request.get("mode", "count") == "count"
+            else None
+        )
         # TRACK-HEAL bookkeeping: track_id -> LIST of {key, cosine, at}, one
         # per NEW identity (isNew=true) the track minted inside the heal
         # window.  A list because a blurred crossing can mint twice in a
@@ -1063,6 +1120,29 @@ class RunLoop:
             # interval up needs to see what it bought and, beside it, that
             # `unique` did not move.
             "faceSearchesSkipped": 0,
+            # INGEST'S OWN ACCOUNT of the frames it did NOT hand this loop
+            # (the motion gate and the bounded live buffer: INGEST_MOTION_GATE,
+            # INGEST_BUFFER_S), as the frame wire reports them — cumulative
+            # frames decoded, withheld for want of motion, and discarded
+            # (buffer full, or a live frame overwritten before anybody read
+            # it), plus the deepest the live buffer ever got behind this loop.
+            # None until a frame carries them: an older ingest measures none
+            # of this, and absent is not zero (see _note_ingest).
+            "framesCaptured": None,
+            "framesSkippedNoMotion": None,
+            "framesDroppedLive": None,
+            "ingestBacklogMax": None,
+            # FACE-SEARCH CADENCE (L4): frames whose face search was skipped
+            # because every body in them was a settled, recently verified
+            # guest.  Read beside `unique` — a saving is only trustworthy if
+            # it is visible.  None when the cadence is off: nothing was
+            # decided, so nothing was measured.
+            "faceDetectSkippedSettled": 0 if settings.face_cadence else None,
+            # FACE SEARCH REGION (L7): frames the region could not be placed on
+            # because they carried no pixel size — searched as if no region
+            # were set (the error toward looking), and counted here.  None
+            # when the run has no region.
+            "faceRegionUnplaced": 0 if self._face_region else None,
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -1144,7 +1224,10 @@ class RunLoop:
         """
         deadline = time.monotonic() + self.s.source_stall_s
         wait_start: float | None = None  # first moment the source made us wait
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        while (
+            not self._stop.is_set() and not self._halt.is_set()
+            and time.monotonic() < deadline
+        ):
             r = self.client.get(f"{self.s.ingest_url}/frame")
             if r.status_code in (204, 404, 410):
                 self._end_reason = "source-ended"  # stub-style explicit end
@@ -1156,6 +1239,7 @@ class RunLoop:
                 continue
             r.raise_for_status()
             body = r.json()
+            self._note_ingest(body)
             if body.get("ended") or not body.get("imageB64"):
                 self._end_reason = "source-ended"
                 return None
@@ -1164,12 +1248,100 @@ class RunLoop:
                 self._last_seq = seq
                 waited = 0.0 if wait_start is None else time.monotonic() - wait_start
                 self.board.observe("ingest", "frameWaitMs", waited * 1000.0)
+                self._observe_ingest_frame(body)
                 return body
             if wait_start is None:
                 wait_start = time.monotonic()
             time.sleep(self.s.source_poll_s)  # same frame again — source idle
+        if self._halt.is_set() and not self._stop.is_set():
+            # The run is being torn down around this fetch: nothing ended or
+            # stalled, and why the run settles is not this poll's to say.
+            return None
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
+
+    #: Frame wire field -> the status counter that carries it (lever L1).
+    #: CUMULATIVE on the wire, so the latest report is the run's figure.
+    _INGEST_COUNTERS = (
+        ("captured", "framesCaptured"),
+        ("skipped", "framesSkippedNoMotion"),
+        ("dropped", "framesDroppedLive"),
+    )
+
+    def _note_ingest(self, body) -> None:
+        """Carry ingest's account of the frames it did not hand this loop.
+
+        WHY THE RUN MUST SAY IT.  With the motion gate on, ingest publishes
+        only frames in which something moved (plus a keepalive at least every
+        INGEST_MOTION_KEEPALIVE_S); with the live buffer on it queues up to
+        INGEST_BUFFER_S of frames and discards past its cap.  Both buy speed
+        by not looking at frames, and a frame nobody looks at is the one way
+        this pipeline can miss a guest without any stage ever seeing them.
+        So the numbers land in the run's status, results and notes: frames
+        decoded, frames withheld for no motion, frames thrown away, and how
+        far behind the loop fell.
+
+        Read on EVERY answer — a repeated frame, and the closing ``ended``
+        one, which is where a file's final totals arrive.  A value that is
+        not a non-negative integer is not a measurement and is ignored; an
+        absent one leaves the counter None (absent is not zero).  Called from
+        the fetching thread (the prefetcher's, when it is on), so it writes
+        under ``_lock`` like every other counter.
+        """
+        if not isinstance(body, dict):
+            return
+        upd = {
+            key: v
+            for wire, key in self._INGEST_COUNTERS
+            if _count(v := body.get(wire))
+        }
+        backlog = body.get("backlog")
+        if not upd and not _count(backlog):
+            return
+        with self._lock:
+            self._status.update(upd)
+            if _count(backlog):
+                deepest = self._status.get("ingestBacklogMax")
+                self._status["ingestBacklogMax"] = (
+                    backlog if deepest is None else max(deepest, backlog)
+                )
+
+    def _observe_ingest_frame(self, body: dict) -> None:
+        """Chart the per-frame half of L1 on the ingest board.
+
+        ``motion`` (the fraction of the small luma image that changed; null
+        when the gate is off) and ``backlog`` (frames queued behind this one)
+        are the two readings an engineer needs beside the throughput: whether
+        the gate's threshold is where the room's motion actually sits, and
+        whether the loop is keeping up or merely draining a queue.  Observed
+        only when measured, once per frame handed over.
+        """
+        motion = body.get("motion")
+        if isinstance(motion, int | float) and not isinstance(motion, bool) and motion == motion:
+            self.board.observe("ingest", "motion", float(motion))
+        backlog = body.get("backlog")
+        if _count(backlog):
+            self.board.observe("ingest", "backlog", float(backlog))
+
+    def _lever_counters(self, st: dict) -> dict:
+        """The throughput levers' own counters, for the notes and the results.
+
+        Only what was MEASURED: the ingest counters appear when ingest
+        reported them, the cadence's skip count when the cadence ran.  An
+        absent key means "not measured" — the planner's
+        results door refuses a null (every value must be a finite number),
+        and a zero would claim a measurement nobody made.  With every lever
+        off and an older ingest this is empty, and the run row is exactly
+        what it has always been.
+        """
+        out: dict = {}
+        for key in (
+            "framesCaptured", "framesSkippedNoMotion", "framesDroppedLive",
+            "ingestBacklogMax", "faceDetectSkippedSettled", "faceRegionUnplaced",
+        ):
+            if st.get(key) is not None:
+                out[key] = st[key]
+        return out
 
     def _next_frame_prefetched(self) -> dict | None:
         """_next_frame, overlapped: hand back the frame fetched DURING the
@@ -1192,6 +1364,333 @@ class RunLoop:
         if frame is not None and not self._stop.is_set():
             self._prefetch = self._prefetch_pool.submit(self._next_frame)
         return frame
+
+    # ------------------------------------------------ the frame source (L3)
+
+    def _frames(self):
+        """This run's frame source: ``(frame, detections-or-None)`` pairs.
+
+        Serial unless HECO_PIPELINE_OVERLAP, and serial is the loop exactly
+        as it has always run.  Kept on ``self`` so every exit path — the
+        failure path in :meth:`run` included — can drain it before anything
+        downstream is released (:meth:`_drain_frames`).
+        """
+        self._frames_in = (
+            self._frames_overlapped() if self.s.pipeline_overlap else self._frames_serial()
+        )
+        return self._frames_in
+
+    def _frames_serial(self):
+        """One frame at a time, its detection inline — today's loop, unchanged."""
+        while not self._stop.is_set():
+            frame = self._next_frame_prefetched()
+            if frame is None:
+                return
+            yield frame, None
+
+    def _frames_overlapped(self):
+        """Frames with their detections already done, ONE frame ahead (L3).
+
+        While the loop thread decides frame k — track, gate, embed, match,
+        the verdict pass, the ledger, the taps — ONE worker thread fetches
+        frame k+1 and runs its detection.  The next job is submitted the
+        moment frame k is handed over and never earlier, so the worker is at
+        most one frame ahead, and everything stateful stays on the loop
+        thread in frame order: the worker only POSTs to stateless detectors
+        and clocks them (:meth:`_detect`).
+
+        ``detectWaitMs`` (count board) is how long the loop stood waiting on
+        the worker: near zero means the decide half is the bottleneck, large
+        means detection is — the split the overlap exists to exploit.
+
+        Draining is this generator's ``finally``: ``_halt`` tells any fetch
+        in flight to give up at once, and the worker is joined before the
+        caller settles anything, so no stage call outlives the run.
+        """
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="frame-detect"
+        )
+        try:
+            pending = pool.submit(self._fetch_and_detect, self._cadence_snapshot())
+            while not self._stop.is_set():
+                t = time.perf_counter()
+                item = pending.result()  # a FETCH failure raises here, as it always did
+                self.board.observe("count", "detectWaitMs", (time.perf_counter() - t) * 1000.0)
+                if item is None:
+                    return
+                # Frame k+1's fetch and detection start NOW, before frame k is
+                # decided: that is the whole overlap.  The cadence's evidence
+                # is taken HERE too, on this thread — the state after frame
+                # k-1 — so what the worker decides on is fixed, not a race.
+                pending = pool.submit(self._fetch_and_detect, self._cadence_snapshot())
+                yield item
+        finally:
+            self._halt.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _fetch_and_detect(self, snapshot=None) -> tuple[dict, "_Detections"] | None:
+        """The detect worker's job: the next frame, then its detections.
+
+        Owns the frame fetch in overlap mode (the prefetcher, when on, is
+        driven from here and only from here), and clocks a non-prefetched
+        fetch straight onto the board rather than through ``_timed``, whose
+        per-frame bookkeeping belongs to the loop thread.  ``snapshot`` is
+        the cadence's evidence as the loop thread saw it at submit time.
+        """
+        if self.s.frame_prefetch:
+            frame = self._next_frame_prefetched()
+        else:
+            t = time.perf_counter()
+            frame = self._next_frame()
+            self.board.observe("ingest", "ingestMs", (time.perf_counter() - t) * 1000.0)
+        if frame is None or self._stop.is_set() or self._halt.is_set():
+            return None
+        return frame, self._detect(frame, snapshot)
+
+    def _detect(self, frame: dict, snapshot=None) -> _Detections:
+        """This frame's detector calls, made without touching loop state.
+
+        Persons always; the face search too when it needs no tracks — the
+        whole frame, or the operator's region (L7).  A crop search is built
+        from THIS frame's tracks, and the tracker is stateful, so it waits for
+        the loop thread exactly as before.  With HECO_PARALLEL_DETECT the two
+        are issued side by side (faces on a second thread) rather than one
+        after the other.  Runs on the detect worker under the overlap, or
+        inline for parallel-only; it POSTs, clocks, and hands back replies
+        (or the exception a call raised) for :meth:`_pipeline_step` to
+        account in frame order.
+
+        Under the cadence (L4) the whole-frame search is RULED ON first, from
+        this frame's person boxes and ``snapshot`` (settled tracks as the
+        loop thread last saw them — see :meth:`_cadence_snapshot`), and may
+        be skipped.  Side by side only when the rule cannot skip anyway
+        (:func:`heco_counting.face_search.may_skip`): a search that has to
+        wait for persons' answer cannot also be issued beside it.
+        """
+        det = _Detections()
+        # The search needs no tracks when it is the whole frame or the
+        # operator's region (L7) — the region wins, whatever the switch says.
+        region = self._region_px(frame) if self._face_region else None
+        det.region_unplaced = self._face_region is not None and region is None
+        within = [region] if region is not None else None
+        whole = region is not None or self.s.faces_whole_frame
+        cadence = whole and self.s.face_cadence
+        now_s = _frame_clock(frame)
+        faces_side = None
+        if whole and self.s.parallel_detect and not (
+            cadence and self._cadence_may_skip(snapshot, now_s)
+        ):
+            faces_side = self._face_pool().submit(
+                _clocked, partial(self._post_faces, frame, within)
+            )
+            if cadence:
+                self._note_face_search(now_s)
+        try:
+            det.persons, det.persons_ms = _clocked(partial(self._post_persons, frame))
+        except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+            det.persons_error = e
+        if faces_side is not None:
+            # Always collected, even behind a persons failure: no call of this
+            # frame may be left running once the frame is handed over.
+            det.face_decided = True
+            try:
+                det.faces, det.faces_ms = faces_side.result()
+            except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+                det.faces_error = e
+            return det
+        if det.persons_error is not None:
+            return det  # inline order: a frame whose persons failed searches no faces
+        if whole:
+            det.face_decided = True
+            if cadence:
+                bodies = face_search.bodies_in(self._cadence_bodies(det.persons, frame), region)
+                if self._cadence_due(bodies, snapshot, now_s) is None:
+                    det.face_skipped = True
+                    return det
+                self._note_face_search(now_s)
+            try:
+                det.faces, det.faces_ms = _clocked(partial(self._post_faces, frame, within))
+            except Exception as e:  # noqa: BLE001 — carried to the loop thread, raised there
+                det.faces_error = e
+        return det
+
+    def _region_px(self, frame: dict) -> dict | None:
+        """The face search region in this frame's pixels, or None if unplaceable.
+
+        The frame's own size first (ingest states it beside the picture), the
+        first frame's JPEG header as the fallback — the same order the body
+        rider uses.  Pure: the caller counts an unplaceable region, on the
+        loop thread.
+        """
+        dims = self._native_dims
+        return face_search.region_px(
+            self._face_region,
+            frame.get("w") or (dims[0] if dims else None),
+            frame.get("h") or (dims[1] if dims else None),
+        )
+
+    # ------------------------------------------------ face-search cadence (L4)
+
+    def _cadence_snapshot(self) -> tuple | None:
+        """The cadence's evidence, taken on the loop thread: tracks and lock times.
+
+        The latest tracker output (boxes copied) and when each track's
+        identity lock was last refreshed.  Settledness itself is judged
+        against the frame being decided, so a snapshot carries times, not
+        verdicts.  None with the cadence off.
+        """
+        if not self.s.face_cadence:
+            return None
+        with self._lock:
+            lock_at = {tid: e["at"] for tid, e in self._locks.items()}
+        tracks = [
+            {"id": t.get("id"), "box": dict(t["box"])}
+            for t in self._cadence_tracks
+            if t.get("id") in lock_at and t.get("box")
+        ]
+        return tracks, lock_at
+
+    def _cadence_settled(self, snapshot, now_s: float | None) -> list[dict]:
+        """Which snapshot tracks are settled at ``now_s`` (the rule's input)."""
+        if snapshot is None:
+            return []
+        tracks, lock_at = snapshot
+        return face_search.settled_tracks(
+            tracks, lock_at, now_s,
+            float(self.s.face_reverify_interval_s), float(self.s.heal_window_s),
+        )
+
+    def _cadence_due(self, bodies: list, snapshot, now_s: float | None) -> str | None:
+        """Why this frame must be searched, or None when the cadence may skip it."""
+        return face_search.search_due(
+            bodies, self._cadence_settled(snapshot, now_s), now_s,
+            self._last_face_search(), float(self.s.face_cadence_max_gap_s),
+        )
+
+    def _cadence_may_skip(self, snapshot, now_s: float | None) -> bool:
+        """Whether the rule could skip this frame at all, before persons answers."""
+        return face_search.may_skip(
+            len(self._cadence_settled(snapshot, now_s)), now_s,
+            self._last_face_search(), float(self.s.face_cadence_max_gap_s),
+        )
+
+    def _cadence_bodies(self, persons: dict | None, frame: dict) -> list:
+        """The person boxes a detect-worker ruling must see: the TRACKABLE ones.
+
+        A box inside a detections-mode zone never forms a track, so it can
+        never be settled, and a face inside it is excluded anyway — leaving
+        it in would keep the search running for a wall TV all night.  The
+        zones' own rule on COPIES, with a silent observer: the worker books
+        nothing; the loop thread does the counting when the frame's turn comes.
+        """
+        boxes = [dict(b) for b in (persons or {}).get("boxes", [])]
+        return zones.apply_detection_zones(boxes, frame, self.zones, _SILENT)
+
+    def _last_face_search(self) -> float | None:
+        """Frame time of the last face search that ran (None before the first)."""
+        with self._lock:
+            return self._last_face_search_s
+
+    def _note_face_search(self, now_s: float | None) -> None:
+        """Record that this frame's face search runs — the max gap counts from here."""
+        with self._lock:
+            self._last_face_search_s = now_s
+
+    def _skip_face_search(self, n_bodies: int) -> dict:
+        """Book a skipped search: counted, on the ledger, and no faces."""
+        self._bump("faceDetectSkippedSettled")
+        self._event(f"face search skipped: {n_bodies} settled")
+        return {"faces": []}
+
+    def _face_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The parallel detector's second thread, created on first use.
+
+        Only ever asked for by whichever single thread runs :meth:`_detect`
+        for this run (the worker, or the loop for parallel-only), so the
+        lazy creation cannot race.
+        """
+        if self._face_pool_ex is None:
+            self._face_pool_ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-detect"
+            )
+        return self._face_pool_ex
+
+    def _detects_inline(self) -> bool:
+        """Whether a serial run still issues its detectors side by side.
+
+        HECO_PARALLEL_DETECT without the overlap: the loop thread itself
+        makes the calls the detect worker would have — persons here, faces
+        on the second thread — and only where the face search needs no
+        tracks.
+        """
+        return (
+            self.s.parallel_detect and not self.s.pipeline_overlap
+            and (self.s.faces_whole_frame or self._face_region is not None)
+        )
+
+    def _drain_frames(self) -> None:
+        """Close the frame source and join its detector threads, at most once."""
+        frames_in, self._frames_in = self._frames_in, None
+        if frames_in is not None:
+            frames_in.close()
+        pool, self._face_pool_ex = self._face_pool_ex, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _post_persons(self, frame: dict) -> dict:
+        """POST one frame to persons /detect (inline or from the detect worker).
+
+        Takes the FRAME, not its picture, so a transport that carries more
+        than the JPEG (a shared-memory frame reference) is one line here.
+        """
+        return self._post(f"{self.s.persons_url}/detect", {"imageB64": frame["imageB64"]})
+
+    def _post_faces(self, frame: dict, within: list | None) -> dict:
+        """POST one frame to faces /detect; ``within`` None searches it whole."""
+        return self._post(
+            f"{self.s.faces_url}/detect", {"imageB64": frame["imageB64"], "within": within}
+        )
+
+    def _take_detected(
+        self, reply: dict | None, ms: float, error: BaseException | None,
+        stage: str, metric: str,
+    ) -> dict:
+        """Account a detector call the worker made, as if it ran here.
+
+        Raises the call's failure first — at the point the inline call would
+        have raised it, so a failed frame settles the run exactly as before.
+        Otherwise the same bookkeeping ``_timed`` does: ``_last_ms``, the
+        board, and this frame's ledger wall time.
+        """
+        if error is not None:
+            raise error
+        self._account(stage, metric, ms)
+        return reply or {}
+
+    def _levers_config(self) -> dict:
+        """The throughput levers this run ran with, for its permanent config.
+
+        Only levers that are ON appear, so a run with every lever off stamps
+        exactly the config it always has (pinned).  Absent therefore means
+        off — or a runner from before the levers, which is the same thing.
+        """
+        levers: dict = {}
+        if self.s.pipeline_overlap:
+            levers["pipelineOverlap"] = True
+        if self.s.parallel_detect:
+            levers["parallelDetect"] = True
+        if self.s.face_cadence:
+            levers["faceCadence"] = {
+                "maxGapS": float(self.s.face_cadence_max_gap_s),
+                # The settledness window it ran against (0 = skips nothing).
+                "reverifyIntervalS": float(self.s.face_reverify_interval_s),
+            }
+        out: dict = {"levers": levers} if levers else {}
+        if self._face_region is not None:
+            # WHERE faces were looked for is part of what the number means:
+            # a guest who never entered the region was never searched for.
+            out["faceRegion"] = dict(self._face_region)
+        return out
 
     def _open_source(self) -> None:
         """Claim ingest's exclusive capture slot for this run.
@@ -1254,6 +1753,8 @@ class RunLoop:
         except Exception as e:  # noqa: BLE001 — a run must always settle
             self.log.error(f"run failed: {type(e).__name__}: {e}")
             self._set(state="failed", error=f"{type(e).__name__}: {e}")
+            # The detect worker first: no stage call may outlive the release.
+            self._drain_frames()
             self._release_run_state()
             if self.planner.run_id is not None:
                 # Best effort: the planner may be down too; local status
@@ -1267,7 +1768,8 @@ class RunLoop:
             # The safety net for every path that did not reach the orderly
             # stop in _run: a failed run must not leave the reporter alive
             # uploading pictures of a run the operator has been told is over.
-            # Idempotent — both clear their handles as they go.
+            # Idempotent — all three clear their handles as they go.
+            self._drain_frames()
             self._stop_reporter()
             self._close_golden()
         return self.status()
@@ -1340,6 +1842,9 @@ class RunLoop:
                         {"modelProfile": req["modelProfile"]}
                         if req.get("modelProfile") else {}
                     ),
+                    # Which throughput levers produced the number — only the
+                    # ones that are ON, so an all-off run stamps what it always did.
+                    **self._levers_config(),
                     "geometry": "poc-2.8mm-2.0m-close-zone",  # CONTRACTS.md POC geometry
                 },
             )
@@ -1367,6 +1872,14 @@ class RunLoop:
             f"counting from {source_label(self.request['source'])} "
             f"(plannerRun={planner_run_id}, site={self.request.get('siteId') or 'none'})"
         )
+        if self.s.face_cadence and float(self.s.face_reverify_interval_s) <= 0:
+            # Said once, at the start: a lever that is on and cannot act is the
+            # "looked set, changed nothing" failure, and the knob is the cause.
+            self.log.warning(
+                "HECO_FACE_CADENCE is on but faceReverifyIntervalS is 0 — no track "
+                "is ever 'recently verified', so the cadence will skip nothing; set "
+                "HECO_FACE_REVERIFY_INTERVAL_S (2-3 s) or the run's quality profile"
+            )
         # Honour any pending consent withdrawals BEFORE the first frame is
         # matched: purge tombstoned staff from the site store now, so a member
         # deleted while the pipeline was off never matches again.
@@ -1395,10 +1908,10 @@ class RunLoop:
             self.reporter.begin(t0)
             self.reporter.start()
 
-        while not self._stop.is_set():
-            frame = self._next_frame_prefetched()
-            if frame is None:
-                break
+        # Frames, and — under HECO_PIPELINE_OVERLAP — their detections, done
+        # one frame ahead on the detect worker (see _frames_overlapped).
+        # Serial yields (frame, None) and is the loop exactly as it ran.
+        for frame, det in self._frames():
             self.board.frame("ingest")
             frames += 1
             t_ms = int(frame.get("tMs", (time.monotonic() - t0) * 1000.0))
@@ -1417,7 +1930,7 @@ class RunLoop:
             loop_t = time.perf_counter()
             self._timed(
                 "count", "stepMs",
-                partial(self._pipeline_step, planner_run_id, frame, t_ms),
+                partial(self._pipeline_step, planner_run_id, frame, t_ms, det),
             )
             self._set(frames=frames)
 
@@ -1454,8 +1967,11 @@ class RunLoop:
             # cost still unaccounted for rather than leaving it invisible.
             self.board.observe("count", "loopMs", (time.perf_counter() - loop_t) * 1000.0)
 
-        # Stop the reporter FIRST, so its final rounds and any owed mint
-        # keyframes land while the run is still open — and so the flush below
+        # The frame source first of all: its detect worker (if any) is joined
+        # here, so nothing below races a stage call still in flight.
+        self._drain_frames()
+        # Then the reporter, BEFORE the flush, so its final rounds and any owed
+        # mint keyframes land while the run is still open — and so the flush below
         # is genuinely the last word on this run's stats rather than racing a
         # thread that is still posting them.
         self._stop_reporter()
@@ -1467,6 +1983,7 @@ class RunLoop:
         self._close_golden()
         self._flush(max(time.monotonic() - t0, 1e-9))
         st = self.status()
+        levers = self._lever_counters(st)
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
@@ -1529,7 +2046,10 @@ class RunLoop:
             f"nearMissMints={st['nearMissMints']} "
             f"galleryOverlaps={st['galleryOverlaps']} "
             f"excludedByZone={st['excludedByZone']} "
-            f"(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
+            # The levers' counters, when measured (see _lever_counters): what
+            # ingest withheld and discarded, beside what the loop counted.
+            + "".join(f"{k}={v} " for k, v in levers.items())
+            + "(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. A run that stopped because the camera
         # vanished must not present itself as a complete count, so it settles
@@ -1562,6 +2082,7 @@ class RunLoop:
             "nearMissMints": st["nearMissMints"],
             "galleryOverlaps": st["galleryOverlaps"],
             "excludedByZone": st["excludedByZone"],
+            **levers,
         }
         try:
             self.planner.end_run(
@@ -1650,8 +2171,17 @@ class RunLoop:
         with contextlib.suppress(Exception):
             self._post(f"{self.s.tracker_url}/release", {"runId": planner_run_id})
 
-    def _pipeline_step(self, planner_run_id: str, frame: dict, t_ms: int) -> None:
-        """Run stages 2..8 for one frame, timing and measuring each."""
+    def _pipeline_step(
+        self, planner_run_id: str, frame: dict, t_ms: int, det: _Detections | None = None
+    ) -> None:
+        """Run stages 2..8 for one frame, timing and measuring each.
+
+        ``det`` holds this frame's detector replies when the detect worker
+        (HECO_PIPELINE_OVERLAP) already made those calls; None makes them
+        here, inline, exactly as always.  Either way everything they feed —
+        the board, the ledger's wall times, every counter and decision — is
+        booked HERE, on the loop thread, in frame order.
+        """
         # THIS frame's embeddings start EMPTY: a zero-kept frame never reaches
         # the embed stage, and without this reset the previous frame's vectors
         # would ride into its golden record (review finding, 2026-08-14).
@@ -1670,11 +2200,19 @@ class RunLoop:
         site_id = self.request.get("siteId")
 
         # person-detect
-        persons = self._timed(
-            "person-detect",
-            "personDetectMs",
-            lambda: self._post(f"{s.persons_url}/detect", {"imageB64": image_b64}),
-        )
+        if det is None and self._detects_inline():
+            # HECO_PARALLEL_DETECT on a serial run: the detector calls the
+            # worker would make, issued side by side from here.
+            det = self._detect(frame, self._cadence_snapshot())
+        if det is None:
+            persons = self._timed(
+                "person-detect", "personDetectMs", partial(self._post_persons, frame)
+            )
+        else:
+            persons = self._take_detected(
+                det.persons, det.persons_ms, det.persons_error,
+                "person-detect", "personDetectMs",
+            )
         board.frame("person-detect")
         boxes = persons.get("boxes", [])
         for b in boxes:
@@ -1701,47 +2239,10 @@ class RunLoop:
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
         self._note_tracks(tracks)
+        if s.face_cadence:
+            self._cadence_tracks = tracks  # what "settled" is judged on next
 
-        # Face-detect region = every RAW person box this frame, deduped against
-        # the track boxes.
-        #
-        # The bug this replaced (finding D1): `[t["box"] for t in tracks] or
-        # boxes` searched ONLY confirmed-track boxes once any track existed.
-        # The tracker reports a track only after min_hits frames (sort.py
-        # SortLite.step), so a guest who has just walked in is a detection with
-        # no reported track — their face was never searched, and because the
-        # count is match.isNew, a face never searched is a guest never counted.
-        #
-        # Raw boxes are therefore the recall-bearing half and go FIRST. The
-        # track half is redundant while the tracker reports only misses == 0
-        # tracks, whose boxes are snapped to the matched detection
-        # (TrackState.update) and so duplicate a raw box. It is kept because
-        # that invariant is the tracker's to change: if coasting tracks are
-        # ever reported, their predicted boxes cover people the detector missed
-        # this frame, which is real recall. Boxes-first ordering means a fresh
-        # detection always wins the dedupe over a stale prediction.
-        within = dedupe_boxes(
-            list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
-        )
-        # RE-VERIFY GATE: skip the crops belonging to tracks that have already
-        # resolved to an identity and were verified recently.  Off by default.
-        # Everyone still unidentified — everyone who can change the count — is
-        # searched every frame regardless, so this only ever removes work that
-        # re-confirms a settled answer.
-        within = self._reverify_within(within, tracks)
-        # None = look at the whole frame once. The re-verify saving above is
-        # a crop-path idea and simply does not apply: there are no crops to
-        # skip, and the one inference costs the same whoever is identified.
-        if s.faces_whole_frame:
-            within = None
-        faces_out = self._timed(
-            "face-detect",
-            "faceDetectMs",
-            lambda: self._post(
-                f"{s.faces_url}/detect", {"imageB64": image_b64, "within": within}
-            ),
-        )
-        board.frame("face-detect")
+        faces_out = self._search_faces(frame, trackable, tracks, det)
         faces = faces_out.get("faces", [])
         for f in faces:
             board.observe("face-detect", "faceBoxWPx", float(f["box"]["w"]))
@@ -2153,6 +2654,95 @@ class RunLoop:
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
         self._count_stage()
+
+    def _search_faces(
+        self, frame: dict, trackable: list, tracks: list, det: _Detections | None
+    ) -> dict:
+        """This frame's face search, booked on the face-detect stage.
+
+        Searched by the detect worker already when the search needed no
+        tracks (``det.face_decided``: the whole frame, or the operator's
+        region) — then only its reply and wall time are booked here, in frame
+        order.  Otherwise searched here, after the tracker: inside the region
+        when one is set (L7), else the whole frame or this frame's person and
+        track boxes, as it always has been.
+        """
+        s = self.s
+        if det is not None and det.face_decided:
+            if det.region_unplaced:
+                self._bump("faceRegionUnplaced")
+            if det.face_skipped:
+                return self._skip_face_search(
+                    len(face_search.bodies_in(trackable, self._region_px(frame)))
+                )
+            reply = self._take_detected(
+                det.faces, det.faces_ms, det.faces_error, "face-detect", "faceDetectMs"
+            )
+            self.board.frame("face-detect")
+            return reply
+        # Face-detect region = every RAW person box this frame, deduped against
+        # the track boxes.
+        #
+        # The bug this replaced (finding D1): `[t["box"] for t in tracks] or
+        # boxes` searched ONLY confirmed-track boxes once any track existed.
+        # The tracker reports a track only after min_hits frames (sort.py
+        # SortLite.step), so a guest who has just walked in is a detection with
+        # no reported track — their face was never searched, and because the
+        # count is match.isNew, a face never searched is a guest never counted.
+        #
+        # Raw boxes are therefore the recall-bearing half and go FIRST. The
+        # track half is redundant while the tracker reports only misses == 0
+        # tracks, whose boxes are snapped to the matched detection
+        # (TrackState.update) and so duplicate a raw box. It is kept because
+        # that invariant is the tracker's to change: if coasting tracks are
+        # ever reported, their predicted boxes cover people the detector missed
+        # this frame, which is real recall. Boxes-first ordering means a fresh
+        # detection always wins the dedupe over a stale prediction.
+        within = dedupe_boxes(
+            list(trackable) + [t["box"] for t in tracks], iou_thr=0.6
+        )
+        # FACE SEARCH REGION (L7): the operator's rectangle replaces whatever
+        # the search would otherwise have been.  A frame with no pixel size
+        # cannot place it and is searched as if no region were set — the
+        # error toward looking — and counted.
+        region = None
+        if self._face_region is not None:
+            region = self._region_px(frame)
+            if region is None:
+                self._bump("faceRegionUnplaced")
+        # FACE-SEARCH CADENCE (L4): ruled on here, from THIS frame's tracks,
+        # before the re-verify gate stamps anything — a skipped frame searched
+        # nobody, so no track may be marked as verified by it.  With a region,
+        # only the bodies it touches can hold the search open.
+        if s.face_cadence:
+            now_s = self._now()
+            bodies = face_search.bodies_in(trackable, region)
+            due = self._cadence_due(bodies, self._cadence_snapshot(), now_s)
+            if due is None:
+                return self._skip_face_search(len(bodies))
+            self._note_face_search(now_s)
+        # RE-VERIFY GATE: skip the crops belonging to tracks that have already
+        # resolved to an identity and were verified recently.  Off by default.
+        # Everyone still unidentified — everyone who can change the count — is
+        # searched every frame regardless, so this only ever removes work that
+        # re-confirms a settled answer.
+        #
+        # None = look at the whole frame once, and there the re-verify saving
+        # is not consulted at all: it is a crop-path idea, there are no crops
+        # to skip, and the one inference costs the same whoever is identified.
+        # It used to run anyway and count every settled track's crop in
+        # faceSearchesSkipped while the whole frame was searched regardless —
+        # a saving the status claimed and the GPU never saw, in exactly the
+        # configuration (whole frame, interval armed) a live 4K profile runs.
+        if region is not None:
+            within = [region]  # one crop, at the frame's native resolution
+        else:
+            within = None if s.faces_whole_frame else self._reverify_within(within, tracks)
+        reply = self._timed(
+            "face-detect", "faceDetectMs", partial(self._post_faces, frame, within)
+        )
+        self.board.frame("face-detect")
+        return reply
 
     #: How many co-presence pairs one run remembers having asserted.  A pair
     #: costs one short string, so this is kilobytes, not megabytes — the cap
@@ -4472,12 +5062,22 @@ class RunLoop:
         """
         t = time.perf_counter()
         out = fn()
-        self._last_ms = (time.perf_counter() - t) * 1000.0
-        self.board.observe(stage, metric, self._last_ms)
-        ms = getattr(self, "_frame_ms", None)
-        if ms is not None:
-            ms[stage] = ms.get(stage, 0.0) + self._last_ms
+        self._account(stage, metric, (time.perf_counter() - t) * 1000.0)
         return out
+
+    def _account(self, stage: str, metric: str, ms: float) -> None:
+        """Book one stage call's wall time: board, ledger, ``_last_ms``.
+
+        Loop thread only — ``_frame_ms`` is the frame being decided, and a
+        call timed on the detect worker belongs to a LATER frame, which is
+        why the worker clocks its calls and :meth:`_take_detected` books
+        them here when that frame's turn comes.
+        """
+        self._last_ms = ms
+        self.board.observe(stage, metric, ms)
+        frame_ms = getattr(self, "_frame_ms", None)
+        if frame_ms is not None:
+            frame_ms[stage] = frame_ms.get(stage, 0.0) + ms
 
     def _event(self, text: str) -> None:
         """Note a count-changing decision against the CURRENT frame.
@@ -4552,6 +5152,42 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+
+
+class _SilentObserver:
+    """A CountingObserver that books nothing — for rulings made off the loop thread."""
+
+    def bump(self, key: str, by: int = 1) -> None:
+        """Discard a counter bump."""
+
+    def observe(self, stage: str, metric: str, value: float) -> None:
+        """Discard a metric observation."""
+
+    def event(self, text: str) -> None:
+        """Discard a ledger event."""
+
+
+_SILENT = _SilentObserver()
+
+
+def _frame_clock(frame: dict) -> float | None:
+    """A frame's own time in seconds (its tMs), or None when it carries none."""
+    t_ms = frame.get("tMs")
+    if isinstance(t_ms, int | float) and not isinstance(t_ms, bool):
+        return float(t_ms) / 1000.0
+    return None
+
+
+def _clocked(fn) -> tuple:
+    """``(fn(), wall ms)`` — a timing that touches no shared state."""
+    t = time.perf_counter()
+    out = fn()
+    return out, (time.perf_counter() - t) * 1000.0
+
+
+def _count(v) -> bool:
+    """Whether ``v`` is a count: a non-negative int (a JSON bool is not one)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def _fmt(x) -> str:

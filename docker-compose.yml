@@ -430,8 +430,39 @@ services:
       # at 4K) and torso colour is read under neutral light. Run f0bfc5's
       # camera AWB already held the warm hall neutral (gains within 2%), so
       # it changed nothing there; a venue with coloured stage light is where
-      # to try it. Reported on runner /health as knobs.appearanceWb.
+      # to try it. Reported on runner /health as knobs.HECO_APPEARANCE_WB.
       HECO_APPEARANCE_WB: ${HECO_APPEARANCE_WB-}
+      # STAGE OVERLAP (lever L3; 1 = on, default off). One worker thread
+      # fetches frame k+1 and runs its detection (persons, and the face search
+      # when it needs no tracks: HECO_FACES_WHOLE_FRAME) while the loop decides
+      # frame k — track, gate, embed, match, verdicts — so the stateless half
+      # of the ~200 ms/frame 4K chain hides behind the stateful half. At most
+      # one frame ahead; every decision stays on the loop thread in frame
+      # order. Off is the loop exactly as it ran (pinned call for call).
+      # GET /health `knobs` shows what the container actually resolved.
+      HECO_PIPELINE_OVERLAP: ${HECO_PIPELINE_OVERLAP-}
+      # PARALLEL DETECT (lever L3; 1 = on, default off). With the whole-frame
+      # face search, persons and faces /detect for the same frame go out side
+      # by side instead of one after the other — with or without the overlap.
+      # Persons measured 31-43 ms through its HTTP service against 8.6 ms of
+      # model time, so what this hides is mostly transport. No effect on the
+      # crop path, which needs this frame's tracks before it can search.
+      HECO_PARALLEL_DETECT: ${HECO_PARALLEL_DETECT-}
+      # FACE-SEARCH CADENCE (lever L4; 1 = on, default off). A frame's face
+      # search is skipped when every person box is covered one-to-one (IoU >=
+      # 0.5) by a SETTLED track — identity lock, face-verified within
+      # HECO_FACE_REVERIFY_INTERVAL_S — and less than
+      # HECO_FACE_CADENCE_MAX_GAP_S (default 1.0 s of footage) has passed since
+      # the last search. Newcomers, stale locks and empty frames are always
+      # searched; skipped frames still track and still assert track presence,
+      # and are counted as faceDetectSkippedSettled. SKIPS NOTHING while
+      # HECO_FACE_REVERIFY_INTERVAL_S is 0 (its default) — set 2-3 s with it.
+      HECO_FACE_CADENCE: ${HECO_FACE_CADENCE-}
+      HECO_FACE_CADENCE_MAX_GAP_S: ${HECO_FACE_CADENCE_MAX_GAP_S-}
+      # Seconds a track that already holds an identity goes between face
+      # verifications: the crop path's re-verify saving, and the cadence's
+      # "settled" window. 0 (default) = verify every frame.
+      HECO_FACE_REVERIFY_INTERVAL_S: ${HECO_FACE_REVERIFY_INTERVAL_S-}
       # The site-planner console on the host machine.
       PLANNER_URL: ${PLANNER_URL:-http://host.docker.internal:8787}
       HECO_INGEST_URL: http://ingest:7101
