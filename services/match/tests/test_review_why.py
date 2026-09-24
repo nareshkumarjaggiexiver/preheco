@@ -627,6 +627,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
                 "nA": 0, "nB": 0,
             },
             "beard": {"a": None, "b": None, "nA": 0, "nB": 0},
+            "light": {"a": None, "b": None, "shift": None, "held": []},
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
     assert got["setAside"] == []

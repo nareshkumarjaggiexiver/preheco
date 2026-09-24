@@ -1795,8 +1795,10 @@ some pair of reads).
   against the same face's cheek band (eye line + 0.25 IED to the nose tip):
   DARK under 0.4 of its median brightness; else PALE under half its median
   saturation — WHITE from 0.9 of its brightness, GREY below; else SKIN.
-  None with the nose tip at or below the mouth line, a window under 6 px or
-  40 lit pixels, or cheeks under 20 pixels or darker than 20.
+  None with the nose tip 0.8 or more of the way from the eye line to the
+  mouth line (1.0 until 2026-09-25: reads 0.85–1.0 named a conflicting
+  class 6.9% of the time), a window under 6 px or 40 lit pixels, or cheeks
+  under 20 pixels or darker than 20.
 - Runner: for every kept face with landmarks on a decoded frame, `POST
   /match` gains **`head`** and **`beard`** (each only when measured; the
   same-frame re-ask carries them too). Timed as `headBeardMs`.
@@ -1820,7 +1822,8 @@ some pair of reads).
     reads over ≥ 2 s; class = the one two thirds of the reads name (a read:
     dark ≥ 0.5 → dark; pale ≥ 0.5 with dark < 0.25 → white or grey; dark ≤
     0.2 with skin ≥ 0.7 → none; else unsure); set aside for none against
-    any beard, or dark against white.
+    a dark beard, or dark against white — none against grey or white only
+    with `HECO_REVIEW_BEARD_PALE=1` (0.15.0; off by default).
   - `/health` gains `reviewHeadClash`, `reviewBeardMinN`.
 - Measured on f0bfc5 (45 identities, 1,092 head and 1,078 beard reads): own
   head reads agree at a median 0.87 (min 0.63); nine same-person splits at
@@ -1833,4 +1836,39 @@ some pair of reads).
   neither and every `why.head`/`why.beard` reads null with zero
   exclusions. The torso has been on every `/match` since v3, so the
   clothing set-aside needs only the new match.
+
+### The light guard (counting + runner + match 0.15.0)
+
+The colour set-asides (clothes, head, beard) read colours, and a light that
+changed between two sightings of one guest moves every one of them — while
+a duplicate is minted exactly when a face fails to match, a change of light
+being one cause. Replayed on f0bfc5's crops (34 single-person identities
+split at their time median, the late half re-read under a per-channel
+shift): ±8% set one genuine duplicate aside (a white shirt's cross 0.99 →
+0.28; a white beard read "none"), ±15% two or three, a stage wash seven or
+eight; frame white balance cures a whole-frame cast and cannot see a light
+on one person.
+
+- `heco_counting.appearance.skin_tone(image_bgr, landmarks, gains=None) ->
+  [log(R/G), log(B/G)] | None` — the medians over the beard reading's
+  cheek window, pixels with max channel 40..252 and min ≥ 8, ≥ 20 of them.
+  A per-channel light is an additive shift of both (whatever the skin).
+- Runner: `POST /match` gains **`skin`** beside `head`/`beard` (when
+  measured; the same-frame re-ask carries it).
+- Match 0.15.0: `skin` = exactly 2 finite numbers (else 422);
+  `body_sightings` gains nullable **`skin BLOB`**. Each identity's skin is
+  the median of its reads. When both identities have one and they differ
+  by more than **`HECO_REVIEW_LIGHT_TOL`** (0.07; 0 = off) on either ratio,
+  the pair's colour reasons are HELD BACK: it stays in the ranked queue
+  (unless gender, age or stature set it aside — not colours, never held).
+  Every row gains **`why.light: {a, b, shift, held}`**; the reply gains
+  **`keptByLight`** (pairs left in the queue by the guard). `/health` gains
+  `reviewLightTol`, `reviewBeardPale`.
+- Measured: one person under one light 0.020 (median; p90 0.048); every
+  false set-aside of the replay 0.08+; different people median 0.083 — so
+  the guard also asks 21 of the 31 true colour-only set-asides of the
+  f0bfc5 replay (10 stay set aside). The trade is deliberate: an extra
+  question over a guest hidden in the collapsed list.
+- Rollout: match first. A match ≤ 0.14.0 drops `skin` (unknown field); a
+  runner before this sends none and the guard never acts (today's rule).
 
