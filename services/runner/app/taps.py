@@ -361,6 +361,7 @@ def match_payload(
     mints: list[dict] | None = None,
     retired: list[dict] | None = None,
     co_present: list[list[str]] | None = None,
+    frame: dict | None = None,
 ) -> dict:
     """Matcher verdicts (personKey + cosine + staff flag) with live counters.
 
@@ -374,6 +375,14 @@ def match_payload(
     """
     rows = verdict_rows(verdicts)
     return {
+        # WHICH FRAME these verdicts are about: its source clock, its capture
+        # sequence and how many bodies it held. A new guest's keyframe round
+        # posts this payload and its picture and nothing else, and the planner
+        # used to stamp the keyframe with the time of the last FULL round's
+        # ingest tap — run 8b8b87 filed p00002's moment at frame 537's time
+        # with frame 552's picture and names, and the tick panel then opened
+        # frame 537 in forensics: a frame from before her face was visible.
+        **(frame or {}),
         "unique": unique,
         "staffCrossings": staff_crossings,
         "staffFaceFrames": staff_face_frames,
@@ -458,6 +467,11 @@ def build_payloads(
             last.get("verdicts", []), unique, staff_crossings,
             staff_face_frames, manual_additions, mints=mints, retired=retired,
             co_present=co_present,
+            frame={
+                "tMs": last.get("t_ms"),
+                "seq": last.get("seq"),
+                "persons": len(last.get("boxes") or []),
+            },
         ),
     }
 
