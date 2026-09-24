@@ -33,8 +33,12 @@ def test_frame_wire_shape():
     f = S.Frame(tMs=120, imageB64="abc=", w=640, h=480, seq=7)
     # `ended` joined the contract so the runner can tell a finished FILE from a
     # blinking CAMERA — both freeze `seq`, and only one means the count is done.
-    assert set(f.model_dump()) == {"tMs", "imageB64", "w", "h", "seq", "ended"}
+    # `frameRef` joined it for the shared-frame transport, and is ADDITIVE:
+    # imageB64 is still populated on every frame unless a caller explicitly
+    # declines it, so a consumer that has never heard of the ref is unaffected.
+    assert set(f.model_dump()) == {"tMs", "imageB64", "w", "h", "seq", "ended", "frameRef"}
     assert f.ended is False, "a live source never claims to have ended"
+    assert f.frameRef is None, "no shared transport unless the producer offers one"
 
 
 def test_track_shapes():
