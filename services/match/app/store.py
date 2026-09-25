@@ -76,7 +76,12 @@ Storage
                   review queue judges an identity's clothing, headwear and
                   beard on every sighting it had, not on the five its
                   template cap kept (:func:`app.gallery.review_duplicates`).
-                  NULL = not measured.
+                  NULL = not measured.  Since 2026-09-25 a row may also
+                  carry ``headwear``: the SigLIP head-covering LOGITS the
+                  embed service read off that sighting (float32[8]), written
+                  AFTER the /match call by the runner's background reader
+                  (:meth:`set_body_headwear`) and only for mints and
+                  template enrolments.
 * ``cannot_link`` "these are two different people" constraints, stored
                   order-independent.  Written by an operator's *false-match*
                   correction and by the runner asserting CO-PRESENCE (two faces
@@ -151,7 +156,8 @@ CREATE TABLE IF NOT EXISTS body_sightings (
     appearance BLOB,
     head       BLOB,
     beard      BLOB,
-    skin       BLOB
+    skin       BLOB,
+    headwear   BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_body_sightings_key ON body_sightings(key);
 CREATE TABLE IF NOT EXISTS cannot_link (
@@ -195,7 +201,26 @@ _BODY_COLUMNS_ADDED = (
     ("head", "BLOB"),         # ... head descriptor, float32[40]
     ("beard", "BLOB"),        # ... beard reading, float32[4]
     ("skin", "BLOB"),         # 2026-09-25: cheek log(R/G), log(B/G), float32[2]
+    ("headwear", "BLOB"),     # 2026-09-25: SigLIP head-covering logits, float32[8]
 )
+
+#: ``store_meta`` key of the head-covering model stamp: WHOSE logits the
+#: ``headwear`` column holds (the embed service's ``model`` — its image
+#: graph's sha256[:12] and its prompt set's sha256[:12]).  Written by the
+#: first headwear write, checked by every one after.
+HEADWEAR_STAMP_KEY = "headwear_model"
+
+
+class HeadwearStampMismatchError(RuntimeError):
+    """A headwear write from a DIFFERENT model or prompt set than the gallery holds.
+
+    Logits are comparable only under one image graph and one prompt set: a
+    class logit is the max over that set's prompts, so another set moves
+    every number without anything looking wrong.  Mixing them in one
+    identity's reads would let a threshold judge two scales at once, so the
+    second model's write is refused, naming both stamps (the embedder guard's
+    pattern, for the one column that has a model of its own).
+    """
 
 
 class BodySighting(NamedTuple):
@@ -220,10 +245,11 @@ class SightingEvidence(NamedTuple):
     """One body-log row's appearance readings, for the review queue.
 
     ``created_at`` is the write time (ISO text); ``appearance`` (the torso
-    descriptor, 48 or 64 long), ``head`` (40), ``beard`` (4) and ``skin``
-    (2: the light the face was read under) are float32 arrays, each None
-    when that sighting did not carry it — absent is not zero.  A row with
-    none of them is never returned.
+    descriptor, 48 or 64 long), ``head`` (40), ``beard`` (4), ``skin``
+    (2: the light the face was read under) and ``headwear`` (8: the
+    head-covering logits, loose view then tight) are float32 arrays, each
+    None when that sighting did not carry it — absent is not zero.  A row
+    with none of them is never returned.
     """
 
     key: str
@@ -232,6 +258,7 @@ class SightingEvidence(NamedTuple):
     head: np.ndarray | None = None
     beard: np.ndarray | None = None
     skin: np.ndarray | None = None
+    headwear: np.ndarray | None = None
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -750,13 +777,15 @@ class VectorStore:
         The review queue's clothing, headwear and beard evidence, per
         SIGHTING, where the template column keeps at most the cap's five —
         and on run f0bfc5 those sat inside two seconds for 20 of 44
-        identities (median span 2.0 s).  Rows with none of the three are
+        identities (median span 2.0 s).  Rows with none of the readings are
         skipped in SQL; a NULL column comes back as None, never as zeros.
+        The head-covering logits ride along (``headwear``): a row written
+        by a runner whose reader was off simply has none.
         """
         rows = self.conn.execute(
-            "SELECT key, created_at, appearance, head, beard, skin FROM body_sightings"
+            "SELECT key, created_at, appearance, head, beard, skin, headwear FROM body_sightings"
             " WHERE appearance IS NOT NULL OR head IS NOT NULL OR beard IS NOT NULL"
-            " OR skin IS NOT NULL"
+            " OR skin IS NOT NULL OR headwear IS NOT NULL"
             " ORDER BY id ASC"
         ).fetchall()
 
@@ -764,9 +793,53 @@ class VectorStore:
             return None if blob is None else np.frombuffer(blob, dtype=np.float32)
 
         return [
-            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b), arr(sk))
-            for k, ts, a, h, b, sk in rows
+            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b), arr(sk), arr(hw))
+            for k, ts, a, h, b, sk, hw in rows
         ]
+
+    def headwear_stamp(self) -> str | None:
+        """The head-covering model this gallery's ``headwear`` logits came from, or None.
+
+        None until the first headwear write: a gallery whose runner never
+        read a head holds no logits and no stamp.
+        """
+        row = self.conn.execute(
+            "SELECT v FROM store_meta WHERE k = ?", (HEADWEAR_STAMP_KEY,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_body_headwear(self, row_id: int, logits, stamp: str) -> bool:
+        """Write one body row's head-covering logits; True if the row exists.
+
+        The reading arrives AFTER its /match call — the runner reads the head
+        on a background worker, so a lost read is an absent read and never a
+        slower frame — and it names the body row that call logged.  False,
+        not an error, when that row is gone: the same-frame guard retracted
+        it, or /mark-staff took the person out, before the read came back.
+
+        ``stamp`` is the reading's model (:data:`HEADWEAR_STAMP_KEY`): the
+        first write adopts it, a later write under another stamp raises
+        :class:`HeadwearStampMismatchError` and writes nothing.  Adopting and
+        writing happen in the caller's transaction, so a refused or failed
+        write leaves neither behind.
+        """
+        text = str(stamp)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO store_meta (k, v) VALUES (?, ?)", (HEADWEAR_STAMP_KEY, text)
+        )
+        held = self.headwear_stamp()
+        if held != text:
+            raise HeadwearStampMismatchError(
+                f"{self.path.name} holds head-covering logits from model `{held}`; this "
+                f"reading is from `{text}`. Logits from another image graph or prompt set "
+                "are on another scale — refused rather than judged together. Either point "
+                f"the embed service back at `{held}`, or start a new run for `{text}`."
+            )
+        blob = np.asarray(logits, dtype=np.float32).tobytes()
+        cur = self.conn.execute(
+            "UPDATE body_sightings SET headwear = ? WHERE id = ?", (blob, int(row_id))
+        )
+        return cur.rowcount > 0
 
     def count_for(self, key: str) -> int:
         """How many templates a single key owns.

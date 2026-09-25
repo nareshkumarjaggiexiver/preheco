@@ -70,7 +70,10 @@ def spoke(i: int, cosine: float = 0.30) -> np.ndarray:
 
 def excluded(**counts) -> dict:
     """The reply's ``excluded`` block: every signal at zero but those named."""
-    return {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, **counts}
+    return {
+        "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        **counts,
+    }
 
 
 @pytest.fixture()
@@ -628,6 +631,10 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             },
             "beard": {"a": None, "b": None, "nA": 0, "nB": 0},
             "light": {"a": None, "b": None, "shift": None, "held": []},
+            "headwear": {
+                "a": None, "b": None, "nA": 0, "nB": 0,
+                "turbanA": 0, "bareA": 0, "turbanB": 0, "bareB": 0,
+            },
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
     assert got["setAside"] == []

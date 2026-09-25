@@ -50,6 +50,7 @@ from .appearance import (
     self_agreement,
     spread,
 )
+from .headwear import headwear_apart, headwear_tallies, headwear_why
 from .store import Neighbour, VectorStore, as_unit, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -1421,6 +1422,10 @@ def review_duplicates(
     light_tol: float = 0.0,
     clothes_well_seen_n: int = 0,
     clothes_well_seen_clash: float = 0.0,
+    headwear: bool = False,
+    headwear_min_n: int = 2,
+    headwear_turban_p: float = 0.8,
+    headwear_bare_p: float = 0.5,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1525,6 +1530,17 @@ def review_duplicates(
       ``why.light.held`` names what was held and ``keptByLight`` counts the
       pairs.  Gender, age and stature are not colours and still apply.
 
+    * **The head covering (2026-09-25).**  Every mint and template
+      enrolment may carry SigLIP head-covering logits on its body row
+      (:mod:`app.headwear`).  ``why.headwear`` reports each side's label
+      and its confident reads on every row; with ``headwear`` on, a pair of
+      two confidently male identities, one reading turban (``headwear_min_n``
+      confident reads, none bare) and the other bare (the reverse), is set
+      aside with reason ``headwear`` (:func:`app.headwear.headwear_apart`).
+      Not a colour: the light guard never holds it back.  Checked LAST, so
+      ``excluded.headwear`` counts only the pairs nothing else set aside.
+      Off (the default), the reads are reported and nothing moves.
+
     EVERY PAIR SET ASIDE STAYS INSPECTABLE.  ``setAside`` lists them —
     ``{a, b, cosine, clothes, why, reasons}``, ranked like the queue and
     capped at ``limit`` — with every signal that spoke in ``reasons`` (the
@@ -1545,11 +1561,15 @@ def review_duplicates(
     identity's median skin reading (``[log(R/G), log(B/G)]`` or null), the
     larger gap between them (null unless both are read) and the colour
     reasons the light guard held back (``[]`` when none).
+    ``why.headwear`` is ``{a, b, nA, nB, turbanA, bareA, turbanB, bareB}``:
+    each side's label (``turban | bare | mixed | unsure``, null when never
+    read — :func:`app.headwear.headwear_label`), its reads and its confident
+    turban and bare reads.
 
     Returns ``{"pairs": [...], "considered": n, "returned": k, "dropped": d,
     "excluded": {"gender": g, "age": a, "stature": s, "clothes": c,
-    "head": h, "beard": b}, "setAside": [...], "setAsideDropped": s,
-    "keptByLight": l}``.
+    "head": h, "beard": b, "headwear": w}, "setAside": [...],
+    "setAsideDropped": s, "keptByLight": l}``.
     ``dropped`` (and ``setAsideDropped``, the set-aside pairs past
     ``limit``) is stated rather than swallowed: a truncated queue that looks
     complete is how a real duplicate goes unreviewed.
@@ -1560,7 +1580,9 @@ def review_duplicates(
     must not wait on an operator's click).
     """
     store = open_store(db_path(data_dir, run_id))
-    excluded = {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0}
+    excluded = {
+        "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+    }
     with store.reading():
         keys = store.keys()
         vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
@@ -1592,6 +1614,7 @@ def review_duplicates(
     wears = head_wear(evidence)
     beards = beard_reads(evidence)
     skins = skin_medians(evidence)
+    coverings = headwear_tallies(evidence, headwear_turban_p, headwear_bare_p)
     candidates, set_aside = [], []
     kept_by_light = 0
     for a, b, cosine, clothes in in_band:
@@ -1644,10 +1667,17 @@ def review_duplicates(
                 "shift": shift,
                 "held": [],
             },
+            "headwear": headwear_why(coverings.get(a), coverings.get(b), headwear_min_n),
         }
         reasons = _side_reasons(
             why["gender"], why["age"], why["stature"],
             gender_min_p, age_child_max, age_adult_min, stature_gap,
+        )
+        # The head covering is not a colour (the light guard never holds it)
+        # and is checked last, so it is counted only where nothing else spoke.
+        covered_apart = headwear and headwear_apart(
+            coverings.get(a), coverings.get(b), genders[a], genders[b],
+            headwear_min_n, gender_min_p,
         )
         colour = []
         if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min) or (
@@ -1668,9 +1698,11 @@ def review_duplicates(
             # people's.  Asked, not set aside — and said so.
             why["light"]["held"] = colour
             colour = []
-            if not reasons:
+            if not reasons and not covered_apart:
                 kept_by_light += 1
         reasons += colour
+        if covered_apart:
+            reasons.append("headwear")
         entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
         if reasons:
             excluded[reasons[0]] += 1
@@ -1751,6 +1783,29 @@ def forget_body_sighting(data_dir: Path, run_id: str, body_id: int) -> bool:
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():
         return store.forget_body_sighting(body_id)
+
+
+def write_headwear(
+    data_dir: Path, run_id: str, body_id: int, logits: list[float], model: str
+) -> bool:
+    """Store one sighting's head-covering logits on its body row; True if written.
+
+    The runner reads the head of a mint or a template enrolment on a
+    background worker and hands the logits back here with the ``bodyId``
+    that /match returned, so the reading lands on exactly the sighting it
+    was cut from — and moves with it through a merge, and leaves with it on
+    a same-frame retraction or a mark-staff.  False, never an error, when
+    the run has no gallery (reset, or swept) or the row is gone; nothing is
+    created for a run that does not exist.  ``model`` is the embed service's
+    stamp; a gallery holding another model's logits refuses it
+    (:class:`app.store.HeadwearStampMismatchError`, a 409 on the wire).
+    """
+    path = db_path(data_dir, run_id)
+    if not path.exists():
+        return False
+    store = open_store(path)
+    with store.transaction():
+        return store.set_body_headwear(body_id, logits, model)
 
 
 def split(data_dir: Path, run_id: str, a: str, b: str) -> int:
