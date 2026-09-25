@@ -14,6 +14,9 @@ The kinds (planner ``run_feedback.kind``, mirrored in api.js ``FEEDBACK_KINDS``)
     mark-staff  {personKey, staffId?} -> move to staff store (unique -1)
                                         REQUIRES the run to carry a siteId
     missed      {note?}               -> manual count (unique +1)
+    not-a-guest {personKey}           -> match /exclude (unique -1): off the
+                                        guest list, templates kept, so the
+                                        face is not re-counted (2026-09-25)
     note                              -> acknowledge only (audit trail)
 
 Two rules earn their own paragraph, because both were places the audit trail
@@ -116,6 +119,12 @@ def plan_action(item: dict, has_site_id: bool = True) -> Action:
         staff_id = payload.get("staffId")
         return Action(fid, "mark-staff", person_key=str(person_key),
                       staff_id=str(staff_id) if staff_id else None)
+
+    if kind == "not-a-guest":
+        person_key = payload.get("personKey")
+        if not person_key:
+            return Action(fid, "invalid", reason="not-a-guest needs a personKey")
+        return Action(fid, "exclude", person_key=str(person_key))
 
     if kind == "missed":
         note = payload.get("note")
