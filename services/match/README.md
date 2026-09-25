@@ -37,7 +37,8 @@ evidence (project hard rule: measure first).
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
-| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes, head, beard}, setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
+| POST | `/review/duplicates` | `{runId, limit?}` | `{runId, threshold, pairs:[{a, b, cosine, clothes, why}], considered, returned, dropped, excluded:{gender, age, stature, clothes, head, beard, headwear}, setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped}` — read-only; see [the review queue's set-asides](#the-review-queues-set-asides) |
+| POST | `/body-sightings/headwear` | `{runId, bodyId, headwear: [8 floats], model}` | `{ok, written}` — one sighting's head-covering logits, written by the runner's background reader (0.16.0); `written:false` when the row or the run is gone; **409** when the gallery already holds another `model`'s logits |
 | POST | `/staff/purge` | `{siteId, staffIds[]}` | `{siteId, removed}` — consent erasure |
 | POST | `/gallery/sweep` | `{maxAgeS?}` | `{swept:[runId], maxAgeS}` — retention backstop |
 
@@ -439,6 +440,40 @@ against a blue one (0.374) and a black kurta against a light check
 (0.496); 0.55 sets both aside. Older galleries (f0bfc5, c84098, 8b8b87)
 replay unchanged.
 
+**The head covering (0.16.0) — LOG-ONLY by default.** The colour head rule
+cannot tell a dark turban from black hair, so it never sets covered against
+bare; run 8b8b87's pair p00005/p00009 (a sky-blue turban against a bare man)
+stayed asked. The embed service now reads the head with SigLIP B/16
+(`services/embed/app/headwear.py`) and the runner writes each mint's and
+each template enrolment's 8 logits — turban, bare, dupatta_or_scarf,
+cap_or_hat of a loose view, then of a tight ellipse-masked view — onto the
+sighting's body row (`POST /body-sightings/headwear`, column
+`body_sightings.headwear`, ADD COLUMN on open; legacy rows read null). The
+first write stamps the gallery with the reader's `model` (its graph's and
+prompt set's sha256[:12]) and a write under another stamp is refused (409):
+logits from another prompt set are on another scale. **Logits are stored,
+not verdicts**: a read is confidently turban (bare) when both views argmax it
+and the smaller of the two views' probabilities is at least
+`HECO_REVIEW_HEADWEAR_TURBAN_P` (0.80; `_BARE_P` 0.50). An identity reads
+`turban` with at least `HECO_REVIEW_HEADWEAR_MIN_N` (2) confident turban
+reads and ZERO confident bare, `bare` the reverse, `mixed` with both,
+`unsure` otherwise. `why.headwear` = `{a, b, nA, nB, turbanA, bareA,
+turbanB, bareB}` on every row. With `HECO_REVIEW_HEADWEAR=1` a pair is set
+aside, reason `headwear`, only when BOTH identities are confidently male at
+the gender bar (`HECO_REVIEW_GENDER_MIN_P`, 0.8 — at 0 the rule is off too)
+and one reads `turban`, the other `bare`: never a dupatta, a cap or an
+unsure head against anything, never a woman, and turban against turban stays
+with the colour rule. Not a colour, so the light guard never holds it back;
+checked last, so `excluded.headwear` counts only pairs nothing else set
+aside. Measured offline (siglip evaluation, 2026-09-25, CPU): on 461 crops
+labelled by eye from the D02 wedding no confident call was wrong (31 turban,
+312 bare; every uncalled turban unsure, never bare), and replayed on 8b8b87's
+own 26-pair queue the rule sets aside exactly p00005/p00009, p00005/p00066,
+p00039/p00055 and p00041/p00074 — all turban against bare by eye. 31 turban
+calls put the one-sided 95 % lower bound on precision at ~0.91, and a safa
+tied for the baraat comes off later in the night: re-verify on the next
+event's footage before switching it on.
+
 ## Run
 
 ```sh
@@ -472,7 +507,19 @@ measured pair (mint at 0.3464 with torso 0.562 → flagged, verdict still a
 mint, gallery grows), plus: out-of-band and empty-gallery mints null, band
 edges, `appearanceSim` null when either side lacks a descriptor, matched
 verdicts and staff hits never flagged, floor 0 disabling, and `/health`
-naming the band. The **weak (clothing) band** replays bench 6e1a5d's two
+naming the band. `tests/test_review_headwear.py` pins the head covering: the
+per-read call (both views, the smaller probability at the bar, dupatta and
+cap never confident), the identity labels (N unanimous reads, one contrary
+read makes `mixed`), storage (the write lands on its `bodyId` row, the first
+write stamps the gallery and another model is a 409 that writes nothing, a
+gone row or run is `written:false` and conjures no file, an existing gallery
+migrates with its rows reading null, the reads move with a merge and leave
+with mark-staff), and the rule's matrix (log-only by default sets nothing
+aside; on, only turban against bare between two confident men; never
+dupatta, cap, unsure, a woman, an unsure or unread sex; the switch, N 0 and
+the gender bar 0 are each an off switch; the light guard never holds it,
+even when it holds a colour reason on the same pair; no cannot_link).
+The **weak (clothing) band** replays bench 6e1a5d's two
 surviving survivors verbatim (0.212/0.797 and 0.228/0.875 → `basis:
 "clothing"`, verdict still a mint, count still up), and pins: clothing 0.60
 at the same face score stays silent, a descriptor-less sighting never enters
@@ -506,6 +553,10 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-dark or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
 | `HECO_REVIEW_BEARD_PALE` | `0` | `1` lets none against a grey or white beard set a pair aside too (off: a warm light reads a white beard as none). |
 | `HECO_REVIEW_LIGHT_TOL` | `0.07` | The light guard: hold back a colour set-aside when the two identities' skin readings differ by more than this. **0 disables the guard.** |
+| `HECO_REVIEW_HEADWEAR` | `0` | `1` lets a turban against a bare head, between two confidently male identities, set a pair aside (reason `headwear`). **Off = log-only**: `why.headwear` is reported either way. |
+| `HECO_REVIEW_HEADWEAR_MIN_N` | `2` | Confident, unanimous head-covering reads each side needs (N = 3 loses 8b8b87's p00039/p00055: the boy had two bare reads). **0 disables the rule.** |
+| `HECO_REVIEW_HEADWEAR_TURBAN_P` | `0.80` | Smaller-of-two-views probability a confident turban read needs (fitted 0.765 at precision ≥ 0.97 on 461 crops, rounded up). |
+| `HECO_REVIEW_HEADWEAR_BARE_P` | `0.50` | ...and a confident bare read (fitted 0.365). |
 | `HECO_REVIEW_CLOTHES_SELF_MIN` | `0.6` | Median pairwise intersection an identity's own torso reads must reach — an identity whose reads disagree (two people merged, a band on a pillar) has no clothing to compare. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the
