@@ -174,6 +174,11 @@ services:
       # to latch onto a DIFFERENT person, which is why the runner's clothing
       # guard and the lock's counters exist. Unset renders as "" = the default.
       HECO_TRACKER_MAX_AGE: ${HECO_TRACKER_MAX_AGE-}
+      # A frame-time gap over this (ms) is a break in the source — a live
+      # camera that dropped out — and clears the run's tracks, so none is
+      # continued onto whoever stands there after the outage. Default
+      # 10000; 0 = off (frame-count coasting alone).
+      HECO_TRACKER_MAX_GAP_MS: ${HECO_TRACKER_MAX_GAP_MS-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -239,6 +244,12 @@ services:
       # per-face vectors >= 0.999999. Unset = off = today's per-face loop.
       # /health knobs.batch shows it as asked AND as the graph allows.
       EMBED_BATCH: ${EMBED_BATCH-}
+      # The SigLIP B/16 head-covering reader (POST /headwear), for the review
+      # queue's turban-against-bare evidence. Unset/empty/off = no reader and
+      # /health, /embed exactly as before. On: the graph's path, e.g.
+      # models/siglip_b16_224_image_fp32.onnx, with headwear_prompts.json and
+      # headwear_text_embeds.npy beside it in the mounted models dir.
+      EMBED_HEADWEAR_MODEL: ${EMBED_HEADWEAR_MODEL-}
     volumes:
       - ./services/embed/models:/srv/services/embed/models:ro
 
@@ -342,6 +353,15 @@ services:
       # false set-aside 0.08+; 0.07 held all of them. Default 0.07, 0 = off.
       HECO_REVIEW_BEARD_PALE: ${HECO_REVIEW_BEARD_PALE-}
       HECO_REVIEW_LIGHT_TOL: ${HECO_REVIEW_LIGHT_TOL-}
+      # HEADWEAR (0.16.0): the runner writes SigLIP head-covering logits onto
+      # mint/enrolment body rows; why.headwear reports them on every review
+      # row. HECO_REVIEW_HEADWEAR=1 lets a turban against a bare head, between
+      # two confidently male identities (>= MIN_N unanimous reads each side),
+      # set a pair aside; default 0 = log-only. Bars: turban 0.80, bare 0.50.
+      HECO_REVIEW_HEADWEAR: ${HECO_REVIEW_HEADWEAR-}
+      HECO_REVIEW_HEADWEAR_MIN_N: ${HECO_REVIEW_HEADWEAR_MIN_N-}
+      HECO_REVIEW_HEADWEAR_TURBAN_P: ${HECO_REVIEW_HEADWEAR_TURBAN_P-}
+      HECO_REVIEW_HEADWEAR_BARE_P: ${HECO_REVIEW_HEADWEAR_BARE_P-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -468,6 +488,14 @@ services:
       # it changed nothing there; a venue with coloured stage light is where
       # to try it. Reported on runner /health as knobs.HECO_APPEARANCE_WB.
       HECO_APPEARANCE_WB: ${HECO_APPEARANCE_WB-}
+      # HEAD-COVERING READS (0|1, default 0 = off). On, every mint and
+      # template enrolment that logged a body row has its head read by embed
+      # POST /headwear on a BACKGROUND worker and the logits written to match
+      # POST /body-sightings/headwear; the loop only cuts the crop. A full
+      # queue (HECO_HEADWEAR_QUEUE crops, default 32) drops and counts
+      # (headwearDropped). Needs embed EMBED_HEADWEAR_MODEL and match 0.16.0.
+      HECO_HEADWEAR: ${HECO_HEADWEAR-}
+      HECO_HEADWEAR_QUEUE: ${HECO_HEADWEAR_QUEUE-}
       # STAGE OVERLAP (lever L3; 1 = on, default off). One worker thread
       # fetches frame k+1 and runs its detection (persons, and the face search
       # when it needs no tracks: HECO_FACES_WHOLE_FRAME) while the loop decides

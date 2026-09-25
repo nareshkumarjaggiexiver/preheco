@@ -81,7 +81,10 @@ RED_BLUE = torso({0: 1.0, 24: 1.0})
 
 def excluded(**counts) -> dict:
     """The reply's ``excluded`` block: every signal at zero but those named."""
-    return {"gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, **counts}
+    return {
+        "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        **counts,
+    }
 
 
 @pytest.fixture()

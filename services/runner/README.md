@@ -474,6 +474,8 @@ and the region; `test_ingest_levers.py` a FIFO, keepalive-gated ingest; and
 | `HECO_SOURCE_POLL_S` | `0.02` | Poll interval while ingest's `seq` is unchanged |
 | `HECO_SOURCE_STALL_S` | `45.0` | Stalled-seq duration before a run gives up (a stall settles `failed` and KEEPS the gallery) |
 | `HECO_RUN_RETENTION_S` | `600` | How long a settled run stays readable from `GET /runs/:id` before it is reaped |
+| `HECO_HEADWEAR` | `0` (off) | Head-covering reads for the review (`app/headwear.py`): after a `/match` that minted or enrolled a template AND returned a `bodyId`, the loop cuts the head's context (face box ±0.5 widths, 1.2 heights up, to the face bottom) and a BACKGROUND worker PNG-encodes it, calls embed `POST /headwear` and writes the 8 logits to match `POST /body-sightings/headwear`. Never staff, never a plain match, never on the frame loop's critical path. Status/results `headwearQueued`, `headwearDropped`, `headwearWritten`, `headwearFailed` (+ status `headwearLastError`) — absent when off. Needs embed `EMBED_HEADWEAR_MODEL` and match 0.16.0 |
+| `HECO_HEADWEAR_QUEUE` | `32` | Crops the worker may hold; a burst past it is dropped and counted (`headwearDropped`), as is anything still queued 10 s after the run ends |
 
 ## Notes
 

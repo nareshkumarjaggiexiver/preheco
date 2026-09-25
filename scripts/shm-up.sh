@@ -52,6 +52,11 @@ export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
 export HECO_QUALITY_REQUIRE_LANDMARKS=${HECO_QUALITY_REQUIRE_LANDMARKS:-1}
 export HECO_QUALITY_MIN_FRONTALITY=${HECO_QUALITY_MIN_FRONTALITY:-0.55}
 export HECO_QUALITY_MIN_EYE_SPAN=${HECO_QUALITY_MIN_EYE_SPAN:-0.30}
+# The head covering, as on the camera stacks (demo-up.sh says why): the
+# SigLIP reader and the turban-vs-bare set-aside.
+export EMBED_HEADWEAR_MODEL=${EMBED_HEADWEAR_MODEL-models/siglip_b16_224_image_fp32.onnx}
+export HECO_HEADWEAR=${HECO_HEADWEAR:-1}
+export HECO_REVIEW_HEADWEAR=${HECO_REVIEW_HEADWEAR:-1}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF, as demo-up.sh starts the camera stacks (fixed
 # chandelier light; see there) — so a comparison against them compares the

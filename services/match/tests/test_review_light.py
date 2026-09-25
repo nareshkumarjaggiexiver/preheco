@@ -164,7 +164,8 @@ def test_a_light_change_holds_the_colour_set_aside_back(client, ticking):
     sighted(client, spoke(1), BLUE_SHIRT, SKIN_WARM8)
     got = review(client)
     assert got["excluded"] == {
-        "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0}
+        "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0,
+        "headwear": 0}
     assert got["setAside"] == [] and got["keptByLight"] == 1
     (row,) = got["pairs"]
     light = row["why"]["light"]
