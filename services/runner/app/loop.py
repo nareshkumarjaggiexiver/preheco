@@ -81,7 +81,7 @@ from . import annotate, taps
 from .config import Settings
 from .feedback import plan_action
 from .reporting import Reporter
-from .stats import SampleBuffer, StatsBoard
+from .stats import SampleBuffer, SourceRate, StatsBoard
 
 
 def source_label(source: dict) -> str:
@@ -770,6 +770,9 @@ class RunLoop:
             ("featnorm",) if float(settings.quality_min_feat_norm) > 0 else ()
         ) + (("balance",) if float(settings.quality_min_balance) > 0 else ())
         self.board = StatsBoard()
+        # The source's own delivery rate, which the ingest stage reports as
+        # its fps once it can be measured (stats.SourceRate says why).
+        self._source_rate = SourceRate()
         self.samples = SampleBuffer(cap=settings.sample_batch_max)
         self._stop = threading.Event()
         # Set once the frame loop is over, however it ended, so a fetch still
@@ -1327,6 +1330,12 @@ class RunLoop:
         motion = body.get("motion")
         if isinstance(motion, int | float) and not isinstance(motion, bool) and motion == motion:
             self.board.observe("ingest", "motion", float(motion))
+        captured, frame_ms = body.get("captured"), body.get("tMs")
+        timed = isinstance(frame_ms, int | float) and not isinstance(frame_ms, bool)
+        if _count(captured) and timed:
+            rate = self._source_rate.observe(float(frame_ms), int(captured))
+            if rate is not None:
+                self.board.set_rate("ingest", rate)
         backlog = body.get("backlog")
         if _count(backlog):
             self.board.observe("ingest", "backlog", float(backlog))
