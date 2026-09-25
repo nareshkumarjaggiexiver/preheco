@@ -39,6 +39,13 @@ POST /api/pipeline/runs/:id/stats      {stage, frames, fps, metrics:{name:{count
 POST /api/pipeline/runs/:id/samples    {samples:[{stage,tMs,metrics}]}   (batch ≤200, ~every 2 s)
 Stage names: ingest | person-detect | track | face-detect | quality | embed | match | count.
 Measured metrics the console charts: personBoxHPx, faceBoxWPx, embedMs, matchCosine.
+A stage's `fps` is its frames ÷ the run's elapsed time, with two exceptions:
+the `count` stage also carries `windowFps` (the processing rate per ~5 s
+window, so min / mean / max show an outage the mean hides), and the
+`ingest` stage's `fps` is the SOURCE's delivery rate once measurable — ingest's
+cumulative `captured` over its own frame clock `tMs`, from 5 s after the first
+frame (past the startup burst), over at least 2 s (runner `stats.SourceRate`,
+2026-09-25: a 15 fps camera read 15.7 on the old figure).
 
 ## Conventions
 - Python 3.12; **one venv per service** (`make venv` in each); ruff + pytest.
