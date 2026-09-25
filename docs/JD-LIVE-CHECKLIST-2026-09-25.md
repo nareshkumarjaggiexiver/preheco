@@ -66,6 +66,14 @@ change.
   means the camera sent nothing for at least 5 seconds; max is what the
   pipeline does when it is fed. If avg is low but max is near the camera's
   fps, the camera or network is the problem, not the box.
+- **Turban against bare head.** The box reads each new guest's head covering
+  (SigLIP) and the duplicate review sets aside a pair when both are men and
+  one wears a turban, the other is bare-headed — the p00005/p00009 kind.
+  Those pairs are listed under "Set aside" in the console, mergeable, with
+  "one man wears a turban and the other is bare-headed". If one of them is
+  wrong, switch the rule off (the reading stays):
+  `HECO_REVIEW_HEADWEAR=0 ./scripts/demo-up.sh both` — the review changes at
+  once, nothing is re-counted.
 - A camera that drops out is reopened as soon as it answers again (checked
   every 10 seconds), and the run stays open through an outage of up to ten
   minutes. The console's silence alarm shows after 30 seconds. After ten
@@ -103,5 +111,6 @@ should read P2 and at least 2400 MHz. Undo: `nvidia-smi -rgc`.
 |---|---|
 | Status shows the decoder fell back to cpu, or the stream will not open | `INGEST_DECODER=cpu ./scripts/demo-up.sh both` |
 | Anything else that started after the speed levers | `HECO_DEMO_LEVERS=0 ./scripts/demo-up.sh both` (the configuration before 2026-09-25) |
+| The head-covering reader misbehaves (embed not healthy, reads failing in status) | `EMBED_HEADWEAR_MODEL= ./scripts/demo-up.sh both` — the reader off, everything else as is |
 | WSL is gone | Log in to Windows (the keepalive task restarts it), or open Ubuntu. |
 | Console cannot reach the box | Section 3. `ping <box-ip>` from the laptop first. |
