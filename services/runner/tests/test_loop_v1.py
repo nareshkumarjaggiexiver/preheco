@@ -3093,14 +3093,43 @@ def test_a_clearly_better_look_replaces_the_card_and_a_marginal_one_does_not():
     img = solid_image(RED_BGR, w=320, h=300)
     at = lambda w: {"box": {"x": 40, "y": 30, "w": w, "h": 78}}  # noqa: E731
 
+    # No pose or clarity on these faces: judged on size alone (width / 160).
     loop._maybe_face_card(img, at(60.0), {"personKey": "p00001"})
-    assert loop._face_pending["p00001"][1] == 60.0
+    assert loop._face_pending["p00001"][1] == pytest.approx(60.0 / 160)
 
     loop._maybe_face_card(img, at(70.0), {"personKey": "p00001"})  # 1.17x
-    assert loop._face_pending["p00001"][1] == 60.0, "marginal: the card stands"
+    assert loop._face_pending["p00001"][1] == pytest.approx(60.0 / 160), "marginal: the card stands"
 
     loop._maybe_face_card(img, at(80.0), {"personKey": "p00001"})  # 1.33x
-    assert loop._face_pending["p00001"][1] == 80.0, "clearly better: replaced"
+    assert loop._face_pending["p00001"][1] == pytest.approx(80.0 / 160), "clearly better: replaced"
+
+
+def test_a_squarer_or_clearer_look_at_the_same_size_replaces_the_card():
+    """THE OPERATOR'S CASE (2026-09-25): a better face at the same distance.
+
+    p00001's card kept its first look, head turned and down, although a later
+    frame showed the face square and clear — the rule compared widths only.
+    Pose (frontality) and clarity (the feature norm on the verdict) now count.
+    """
+    fake = Cards(n_frames=1)
+    loop = make_loop(
+        fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}}, face_card_improve=1.15
+    )
+    img = solid_image(RED_BGR, w=320, h=300)
+    face = lambda fr: {"box": {"x": 40, "y": 30, "w": 120, "h": 150}, "frontality": fr}  # noqa: E731
+
+    loop._maybe_face_card(img, face(0.3), {"personKey": "p00001", "featNorm": 17.0})
+    first = loop._face_pending["p00001"][1]
+    loop._maybe_face_card(img, face(0.35), {"personKey": "p00001", "featNorm": 17.5})
+    assert loop._face_pending["p00001"][1] == first, "barely different: the card stands"
+    loop._maybe_face_card(img, face(0.95), {"personKey": "p00001", "featNorm": 23.0})
+    assert loop._face_pending["p00001"][1] > first * 1.15, "square and clear: replaced"
+
+    # ...and a bigger but side-on, blurred look does not undo it.
+    best = loop._face_pending["p00001"][1]
+    big_profile = {"box": {"x": 20, "y": 20, "w": 200, "h": 240}, "frontality": 0.1}
+    loop._maybe_face_card(img, big_profile, {"personKey": "p00001", "featNorm": 15.0})
+    assert loop._face_pending["p00001"][1] == best
 
 
 def test_a_card_the_planner_refused_stays_pending_for_the_next_round():

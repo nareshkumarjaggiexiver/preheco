@@ -426,7 +426,9 @@ class Settings:
     # from 40 px to 200 px costs five uploads, not five hundred.  Lower means
     # sharper cards and more uploads inside the tap round's budget; 1.0 would
     # re-upload on every marginally wider face and is the setting to avoid.
-    face_card_improve: float = 1.25
+    # 1.15 since 2026-09-25, when "better" became size x pose x clarity
+    # (a squarer look at the same size moves the score by 15-50%).
+    face_card_improve: float = 1.15
 
     # CO-PRESENCE SPLITS (see loop._assert_co_presence).  1 = on, 0 = off.
     #

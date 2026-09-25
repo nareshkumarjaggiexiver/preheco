@@ -2543,6 +2543,11 @@ class RunLoop:
                 attributes=attr, feat_norm=norm, body=body_box,
                 head=head, beard=beard, skin=skin,
             ))
+            # The face's clarity rides its verdict to the card choice
+            # (_card_quality): the recogniser's own reading of how clear,
+            # frontal and unobstructed this look is.
+            if norm is not None and isinstance(m, dict):
+                m.setdefault("featNorm", norm)
             board.frame("match")
             if m.get("cosine") is not None:
                 board.observe("match", "matchCosine", float(m["cosine"]))
@@ -2873,6 +2878,33 @@ class RunLoop:
         """Delegates to :func:`heco_counting.association.different_bodies`."""
         return association.different_bodies(bodies, a, b)
 
+    #: A card's full SIZE credit is reached at this face width (px): the
+    #: embedders' 112 px input and a margin. Beyond it pose and clarity decide.
+    CARD_FULL_PX = 160.0
+
+    def _card_quality(self, face: dict, m: dict) -> float:
+        """How good a look this face is, for the register's card: size x pose x clarity.
+
+        THE OPERATOR'S CASE (2026-09-25): p00001's card kept its first look
+        although a later frame showed the face clearly better — the rule
+        compared face WIDTHS only, so a squarer, sharper look at the same
+        distance never won. Now: size (width over CARD_FULL_PX, capped at 1)
+        times pose (0.5 + 0.5 x frontality — a profile halves it) times
+        clarity (the ArcFace feature norm over 20 — it drops for a face turned,
+        tilted down, blurred or half covered). A signal the face does not carry
+        counts 1.0, so an older runner's face is judged on size alone.
+        """
+        def num(v):
+            return float(v) if isinstance(v, int | float) and not isinstance(v, bool) else None
+
+        width = num((face.get("box") or {}).get("w")) or 0.0
+        size = min(1.0, width / self.CARD_FULL_PX) if width > 0 else 0.0
+        fr = num(face.get("frontality"))
+        pose = 0.5 + 0.5 * max(0.0, min(1.0, fr)) if fr is not None else 1.0
+        n = num((m or {}).get("featNorm"))
+        clarity = n / 20.0 if n is not None and n > 0 else 1.0
+        return size * pose * clarity
+
     def _maybe_face_card(self, frame_img, face: dict, m: dict) -> None:
         """Keep this guest's best face so far, cropped, for the register.
 
@@ -2888,7 +2920,10 @@ class RunLoop:
         later face is taken only when it is clearly better, by a margin
         (``face_card_improve``), which bounds the number of cards per guest to
         a handful whatever the run does: each replacement must beat the last by
-        that factor, so the count is logarithmic in how much the face grows.
+        that factor, so the count is logarithmic in how much the face improves.
+        Better is :meth:`_card_quality` — size, pose and clarity — since
+        2026-09-25; before, width alone, and a clearer look at the same
+        distance never replaced the first.
 
         Cropping happens HERE and uploading does not. Encoding a 192 px JPEG is
         about a millisecond; posting it is a network round trip, and network
@@ -2910,7 +2945,8 @@ class RunLoop:
         # No separate zero-width guard: face_crop refuses a box with no area
         # (tested there), and a branch here that no test could distinguish from
         # its absence is exactly the dead defence this codebase keeps catching.
-        width = float(box.get("w") or 0.0)
+        # "Better" is the card quality (size x pose x clarity), not width.
+        width = self._card_quality(face, m)
         # LOCKED, because the reporter thread reads this dict while uploading.
         # _flush_face_cards was always written for a concurrent writer ("a
         # better crop may have arrived while the upload was in flight") but
