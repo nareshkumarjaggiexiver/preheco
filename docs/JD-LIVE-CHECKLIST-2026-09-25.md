@@ -15,6 +15,16 @@ rules. `./scripts/demo-up.sh status` on the box shows every one of them.
       camera's infrared light switches on and draws more power; on an
       underpowered port the camera's light blinks on and off and it drops
       off the network every minute or so (the Sharon test, 2026-09-25).
+- [ ] **The camera's switch port in its normal (100 m) mode, not 250 m.**
+      On most PoE switches the 250 m "extend" mode runs the port at
+      10 Mbit/s, and the camera's 4K main stream alone is about 8.6 Mbit/s.
+      At Sharon, 16:45, on that port: every stream started at 15 fps, then
+      fell to 8–9 fps with 1-second gaps and one 7.8 s stall. The camera
+      answered ping in 37–209 ms (the office router: 4 ms), with nothing on
+      the laptop connected to it. Not yet confirmed on the switch itself.
+      Power the camera from a PoE+ port or with a better cable instead. If
+      250 m mode must stay, set the main stream to 4–5 Mbit/s constant
+      bitrate and keep the NVR off this camera.
 
 ## 2. Power-up order
 
@@ -49,11 +59,13 @@ change.
 - Use the camera's **main** stream (4K H.265) for analysis.
 - **Check the camera's fps at the zoom you will use.** At Sharon the same
   CP Plus model halved its frame rate at full zoom (15 to about 7.5 fps,
-  indoor lights on) and went back to 15 fps at 50% zoom: at the long end
-  the lens lets in far less light and the camera slows its shutter. If it
-  halves, zoom out, or cap the shutter at 1/25 s in the camera's exposure
-  settings and let gain make up the brightness. The box processed about
-  99% of the frames the camera sent either way.
+  indoor lights on) and went back to 15 fps at 50% zoom. Two explanations
+  fit: at the long end the lens lets in less light and the camera slows its
+  shutter; or the 10 Mbit/s port above (more detail means a higher bitrate).
+  Check the port mode first. Then, if it still halves, zoom out, or cap the
+  shutter at 1/25 s in the camera's exposure settings and let gain make up
+  the brightness. The box processed about 99% of the frames the camera sent
+  either way.
 - Start the run from the console on camera A. Use camera B only for a
   second camera. Leave the quality choice on **Box default**: the box now
   drops half faces itself (landmarks, frontality 0.55, eye span 0.30), which
