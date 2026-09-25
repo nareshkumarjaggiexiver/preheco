@@ -87,6 +87,9 @@ class StatsBoard:
         self._lock = threading.Lock()
         #: stage -> (window start, the stage's frames then); see observe_window_rate.
         self._windows: dict[str, tuple[float, int]] = {}
+        #: stage -> a rate measured elsewhere that replaces frames ÷ elapsed
+        #: in the snapshot (set_rate; today only ingest's SourceRate).
+        self._rates: dict[str, float] = {}
 
     def frame(self, stage: str) -> None:
         """Count one processed frame for a stage."""
@@ -97,6 +100,11 @@ class StatsBoard:
         """Record one metric observation under a stage."""
         with self._lock:
             self.stages[stage].observe(name, value)
+
+    def set_rate(self, stage: str, fps: float) -> None:
+        """Report ``fps`` as ``stage``'s rate instead of frames ÷ elapsed."""
+        with self._lock:
+            self._rates[stage] = fps
 
     def observe_window_rate(
         self, stage: str, now: float, window_s: float, name: str = "windowFps"
@@ -142,7 +150,9 @@ class StatsBoard:
             for stage, st in self.stages.items():
                 if st.frames == 0 and not st.metrics:
                     continue
-                fps = st.frames / elapsed_s if elapsed_s > 0 else 0.0
+                fps = self._rates.get(stage)
+                if fps is None:
+                    fps = st.frames / elapsed_s if elapsed_s > 0 else 0.0
                 out.append(
                     {
                         "stage": stage,
@@ -152,6 +162,51 @@ class StatsBoard:
                     }
                 )
         return out
+
+
+class SourceRate:
+    """Frames the SOURCE delivered per second, on ingest's own clock.
+
+    THE CASE (2026-09-25, the Sharon CP Plus camera at 15 fps, GOP 15): the
+    console's "source fps" read 15.7. It was the runner's frames ÷ time since
+    ITS clock started — after the camera connection opened, which took
+    9-12 s, while the video buffered during the opening was then decoded
+    faster than real time: extra frames over a short clock. Ingest's own
+    counter said 15.0 (about 305 frames every 20 s).
+
+    So the source's rate is read from ingest's cumulative ``captured``
+    counter against the frame's ``tMs`` (ingest's clock), from an origin
+    ``warmup_ms`` after the first frame — past the startup burst — and only
+    once ``min_span_ms`` has passed since that origin. A counter or clock
+    that goes backwards is a restarted capture and is measured afresh.
+    ``rate`` is None until it can be said.
+    """
+
+    def __init__(self, warmup_ms: float = 5000.0, min_span_ms: float = 2000.0) -> None:
+        """Measure from ``warmup_ms`` after the first frame, over at least ``min_span_ms``."""
+        self.warmup_ms = warmup_ms
+        self.min_span_ms = min_span_ms
+        self._first: float | None = None
+        self._origin: tuple[float, int] | None = None
+        self._last: tuple[float, int] | None = None
+        self.rate: float | None = None
+
+    def observe(self, t_ms: float, captured: int) -> float | None:
+        """Fold one handed-over frame's (tMs, captured); the rate so far, or None."""
+        last, self._last = self._last, (t_ms, captured)
+        if last is not None and (captured < last[1] or t_ms < last[0]):
+            self._first, self._origin, self.rate = None, None, None
+        origin = self._origin
+        if origin is None:
+            if self._first is None or t_ms < self._first:
+                self._first = t_ms
+            if t_ms - self._first >= self.warmup_ms:
+                self._origin = (t_ms, captured)
+            return self.rate
+        t0, c0 = origin
+        if t_ms - t0 >= self.min_span_ms:
+            self.rate = (captured - c0) * 1000.0 / (t_ms - t0)
+        return self.rate
 
 
 class SampleBuffer:
