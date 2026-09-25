@@ -170,6 +170,11 @@ CREATE TABLE IF NOT EXISTS manual (
     note       TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS excluded (
+    key        TEXT PRIMARY KEY,
+    reason     TEXT,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v INTEGER NOT NULL
@@ -659,6 +664,29 @@ class VectorStore:
         """Keys of operator-attested people (no template), ascending."""
         self._index()
         return sorted(self._manual)
+
+    def exclude(self, key: str, reason: str | None = None) -> bool:
+        """Take ``key`` out of the guest list (*not-a-guest*); True if newly excluded.
+
+        THE OPERATOR'S ASK (2026-09-25): "there should be an option to remove
+        the guest from the list" — a half face, a poster, a reflection, a
+        person the rules let through. Nothing is deleted: the key keeps every
+        template, so a later sighting of the same face still MATCHES it and is
+        not counted again, which a deletion would get wrong (the face would
+        come back as a new guest). The review queue skips an excluded key.
+        False for a key the gallery does not hold, or one already excluded.
+        """
+        if key not in set(self.keys()) and key not in self.manual_keys():
+            return False
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO excluded (key, reason, created_at) VALUES (?, ?, ?)",
+            (key, reason, _now()),
+        )
+        return cur.rowcount == 1
+
+    def excluded_keys(self) -> set[str]:
+        """Every key an operator has taken out of the guest list."""
+        return {k for (k,) in self.conn.execute("SELECT key FROM excluded")}
 
     def vectors_for(self, key: str) -> list[np.ndarray]:
         """Every stored template for one key as float32 arrays."""

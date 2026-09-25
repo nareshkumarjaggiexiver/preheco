@@ -92,7 +92,9 @@ def _env_s(name: str, default: float) -> float:
 #: every review row gains why.headwear and `excluded` gains `headwear` — a
 #: turban against a bare head between two confident men, set aside only
 #: with HECO_REVIEW_HEADWEAR=1 (default 0: log-only).  Additive.
-VERSION = "0.16.0"
+#: 0.17.0 (2026-09-25): POST /exclude {runId, personKey} — the operator's
+#: *not-a-guest* removal; the key keeps its templates and leaves the review.
+VERSION = "0.17.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -367,6 +369,14 @@ class EnrolRequest(BaseModel):
     siteId: str
     staffId: str
     samples: list[EnrolSample] = Field(min_length=1)
+
+
+class ExcludeRequest(BaseModel):
+    """Body of POST /exclude — take one identity off the guest list (*not-a-guest*)."""
+
+    runId: str
+    personKey: str = Field(min_length=1)
+    reason: str | None = None
 
 
 class MergeRequest(BaseModel):
@@ -710,6 +720,24 @@ def merge(body: MergeRequest) -> dict:
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {"merged": merged, "galleryN": n}
+
+
+@app.post("/exclude")
+def exclude(body: ExcludeRequest) -> dict:
+    """*not-a-guest*: take ``personKey`` off the guest list.
+
+    ``excluded`` is true only when the key was in the gallery and not already
+    excluded; the caller lowers its count then, and only then. The key keeps
+    its templates, so the same face sighted again matches it and is not
+    re-counted, and the review queue never asks about it again.
+    """
+    try:
+        done = gallery.exclude(
+            config.data_dir(), body.runId, body.personKey, body.reason or "operator-removed"
+        )
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"excluded": done, "personKey": body.personKey}
 
 
 @app.post("/split")
