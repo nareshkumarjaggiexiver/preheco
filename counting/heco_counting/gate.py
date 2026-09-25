@@ -80,6 +80,10 @@ class GateThresholds:
     #: not a floor, because the underlying test is topological — there is no
     #: continuum between "eyes above nose above mouth" and not.
     require_landmarks: bool = False
+    #: Reject a face this share or more of which lies inside the head of a
+    #: person nearer the camera (``headOverlap``, stamped by the runner from
+    #: :func:`heco_counting.association.nearer_head_overlap`). 0.0 = off.
+    max_head_overlap: float = 0.0
 
     @classmethod
     def from_settings(cls, s) -> "GateThresholds":
@@ -92,6 +96,7 @@ class GateThresholds:
             min_sharpness=float(s.quality_min_sharpness),
             min_eye_span=float(s.quality_min_eye_span),
             require_landmarks=bool(s.quality_require_landmarks),
+            max_head_overlap=float(getattr(s, "quality_max_head_overlap", 0.0) or 0.0),
         )
 
     @property
@@ -112,7 +117,8 @@ class GateThresholds:
             )
             if floor > 0.0
         )
-        return (("landmarks",) if self.require_landmarks else ()) + floors
+        occluded = ("occluded",) if self.max_head_overlap > 0.0 else ()
+        return (("landmarks",) if self.require_landmarks else ()) + occluded + floors
 
 
 @dataclass(frozen=True)
@@ -181,6 +187,15 @@ def gate_face(face: dict, t: GateThresholds) -> Verdict:
             unmeasured.append("landmarks")
         elif not plausible:
             return Verdict("landmarks")
+
+    # Behind someone's head: a face, but not one to count from (the half
+    # face behind a nearer guest, run 125001's p00005). Unknown never rejects.
+    if t.max_head_overlap > 0.0:
+        covered = _signal(face, "headOverlap")
+        if covered is None:
+            unmeasured.append("occluded")
+        elif covered >= t.max_head_overlap:
+            return Verdict("occluded", tuple(unmeasured))
 
     for name, key, floor in (
         ("ied", "iedPx", t.min_ied_px),

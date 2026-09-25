@@ -69,6 +69,61 @@ def person_box_for(face: dict, boxes: list) -> dict | None:
     return best
 
 
+#: A standing adult's head, as a share of their person box: about one body
+#: height in 7.5 tall, and about as wide as tall in this view. Sized off the
+#: box HEIGHT, not its width, because a guest with arms out (run 125001's
+#: grey-haired man, box 320 px wide at 1280) has a box three heads wide.
+HEAD_H_FRAC = 0.15
+HEAD_W_FRAC = 0.15
+#: How much lower another person's feet must sit before they count as NEARER
+#: the camera: a share of the taller of the two boxes, so two guests side by
+#: side on the same floor line are never ordered.
+NEARER_MARGIN_FRAC = 0.05
+
+
+def nearer_head_overlap(face: dict, boxes: list) -> float | None:
+    """The share of ``face`` covered by the head of a person NEARER the camera.
+
+    THE CASE (2026-09-25, run 125001, p00005): a man's face half hidden behind
+    the grey head of a guest standing in front of him passed every face
+    gate — the detector drew plausible landmarks on the visible half, and
+    the half-balance floor looks for a DARK half, not grey hair. No gate
+    looked at what was in front of the face.
+
+    The face's own person is :func:`person_box_for`'s. Every OTHER person
+    whose box bottom (feet) sits lower in the frame by more than
+    NEARER_MARGIN_FRAC of the taller box is nearer the camera, and their head
+    is the top HEAD_H_FRAC of their box, HEAD_W_FRAC of its height wide,
+    centred on the box. The answer is the largest share of the face box
+    lying inside one of those heads (0.0 when none overlaps); None when the
+    face sits in no person box, since nothing can then be ordered by depth.
+    """
+    own = person_box_for(face, boxes)
+    if own is None:
+        return None
+    fb = face.get("box") or {}
+    fx, fy = float(fb.get("x", 0.0)), float(fb.get("y", 0.0))
+    fw, fh = float(fb.get("w", 0.0)), float(fb.get("h", 0.0))
+    if fw <= 0.0 or fh <= 0.0:
+        return None
+    own_bottom = float(own.get("y", 0.0)) + float(own.get("h", 0.0))
+    worst = 0.0
+    for b in boxes:
+        if b is own:
+            continue
+        bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+        bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
+        margin = NEARER_MARGIN_FRAC * max(bh, float(own.get("h", 0.0)))
+        if by + bh <= own_bottom + margin:
+            continue  # not nearer the camera
+        hw, hh = HEAD_W_FRAC * bh, HEAD_H_FRAC * bh
+        hx = bx + bw / 2.0 - hw / 2.0
+        ix = max(0.0, min(fx + fw, hx + hw) - max(fx, hx))
+        iy = max(0.0, min(fy + fh, by + hh) - max(fy, by))
+        worst = max(worst, (ix * iy) / (fw * fh))
+    return worst
+
+
 def different_bodies(bodies: dict, a: str | None, b: str | None) -> bool:
     """Were these two identities seen on DIFFERENT bodies in one frame?
 
