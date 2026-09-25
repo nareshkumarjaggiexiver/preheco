@@ -32,7 +32,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from heco_common.gate_auth import install_bearer_gate
 from heco_common.ort import is_trt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import __version__
 from .align import align_face, half_balance
