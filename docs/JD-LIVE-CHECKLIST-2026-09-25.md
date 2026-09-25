@@ -66,6 +66,10 @@ change.
   means the camera sent nothing for at least 5 seconds; max is what the
   pipeline does when it is fed. If avg is low but max is near the camera's
   fps, the camera or network is the problem, not the box.
+- **Removing a guest who is not one** (a half face, a poster, a staff member
+  you do not want enrolled): in the console's guest list, press **Remove** on
+  the card, then confirm. The count drops by one; the same face seen again
+  stays out of the count. Works during and after a run.
 - **Turban against bare head.** The box reads each new guest's head covering
   (SigLIP) and the duplicate review sets aside a pair when both are men and
   one wears a turban, the other is bare-headed — the p00005/p00009 kind.
