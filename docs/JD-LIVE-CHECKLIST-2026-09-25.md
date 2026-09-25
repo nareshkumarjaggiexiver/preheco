@@ -56,6 +56,15 @@ change.
 
 ## 4. The run
 
+- **Test the camera before the first run.** Console: site, Devices, the
+  camera, **Test** (planner `5629c7e` or later; restart the console after
+  pulling it). The right panel measures the main stream straight off the
+  camera's timestamps: it should read about 15.0 of the 15 fps it is set
+  to, with no gaps and no long waits, for a minute. A red "Set to 15,
+  delivering 7.5" means the camera, not the box: check the switch port
+  mode (section 1), then zoom and exposure, and watch the number move.
+  "Test against a study" lays the saved study's lanes over the picture;
+  "Capture density" shows whether the edges are as sharp as the middle.
 - Use the camera's **main** stream (4K H.265) for analysis.
 - **Check the camera's fps at the zoom you will use.** At Sharon the same
   CP Plus model halved its frame rate at full zoom (15 to about 7.5 fps,
