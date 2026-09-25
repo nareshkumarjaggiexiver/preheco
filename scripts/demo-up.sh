@@ -110,6 +110,22 @@ export HECO_QUALITY_MIN_BALANCE=${HECO_QUALITY_MIN_BALANCE:-0.33}
 export HECO_QUALITY_REQUIRE_LANDMARKS=${HECO_QUALITY_REQUIRE_LANDMARKS:-1}
 export HECO_QUALITY_MIN_FRONTALITY=${HECO_QUALITY_MIN_FRONTALITY:-0.55}
 export HECO_QUALITY_MIN_EYE_SPAN=${HECO_QUALITY_MIN_EYE_SPAN:-0.30}
+# THE HEAD COVERING, ON — reader and set-aside (2026-09-25, for JD Grand).
+# The operator's complaint it answers: run 8b8b87 asked about p00005/p00009,
+# a Sikh in a sky-blue turban against a bare-headed man. The SigLIP B/16
+# reader (embed, models/siglip_b16_224_image_fp32.onnx and its prompt and
+# text-embedding files beside it) reads the head of every new guest and
+# every template enrolment on a background worker; match sets a pair aside
+# only when both are confidently men and one confidently wears a turban,
+# the other is confidently bare. Offline on the D02 wedding: 461 crops
+# labelled by eye, no confident call wrong; replayed on 8b8b87 it set aside
+# exactly the four turban-against-bare pairs of its 26. Evidence from one
+# wedding (turban precision's 95% lower bound ~0.91), so a pair set aside
+# stays in the console's Set aside list, mergeable. HECO_REVIEW_HEADWEAR=0
+# goes back to log-only; EMBED_HEADWEAR_MODEL= (empty) turns the reader off.
+export EMBED_HEADWEAR_MODEL=${EMBED_HEADWEAR_MODEL-models/siglip_b16_224_image_fp32.onnx}
+export HECO_HEADWEAR=${HECO_HEADWEAR:-1}
+export HECO_REVIEW_HEADWEAR=${HECO_REVIEW_HEADWEAR:-1}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF (match default 0.07). It holds back a colour
 # set-aside when two identities' face skin says they were read under
@@ -291,8 +307,9 @@ PY
   echo '    PIXEL_THR 0.08, KEEPALIVE_S 1.0) · INGEST_BUFFER_S 0 (MB 2048) · INGEST_DECODER cpu · INGEST_CV_THREADS unset ·'
   echo '    INGEST_LIVE_TIMEOUT_S 0 (OpenCV 30 s / ffmpeg own timeouts; 10 recommended for live cameras) ·'
   echo '    EMBED_BATCH 0 · FACES_SCRFD_INPUT 640 · TensorRT only with HECO_TRT=1 (device truth above).'
-  echo '    head covering (all off in the services, none set by this script): EMBED_HEADWEAR_MODEL unset ·'
-  echo '    HEADWEAR 0 (QUEUE 32) · REVIEW_HEADWEAR 0 = log-only (MIN_N 2, TURBAN_P 0.80, BARE_P 0.50).'
+  echo '    head covering: off in the services; this script turns it ON — EMBED_HEADWEAR_MODEL'
+  echo '    models/siglip_b16_224_image_fp32.onnx · HEADWEAR 1 (QUEUE 32) · REVIEW_HEADWEAR 1 (MIN_N 2,'
+  echo '    TURBAN_P 0.80, BARE_P 0.50); REVIEW_HEADWEAR=0 is log-only, EMBED_HEADWEAR_MODEL= turns the reader off.'
 }
 
 case "${1:-both}" in
