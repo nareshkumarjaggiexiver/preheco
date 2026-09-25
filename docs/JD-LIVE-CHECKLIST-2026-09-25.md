@@ -58,7 +58,10 @@ change.
   second camera. Leave the quality choice on **Box default**: the box now
   drops half faces itself (landmarks, frontality 0.55, eye span 0.30), which
   removed profiles, backs of heads and pillar-hidden faces on the Sharon
-  test clip and kept every frontal guest.
+  test clip and kept every frontal guest. It also drops a face half hidden
+  behind the head of someone standing nearer the camera (the D02 recording:
+  8 guests to 7, the half face gone, every real guest kept) — under Strict
+  too.
 - Watch: processed fps against the camera's fps, dropped frames, and on the
   box `./scripts/demo-up.sh status` for TensorRT and the `nvdec` decoder.
 - The run's processing fps reads `avg · min · max`. avg is over the whole
