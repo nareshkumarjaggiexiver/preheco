@@ -113,7 +113,8 @@ class SortLite:
     """
 
     def __init__(self, max_age: int = 30, min_hits: int = 3,
-                 iou_min: float = 0.2, vel_smooth: float = 0.5) -> None:
+                 iou_min: float = 0.2, vel_smooth: float = 0.5,
+                 max_gap_ms: int = 0) -> None:
         """Configure thresholds; state starts empty.
 
         WHY ``max_age`` DEFAULTS TO 30 AND NOT THE ORIGINAL 15 (bench 6e1a5d,
@@ -145,9 +146,16 @@ class SortLite:
         self.tracks: list[TrackState] = []
         self.frame_count = 0
         self._next_id = 1
+        #: A break in the SOURCE, not a slow frame: see step().  0 = off.
+        self.max_gap_ms = max_gap_ms
+        self.last_t_ms: int | None = None
+        #: How many times a source break cleared the tracks (for /health).
+        self.gap_resets = 0
 
     def step(
-        self, detections: list[tuple[float, float, float, float, float | None]]
+        self,
+        detections: list[tuple[float, float, float, float, float | None]],
+        t_ms: int | None = None,
     ) -> list[TrackState]:
         """Advance one frame with ``detections`` [(x, y, w, h, conf), ...].
 
@@ -155,7 +163,29 @@ class SortLite:
         *confirmed* (hits >= min_hits, waived during run warm-up). Coasting
         tracks are predicted but not reported — a track that reappears
         within ``max_age`` frames keeps its id.
+
+        A BREAK IN THE SOURCE CLEARS THE TRACKS (``max_gap_ms``, 2026-09-25).
+        ``max_age`` counts FRAMES, so a live camera that dropped out for two
+        minutes came back one frame later as far as coasting was concerned:
+        the first detections after the outage could continue tracks from
+        before it, onto whoever now stood where they were — and a track that
+        changed person is what the runner's heal and identity lock act on.
+        When the frame time ``t_ms`` jumps forward by more than
+        ``max_gap_ms`` (or backwards, a source that restarted its clock),
+        every track is dropped before association.  Ids keep counting up, so
+        a new track can never be mistaken for an old one downstream.  A slow
+        frame is never this: at 3.9 fps a frame is 256 ms, and a live stall
+        is at least the ingest's 10 s silence timeout plus a reconnect.
         """
+        if t_ms is not None:
+            last = self.last_t_ms
+            if (
+                self.max_gap_ms > 0 and last is not None
+                and (t_ms - last > self.max_gap_ms or t_ms < last)
+            ):
+                self.tracks = []
+                self.gap_resets += 1
+            self.last_t_ms = t_ms
         self.frame_count += 1
         for t in self.tracks:
             t.predict()
