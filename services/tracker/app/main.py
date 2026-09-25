@@ -19,9 +19,10 @@ resident until somebody restarted the process.  The runner now calls
 for ``TRACKER_RUN_TTL_S`` (default 1 h) as a backstop for runs that died
 without releasing.
 
-Note ``tMs`` is accepted for the wire contract but the tracker is
-frame-based: max-age and min-hits count frames, not milliseconds — honest
-POC simplification, documented in the README.
+Note the tracker is frame-based: max-age and min-hits count frames, not
+milliseconds.  ``tMs`` is read for one thing only: a jump of more than
+``HECO_TRACKER_MAX_GAP_MS`` (10 s) between frames is a break in the source
+and clears the run's tracks (SortLite.step says why).
 """
 
 import time
@@ -65,6 +66,12 @@ _last_used: dict[str, float] = {}
 #: widens the window in which a ghost track can latch onto a DIFFERENT person.
 DEFAULT_MAX_AGE = 30
 
+#: Frame-time gap (ms) that counts as a break in the source and clears the
+#: run's tracks (SortLite.step).  10 s: longer than any processing gap, and
+#: shorter than any live reconnect (the ingest's silence timeout alone is
+#: 10 s).  0 = off, the frame-count coasting alone as before 2026-09-25.
+DEFAULT_MAX_GAP_MS = 10_000
+
 
 def _max_age() -> int:
     """Frames of coasting, from ``HECO_TRACKER_MAX_AGE`` (default 30).
@@ -88,6 +95,7 @@ def _new_tracker() -> SortLite:
         min_hits=env_int("TRACKER_MIN_HITS", 3),
         iou_min=env_float("TRACKER_IOU_MIN", 0.2),
         vel_smooth=env_float("TRACKER_VEL_SMOOTH", 0.5),
+        max_gap_ms=max(0, env_int("HECO_TRACKER_MAX_GAP_MS", DEFAULT_MAX_GAP_MS)),
     )
 
 
@@ -137,7 +145,7 @@ def track(body: TrackRequest) -> TrackResponse:
         tracker = _runs[body.runId] = _new_tracker()
     _last_used[body.runId] = now
     dets = [(b.x, b.y, b.w, b.h, b.conf) for b in body.boxes]
-    out = tracker.step(dets)
+    out = tracker.step(dets, t_ms=body.tMs)
     return TrackResponse(
         tracks=[
             Track(
@@ -161,4 +169,7 @@ def health() -> dict:
     return {
         **Health(ok=True, model="sort-lite-iou-velocity", version=__version__).model_dump(),
         "runs": len(_runs),
+        # Source breaks that cleared a resident run's tracks (max_gap_ms).
+        "gapResets": sum(t.gap_resets for t in _runs.values()),
+        "maxGapMs": max(0, env_int("HECO_TRACKER_MAX_GAP_MS", DEFAULT_MAX_GAP_MS)),
     }
