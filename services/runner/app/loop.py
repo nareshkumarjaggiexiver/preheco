@@ -80,6 +80,8 @@ from heco_counting.ports import MatchRefused
 from . import annotate, taps
 from .config import Settings
 from .feedback import plan_action
+from .headwear import COUNTERS as HEADWEAR_COUNTERS
+from .headwear import HeadwearWorker
 from .reporting import Reporter
 from .stats import SampleBuffer, SourceRate, StatsBoard
 
@@ -919,6 +921,9 @@ class RunLoop:
         # Open file handle for the golden decision capture, or None (default).
         # See _write_golden: this is the artifact a refactor is proved against.
         self._golden = None
+        # The head-covering reader's background worker (app.headwear), or
+        # None — always None with HECO_HEADWEAR off, the default.
+        self._headwear: HeadwearWorker | None = None
         # Native frame dimensions, read ONCE from the first frame's JPEG header
         # (the camera's resolution does not change mid-run) — they ride the
         # ingest tap and the forensic uploads so the console can scale ledger
@@ -1154,6 +1159,10 @@ class RunLoop:
             # were set (the error toward looking), and counted here.  None
             # when the run has no region.
             "faceRegionUnplaced": 0 if self._face_region else None,
+            # HEAD-COVERING READS (app.headwear): queued, dropped (queue full,
+            # or unread at the end), written onto their body rows, failed.
+            # None when HECO_HEADWEAR is off: nothing was read.
+            **{k: (0 if settings.headwear else None) for k in HEADWEAR_COUNTERS},
             # The floors this run is actually enforcing beyond width, so the
             # status says what gate produced the number, not just the number.
             # A tuple, because status() hands out a SHALLOW copy of this dict.
@@ -1355,6 +1364,7 @@ class RunLoop:
         for key in (
             "framesCaptured", "framesSkippedNoMotion", "framesDroppedLive",
             "ingestBacklogMax", "faceDetectSkippedSettled", "faceRegionUnplaced",
+            *HEADWEAR_COUNTERS,
         ):
             if st.get(key) is not None:
                 out[key] = st[key]
@@ -1706,6 +1716,9 @@ class RunLoop:
             # WHERE faces were looked for is part of what the number means:
             # a guest who never entered the region was never searched for.
             out["faceRegion"] = dict(self._face_region)
+        if self.s.headwear:
+            # The review evidence this run gathered (never a count input).
+            out["headwear"] = {"queue": int(self.s.headwear_queue)}
         return out
 
     def _open_source(self) -> None:
@@ -1771,6 +1784,7 @@ class RunLoop:
             self._set(state="failed", error=f"{type(e).__name__}: {e}")
             # The detect worker first: no stage call may outlive the release.
             self._drain_frames()
+            self._stop_headwear(0.0)
             self._release_run_state()
             if self.planner.run_id is not None:
                 # Best effort: the planner may be down too; local status
@@ -1786,9 +1800,38 @@ class RunLoop:
             # uploading pictures of a run the operator has been told is over.
             # Idempotent — all three clear their handles as they go.
             self._drain_frames()
+            self._stop_headwear(0.0)
             self._stop_reporter()
             self._close_golden()
         return self.status()
+
+    #: Seconds a finished run gives the head-covering worker to empty its
+    #: queue before what is left is counted as dropped.
+    _HEADWEAR_DRAIN_S = 10.0
+
+    def _stop_headwear(self, drain_s: float) -> None:
+        """Drain (up to ``drain_s``) and stop the head-covering worker, at most once."""
+        worker, self._headwear = self._headwear, None
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                worker.finish(drain_s)
+
+    def _maybe_read_headwear(self, frame_img, face: dict, m: dict) -> None:
+        """Hand a mint's or an enrolment's head to the background reader.
+
+        Only a guest verdict that minted or enrolled a template AND logged a
+        body row (``bodyId``): the read is written onto that row. The loop
+        pays a crop slice and a non-blocking put; a full queue is a dropped,
+        counted read. Staff never get here.
+        """
+        worker = self._headwear
+        if worker is None or frame_img is None:
+            return
+        if not (m.get("isNew") or m.get("templateAdded")) or m.get("bodyId") is None:
+            return
+        th = time.perf_counter()
+        worker.offer(int(m["bodyId"]), frame_img, face.get("box"))
+        self.board.observe("count", "headwearCutMs", (time.perf_counter() - th) * 1000.0)
 
     def _stop_reporter(self) -> None:
         """Drain and stop the observability thread, at most once."""
@@ -1913,6 +1956,11 @@ class RunLoop:
         # The gallery, behind the library's port. Constructed once the planner
         # run id exists, because that id IS the gallery's identity.
         self.match_port = MatchClient(self, planner_run_id)
+        # The head-covering reader, when on: its own thread, bound to this
+        # run's gallery like the port above.
+        if self.s.headwear:
+            self._headwear = HeadwearWorker(self, planner_run_id, self.s.headwear_queue)
+            self._headwear.start()
 
         self._open_golden()
 
@@ -1986,6 +2034,9 @@ class RunLoop:
         # The frame source first of all: its detect worker (if any) is joined
         # here, so nothing below races a stage call still in flight.
         self._drain_frames()
+        # The head-covering reads still queued get a bounded moment to land
+        # before the notes are written (the rest are counted as dropped).
+        self._stop_headwear(self._HEADWEAR_DRAIN_S)
         # Then the reporter, BEFORE the flush, so its final rounds and any owed
         # mint keyframes land while the run is still open — and so the flush below
         # is genuinely the last word on this run's stats rather than racing a
@@ -2667,6 +2718,8 @@ class RunLoop:
             # uploads on the hot path are what produced the 0.4 fps death
             # spiral, and a thumbnail must never cost a guest.
             self._maybe_face_card(frame_img, face, m)
+            # ...and its head, for the review queue, off the loop (HECO_HEADWEAR).
+            self._maybe_read_headwear(frame_img, face, m)
 
             track_id = self._track_for(face, tracks)
             if track_id is None:
