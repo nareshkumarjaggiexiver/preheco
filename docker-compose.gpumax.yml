@@ -107,6 +107,9 @@ services:
       # HECO_DEVICE bug of 2026-09-24 over again. Unset = models/genderage.onnx
       # if mounted, else off (attributes null, never guessed).
       EMBED_ATTR_MODEL: ${EMBED_ATTR_MODEL-}
+      # The SigLIP head-covering reader, named here for the same reason as
+      # EMBED_ATTR_MODEL (base compose has the story). Unset = off.
+      EMBED_HEADWEAR_MODEL: ${EMBED_HEADWEAR_MODEL-}
       HECO_EMBEDDING_DIM: ${HECO_EMBEDDING_DIM-}
       HECO_EMBEDDER_ID: ${HECO_EMBEDDER_ID-}
 
