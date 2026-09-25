@@ -1128,6 +1128,7 @@ class RunLoop:
             # ...and because one half of the face was hidden or dark (see
             # _gate_balance): the railing-across-the-face gate.
             "gatedByBalance": 0,
+            "gatedByOccluded": 0,
             "gatedUnmeasured": 0,
             # RE-VERIFY SAVING: person crops NOT searched for a face this run
             # because the track already held an identity and had been verified
@@ -2356,6 +2357,12 @@ class RunLoop:
         # this is today's behaviour until an operator opts in.  Every face is
         # stamped with WHY it was rejected, for the taps and the overlay.
         tq = time.perf_counter()
+        if self.gate.max_head_overlap > 0.0:
+            # Stamped only when armed, so the default path is unchanged.
+            for f in countable:
+                covered = association.nearer_head_overlap(f, boxes)
+                if covered is not None:
+                    f["headOverlap"] = round(covered, 3)
         outcome = gate.gate_faces(countable, self.gate)
         kept = outcome.kept
         board.frame("quality")
@@ -3568,6 +3575,7 @@ class RunLoop:
         "sharpness": "gatedBySharpness",
         "featnorm": "gatedByFeatNorm",
         "balance": "gatedByBalance",
+        "occluded": "gatedByOccluded",
     }
 
     def _reverify_within(self, within: list[dict], tracks: list[dict]) -> list[dict]:
