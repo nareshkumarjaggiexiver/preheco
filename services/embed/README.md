@@ -86,6 +86,34 @@ make run      # uvicorn on :7105
   `attrMs` that of the attribute pass (null when off).
   Malformed faces (not five [x, y] landmarks; a box without numeric
   x, y, w, h when the attribute pass is on) → 400.
+- `POST /headwear` `{imageB64, faces: [{box}], crop?: {x, y, frameW, frameH}}`
+  → `{readings: [[8 floats] | null], model, ms}` — **only when
+  `EMBED_HEADWEAR_MODEL` names the SigLIP graph** (off: 404, exactly an
+  unknown route; `/health` and `/embed` unchanged). Per face, the 4 class
+  logits (turban, bare, dupatta_or_scarf, cap_or_hat) of a LOOSE view (box
+  ±0.30 face widths, 1.0 face heights up) then of a TIGHT ellipse-masked view
+  (±0.15, 0.8 up) — geometry, letterbox, `cv2.INTER_AREA` and scoring are the
+  evaluation's reference reader verbatim (`tests/headwear_ref.py` pins it).
+  `box` is in the image's pixels; `crop` says where the image was cut from
+  its frame, and a view that needs pixels past a CUT edge is a 400 (a frame
+  edge clamps, as the reference does). `model` is the stamp `<graph
+  sha256[:12]>+<prompt JSON sha256[:12]>`; the match service keeps one per
+  gallery. `/health` then carries `headwear: {model, stamp, error, device}`:
+  a set that will not load is `error` (and a 503 on the route), never
+  `ok:false`.
+
+### The head-covering reader (optional, off unless named)
+
+Files, in one directory (the container's `/srv/services/embed/models/`, the
+bind-mounted `services/embed/models/`): `siglip_b16_224_image_fp32.onnx`
+(372 MB, `google/siglip-base-patch16-224`, Apache-2.0; never committed),
+`headwear_prompts.json` and `headwear_text_embeds.npy` beside it. The JSON
+records the other two files' sha256 and a mismatched set refuses to load.
+Measured offline (CPU, 461 crops labelled by eye): no confident call wrong
+at turban ≥ 0.80 / bare ≥ 0.50; ~0.15 s per image on an 8-thread CPU (a read
+is two). **FP16 parity on the box is unmeasured**: `python -m app.headwear
+parity <crops_dir> <meta.json> TRT` inside the container compares TRT with
+CPU fp32 on context crops (target cosine ≥ 0.999, no call changed).
 
 ## Test
 
@@ -104,6 +132,7 @@ model-dependent tests fully exercise the real graph with synthetic frames
 | --- | --- | --- |
 | `EMBED_MODEL` | `models/face_recognition_sface_2021dec.onnx` | weights path |
 | `EMBED_ATTR_MODEL` | `models/genderage.onnx` if present, else off | gender/age weights path; `off` disables the pass even when the default file exists |
+| `EMBED_HEADWEAR_MODEL` | off | the SigLIP head-covering graph, e.g. `models/siglip_b16_224_image_fp32.onnx` (prompt JSON + text bank beside it). Unset, empty or `off` = no reader, no `/health` key, `/headwear` 404. Runs on `HECO_DEVICE` (TRT: its own fp16 engine, cold build at the first `/health`) |
 | `HECO_DEVICE` | `CPU` | ORT providers for the arcface family and the attribute pass (`CUDA`, `TRT`, `GPU`, …); the sface family is cv2 and ignores it. `TRT` = TensorRT fp16 then CUDA then CPU: ArcFace-R50 vs fp32 on 40 frames (208 faces) cosine min 0.9997 (0.9999 for faces >= 56 px), feature norm within 1.1%, no gender flips, age within 0.17 y |
 | `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |
 | `EMBED_BATCH` | off | `1` runs a request's faces through ONE session.run (dynamic-batch graphs; the attribute pass too), chunks of 16. 5.5 faces per 4K frame on the 4060: embed 23.3 -> 11.6 ms, attributes 6.1 -> 1.7 ms on CUDA; cosine to per-face >= 0.999999. `/health` `knobs.batch` shows requested vs active |

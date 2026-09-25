@@ -129,6 +129,42 @@ def reduce_mean_model(elem_type: int, input_shape: tuple[int, ...],
     return _int(1, 8) + _blob(7, graph) + _blob(8, opset)
 
 
+def _tensor(name: str, dims: tuple[int, ...], raw_f32: bytes) -> bytes:
+    """TensorProto {dims(1)..., data_type(2)=FLOAT, name(8), raw_data(9)}."""
+    dims_pb = b"".join(_int(1, d) for d in dims)
+    return dims_pb + _int(2, FLOAT) + _string(8, name) + _blob(9, raw_f32)
+
+
+def embedding_model(weights_f32: bytes, dim: int, input_name: str = "pixel_values",
+                    output_name: str = "image_embeds", size: int = 224) -> bytes:
+    """A ModelProto shaped like the SigLIP image tower: [N,3,size,size] -> [N,dim].
+
+    ReduceMean over the spatial axes gives each image's mean R, G, B (in the
+    [-1, 1] the reader feeds), then MatMul with a constant [3, dim] weight
+    (``weights_f32``, little-endian float32, row-major) — so a test can
+    compute the exact embedding from the exact blob, and the head-covering
+    reader's preprocessing is pinned at value level through a real session.
+    """
+    rm = (
+        _string(1, input_name) + _string(2, "m")
+        + _string(3, "reduce_mean") + _string(4, "ReduceMean")
+        + _blob(5, _attr_ints("axes", (2, 3))) + _blob(5, _attr_int("keepdims", 0))
+    )
+    mm = (
+        _string(1, "m") + _string(1, "W") + _string(2, output_name)
+        + _string(3, "matmul") + _string(4, "MatMul")
+    )
+    graph = (
+        _blob(1, rm) + _blob(1, mm)
+        + _string(2, "tiny_tower")
+        + _blob(5, _tensor("W", (3, dim), weights_f32))
+        + _blob(11, _value_info(input_name, FLOAT, ("N", 3, size, size)))
+        + _blob(12, _value_info(output_name, FLOAT, ("N", dim)))
+    )
+    opset = _int(2, 13)
+    return _int(1, 8) + _blob(7, graph) + _blob(8, opset)
+
+
 def write_model(directory: Path, filename: str, elem_type: int,
                 input_shape: tuple[int, ...]) -> Path:
     """Serialize a flatten_model to `directory/filename` and return the path."""

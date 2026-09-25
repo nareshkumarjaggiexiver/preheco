@@ -14,9 +14,11 @@ Endpoints:
     POST /review/duplicates {runId, limit?}
         -> {runId, threshold, pairs:[{a, b, cosine, clothes, why}],
             considered, returned, dropped,
-            excluded: {gender, age, stature, clothes, head, beard},
+            excluded: {gender, age, stature, clothes, head, beard, headwear},
             setAside:[{a, b, cosine, clothes, why, reasons}], setAsideDropped,
             keptByLight}
+    POST /body-sightings/headwear {runId, bodyId, headwear: [8], model}
+        -> {ok, written}                           (the head-covering reader)
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
@@ -47,7 +49,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config, gallery, staff
 from .appearance import APPEARANCE_DIMS, BEARD_DIM, HEAD_DIM, SKIN_DIM
-from .store import EmbedderMismatchError, close_all_stores
+from .headwear import HEADWEAR_DIM
+from .store import EmbedderMismatchError, HeadwearStampMismatchError, close_all_stores
 
 
 def _env_s(name: str, default: float) -> float:
@@ -83,7 +86,13 @@ def _env_s(name: str, default: float) -> float:
 #: 0.15.2 (2026-09-25): head slots 27/28 carry the headwear share (chromatic
 #: pixels outside the skin window) and its flag; heads are compared on bins
 #: 0..26 only, and a bald scalp is no longer headwear.  Wire shape unchanged.
-VERSION = "0.15.2"
+#: 0.16.0 (2026-09-25): POST /body-sightings/headwear stores a sighting's
+#: SigLIP head-covering logits (body_sightings.headwear, ADD COLUMN; the
+#: gallery stamps their model in store_meta and refuses another with a 409);
+#: every review row gains why.headwear and `excluded` gains `headwear` — a
+#: turban against a bare head between two confident men, set aside only
+#: with HECO_REVIEW_HEADWEAR=1 (default 0: log-only).  Additive.
+VERSION = "0.16.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -151,6 +160,17 @@ app = FastAPI(title="heco-match", version=VERSION, lifespan=_lifespan)
 # carefully-written way-out message never reaching the wire.
 @app.exception_handler(EmbedderMismatchError)
 async def _embedder_mismatch(request, exc):  # noqa: ANN001, D401
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+# A headwear write from another model is the same kind of permanent conflict:
+# the gallery's logits are on one model's scale and nothing a retry does will
+# change that, so the runner must see it as settled (4xx), not as a 5xx to
+# try again at every mint.
+@app.exception_handler(HeadwearStampMismatchError)
+async def _headwear_mismatch(request, exc):  # noqa: ANN001, D401
     from fastapi.responses import JSONResponse
 
     return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -299,6 +319,38 @@ class MatchRequest(BaseModel):
         return v
 
 
+
+
+class HeadwearWrite(BaseModel):
+    """Body of POST /body-sightings/headwear — one sighting's head-covering read.
+
+    ``bodyId`` is the rowid a /match reply returned for the sighting;
+    ``headwear`` the embed service's 8 logits (turban, bare,
+    dupatta_or_scarf, cap_or_hat of the loose view, then the tight view's);
+    ``model`` its stamp.  Any other shape is a 422 naming the contract.
+    """
+
+    runId: str
+    bodyId: int = Field(ge=1)
+    headwear: list[float]
+    model: str = Field(min_length=1, max_length=64)
+
+    @field_validator("headwear")
+    @classmethod
+    def _headwear_is_8_logits(cls, v: list[float]) -> list[float]:
+        """Exactly 8 numbers: 4 class logits per view, loose then tight.
+
+        Finiteness is checked in the endpoint, not here: a validation error
+        echoes its input, and an infinity in the echo cannot be rendered as
+        JSON — the 422 would become a 500.
+        """
+        if len(v) != HEADWEAR_DIM:
+            raise ValueError(
+                "headwear must be exactly 8 finite logits (turban, bare,"
+                " dupatta_or_scarf, cap_or_hat of the loose view, then of the"
+                f" tight view); got {len(v)} values"
+            )
+        return v
 
 
 class EnrolSample(BaseModel):
@@ -452,6 +504,12 @@ def health() -> dict:
         "reviewBeardMinN": config.review_beard_min_n(),
         "reviewBeardPale": config.review_beard_pale(),
         "reviewLightTol": config.review_light_tol(),
+        # The head-covering rule: false = log-only (why.headwear reported,
+        # nothing set aside), and the call's own bars beside it.
+        "reviewHeadwear": config.review_headwear(),
+        "reviewHeadwearMinN": config.review_headwear_min_n(),
+        "reviewHeadwearTurbanP": config.review_headwear_turban_p(),
+        "reviewHeadwearBareP": config.review_headwear_bare_p(),
     }
 
 
@@ -746,10 +804,40 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             beard_min_n=config.review_beard_min_n(),
             beard_pale=config.review_beard_pale(),
             light_tol=config.review_light_tol(),
+            headwear=config.review_headwear(),
+            headwear_min_n=config.review_headwear_min_n(),
+            headwear_turban_p=config.review_headwear_turban_p(),
+            headwear_bare_p=config.review_headwear_bare_p(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {"runId": body.runId, "threshold": config.threshold(), **report}
+
+
+@app.post("/body-sightings/headwear")
+def body_sighting_headwear(body: HeadwearWrite) -> dict:
+    """Store one sighting's head-covering logits on the body row /match logged.
+
+    The runner's background reader is the caller: after a /match that minted
+    or enrolled (and returned a ``bodyId``) it cuts the head from that very
+    frame, asks embed POST /headwear, and writes the 8 logits here.  Logits,
+    not a verdict — the review makes the call from config
+    (:mod:`app.headwear`).  ``written: false`` is ordinary: the row was
+    retracted by the same-frame guard or removed with its person, or the
+    run's gallery no longer exists.  409 when the gallery already holds
+    another model's logits (the first write stamps the gallery).
+    """
+    if not all(math.isfinite(x) for x in body.headwear):
+        raise HTTPException(
+            status_code=422, detail="headwear must be exactly 8 FINITE logits"
+        )
+    try:
+        written = gallery.write_headwear(
+            config.data_dir(), body.runId, body.bodyId, body.headwear, body.model
+        )
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"ok": True, "written": written}
 
 
 @app.post("/template/forget")

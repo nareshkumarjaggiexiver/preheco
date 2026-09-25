@@ -545,6 +545,17 @@ class Settings:
     # light measures otherwise.
     appearance_wb: bool = False
 
+    # HEAD-COVERING READS (app.headwear, HECO_HEADWEAR).  Off by default.  On,
+    # every /match that MINTED or ENROLLED a template and logged a body row
+    # has its head read by the embed service's SigLIP reader (POST
+    # /headwear) on a background worker, and the 8 logits are written onto
+    # that body row (match POST /body-sightings/headwear) for the review
+    # queue.  The loop only cuts the context crop and hands it over; a full
+    # queue (headwear_queue crops) drops the read and counts it.  Run 8b8b87:
+    # 734 such reads for 74 identities, ~0.75/s in bursts.
+    headwear: bool = False
+    headwear_queue: int = 32
+
     # ENROL MODE: how many face samples (best by quality) to keep per staff
     # walk-through before writing them to the site staff store.
     enrol_best_n: int = 5
@@ -651,6 +662,8 @@ def from_env() -> Settings:
         feedback_poll_s=env_float("HECO_FEEDBACK_POLL_S", s.feedback_poll_s),
         enrol_best_n=env_int("HECO_ENROL_BEST_N", s.enrol_best_n),
         appearance_wb=env_bool("HECO_APPEARANCE_WB", s.appearance_wb),
+        headwear=env_bool("HECO_HEADWEAR", s.headwear),
+        headwear_queue=max(1, env_int("HECO_HEADWEAR_QUEUE", s.headwear_queue)),
     )
 
 
@@ -674,4 +687,7 @@ def knobs(s: Settings) -> dict:
         # Not a throughput lever: white balance for the review's colour
         # evidence (torso, head, beard), off by default.
         "HECO_APPEARANCE_WB": s.appearance_wb,
+        # The head-covering reads for the review (background worker), off by default.
+        "HECO_HEADWEAR": s.headwear,
+        "HECO_HEADWEAR_QUEUE": s.headwear_queue,
     }

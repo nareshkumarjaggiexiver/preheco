@@ -418,6 +418,36 @@ DEFAULT_REVIEW_BEARD_PALE = False
 # runner before match 0.15.0): no guard, today's rule.
 DEFAULT_REVIEW_LIGHT_TOL = 0.07
 
+# HEADWEAR — the SigLIP B/16 head-covering reads (2026-09-25).  The runner
+# reads the head of every mint and template enrolment on a background worker
+# (embed POST /headwear) and writes the 8 logits onto the sighting's body row;
+# the review reports them on every row (why.headwear) and MAY set a pair
+# aside, reason "headwear": both identities confidently male at the gender
+# bar above, one with >= MIN_N confident turban reads and no confident bare,
+# the other >= MIN_N bare and no turban (app.headwear.headwear_apart).  Not a
+# colour, so the light guard never holds it back; never written to
+# cannot_link.
+#
+# THE SWITCH SHIPS OFF — LOG-ONLY.  Measured offline on 461 crops labelled by
+# eye from one wedding (siglip eval, 2026-09-25): no confident call wrong
+# (turban 31 calls, bare 312), and replayed on run 8b8b87 the rule sets aside
+# 4 of its 26 queued pairs (p00005/p00009, p00005/p00066, p00039/p00055,
+# p00041/p00074), all turban against bare by eye.  But 31 turban calls put
+# the one-sided 95 % lower bound on precision at ~0.91: 0.97 is not proven,
+# and a safa tied for the baraat comes off later in the night.  Re-verify on
+# the next event's footage (its turban and bare men labelled by eye), then
+# HECO_REVIEW_HEADWEAR=1.
+DEFAULT_REVIEW_HEADWEAR = False
+# Confident unanimous reads each side needs.  N = 1 was also error-free on
+# 8b8b87 but lets one read decide; N = 3 loses p00039/p00055 (the boy had
+# only two bare reads).  0 turns the rule off like the switch.
+DEFAULT_REVIEW_HEADWEAR_MIN_N = 2
+# A read is confidently turban (bare) when BOTH views argmax it and the
+# smaller of the two probabilities reaches this.  Fitted for precision >=
+# 0.97 on the 461 crops: turban 0.765, bare 0.365; shipped rounded up.
+DEFAULT_REVIEW_HEADWEAR_TURBAN_P = 0.80
+DEFAULT_REVIEW_HEADWEAR_BARE_P = 0.50
+
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
 # it is the anchor for every stature estimate and the planner's default
@@ -526,6 +556,36 @@ def review_light_tol() -> float:
     """Largest skin-reading gap at which a colour set-aside still applies
     (env HECO_REVIEW_LIGHT_TOL; 0 = the guard is off)."""
     return max(0.0, _env_f("HECO_REVIEW_LIGHT_TOL", DEFAULT_REVIEW_LIGHT_TOL))
+
+
+def review_headwear() -> bool:
+    """May a turban against a bare head set a pair aside (env HECO_REVIEW_HEADWEAR, 0|1)?
+
+    Default off: the reads are stored and ``why.headwear`` reports them on
+    every row either way (log-only); on, the rule acts (app.headwear).
+    """
+    raw = os.environ.get("HECO_REVIEW_HEADWEAR")
+    if raw is None or not raw.strip():
+        return DEFAULT_REVIEW_HEADWEAR
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def review_headwear_min_n() -> int:
+    """Confident unanimous head-covering reads each identity needs
+    (env HECO_REVIEW_HEADWEAR_MIN_N; 0 = the rule off)."""
+    return max(0, int(_env_f("HECO_REVIEW_HEADWEAR_MIN_N", DEFAULT_REVIEW_HEADWEAR_MIN_N)))
+
+
+def review_headwear_turban_p() -> float:
+    """Smaller-of-two-views probability a confident turban read needs
+    (env HECO_REVIEW_HEADWEAR_TURBAN_P)."""
+    return _env_f("HECO_REVIEW_HEADWEAR_TURBAN_P", DEFAULT_REVIEW_HEADWEAR_TURBAN_P)
+
+
+def review_headwear_bare_p() -> float:
+    """Smaller-of-two-views probability a confident bare read needs
+    (env HECO_REVIEW_HEADWEAR_BARE_P)."""
+    return _env_f("HECO_REVIEW_HEADWEAR_BARE_P", DEFAULT_REVIEW_HEADWEAR_BARE_P)
 
 
 def adult_height_m() -> float:

@@ -21,7 +21,7 @@ no message bus at POC scale (NATS arrives with multi-camera).
 | --------- | ---- | --- |
 | ingest    | 7101 | RTSP/file → JPEG frames on demand: GET /frame (latest), POST /open {url \| path, loop?, isFile?, owner?, takeover?}, POST /close {owner?} |
 | persons   | 7102 | POST /detect {imageB64} → {boxes:[{x,y,w,h,conf}]} — YOLOX-nano ONNX (Apache-2.0) |
-| tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}) |
+| tracker   | 7103 | POST /track {runId, boxes, tMs} → {tracks:[{id,box,ageFrames,hits}]} — own SORT-style IoU+velocity, stateful per runId (POST /reset {runId}, POST /release {runId}); a `tMs` jump over `HECO_TRACKER_MAX_GAP_MS` (10 s) or backwards clears the run's tracks (a break in the source), `/health` gains `gapResets`, `maxGapMs` |
 | faces     | 7104 | POST /detect {imageB64, within?:[boxes]} → {faces:[{box,landmarks,conf,widthPx,quality,iedPx?,frontality?,sharpness?,eyeSpanRatio?,landmarksPlausible?}]} — YuNet (OpenCV zoo, MIT) |
 | embed     | 7105 | POST /embed {imageB64, faces} → {embeddings:[[dim]], norms:[float], attributes:[{gender,genderP,age} \| null]} — SFace 128-d or ArcFace 512-d; `norms`/`attributes` since 2026-09-24 (v4 below) |
 | match     | 7106 | POST /match {runId, embedding, quality?, appearance?, attributes?, featNorm?, body?} → {personKey, isNew, cosine, galleryN, templateN, templateAdded, appearanceSim, appearanceVetoed, templateId, bodyId, nearMiss} — gallery in SQLite per runId, cosine threshold 0.363 (SFace paper operating point; POC-tunable via env), several templates per guest, advisory torso-appearance tie-breaker + near-miss mint flag (v2 below; withheld for a `cannot_link` pair since v3) |
@@ -39,6 +39,13 @@ POST /api/pipeline/runs/:id/stats      {stage, frames, fps, metrics:{name:{count
 POST /api/pipeline/runs/:id/samples    {samples:[{stage,tMs,metrics}]}   (batch ≤200, ~every 2 s)
 Stage names: ingest | person-detect | track | face-detect | quality | embed | match | count.
 Measured metrics the console charts: personBoxHPx, faceBoxWPx, embedMs, matchCosine.
+A stage's `fps` is its frames ÷ the run's elapsed time, with two exceptions:
+the `count` stage also carries `windowFps` (the processing rate per ~5 s
+window, so min / mean / max show an outage the mean hides), and the
+`ingest` stage's `fps` is the SOURCE's delivery rate once measurable — ingest's
+cumulative `captured` over its own frame clock `tMs`, from 5 s after the first
+frame (past the startup burst), over at least 2 s (runner `stats.SourceRate`,
+2026-09-25: a 15 fps camera read 15.7 on the old figure).
 
 ## Conventions
 - Python 3.12; **one venv per service** (`make venv` in each); ruff + pytest.
@@ -1931,3 +1938,60 @@ and 37).
   stripe) is still asked. Replayed offline on f0bfc5, c84098, 8b8b87 and
   b5367d: no pair moved (their identities carry fewer reads).
 
+
+### The head covering (embed + runner + match 0.16.0, 2026-09-25) — shipped OFF / log-only
+
+Run 8b8b87's queue put a sky-blue turban beside a bare man (p00005/p00009);
+the colour head rule never sets covered against bare. SigLIP B/16 reads the
+head semantically. Offline (461 crops labelled by eye, D02 wedding, CPU): no
+confident call wrong at turban ≥ 0.80 / bare ≥ 0.50 (31 turban, 312 bare
+calls; every uncalled turban unsure, never bare) — but 31 turban calls bound
+precision only at ≥ ~0.91 (95 %, one-sided).
+
+- **embed** `POST /headwear {imageB64, faces: [{box}], crop?: {x, y, frameW,
+  frameH}}` → `{readings: [[8 floats] | null], model, ms}`: per face the 4
+  class LOGITS (turban, bare, dupatta_or_scarf, cap_or_hat) of the LOOSE view
+  (box ±0.30 face widths, 1.0 face heights up, to the face bottom) then of the
+  TIGHT view (±0.15, 0.8 up, outside the inscribed ellipse grey 127); each
+  letterboxed grey, `cv2.INTER_AREA` to 224, [-1, 1]; class logit = max over
+  its prompts of 117.33·cos − 12.93. The evaluation's reference reader
+  verbatim. `box` in the image's pixels; `crop` = where the image was cut
+  from its frame (a view needing pixels past a CUT edge → 400; a frame edge
+  clamps). `model` = `<graph sha256[:12]>+<prompt JSON sha256[:12]>`. Only
+  when **`EMBED_HEADWEAR_MODEL`** names the graph (prompt JSON + text bank
+  beside it, sha256-checked); off: 404 like an unknown route, `/health` and
+  `/embed` unchanged. On: `/health` gains `headwear {model, stamp, error,
+  device}`; a set that will not load is `error` + 503, never `ok:false`.
+- **runner** **`HECO_HEADWEAR`** (0|1, default 0): after a `/match` with
+  `isNew` or `templateAdded` AND a `bodyId`, the loop cuts the context crop
+  (±0.5 face widths, 1.2 heights up, to the face bottom) and a background
+  worker (queue **`HECO_HEADWEAR_QUEUE`**, 32; full = dropped, counted) posts
+  it as PNG to embed and the logits to match. Status/results
+  `headwearQueued`, `headwearDropped`, `headwearWritten`, `headwearFailed`
+  (absent when off); run config `headwear {queue}`.
+- **match 0.16.0** `POST /body-sightings/headwear {runId, bodyId, headwear:
+  [8], model}` → `{ok, written}`: `body_sightings.headwear BLOB` (ADD
+  COLUMN; legacy rows null); the first write stamps `store_meta
+  headwear_model`, another model → 409. A read is confidently turban (bare)
+  when both views argmax it and min p ≥ **`HECO_REVIEW_HEADWEAR_TURBAN_P`**
+  0.80 (**`_BARE_P`** 0.50). Every review row gains **`why.headwear {a, b,
+  nA, nB, turbanA, bareA, turbanB, bareB}`** (`a`/`b`: turban | bare | mixed
+  | unsure | null); `excluded` gains **`headwear`**. With
+  **`HECO_REVIEW_HEADWEAR=1`** (default 0 = log-only) a pair is set aside,
+  reason `headwear`, when both identities are male at ≥
+  `HECO_REVIEW_GENDER_MIN_P` (0 = rule off too) and one has ≥
+  **`HECO_REVIEW_HEADWEAR_MIN_N`** (2) confident turban reads and none bare,
+  the other the reverse. Never dupatta, cap, unsure or a woman; not a colour
+  (the light guard never holds it); checked last; never `cannot_link`.
+- Replayed with match's own code on a copy of 8b8b87's gallery (floor 0.28,
+  light tol 0) with the evaluation's reads of its 734 mints and enrolments
+  (733 with a body row): 26 pairs log-only, 22 with the rule on — exactly
+  p00005/p00009, p00005/p00066, p00039/p00055, p00041/p00074 leave; nothing
+  else moves.
+- Rollout: match, then embed (model files + `EMBED_HEADWEAR_MODEL`), then
+  runner `HECO_HEADWEAR=1` — log-only. Re-verify on the next event's footage
+  (turban and bare men labelled by eye) before `HECO_REVIEW_HEADWEAR=1`. A
+  safa tied for the baraat comes off later in the night: keep the rule off at
+  such events. FP16 (TRT) parity is unmeasured: `python -m app.headwear
+  parity <crops> <meta.json> TRT` in the embed container, target cosine ≥
+  0.999 and no call changed.
