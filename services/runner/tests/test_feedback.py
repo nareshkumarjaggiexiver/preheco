@@ -80,3 +80,11 @@ def test_payload_as_json_string_is_parsed():
     """The planner may hand the payload back as a JSON string; parse it."""
     a = plan_action({"id": 12, "kind": "duplicate", "payload": '{"personKeys": ["p1", "p2"]}'})
     assert a.kind == "merge" and a.key_a == "p1" and a.key_b == "p2"
+
+
+def test_not_a_guest_maps_to_exclude_and_needs_a_key():
+    """not-a-guest names one person; without one it is invalid, never applied."""
+    act = plan_action({"id": 21, "kind": "not-a-guest", "payload": {"personKey": "p00005"}})
+    assert act.kind == "exclude" and act.person_key == "p00005"
+    bad = plan_action({"id": 22, "kind": "not-a-guest", "payload": {}})
+    assert bad.kind == "invalid" and "personKey" in bad.reason

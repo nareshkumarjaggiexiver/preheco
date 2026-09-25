@@ -1995,3 +1995,23 @@ precision only at ≥ ~0.91 (95 %, one-sided).
   such events. FP16 (TRT) parity is unmeasured: `python -m app.headwear
   parity <crops> <meta.json> TRT` in the embed container, target cosine ≥
   0.999 and no call changed.
+
+### Not a guest — the operator removes a guest (match 0.17.0 + runner, 2026-09-25)
+
+The operator's ask: "there should be an option to remove the guest from the
+list". A new planner feedback kind **`not-a-guest {personKey}`**.
+- Match `POST /exclude {runId, personKey, reason?}` → `{excluded, personKey}`:
+  the key goes into a new `excluded` table (CREATE IF NOT EXISTS; nothing
+  else changes). It keeps every template, so a later sighting of the same
+  face MATCHES it and is not counted again (a deletion would re-count it as a
+  new guest), and `/review/duplicates` never lists it again. `excluded` is
+  false for a key the gallery does not hold or one already excluded — the
+  caller lowers its count only on true.
+- Runner (live run): the feedback poll maps `not-a-guest` to `/exclude`; on
+  `excluded: true` the unique count drops by one, the mint ledger forgets the
+  key and it is retired `{personKey, intoKey: null, reason:
+  "operator-removed"}` on the match tap, which the console already uses to
+  drop a guest's card. A payload without a personKey is rejected, never
+  applied.
+- Planner (ended run): applies it against the gallery the run left, as it
+  does for the other corrections.

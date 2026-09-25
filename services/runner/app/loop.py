@@ -4929,6 +4929,20 @@ class RunLoop:
                     self._retire_key(action.person_key, None, "mark-staff")
                     return True
                 return False
+            if action.kind == "exclude":
+                # not-a-guest: off the list, templates kept — a later
+                # sighting of the same face matches the excluded key and is
+                # not counted again.
+                r = self._post(
+                    f"{self.s.match_url}/exclude",
+                    {"runId": run, "personKey": action.person_key},
+                )
+                if r.get("excluded"):
+                    self._dec_unique()
+                    self._forget_mint(action.person_key)  # no longer a guest
+                    self._retire_key(action.person_key, None, "operator-removed")
+                    return True
+                return False
             if action.kind == "count-missed":
                 body = {"runId": run}
                 if action.note:
