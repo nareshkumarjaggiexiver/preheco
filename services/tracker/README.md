@@ -22,6 +22,14 @@ max-age coasting, min-hits confirmation. `/health` reports
   coincident detections are ambiguous and *may* swap — accepted at POC.
 - Frame-based, not time-based: `tMs` is accepted on the wire but max-age
   and min-hits count frames.
+- **One exception, a break in the source** (2026-09-25): when `tMs` jumps
+  forward by more than `HECO_TRACKER_MAX_GAP_MS` (10 s) between two frames,
+  or goes backwards, every track of the run is dropped before association.
+  A live camera that dropped out for two minutes otherwise came back "one
+  frame later", and the first detections could continue a track from
+  before the outage onto whoever now stood there. Ids keep counting up, so
+  a new track is never mistaken for an old one downstream. `/health`
+  reports `gapResets` and `maxGapMs`.
 
 ## API
 
@@ -70,6 +78,7 @@ id; per-run isolation; reset semantics; env tuning.
 | env | default | meaning |
 | --- | ------- | ------- |
 | `HECO_TRACKER_MAX_AGE` | `30` | Frames a track may coast unmatched before it is dropped. **Was 15**; bench 6e1a5d (2026-08-06) counted SIX ids for ONE person (tracks 2/5/6/7/8/12) because at 3.97 fps 15 frames is 3.75 s and every seated-detector gap longer than that minted a new id. 30 ≈ 7.5 s. Treats a symptom — the disease is the person detector losing seated bodies — and a longer coast widens the window for a ghost track to latch onto a DIFFERENT person, which the runner's clothing guard exists to catch. |
+| `HECO_TRACKER_MAX_GAP_MS` | `10000` | A frame-time jump larger than this (or backwards) is a break in the source and clears the run's tracks. Longer than any processing gap (a frame at 3.9 fps is 256 ms), shorter than any live reconnect (the ingest's silence timeout alone is 10 s). **0 turns it off** — frame-count coasting alone, as before 2026-09-25. |
 | `TRACKER_MAX_AGE` | (unset) | Deprecated spelling of the above, still read so an existing deployment's explicit value is not silently ignored. `HECO_TRACKER_MAX_AGE` wins when both are set. |
 | `TRACKER_MIN_HITS` | `3` | Matched frames before a track is reported (ghost suppression). |
 | `TRACKER_IOU_MIN` | `0.2` | Association gate: pairs below this IoU never match. |
