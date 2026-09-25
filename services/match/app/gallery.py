@@ -1584,7 +1584,10 @@ def review_duplicates(
         "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
     }
     with store.reading():
-        keys = store.keys()
+        # An operator's not-a-guest removal is never asked about again.
+        gone = store.excluded_keys()
+        held = store.keys()
+        keys = [k for k in held if k not in gone]
         vecs = {k: [as_unit(v) for v in store.vectors_for(k)] for k in keys}
         apps = {k: store.appearances_for(k) for k in keys}
         tpl_torsos = {k: store.appearance_rows_for(k) for k in keys}
@@ -1806,6 +1809,19 @@ def write_headwear(
     store = open_store(path)
     with store.transaction():
         return store.set_body_headwear(body_id, logits, model)
+
+
+def exclude(data_dir: Path, run_id: str, key: str, reason: str = "operator-removed") -> bool:
+    """*not-a-guest*: take ``key`` off the guest list; True if it was newly excluded.
+
+    The key keeps its templates (a later sighting of that face matches it and
+    is not re-counted — :meth:`app.store.VectorStore.exclude` says why), and
+    :func:`review_duplicates` never asks about it again. The caller owns the
+    count: the runner drops its live unique count, the planner an ended run's.
+    """
+    store = open_store(db_path(data_dir, run_id))
+    with store.transaction():
+        return store.exclude(key, reason)
 
 
 def split(data_dir: Path, run_id: str, a: str, b: str) -> int:

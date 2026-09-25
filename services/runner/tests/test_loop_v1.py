@@ -86,6 +86,7 @@ class V1Fake:
         self.match_bodies: list[dict] = []  # every /match request body, in order
         self.splits: list[dict] = []
         self.mark_staff: list[dict] = []
+        self.excludes: list[dict] = []
         self.manual_counts: list[dict] = []
         self.opened: dict | None = None
         self.closed: dict | None = None
@@ -210,6 +211,11 @@ class V1Fake:
                 "moved": 1, "galleryN": max(0, self.guest_n - 1),
                 "staffKey": body.get("staffId") or "anon00001",
             })
+        if path == "/exclude":
+            self.excludes.append(body)
+            key = body.get("personKey")
+            first = sum(1 for b in self.excludes if b.get("personKey") == key) == 1
+            return httpx.Response(200, json={"excluded": first, "personKey": body.get("personKey")})
         if path == "/staff/purge":
             self.purges.append(body)
             return httpx.Response(200, json={
@@ -488,6 +494,22 @@ def test_feedback_mark_staff_moves_and_resolves():
     assert fake.mark_staff and fake.mark_staff[0]["personKey"] == "p00001"
     assert fake.mark_staff[0]["siteId"] == "site-1" and fake.mark_staff[0]["staffId"] == "st-7"
     assert ("fb-2", "applied") in fake.resolved
+
+
+def test_feedback_not_a_guest_excludes_lowers_the_count_and_resolves():
+    """not-a-guest hits /exclude, drops the count by one, retires the key."""
+    item = {"id": "fb-9", "kind": "not-a-guest", "status": "open",
+            "payload": {"personKey": "p00001"}}
+    fake = V1Fake(n_frames=3, face_widths=(85.0,), feedback_items=[item])
+    request = {"eventId": "ev-1", "siteId": "site-1", "source": {"path": "/x.mp4"}}
+    loop = make_loop(fake, request, feedback_poll_s=0.0)
+    loop.run()
+    assert fake.excludes and fake.excludes[0]["personKey"] == "p00001"
+    assert ("fb-9", "applied") in fake.resolved
+    # Retired like a staff-marked key, so the console drops the guest's card
+    # (the count arithmetic is the shared _dec_unique mark-staff uses).
+    assert any(r["personKey"] == "p00001" and r["reason"] == "operator-removed"
+               for r in loop._retired)
 
 
 def test_enrol_mode_writes_best_samples_and_reports():
