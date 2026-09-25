@@ -117,6 +117,11 @@ class Settings:
     #: see, because IED in pixels grows as a guest approaches while this
     #: collapses in profile at any distance.  Suggested when armed: 0.30.
     quality_min_eye_span: float = 0.0
+    # The share of a face covered by the head of a person NEARER the camera at
+    # which it is rejected (heco_counting.association.nearer_head_overlap).
+    # 0 = off. 2026-09-25: run 125001's p00005, a face half behind a nearer
+    # guest's grey head, passed the strict gate.
+    quality_max_head_overlap: float = 0.0
     #: Reject detections whose 5 landmarks do not describe a face (eyes above
     #: nose above mouth, sane eye span, nose near the eye span).  Boolean, not
     #: a floor: the test is topological.  This is the one gate here that says
@@ -610,6 +615,9 @@ def from_env() -> Settings:
         quality_min_frontality=env_float("HECO_QUALITY_MIN_FRONTALITY", s.quality_min_frontality),
         quality_min_sharpness=env_float("HECO_QUALITY_MIN_SHARPNESS", s.quality_min_sharpness),
         quality_min_eye_span=env_float("HECO_QUALITY_MIN_EYE_SPAN", s.quality_min_eye_span),
+        quality_max_head_overlap=env_float(
+            "HECO_QUALITY_MAX_HEAD_OVERLAP", s.quality_max_head_overlap
+        ),
         quality_require_landmarks=env_bool(
             "HECO_QUALITY_REQUIRE_LANDMARKS", s.quality_require_landmarks
         ),
