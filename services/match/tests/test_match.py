@@ -1178,6 +1178,8 @@ def test_review_writes_nothing(client):
 def test_review_on_an_empty_or_unknown_run_is_an_empty_queue(client):
     """No gallery, no question — not a 500."""
     got = review(client, run="never-ran")
+    policy = got.pop("policy")
+    assert policy["threshold"] == config.DEFAULT_THRESHOLD, "the bars travel with the queue (0.19.1)"
     assert got == {
         "runId": "never-ran", "threshold": config.DEFAULT_THRESHOLD,
         "pairs": [], "considered": 0, "returned": 0, "dropped": 0,

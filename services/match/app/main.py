@@ -105,7 +105,9 @@ def _env_s(name: str, default: float) -> float:
 #: (HECO_REVIEW_CLOTHES_BURST_CLASH, default 0.25; /health
 #: reviewClothesBurstClash).  Additive: an older runner sends no
 #: minFaceCosine and folds as before.
-VERSION = "0.19.0"
+#: 0.19.1 (2026-09-29): /review/duplicates replies with ``policy`` — the bars
+#: that queue was made under.  Additive.
+VERSION = "0.19.1"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -825,6 +827,11 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
 
     Read-only: no template is written, no key is merged, `galleryN` is
     untouched.  Acting on a row is the operator's existing one-click /merge.
+
+    Since 0.19.1 the reply carries ``policy`` — the bars this very queue was
+    made under (:func:`_review_policy`), so a console drawing a pair's
+    evidence against its thresholds draws the ones that ran, and a copy of
+    the reply kept for later still says what they were.
     """
     try:
         report = gallery.review_duplicates(
@@ -861,7 +868,34 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return {"runId": body.runId, "threshold": config.threshold(), **report}
+    return {
+        "runId": body.runId, "threshold": config.threshold(), "policy": _review_policy(), **report,
+    }
+
+
+def _review_policy() -> dict:
+    """The review's bars as this process holds them — one read of config, the
+    same values /review/duplicates used and /health reports."""
+    return {
+        "threshold": config.threshold(),
+        "floor": config.review_floor(),
+        "genderMinP": config.review_gender_min_p(),
+        "ageChildMax": config.review_age_child_max(),
+        "ageAdultMin": config.review_age_adult_min(),
+        "statureGap": config.review_stature_gap(),
+        "statureMinN": config.review_stature_min_n(),
+        "clothesClash": config.review_clothes_clash(),
+        "clothesMinN": config.review_clothes_min_n(),
+        "clothesSelfMin": config.review_clothes_self_min(),
+        "clothesWellSeenN": config.review_clothes_well_seen_n(),
+        "clothesWellSeenClash": config.review_clothes_well_seen_clash(),
+        "clothesBurstClash": config.review_clothes_burst_clash(),
+        "headClash": config.review_head_clash(),
+        "beardMinN": config.review_beard_min_n(),
+        "lightTol": config.review_light_tol(),
+        "headwear": config.review_headwear(),
+        "headwearMinN": config.review_headwear_min_n(),
+    }
 
 
 @app.post("/body-sightings/headwear")

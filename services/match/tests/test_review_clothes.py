@@ -581,3 +581,14 @@ def test_templates_are_the_fallback_only_for_an_identity_without_body_log_torsos
     hub_side, spoke_side = ("A", "B") if row["a"] == kh else ("B", "A")
     assert (wc["n" + hub_side], wc["n" + spoke_side]) == (3, 3)
     assert wc["self" + hub_side] == pytest.approx(1.0), "kh's stray BLUE template is not a read"
+
+
+def test_the_reply_carries_the_policy_it_was_made_under(client, ticking, monkeypatch):
+    """0.19.1: the bars travel with the queue, so a console draws the ones that ran."""
+    got = review(client)
+    assert got["policy"]["clothesClash"] == pytest.approx(0.35)
+    assert got["policy"]["clothesBurstClash"] == pytest.approx(0.25)
+    assert got["policy"]["floor"] == pytest.approx(config.review_floor())
+    assert got["policy"]["threshold"] == pytest.approx(got["threshold"])
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_BURST_CLASH", "0.2")
+    assert review(client)["policy"]["clothesBurstClash"] == pytest.approx(0.2)
