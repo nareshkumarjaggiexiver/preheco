@@ -457,12 +457,15 @@ and the smaller of the two views' probabilities is at least
 `HECO_REVIEW_HEADWEAR_TURBAN_P` (0.80; `_BARE_P` 0.50). An identity reads
 `turban` with at least `HECO_REVIEW_HEADWEAR_MIN_N` (2) confident turban
 reads and ZERO confident bare, `bare` the reverse, `mixed` with both,
-`unsure` otherwise. `why.headwear` = `{a, b, nA, nB, turbanA, bareA,
-turbanB, bareB}` on every row. With `HECO_REVIEW_HEADWEAR=1` a pair is set
+`cap` (with `HECO_REVIEW_HEADWEAR_CAP_P` > 0) with N confident cap reads, no
+confident turban and no read whose loose view alone saw a turban, `unsure`
+otherwise. `why.headwear` = `{a, b, nA, nB, turbanA, bareA, turbanB, bareB,
+capA, capB}` on every row. With `HECO_REVIEW_HEADWEAR=1` a pair is set
 aside, reason `headwear`, only when BOTH identities are confidently male at
 the gender bar (`HECO_REVIEW_GENDER_MIN_P`, 0.8 — at 0 the rule is off too)
-and one reads `turban`, the other `bare`: never a dupatta, a cap or an
-unsure head against anything, never a woman, and turban against turban stays
+and one reads `turban`, the other `bare` — or `cap`, with the cap call on:
+never a dupatta or an unsure head against anything, never a cap against a
+bare head (caps come off), never a woman, and turban against turban stays
 with the colour rule. Not a colour, so the light guard never holds it back;
 checked last, so `excluded.headwear` counts only pairs nothing else set
 aside. Measured offline (siglip evaluation, 2026-09-25, CPU): on 461 crops
@@ -557,6 +560,7 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_REVIEW_HEADWEAR_MIN_N` | `2` | Confident, unanimous head-covering reads each side needs (N = 3 loses 8b8b87's p00039/p00055: the boy had two bare reads). **0 disables the rule.** |
 | `HECO_REVIEW_HEADWEAR_TURBAN_P` | `0.80` | Smaller-of-two-views probability a confident turban read needs (fitted 0.765 at precision ≥ 0.97 on 461 crops, rounded up). |
 | `HECO_REVIEW_HEADWEAR_BARE_P` | `0.50` | ...and a confident bare read (fitted 0.365). |
+| `HECO_REVIEW_HEADWEAR_CAP_P` | `0` | ...and a confident cap read. **0 = no cap call** (the rule as it shipped); > 0 lets a turban against a cap set a pair aside too. One run's evidence (JD Grand, 2026-09-26), so `demo-up.sh` sets 0.5 rather than the default. |
 | `HECO_REVIEW_CLOTHES_SELF_MIN` | `0.6` | Median pairwise intersection an identity's own torso reads must reach — an identity whose reads disagree (two people merged, a band on a pillar) has no clothing to compare. |
 
 Staff enrolment is unaffected by all five: staff templates come only from the

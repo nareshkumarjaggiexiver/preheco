@@ -447,6 +447,16 @@ DEFAULT_REVIEW_HEADWEAR_MIN_N = 2
 # 0.97 on the 461 crops: turban 0.765, bare 0.365; shipped rounded up.
 DEFAULT_REVIEW_HEADWEAR_TURBAN_P = 0.80
 DEFAULT_REVIEW_HEADWEAR_BARE_P = 0.50
+# The CAP call (2026-09-26): a read is confidently a cap when both views
+# argmax cap_or_hat at this; an identity is "cap" with MIN_N of them, no
+# confident turban and no loose-view turban (a dark turban's tight view reads
+# as a cap).  With the rule on, turban against cap is set aside like turban
+# against bare; a cap never counts against a bare head (caps come off).  0 =
+# no cap call, the rule exactly as before.  Measured on ONE run (JD Grand,
+# 2026-09-26: three capped men labelled cap, the dark turban left unsure, one
+# turban-vs-cap pair set aside, nothing else moved) — too few turbans to call
+# it proven, so it ships off and the demo stacks turn it on.
+DEFAULT_REVIEW_HEADWEAR_CAP_P = 0.0
 
 # The height a stature ratio of 1.0 means, in metres.  The user's instruction
 # for this deployment: the North Indian adult average is 5'9" = 1.75 m, and
@@ -586,6 +596,12 @@ def review_headwear_bare_p() -> float:
     """Smaller-of-two-views probability a confident bare read needs
     (env HECO_REVIEW_HEADWEAR_BARE_P)."""
     return _env_f("HECO_REVIEW_HEADWEAR_BARE_P", DEFAULT_REVIEW_HEADWEAR_BARE_P)
+
+
+def review_headwear_cap_p() -> float:
+    """Smaller-of-two-views probability a confident cap read needs
+    (env HECO_REVIEW_HEADWEAR_CAP_P; 0 = no cap call, the default)."""
+    return max(0.0, _env_f("HECO_REVIEW_HEADWEAR_CAP_P", DEFAULT_REVIEW_HEADWEAR_CAP_P))
 
 
 def adult_height_m() -> float:

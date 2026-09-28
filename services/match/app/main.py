@@ -94,7 +94,11 @@ def _env_s(name: str, default: float) -> float:
 #: with HECO_REVIEW_HEADWEAR=1 (default 0: log-only).  Additive.
 #: 0.17.0 (2026-09-25): POST /exclude {runId, personKey} — the operator's
 #: *not-a-guest* removal; the key keeps its templates and leaves the review.
-VERSION = "0.17.0"
+#: 0.18.0 (2026-09-26): the head covering's CAP call (HECO_REVIEW_HEADWEAR_CAP_P,
+#: default 0 = off; /health reviewHeadwearCapP): why.headwear gains capA/capB
+#: and the label "cap", and with the rule on a turban against a cap is set
+#: aside like a turban against a bare head.  Additive.
+VERSION = "0.18.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -520,6 +524,7 @@ def health() -> dict:
         "reviewHeadwearMinN": config.review_headwear_min_n(),
         "reviewHeadwearTurbanP": config.review_headwear_turban_p(),
         "reviewHeadwearBareP": config.review_headwear_bare_p(),
+        "reviewHeadwearCapP": config.review_headwear_cap_p(),
     }
 
 
@@ -836,6 +841,7 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             headwear_min_n=config.review_headwear_min_n(),
             headwear_turban_p=config.review_headwear_turban_p(),
             headwear_bare_p=config.review_headwear_bare_p(),
+            headwear_cap_p=config.review_headwear_cap_p(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
