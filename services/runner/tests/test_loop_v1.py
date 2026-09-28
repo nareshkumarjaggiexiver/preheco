@@ -3104,6 +3104,40 @@ def test_a_clearly_better_look_replaces_the_card_and_a_marginal_one_does_not():
     assert loop._face_pending["p00001"][1] == pytest.approx(80.0 / 160), "clearly better: replaced"
 
 
+def test_a_look_alike_never_takes_over_a_guests_card():
+    """THE PICTURE BELONGS TO ITS PERSON (JD Grand run 71eb8e, 2026-09-28).
+
+    The officer was minted p00296; a second later the man beside him, same
+    cream turban and grey beard, matched p00296 near the line for one frame,
+    and his closer, clearer face replaced the card. A better look now has to
+    agree with the face ON the card (face_card_same_min), not just with the
+    identity: the look-alike is refused, the guest himself is not.
+    """
+    fake = Cards(n_frames=1)
+    loop = make_loop(
+        fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}}, face_card_improve=1.15
+    )
+    img = solid_image(RED_BGR, w=320, h=300)
+    at = lambda w: {"box": {"x": 40, "y": 30, "w": w, "h": 78}}  # noqa: E731
+    officer = [1.0, 0.0, 0.0]
+    look_alike = [0.36, 0.933, 0.0]  # cosine 0.36 to the officer's card face
+    officer_again = [0.8, 0.0, 0.6]  # cosine 0.8: the same man, another look
+
+    loop._maybe_face_card(img, at(40.0), {"personKey": "p00296", "isNew": True, "_embedding": officer})
+    first = loop._face_pending["p00296"][1]
+    loop._maybe_face_card(img, at(90.0), {"personKey": "p00296", "_embedding": look_alike})
+    assert loop._face_pending["p00296"][1] == first, "a clearer look-alike does not take the card"
+    loop._maybe_face_card(img, at(90.0), {"personKey": "p00296", "_embedding": officer_again})
+    assert loop._face_pending["p00296"][1] > first, "the guest's own better look still does"
+    assert loop._face_card_vecs["p00296"] == officer_again, "and becomes the card the next one is held to"
+
+    # 0 turns the check off: the look-alike would have replaced it, as before.
+    off = make_loop(fake, {"eventId": "ev-1", "source": {"path": "/x.mp4"}}, face_card_same_min=0.0)
+    off._maybe_face_card(img, at(40.0), {"personKey": "p00296", "_embedding": officer})
+    off._maybe_face_card(img, at(90.0), {"personKey": "p00296", "_embedding": look_alike})
+    assert off._face_pending["p00296"][1] == pytest.approx(90.0 / 160)
+
+
 def test_a_squarer_or_clearer_look_at_the_same_size_replaces_the_card():
     """THE OPERATOR'S CASE (2026-09-25): a better face at the same distance.
 
