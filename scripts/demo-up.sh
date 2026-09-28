@@ -131,6 +131,12 @@ export HECO_QUALITY_MAX_HEAD_OVERLAP=${HECO_QUALITY_MAX_HEAD_OVERLAP:-0.3}
 export EMBED_HEADWEAR_MODEL=${EMBED_HEADWEAR_MODEL-models/siglip_b16_224_image_fp32.onnx}
 export HECO_HEADWEAR=${HECO_HEADWEAR:-1}
 export HECO_REVIEW_HEADWEAR=${HECO_REVIEW_HEADWEAR:-1}
+# ...and a turban against a CAP (match 0.18.0, JD Grand 2026-09-26: a red-cap
+# man queued against a maroon turban). A cap counts only with no loose-view
+# turban read (a dark turban's tight view reads as a cap) and never against a
+# bare head (caps come off). One run's evidence, so it lives here, not in the
+# service default: HECO_REVIEW_HEADWEAR_CAP_P=0 turns the cap call off.
+export HECO_REVIEW_HEADWEAR_CAP_P=${HECO_REVIEW_HEADWEAR_CAP_P:-0.5}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF (match default 0.07). It holds back a colour
 # set-aside when two identities' face skin says they were read under
@@ -224,7 +230,8 @@ knobs() {
        HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
        HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_CLOTHES_WELL_SEEN_N \
        HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
-       HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL HECO_REVIEW_HEADWEAR HECO_REVIEW_HEADWEAR_MIN_N -- "$@"
+       HECO_REVIEW_BEARD_PALE HECO_REVIEW_LIGHT_TOL HECO_REVIEW_HEADWEAR HECO_REVIEW_HEADWEAR_MIN_N \
+       HECO_REVIEW_HEADWEAR_CAP_P -- "$@"
   show "$name" runner HECO_PRESENCE_SPLIT HECO_COPRESENCE_SPLIT HECO_QUALITY_MIN_FEAT_NORM HECO_QUALITY_MIN_BALANCE \
        HECO_QUALITY_REQUIRE_LANDMARKS HECO_QUALITY_MIN_FRONTALITY HECO_QUALITY_MIN_EYE_SPAN \
        HECO_QUALITY_MAX_HEAD_OVERLAP \

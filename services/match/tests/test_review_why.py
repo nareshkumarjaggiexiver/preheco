@@ -633,7 +633,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             "light": {"a": None, "b": None, "shift": None, "held": []},
             "headwear": {
                 "a": None, "b": None, "nA": 0, "nB": 0,
-                "turbanA": 0, "bareA": 0, "turbanB": 0, "bareB": 0,
+                "turbanA": 0, "bareA": 0, "turbanB": 0, "bareB": 0, "capA": 0, "capB": 0,
             },
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"

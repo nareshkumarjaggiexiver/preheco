@@ -800,8 +800,10 @@ one.
   to `min(face bottom + 2.5 × face height, person box bottom)`; horizontally
   the person box inset 15% each side.
 - **No descriptor** when the crop is under 24 px in either dimension, when
-  there is no containing person box, or when fewer than 100 unmasked pixels
-  remain. **Absent is not zero** — an absent descriptor disables every
+  there is no containing person box, when fewer than 100 unmasked pixels
+  remain, or (2026-09-29) when under 10% of the crop is lit — a black shirt
+  in a dim hall leaves only specks (a chest logo, a button), and those are
+  not the garment. **Absent is not zero** — an absent descriptor disables every
   appearance behaviour for that sighting (the `gatedUnmeasured` /
   `zoneUnmeasured` convention applied to clothing).
 - **Similarity**: histogram intersection (sum of element-wise minimums; both
@@ -2015,3 +2017,27 @@ list". A new planner feedback kind **`not-a-guest {personKey}`**.
   applied.
 - Planner (ended run): applies it against the gallery the run left, as it
   does for the other corrections.
+
+### The cap call — a turban against a cap (match 0.18.0, 2026-09-26)
+
+JD Grand's live run queued a red-cap man (p00025) against a maroon turban
+(p00049) as a possible duplicate: the head-covering reader said cap in both
+views on every read, but a cap had no call, so p00025 was `unsure`.
+- **`HECO_REVIEW_HEADWEAR_CAP_P`** (default **0 = no cap call**, the rule as
+  before; `/health` `reviewHeadwearCapP`): a read is confidently a cap when
+  both views argmax `cap_or_hat` and min p ≥ it. An identity reads **`cap`**
+  with ≥ `HECO_REVIEW_HEADWEAR_MIN_N` confident cap reads, no confident turban
+  and **no read whose LOOSE view alone saw a turban** at the turban bar — a
+  dark turban in dim light reads as a cap in the tight view (p00019: cap on 3
+  of 10 reads, loose-view turban 0.86–1.00 on 5).
+- `why.headwear` gains **`capA`, `capB`** (confident cap reads; 0 with the
+  call off) and the label `cap`. With `HECO_REVIEW_HEADWEAR=1` a **turban
+  against a cap** is set aside like a turban against a bare head (same male
+  gate, same reason `headwear`). Never a cap against a bare head: caps come
+  off.
+- Replayed with match's own code on a copy of that run's gallery (the box's
+  settings): at 0 the queue is unchanged (21 queued, 3 set aside); at 0.5 the
+  three capped men (p00014, p00025, p00050) read `cap`, the dark turban stays
+  `unsure`, and exactly p00025/p00049 leaves the queue. One run and two
+  turbans is thin evidence: the service default stays 0 and `demo-up.sh`
+  sets 0.5.

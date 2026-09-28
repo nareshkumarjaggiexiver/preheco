@@ -13,6 +13,9 @@ runner writes the 8 logits onto the sighting's body row, and the review:
   only between two confidently male identities, only turban (>= N confident
   reads, none bare) against bare (the reverse) — never a dupatta, a cap or an
   unsure head against anything;
+* with HECO_REVIEW_HEADWEAR_CAP_P > 0 (match 0.18.0) also turban against a
+  CAP — never a cap against a bare head, and never a "cap" whose loose view
+  saw a turban (a dark turban's tight view reads as a cap);
 * is not a colour: the light guard never holds it back;
 * writes nothing: no cannot_link, no merge.
 
@@ -34,6 +37,7 @@ from app.headwear import (
     headwear_apart,
     headwear_label,
     headwear_tallies,
+    loose_turban,
     read_call,
 )
 from fastapi.testclient import TestClient
@@ -76,6 +80,10 @@ CAP = logits([0.02, 0.02, 0.01, 0.95], [0.03, 0.02, 0.01, 0.94])
 UNSURE = logits([0.90, 0.08, 0.01, 0.01], [0.10, 0.85, 0.03, 0.02])
 #: Turban in both views but the tight view only 0.70 sure: under the 0.80 bar.
 WEAK_TURBAN = logits([0.95, 0.03, 0.01, 0.01], [0.70, 0.20, 0.05, 0.05])
+#: A DARK turban in dim light (JD Grand p00019): the loose view sees the whole
+#: turban, the tight view a cap — and on other reads both views say cap.
+DARK_TURBAN = logits([0.90, 0.02, 0.02, 0.06], [0.05, 0.10, 0.02, 0.83])
+DARK_AS_CAP = logits([0.20, 0.10, 0.05, 0.65], [0.05, 0.10, 0.02, 0.83])
 
 
 def excluded(**counts) -> dict:
@@ -227,6 +235,58 @@ def test_apart_is_turban_against_bare_between_two_confident_men_only():
     assert headwear_apart(t, b, *men, 2, 0.0) is False, "no gender bar, no male gate, no rule"
 
 
+def test_a_cap_is_called_only_with_its_own_bar_set():
+    """No cap call by default (caps come off); CAP_P > 0 calls one on both views."""
+    assert read_call(CAP, 0.8, 0.5) == "unsure", "the default: no cap call"
+    assert read_call(CAP, 0.8, 0.5, 0.5) == "cap"
+    assert read_call(CAP, 0.8, 0.5, 0.96) == "unsure", "the tight view read 0.94"
+    assert read_call(DARK_TURBAN, 0.8, 0.5, 0.5) == "unsure", "the views disagree"
+    assert read_call(DARK_AS_CAP, 0.8, 0.5, 0.5) == "cap", "a dark turban can read as a cap"
+    assert read_call(TURBAN, 0.8, 0.5, 0.5) == "turban", "the other calls are unchanged"
+
+
+def test_the_loose_view_alone_is_evidence_not_a_call():
+    """The loose view sees the whole turban — and a neighbour's."""
+    assert loose_turban(DARK_TURBAN, 0.8) is True
+    assert loose_turban(TURBAN, 0.8) is True
+    assert loose_turban(DARK_AS_CAP, 0.8) is False
+    assert loose_turban(CAP, 0.8) is False
+    assert loose_turban(UNSURE, 0.95) is False, "0.90 < 0.95"
+    assert loose_turban([float("nan")] * 8, 0.8) is False
+
+
+def test_a_cap_label_needs_n_cap_reads_no_turban_and_no_loose_turban():
+    """JD Grand's three capped men read cap; the dark turban (cap 3 of 10,
+    loose-view turban on 5) must stay unsure."""
+    assert headwear_label(HeadwearTally(14, 0, 0, cap=14), 2) == "cap"
+    assert headwear_label(HeadwearTally(5, 0, 0, cap=3), 2) == "cap"
+    assert headwear_label(HeadwearTally(10, 0, 0, cap=3, loose_turban=5), 2) == "unsure", "p00019"
+    assert headwear_label(HeadwearTally(5, 1, 0, cap=3), 2) == "unsure", "a confident turban read"
+    assert headwear_label(HeadwearTally(5, 0, 0, cap=1), 2) == "unsure", "one read < N"
+    assert headwear_label(HeadwearTally(6, 0, 3, cap=3), 2) == "bare", "bare decides first"
+    assert headwear_label(HeadwearTally(11, 11, 0, cap=2, loose_turban=11), 2) == "turban"
+    rows_ = [type("R", (), {"key": "k", "headwear": np.asarray(r, dtype=np.float32)})()
+             for r in (DARK_AS_CAP, DARK_AS_CAP, DARK_TURBAN)]
+    (tally,) = headwear_tallies(rows_, 0.8, 0.5, 0.5).values()
+    assert tally == HeadwearTally(3, 0, 0, cap=2, loose_turban=1)
+    assert headwear_label(tally, 2) == "unsure"
+    (off,) = headwear_tallies(rows_, 0.8, 0.5).values()
+    assert off.cap == 0, "no cap call, no cap reads"
+
+
+def test_apart_takes_turban_against_cap_only_with_the_cap_call_on():
+    """A capped man does not put on a turban mid-event; he does take his cap off."""
+    t, c, b = HeadwearTally(11, 11, 0), HeadwearTally(5, 0, 0, cap=4), HeadwearTally(7, 0, 7)
+    men = (("M", 0.9), ("M", 0.85))
+    assert headwear_apart(t, c, *men, 2, 0.8) is False, "the default: a cap is unsure"
+    assert headwear_apart(t, c, *men, 2, 0.8, cap=True) is True
+    assert headwear_apart(c, t, *men, 2, 0.8, cap=True) is True, "order-free"
+    assert headwear_apart(c, b, *men, 2, 0.8, cap=True) is False, "caps come off"
+    assert headwear_apart(c, c, *men, 2, 0.8, cap=True) is False
+    assert headwear_apart(t, b, *men, 2, 0.8, cap=True) is True, "turban vs bare unchanged"
+    assert headwear_apart(t, c, ("M", 0.9), ("F", 0.9), 2, 0.8, cap=True) is False, "a woman"
+
+
 # ------------------------------------------------------------- storage
 
 
@@ -332,7 +392,7 @@ def test_the_reads_move_with_a_merge_and_leave_with_mark_staff(tmp_path):
         s.set_body_headwear(b2, TURBAN, MODEL)
         assert s.merge("p00001", "p00002") is True
         tallies = headwear_tallies(s.sighting_evidence(), 0.8, 0.5)
-        assert tallies == {"p00001": HeadwearTally(2, 2, 0)}
+        assert tallies == {"p00001": HeadwearTally(2, 2, 0, loose_turban=2)}
         s.remove("p00001")
         assert s.sighting_evidence() == []
 
@@ -355,6 +415,7 @@ def test_why_headwear_rides_every_row_and_log_only_sets_nothing_aside(client, tm
         t.lower(): "turban", b.lower(): "bare",
         f"n{t}": 3, f"n{b}": 3,
         f"turban{t}": 3, f"bare{t}": 0, f"turban{b}": 0, f"bare{b}": 2,
+        f"cap{t}": 0, f"cap{b}": 0,
     }
     unread = row_of(got, kt, k_none)
     u = side(unread, k_none)
@@ -437,6 +498,42 @@ def test_the_switch_min_n_and_the_gender_bar_are_all_off_switches(
     monkeypatch.setenv("HECO_REVIEW_HEADWEAR", "1")
     (aside,) = review(client)["setAside"]
     assert {aside["a"], aside["b"]} == {kt, kb}
+
+
+def test_with_the_cap_call_on_turban_against_cap_is_set_aside_and_nothing_else(
+    client, tmp_path, rule_on, monkeypatch
+):
+    """JD Grand, 2026-09-26: a red cap queued against a maroon turban. With
+    CAP_P the capped man leaves the turban's queue; the dark turban and the
+    cap-against-bare pair stay asked."""
+    kt = person(client, tmp_path, hub(), [TURBAN] * 3)
+    k_cap = person(client, tmp_path, spoke(1), [CAP] * 3)
+    k_dark = person(client, tmp_path, spoke(2), [DARK_AS_CAP] * 3 + [DARK_TURBAN] * 2)
+    got = review(client)
+    assert got["excluded"] == excluded() and got["setAside"] == [], "CAP_P unset: as before"
+    row = row_of(got, kt, k_cap)
+    assert row["why"]["headwear"][side(row, k_cap).lower()] == "unsure"
+    monkeypatch.setenv("HECO_REVIEW_HEADWEAR_CAP_P", "0.5")
+    got = review(client)
+    assert got["excluded"] == excluded(headwear=1)
+    (aside,) = got["setAside"]
+    assert {aside["a"], aside["b"]} == {kt, k_cap} and aside["reasons"] == ["headwear"]
+    c = side(aside, k_cap)
+    assert aside["why"]["headwear"][c.lower()] == "cap" and aside["why"]["headwear"][f"cap{c}"] == 3
+    dark = row_of(got, kt, k_dark)
+    assert dark in got["pairs"], "the dark turban stays asked"
+    assert dark["why"]["headwear"][side(dark, k_dark).lower()] == "unsure"
+
+
+def test_a_cap_never_sets_a_bare_head_aside(client, tmp_path, rule_on, monkeypatch):
+    """Caps come off: cap against bare is asked, whatever the bar."""
+    monkeypatch.setenv("HECO_REVIEW_HEADWEAR_CAP_P", "0.5")
+    kc = person(client, tmp_path, hub(), [CAP] * 3)
+    person(client, tmp_path, spoke(1), [BARE] * 3)
+    got = review(client)
+    assert got["excluded"] == excluded() and got["setAside"] == []
+    (row,) = got["pairs"]
+    assert row["why"]["headwear"][side(row, kc).lower()] == "cap"
 
 
 def test_the_bars_are_config_the_logits_never_change(client, tmp_path, rule_on, monkeypatch):
@@ -541,6 +638,12 @@ def test_health_reports_the_headwear_policy_and_empty_means_unset(client, monkey
     assert body["reviewHeadwearMinN"] == 2
     assert body["reviewHeadwearTurbanP"] == pytest.approx(0.80)
     assert body["reviewHeadwearBareP"] == pytest.approx(0.50)
+    assert body["reviewHeadwearCapP"] == pytest.approx(0.0), "no cap call unless asked"
+    monkeypatch.setenv("HECO_REVIEW_HEADWEAR_CAP_P", "0.5")
+    assert client.get("/health").json()["reviewHeadwearCapP"] == pytest.approx(0.5)
+    monkeypatch.setenv("HECO_REVIEW_HEADWEAR_CAP_P", "-1")
+    assert config.review_headwear_cap_p() == 0.0, "clamped: a negative bar is off"
+    monkeypatch.delenv("HECO_REVIEW_HEADWEAR_CAP_P")
     for name in ("HECO_REVIEW_HEADWEAR", "HECO_REVIEW_HEADWEAR_MIN_N",
                  "HECO_REVIEW_HEADWEAR_TURBAN_P", "HECO_REVIEW_HEADWEAR_BARE_P"):
         monkeypatch.setenv(name, "")

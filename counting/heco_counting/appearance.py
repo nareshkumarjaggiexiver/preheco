@@ -141,8 +141,9 @@ evidence the review carries alongside this signal.
 
 ABSENT IS NOT ZERO (codebase-wide convention, like ``gatedUnmeasured`` /
 ``zoneUnmeasured``): a sighting with no descriptor — no containing person box,
-a crop under 24 px, fewer than 100 lit non-skin pixels, an undecodable frame,
-an old run recorded before this existed — returns/means None, and None never
+a crop under 24 px, fewer than 100 lit non-skin pixels, a band mostly too dark
+to read, an undecodable frame, an old run recorded before this existed —
+returns/means None, and None never
 vetoes anything.  A signal that could not be measured must not be treated as
 a signal that measured "different".  The same applies ACROSS VERSIONS: a
 48-float v2 descriptor from an older gallery row compared with a 64-float v3
@@ -244,6 +245,24 @@ MIN_CROP_PX = 24
 #: colour-only descriptor renormalised to 1.0 caps every comparison at 0.9
 #: and reads the missing pattern as 0.1 of disagreement.
 MIN_UNMASKED_PX = 100
+#: A fifth, also after the contract: a band with under this share of its
+#: pixels lit (V inside [V_MIN, V_MAX]) is None however many pixels that
+#: share comes to.  THE CASE (2026-09-28, D02 19 Sep clip, p00005): a black
+#: polo in a dim hall left 0.1-6% of his band lit — an orange chest logo, a
+#: white button, the edge of a neighbour: thousands of pixels at 4K, far
+#: over MIN_UNMASKED_PX, but specks, not the garment.  The same shirt read
+#: 0.07, 0.09 and 0.68 against itself, which branded him "clothing
+#: mismatch" in both runs of that clip.  Measured on that clip (both runs'
+#: 127 kept faces, the ledger's own boxes on the 4K frames; the median band
+#: in that hall is 24% lit): same-person pairs >= 5 s apart whose darker
+#: side was under 2.5% lit read as a clash 92% of the time, every bucket
+#: from 2.5% to 30% at 0-7%.  0.10 takes the same-person clash rate from
+#: 16.4% to 4.6% and leaves 18.8% of sightings unmeasured; 0.05 scored the
+#: same on the few pairs between the two but keeps p00005's 6% sighting;
+#: 0.20, the first guess, unmeasures a third of the hall, throws away 256
+#: same-person pairs at 10-20% lit that agreed every time, and scores worse
+#: (9.0%).
+MIN_LIT_SHARE = 0.1
 
 #: Where the band STARTS below the face, in face heights.  v2 started at 0
 #: (the chin) and read neck, chest skin and shoulder hair before any cloth;
@@ -487,10 +506,12 @@ def torso_descriptor(
     either dimension, or fewer than 100 full-weight pixels (V < 30 shadow /
     V > 252 blowout / YCrCb skin tone) — or, added after the contract, when
     the face sits at the box's left or right edge (FACE_EDGE_WIDTHS: the
-    band would be the occluder, not the torso) or the band's resized mask
-    keeps no interior cloth pixel for the pattern parts.  None means "could
-    not measure", and per the module convention it must never be treated
-    as a clash.
+    band would be the occluder, not the torso), the band's resized mask
+    keeps no interior cloth pixel for the pattern parts, or under
+    MIN_LIT_SHARE of the band is lit at all (a black shirt in a dim hall:
+    the specks that survive the shadow mask are not the garment).  None
+    means "could not measure", and per the module convention it must never
+    be treated as a clash.
 
     ``gains`` — the frame's white-balance gains from :func:`frame_gains` —
     are applied to the band before the skin window and the colour bins read
@@ -516,6 +537,8 @@ def torso_descriptor(
         lit, skin, skin_w = _analyse(colour_crop, sensor_bgr=crop)
     cloth = lit & ~skin
     if int(cloth.sum()) < MIN_UNMASKED_PX:
+        return None
+    if float(lit.mean()) < MIN_LIT_SHARE:
         return None
 
     hsv = cv2.cvtColor(colour_crop, cv2.COLOR_BGR2HSV)

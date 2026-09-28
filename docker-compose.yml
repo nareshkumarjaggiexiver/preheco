@@ -358,10 +358,13 @@ services:
       # row. HECO_REVIEW_HEADWEAR=1 lets a turban against a bare head, between
       # two confidently male identities (>= MIN_N unanimous reads each side),
       # set a pair aside; default 0 = log-only. Bars: turban 0.80, bare 0.50.
+      # CAP_P (0.18.0) > 0 adds a cap call: turban against a cap is set aside
+      # too (never a cap against a bare head); default 0 = no cap call.
       HECO_REVIEW_HEADWEAR: ${HECO_REVIEW_HEADWEAR-}
       HECO_REVIEW_HEADWEAR_MIN_N: ${HECO_REVIEW_HEADWEAR_MIN_N-}
       HECO_REVIEW_HEADWEAR_TURBAN_P: ${HECO_REVIEW_HEADWEAR_TURBAN_P-}
       HECO_REVIEW_HEADWEAR_BARE_P: ${HECO_REVIEW_HEADWEAR_BARE_P-}
+      HECO_REVIEW_HEADWEAR_CAP_P: ${HECO_REVIEW_HEADWEAR_CAP_P-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}

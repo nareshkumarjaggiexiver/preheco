@@ -1426,6 +1426,7 @@ def review_duplicates(
     headwear_min_n: int = 2,
     headwear_turban_p: float = 0.8,
     headwear_bare_p: float = 0.5,
+    headwear_cap_p: float = 0.0,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1536,7 +1537,8 @@ def review_duplicates(
       and its confident reads on every row; with ``headwear`` on, a pair of
       two confidently male identities, one reading turban (``headwear_min_n``
       confident reads, none bare) and the other bare (the reverse), is set
-      aside with reason ``headwear`` (:func:`app.headwear.headwear_apart`).
+      aside with reason ``headwear`` (:func:`app.headwear.headwear_apart`);
+      with ``headwear_cap_p`` > 0 a turban against a CAP is set aside too.
       Not a colour: the light guard never holds it back.  Checked LAST, so
       ``excluded.headwear`` counts only the pairs nothing else set aside.
       Off (the default), the reads are reported and nothing moves.
@@ -1617,7 +1619,7 @@ def review_duplicates(
     wears = head_wear(evidence)
     beards = beard_reads(evidence)
     skins = skin_medians(evidence)
-    coverings = headwear_tallies(evidence, headwear_turban_p, headwear_bare_p)
+    coverings = headwear_tallies(evidence, headwear_turban_p, headwear_bare_p, headwear_cap_p)
     candidates, set_aside = [], []
     kept_by_light = 0
     for a, b, cosine, clothes in in_band:
@@ -1680,7 +1682,7 @@ def review_duplicates(
         # and is checked last, so it is counted only where nothing else spoke.
         covered_apart = headwear and headwear_apart(
             coverings.get(a), coverings.get(b), genders[a], genders[b],
-            headwear_min_n, gender_min_p,
+            headwear_min_n, gender_min_p, cap=headwear_cap_p > 0,
         )
         colour = []
         if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min) or (

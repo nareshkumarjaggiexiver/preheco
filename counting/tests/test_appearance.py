@@ -141,6 +141,46 @@ def test_an_unmeasurable_pattern_makes_the_sighting_none(monkeypatch):
     assert ap.torso_descriptor(plain(RED), FACE, PERSON) is None
 
 
+#: The v3 band of FACE inside PERSON: x 80..220, y 170..420.
+BAND = (slice(170, 420), slice(80, 220))
+
+
+def black_polo_with_logo() -> np.ndarray:
+    """p00005's shirt: black under dim light, a 40 x 40 orange chest logo."""
+    img = plain((10, 10, 10))
+    img[260:300, 150:190] = (0, 110, 230)
+    return img
+
+
+def test_a_band_mostly_too_dark_to_read_is_none():
+    """None condition 6 (post-contract, 2026-09-29): p00005's black polo.
+
+    In a dim hall 94-100% of his band sat under V 30.  What survived the
+    shadow mask was an orange chest logo, a white button and the edge of a
+    neighbour — well over the 100-pixel floor, and the same shirt then read
+    0.07, 0.09 and 0.68 against itself, which branded him "clothing
+    mismatch" in the register.  Under MIN_LIT_SHARE of the band lit, the
+    specks are not the garment: None.
+    """
+    shirt = black_polo_with_logo()
+    lit, skin = ap.masks(shirt[BAND])
+    assert int((lit & ~skin).sum()) >= ap.MIN_UNMASKED_PX, "the logo alone passes the pixel floor"
+    assert lit.mean() < ap.MIN_LIT_SHARE
+    assert ap.torso_descriptor(shirt, FACE, PERSON) is None
+    assert ap.MIN_LIT_SHARE == 0.1
+
+
+def test_a_dark_suit_over_a_white_shirt_is_still_measured():
+    """The rule is about specks, not dark clothes: a black suit open over a
+    narrow white shirt front leaves ~14% of the band lit — a reading.  On
+    the D02 clip, same-person pairs at 10-20% lit agreed every time."""
+    suit = plain((10, 10, 10))
+    suit[:, 130:150] = (235, 235, 235)
+    lit, _ = ap.masks(suit[BAND])
+    assert ap.MIN_LIT_SHARE < lit.mean() < 0.2
+    assert ap.torso_descriptor(suit, FACE, PERSON) is not None
+
+
 def test_saturated_orange_is_cloth_not_skin_at_any_exposure():
     """The exposure cliff: an orange kurta (H 15, S 255) at V 150 vs V 155.
 
