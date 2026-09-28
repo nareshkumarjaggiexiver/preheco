@@ -307,6 +307,50 @@ sleeps persons 30, faces 70, embed 20, match 5 ms):
 reports processed and footage fps against camera rate, the count, and every
 lever counter from the settled run record.
 
+## v6: planner writes survive a planner restart (2026-09-29)
+
+**The incident.** Taps, frames, face cards and frame-record batches were
+single attempts that swallowed failure — right for the loop, wrong for the
+record: the planner's restart dropped every tap and frame the runner posted
+meanwhile, and runs were marked failed "the runner went silent". The runner
+now builds its planner client **durable** (`HECO_PLANNER_DURABLE`, default
+on; `heco_common.planner.Outbox`, contract in CONTRACTS.md):
+
+- **The first attempt is unchanged.** With nothing queued, a post is tried
+  once, synchronously, through the same short report client
+  (`HECO_REPORT_TIMEOUT_S`). Accepted: done, exactly as before.
+- **The planner away** (no answer, a timeout, 502/503/504, 408, 429): the
+  message is kept in memory and a background sender — one per run, alive only
+  while something is queued — delivers the queue **in order**, retrying the
+  same head with backoff 0.5 s doubling to 15 s. While anything is queued,
+  new posts join it **without an attempt**: order holds, and an outage costs
+  the reporting path less than it did (no timeout per post).
+- **Refused** (any other 4xx): dropped as before, counted; a 401 keeps its
+  `plannerAuthFailures` bookkeeping. **A server error** (500, 501, 505+) is
+  the planner up and failing this message: retried like an outage, but six
+  times at most — one message it cannot take must not hold every later one
+  behind it for the rest of the run.
+- **Bounded per run** at `HECO_PLANNER_OUTBOX_MAX_BYTES` (512 MB of JPEG
+  bytes and JSON length): past it live-ring stage frames go first, then
+  forensic frames, then the oldest messages — never the run end. A live-ring
+  frame older than 30 s is skipped at delivery: it only feeds the "latest
+  frame" view, and a late one would put an old picture over the live one.
+- **The run end is last.** The settle drains the queue (up to 30 s) before
+  the record is written, so `outboxDelivered` means delivered. If the closing
+  PUT still fails with the planner away it is queued too, delivered after the
+  run thread has returned, and the status `error` says so.
+- **Stamped**: `X-Heco-Delivery: <runId>:<n>` and `X-Heco-At: <call time>`
+  on every attempt, so the planner can drop a repeat and date a late arrival.
+- **Visible**: `GET /health` → `plannerOutbox`; a run whose outbox was used
+  reports `outboxDelivered`, `outboxDropped`, `outboxBacklogMax` (plus
+  `frameRecordsQueued` / `faceCardsQueued` beside the posted counts) in
+  status, notes and results, and logs one WARNING when the planner stops
+  answering and one line when it is back. A run whose every post landed
+  reports exactly what it always did — the pinned call-sequence fixture
+  replays unchanged through a durable client
+  (`tests/test_planner_durable.py`).
+- **Memory only**: a runner restart still loses what is queued.
+
 ## v1: staff, taps, feedback, enrol
 
 - **Staff whitelist.** A run carrying a `siteId` sends it on every `/match`, so
@@ -376,7 +420,8 @@ lever counter from the settled run record.
 - **Reporting never stalls or kills the count.** The stats flush is best-effort
   (`plannerReportErrors` counts what was lost; stats are upserted aggregates,
   so the next flush repairs the gap), planner traffic uses its own short
-  timeouts, and a whole tap round shares `HECO_TAP_BUDGET_S`.
+  timeouts, and a whole tap round shares `HECO_TAP_BUDGET_S`. Since v6 what
+  the planner is away for is kept and delivered later, not lost.
 - **End of run the runner hands state back**: ingest `/close`, tracker
   `/release`, match `/reset` (deleting the gallery file) — all best-effort,
   before the closing planner PUT.
@@ -385,9 +430,9 @@ lever counter from the settled run record.
 
 | method | path | body | returns |
 | --- | --- | --- | --- |
-| GET | `/health` | — | `{ok, model, version, build, pipeline, host, knobs}` — `knobs`: the throughput levers as this process resolved them |
+| GET | `/health` | — | `{ok, model, version, build, pipeline, host, knobs, plannerOutbox?}` — `knobs`: the throughput levers as this process resolved them; `plannerOutbox` (durable only, v6): what the runner holds for the planner now (`backlog`, `bytes`, `runsHolding`) and has delivered/dropped (`dropped` by reason) |
 | POST | `/runs` | `{eventId, placementId?, source:{url\|path, loop?, isFile?, lockstep?, motionGate?, bufferS?}, plannerUrl?, label?, mode?, siteId?, staffId?, exclusionZones?:[{label, points:[[x,y],…]}], faceRegion?:{x, y, w, h}}` — zone points normalized 0..1, ≥3 per polygon; `faceRegion` normalized, inside the frame, ≥ 5% a side; 422 otherwise; `source.motionGate` / `source.bufferS` go to ingest `/open` as its per-run L1 overrides (absent = the ingest env's own setting) | `{runId, state}` |
-| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, coPresenceSplits, trackPresenceSplits, sameFrameSplits, gatedByFeatNorm, appearanceRefused, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error; and the levers' framesCaptured, framesSkippedNoMotion, framesDroppedLive, ingestBacklogMax, faceDetectSkippedSettled, faceRegionUnplaced — null when not measured) |
+| GET | `/runs/{runId}` | — | live local status (frames, unique, manualAdditions, staffCrossings, staffFaceFrames, healedSplits, lockedTrackFolds, coPresenceSplits, trackPresenceSplits, sameFrameSplits, gatedByFeatNorm, appearanceRefused, distinctTracks, healVetoedByAppearance, healUncertainAppearance, enrolVetoedByAppearance, nearMissMints, excludedByZone, zoneUnmeasured, subCanonShare, feedbackApplied/Rejected, multiFaceFramesSkipped, plannerReportErrors, tapRoundsAbandoned, tapRoundsDeferred, sampleCount, state, error; and the levers' framesCaptured, framesSkippedNoMotion, framesDroppedLive, ingestBacklogMax, faceDetectSkippedSettled, faceRegionUnplaced — null when not measured; and, only once the planner outbox was used, outboxDelivered, outboxDropped, outboxBacklog, outboxBacklogMax, frameRecordsQueued, faceCardsQueued, forensicFramesQueued) |
 | POST | `/runs/{runId}/stop` | — | ends the run after the current frame (RTSP sources never end alone) |
 
 `mode` is `count` (default) or `enrol`. `siteId` opts a count run into the staff
@@ -450,6 +495,16 @@ the max gap, track presence on skipped frames, the overlap's fixed ruling)
 and the region; `test_ingest_levers.py` a FIFO, keepalive-gated ingest; and
 `test_bench_live.py` the bench script against a fake console.
 
+Durable planner writes (v6) are held to the same fixture:
+`test_planner_durable.py` replays all five pinned runs through a DURABLE
+client unchanged, then restarts the planner under live runs (sync and async
+reporting, best-effort paths or everything down) and checks every tap, frame,
+forensic picture and frame record lands exactly once and in order; that a
+queued ledger batch is not re-posted, a route the planner keeps failing does
+not block the rest, a missed run end is delivered after the run returns, and
+`/health` and the knobs report it. The outbox itself is tested in
+`common/tests/test_planner_outbox.py`.
+
 ## Tune
 
 | env | default | meaning |
@@ -468,6 +523,8 @@ and the region; `test_ingest_levers.py` a FIFO, keepalive-gated ingest; and
 | `HECO_REQUEST_TIMEOUT_S` | `30` | Per-STAGE HTTP timeout (a stage call is the product) |
 | `HECO_PLANNER_TIMEOUT_S` | `5.0` | Retrying planner calls (run record, stats, samples) |
 | `HECO_REPORT_TIMEOUT_S` | `2.0` | Best-effort planner calls (taps, frames, feedback) — bounds the stall a wedged planner can cause |
+| `HECO_PLANNER_DURABLE` | `1` (on) | Keep the taps, frames, face cards, frame records and run end the planner was away for, and deliver them in order when it answers (v6). The first attempt is unchanged; behind a backlog nothing is attempted. **0 = the old single attempt that drops on failure** |
+| `HECO_PLANNER_OUTBOX_MAX_BYTES` | `536870912` (512 MB) | Per-run outbox bound, in payload bytes (JPEG bytes, JSON length). Past it live-ring stage frames go first, then forensic frames, then the oldest messages (never the run end) — each counted in `outboxDropped` |
 | `HECO_TAP_BUDGET_S` | `3.0` | Ceiling for ONE tap round (5 payloads + 5 JPEGs); the rest is dropped |
 | `HECO_TAP_DUTY_FACTOR` | `3.0` | Duty-cycle guard: a round fires only after this × the previous round's measured cost has passed since it ENDED (~25% duty at 3 — the every-frame 0.4 fps lock-in is impossible by construction). `0` disables; deferred rounds count `tapRoundsDeferred` |
 | `HECO_STAFF_COOLDOWN_S` | `5.0` | A staff member re-seen within this is the SAME crossing |

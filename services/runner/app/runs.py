@@ -38,6 +38,29 @@ from .loop import (
 #: above all).  Anything else has finished, however it finished.
 LIVE_STATES = frozenset({"starting", "running", "enrolling"})
 
+#: How /health adds the outboxes of several runs together: counters and the
+#: backlog now are SUMMED; the high-water marks are the deepest any ONE run's
+#: outbox got, because the bound they are read against is per run.
+_OUTBOX_SUMMED = ("queued", "delivered", "deliveredLate", "retried", "backlog", "bytes")
+_OUTBOX_PEAKS = ("backlogMax", "bytesMax")
+
+
+def _outbox_zero() -> dict:
+    """An empty outbox tally, shaped like PlannerClient.outbox_stats()."""
+    return {**{k: 0 for k in _OUTBOX_SUMMED + _OUTBOX_PEAKS}, "dropped": {}}
+
+
+def _fold_outbox(total: dict, stats: dict | None) -> None:
+    """Add one client's outbox_stats() into a running tally, in place."""
+    if not stats:
+        return
+    for key in _OUTBOX_SUMMED:
+        total[key] += stats.get(key, 0)
+    for key in _OUTBOX_PEAKS:
+        total[key] = max(total[key], stats.get(key, 0))
+    for reason, n in stats.get("dropped", {}).items():
+        total["dropped"][reason] = total["dropped"].get(reason, 0) + n
+
 
 class ModelSwapInProgress(RuntimeError):
     """The swap window and a run start collided; whoever came second gets this.
@@ -79,6 +102,14 @@ class RunManager:
         # run could start mid-swap and stamp falsified models).
         self._swapping = False
         self._lock = threading.Lock()
+        # run_id -> that run's DURABLE planner client, kept past the run's own
+        # reaping for as long as its outbox still holds something: a run end
+        # queued while the planner was down is delivered after the run is
+        # gone from the registry, and /health must still see it waiting.
+        # Once idle and reaped, its counters are folded into _outbox_retired so
+        # the process totals never run backwards.
+        self._planners: dict[str, PlannerClient] = {}
+        self._outbox_retired = _outbox_zero()
 
     def probe_client(self) -> "httpx.Client":
         """A short-lived credentialed client for probe/apply orchestration.
@@ -171,12 +202,20 @@ class RunManager:
         # adapter having to know about auth.
         planner_http = httpx.Client(timeout=settings.planner_timeout_s, **auth)
         report_http = httpx.Client(timeout=settings.report_timeout_s, **auth)
+        # DURABLE (HECO_PLANNER_DURABLE, default on): what the planner is away
+        # for is kept and delivered in order when it answers, instead of lost —
+        # the planner's restart used to drop every tap and frame posted
+        # meanwhile, and runs were marked failed "the runner went silent". The
+        # outbox's first attempt rides the SAME short report client, and its
+        # sender thread the same clients after that; no new client is built.
         planner = PlannerClient(
             planner_url,
             transport=httpx_transport(planner_http),
             best_effort_transport=httpx_transport(report_http),
             file_transport=httpx_file_transport(report_http),
             token_provider=self.token_provider,
+            durable=settings.planner_durable,
+            outbox_max_bytes=settings.planner_outbox_max_bytes,
         )
         loop = RunLoop(run_id, request, settings, client, planner, is_live_run=self._is_live)
         thread = threading.Thread(target=loop.run, name=run_id, daemon=True)
@@ -188,6 +227,8 @@ class RunManager:
                     )
                 self._runs[run_id] = loop
                 self._threads[run_id] = thread
+                if planner.durable:
+                    self._planners[run_id] = planner
                 # Started INSIDE the lock: a reaper reads liveness off the thread,
                 # and a registered-but-not-yet-started thread reports not-alive.
                 # The reaper takes this same lock, so it cannot observe that gap.
@@ -247,7 +288,53 @@ class RunManager:
                 self._runs.pop(run_id, None)
                 self._threads.pop(run_id, None)
                 self._settled_at.pop(run_id, None)
+            orphans = [(rid, p) for rid, p in self._planners.items() if rid not in self._runs]
+        self._retire_idle_planners(orphans)
         return reaped
+
+    def _retire_idle_planners(self, orphans: list[tuple[str, PlannerClient]]) -> None:
+        """Let go of reaped runs' planner clients once their outbox is empty.
+
+        A client whose outbox still holds something stays — its sender is
+        delivering a run end the planner has not heard yet, and /health must
+        keep showing that. Its stats are read OUTSIDE the registry lock:
+        outbox_stats() takes the client's own lock, and this module never
+        nests the two.
+        """
+        idle = []
+        for run_id, planner in orphans:
+            stats = planner.outbox_stats()
+            if not stats or not stats["backlog"]:
+                idle.append((run_id, planner, stats))
+        if not idle:
+            return
+        with self._lock:
+            for run_id, planner, stats in idle:
+                if self._planners.get(run_id) is planner:
+                    del self._planners[run_id]
+                    _fold_outbox(self._outbox_retired, stats)
+
+    def planner_outbox(self) -> dict:
+        """This process's planner outboxes, added up — GET /health ``plannerOutbox``.
+
+        Lifetime counters (runs long reaped included), the backlog and bytes
+        held NOW, the deepest any one run's outbox got, ``runsHolding`` (runs
+        whose outbox holds something now) and ``bytesLimit`` (the per-run
+        bound). A backlog that is not shrinking is a planner that is not
+        answering; ``dropped`` says what the bound or the planner cost.
+        """
+        with self._lock:
+            planners = list(self._planners.values())
+            total = {**self._outbox_retired, "dropped": dict(self._outbox_retired["dropped"])}
+        holding = 0
+        for planner in planners:
+            stats = planner.outbox_stats()
+            _fold_outbox(total, stats)
+            if stats and stats["backlog"]:
+                holding += 1
+        total["runsHolding"] = holding
+        total["bytesLimit"] = self.settings.planner_outbox_max_bytes
+        return total
 
     def _is_live(self, run_id: str) -> bool:
         """Is run_id a run of this process that is STILL RUNNING?

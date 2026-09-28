@@ -72,7 +72,15 @@ from heco_common.auth import TokenProvider
 from heco_common.geometry import dedupe_boxes, iou_xywh
 from heco_common.imaging import decode_jpeg_b64
 from heco_common.logs import RunLog, safe, setup_logging
-from heco_common.planner import FileTransport, PlannerClient, PlannerError, Transport
+from heco_common.planner import (
+    ACCEPTED,
+    QUEUED,
+    FileTransport,
+    PlannerClient,
+    PlannerDeferred,
+    PlannerError,
+    Transport,
+)
 from heco_common.schemas import Sample
 from heco_counting import appearance, association, face_search, gate, zones
 from heco_counting import config as counting_config
@@ -192,10 +200,16 @@ def httpx_transport(client: httpx.Client) -> Transport:
     One adapter, several clients: the runner builds a long-timeout client for
     stage calls and short-timeout ones for planner traffic (see RunManager),
     and tests route everything through one httpx.MockTransport.
+
+    ``headers`` is the durable client's X-Heco-Delivery/X-Heco-At stamp; a
+    non-durable client never passes it, and ``None`` sends exactly what was
+    always sent.
     """
 
-    def transport(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
-        r = client.request(method, url, json=payload)
+    def transport(
+        method: str, url: str, payload: dict | None, headers: dict | None = None
+    ) -> tuple[int, dict]:
+        r = client.request(method, url, json=payload, headers=headers)
         return r.status_code, (r.json() if r.content else {})
 
     return transport
@@ -206,12 +220,20 @@ def httpx_file_transport(client: httpx.Client) -> FileTransport:
 
     Debug frames are ``multipart/form-data`` (a ``stage`` field + the JPEG
     ``file``), so they need their own adapter separate from the JSON transport.
+    ``headers`` as for :func:`httpx_transport`.
     """
 
     def transport(
-        url: str, fields: dict, filename: str, content: bytes, content_type: str
+        url: str,
+        fields: dict,
+        filename: str,
+        content: bytes,
+        content_type: str,
+        headers: dict | None = None,
     ) -> tuple[int, dict]:
-        r = client.post(url, data=fields, files={"file": (filename, content, content_type)})
+        r = client.post(
+            url, data=fields, files={"file": (filename, content, content_type)}, headers=headers
+        )
         return r.status_code, (r.json() if r.content else {})
 
     return transport
@@ -973,6 +995,10 @@ class RunLoop:
         self._settled_feedback: dict = {}
         # staffId -> monotonic time last seen, for crossing debounce.
         self._staff_last_seen: dict = {}
+        # Was the planner outbox holding anything at the last look? Only the
+        # CHANGE is logged (see _note_outbox): one line when the planner stops
+        # answering, one when it is answering again — not one per flush.
+        self._outbox_holding = False
         self._status: dict = {
             "runId": run_id,
             "plannerRunId": None,
@@ -2197,8 +2223,13 @@ class RunLoop:
         self._prefetch_pool.shutdown(wait=True, cancel_futures=True)
         self._close_golden()
         self._flush(max(time.monotonic() - t0, 1e-9))
+        # What the planner was away for goes out BEFORE the record is written,
+        # so the record can say what became of it (bounded by the client's
+        # drain timeout; end_run then has nothing left to wait for).
+        self._settle_outbox()
         st = self.status()
         levers = self._lever_counters(st)
+        outbox = self._outbox_counters(st)
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
@@ -2267,6 +2298,9 @@ class RunLoop:
             # The levers' counters, when measured (see _lever_counters): what
             # ingest withheld and discarded, beside what the loop counted.
             + "".join(f"{k}={v} " for k, v in levers.items())
+            # The planner outbox's, when it was used (see OUTBOX_COUNTERS):
+            # what reached the planner late, and what never did.
+            + "".join(f"{k}={v} " for k, v in outbox.items())
             + "(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. A run that stopped because the camera
@@ -2302,12 +2336,26 @@ class RunLoop:
             "galleryOverlaps": st["galleryOverlaps"],
             "excludedByZone": st["excludedByZone"],
             **levers,
+            **outbox,
         }
         try:
             self.planner.end_run(
                 status=status, notes=notes, results=results,
                 end_reason=self._end_reason,
+                # _settle_outbox already gave the queue its wait; a second one
+                # would only double what a planner outage costs the settle.
+                drain_timeout_s=0.0,
             )
+        except PlannerDeferred as e:
+            # The planner is still away, but the end is not lost: the client's
+            # outbox keeps it — stamped with this moment — and delivers it when
+            # the planner answers, long after this thread has returned.
+            self.log.warning(
+                f"counted {st['unique']}; the planner is not answering, so the run "
+                f"end is queued and will be delivered when it does: {e}"
+            )
+            self._bump("plannerReportErrors")
+            self._set(error=f"run ended; the planner was not answering, so its end is queued: {e}")
         except PlannerError as e:  # the count happened; only the report is lost
             self.log.error(f"counted {st['unique']} but the planner was not told: {e}")
             self._bump("plannerReportErrors")
@@ -3185,7 +3233,12 @@ class RunLoop:
         for key, (jpeg, width) in pending:
             if time.monotonic() >= deadline:
                 return
-            if not self.planner.post_face_card(key, jpeg):
+            # QUEUED is as good as sent for this bookkeeping: the planner
+            # client's outbox delivers the card when the planner answers, and
+            # keeping it pending would queue it again every round — the same
+            # picture, over and over, for as long as the planner is away.
+            outcome = self.planner.offer_face_card(key, jpeg)
+            if outcome not in (ACCEPTED, QUEUED):
                 continue
             with self._lock:
                 # Only clear what we actually sent: a better crop may have
@@ -3193,7 +3246,7 @@ class RunLoop:
                 if self._face_pending.get(key, (None, None))[1] == width:
                     self._face_pending.pop(key, None)
                 self._face_cards[key] = max(self._face_cards.get(key, 0.0), width)
-            self._bump("faceCardsPosted")
+            self._bump("faceCardsPosted" if outcome == ACCEPTED else "faceCardsQueued")
 
     def _split_same_key(
         self,
@@ -4734,7 +4787,7 @@ class RunLoop:
         except Exception:  # noqa: BLE001 — an opaque stub frame has no picture to keep
             self._bump("forensicFramesDropped")
             return
-        ok = self.planner.post_frame(
+        outcome = self.planner.offer_frame(
             "ingest",
             raw,
             extra={
@@ -4745,7 +4798,13 @@ class RunLoop:
                 "height": last.get("h"),
             },
         )
-        self._bump("forensicFramesPosted" if ok else "forensicFramesDropped")
+        # A picture the planner's outbox is holding is not a dropped one:
+        # counting it lost would send someone hunting a gap that fills itself.
+        self._bump(
+            "forensicFramesPosted" if outcome == ACCEPTED
+            else "forensicFramesQueued" if outcome == QUEUED
+            else "forensicFramesDropped"
+        )
 
     def _record_frame(self) -> None:
         """Append THIS frame's decisions to the ledger the engineer reads.
@@ -5479,6 +5538,9 @@ class RunLoop:
                 results=results,
                 end_reason=self._end_reason,
             )
+        except PlannerDeferred as e:  # kept by the outbox: told when it answers
+            self._bump("plannerReportErrors")
+            self.log.warning(f"enrolment {status}; the planner will be told when it answers: {e}")
         except Exception as e:  # noqa: BLE001 — the templates are already stored
             self._bump("plannerReportErrors")
             self.log.warning(f"enrolment {status} but the planner was not told: {e}")
@@ -5552,8 +5614,15 @@ class RunLoop:
             with self._lock:
                 batch, self._frame_ledger = self._frame_ledger, []
             if batch:
-                if self.planner.post_frame_records(batch):
+                outcome = self.planner.offer_frame_records(batch)
+                if outcome == ACCEPTED:
                     self._bump("frameRecordsPosted", len(batch))
+                elif outcome == QUEUED:
+                    # The planner client's outbox holds them and delivers them
+                    # in order. Re-queueing here as well would post each record
+                    # twice — and, every flush of an outage, queue a growing
+                    # copy of everything the outbox already has.
+                    self._bump("frameRecordsQueued", len(batch))
                 else:
                     # Back in hand for the next flush, at the FRONT. Today the
                     # drain and this restore both happen between frames, so
@@ -5588,6 +5657,68 @@ class RunLoop:
                 # way to the console so nobody has to read a container log.
                 tokenLastError=provider.last_error,
             )
+        self._note_outbox()
+
+    #: The durable outbox's share of the run's permanent record — present only
+    #: when the outbox was USED (something was queued), so a run whose every
+    #: post landed reports exactly what it always reported. The two *Queued
+    #: counts sit beside frameRecordsPosted / faceCardsPosted: without them a
+    #: ledger delivered late reads as a ledger with a hole in it.
+    OUTBOX_COUNTERS = (
+        "outboxDelivered", "outboxDropped", "outboxBacklogMax",
+        "frameRecordsQueued", "faceCardsQueued",
+    )
+
+    def _note_outbox(self) -> None:
+        """Put the durable planner client's outbox on the run's status.
+
+        Silent until the outbox is first used — absent is not zero, and a run
+        whose every post landed must not grow new keys. From then on the status
+        carries what it delivered, dropped and holds; and the CHANGE is logged
+        once each way, because "swallowed is not silent" applies to a planner
+        outage too: the warning is where an engineer finds when it went away.
+        """
+        if not getattr(self.planner, "durable", False):
+            return
+        stats = self.planner.outbox_stats()
+        if not stats or not stats["queued"]:
+            return
+        dropped = sum(stats["dropped"].values())
+        self._set(
+            outboxDelivered=stats["delivered"],
+            outboxDropped=dropped,
+            outboxBacklog=stats["backlog"],
+            outboxBacklogMax=stats["backlogMax"],
+        )
+        holding = stats["backlog"] > 0
+        if holding and not self._outbox_holding:
+            self.log.warning(
+                f"the planner is not answering: holding {stats['backlog']} report(s) "
+                f"({stats['bytes']} bytes) to deliver, in order, when it does"
+            )
+        elif self._outbox_holding and not holding:
+            self.log.info(
+                f"the planner is answering again: outbox empty "
+                f"(delivered {stats['delivered']} late, dropped {dropped})"
+            )
+        self._outbox_holding = holding
+
+    def _settle_outbox(self) -> None:
+        """Give the outbox its moment BEFORE the run's record is written.
+
+        end_run would drain it too, but the notes and results are built before
+        end_run is called: draining here is what makes outboxDelivered in the
+        permanent record mean "delivered", not "delivered by the time the
+        counters happened to be read" — and the count run's end_run is then
+        told not to wait a second time.
+        """
+        if getattr(self.planner, "durable", False):
+            self.planner.drain_outbox()
+            self._note_outbox()
+
+    def _outbox_counters(self, st: dict) -> dict:
+        """The outbox's counters for the notes and the results (see OUTBOX_COUNTERS)."""
+        return {k: st[k] for k in self.OUTBOX_COUNTERS if st.get(k) is not None}
 
 
 #: The window behind count.windowFps (StatsBoard.observe_window_rate): at

@@ -381,6 +381,14 @@ def health() -> dict:
         # because a knob with no compose passthrough looks set and does nothing
         # (that has cost this repo three evenings).
         "knobs": config.knobs(manager.settings),
+        # WHAT THE RUNNER IS HOLDING FOR THE PLANNER (durable writes only):
+        # the backlog its outboxes carry now, and what they delivered and
+        # dropped. The planner cannot report its own outage, so this is where
+        # "is anything waiting to reach it?" is answered.
+        **(
+            {"plannerOutbox": manager.planner_outbox()}
+            if manager.settings.planner_durable else {}
+        ),
     }
 
 

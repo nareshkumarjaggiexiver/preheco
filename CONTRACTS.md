@@ -71,6 +71,10 @@ Every ~2 s while running:
   payload = the stage's latest structured output, truncated to what a human
   debugger needs (≤32 KB): boxes, track ids+ages, face quality flags,
   personKey + cosine per match, unique/staff counters.
+- Since 2026-09-29 these writes (and face cards, frame records and the run
+  end) are DURABLE: kept while the planner is away and delivered in order,
+  each carrying `X-Heco-Delivery` and `X-Heco-At` — see "a planner restart
+  loses nothing the runner posted" at the end of this file.
 
 ### Staff whitelist (the professional enrolment flow)
 - SITE STAFF STORE: data/staff-<siteId>.db (SQLite; embeddings table:
@@ -2053,3 +2057,79 @@ views on every read, but a cap had no call, so p00025 was `unsure`.
   `unsure`, and exactly p00025/p00049 leaves the queue. One run and two
   turbans is thin evidence: the service default stays 0 and `demo-up.sh`
   sets 0.5.
+
+
+## v4 addition — a planner restart loses nothing the runner posted (runner + heco-common, 2026-09-29)
+
+The v1 taps were single attempts that swallowed failure — right for the
+frame loop, wrong for the record: **the planner's restart dropped every tap
+and frame the runner posted meanwhile, and runs were marked failed "the
+runner went silent".** The runner's planner client is now DURABLE (runner
+`HECO_PLANNER_DURABLE`, default on; `heco_common.planner.Outbox`).
+`HECO_PLANNER_DURABLE=0` is the old behaviour exactly.
+
+### The guarantee
+
+- **What it covers**: `POST …/taps`, `…/frames`, `…/faces` and
+  `…/frame-records`, and the closing `PUT /api/pipeline/runs/:id` when it
+  fails with the planner away. Not the reads (feedback, tombstones) nor their
+  status PUTs — an open item is simply re-applied by the next poll — and not
+  create/stats/samples, which keep their retrying path.
+- **At least once, in order, per run.** The first attempt is the old one
+  (same client, same `HECO_REPORT_TIMEOUT_S`). When the planner is AWAY — no
+  answer, a timeout, 502/503/504, 408, 429 — the write is kept in memory and
+  a background sender retries the SAME head (backoff 0.5 s, ×2, 15 s cap)
+  until it lands; nothing overtakes it. While anything is queued, later
+  writes queue behind it without an attempt, so an outage costs the
+  reporting path nothing.
+- **What is still dropped, and counted** (runner `outboxDropped`, `/health`
+  `plannerOutbox.dropped` by reason): a refusal (`rejected`: any other 4xx;
+  `unauthorized`: 401, which also keeps its `plannerAuthFailures`
+  bookkeeping); a server error (500, 501, 505+) answered six times to the
+  same write (`failed` — the planner is up, and one write it cannot take must
+  not hold every later one behind it); a body that cannot be JSON-encoded
+  (`unsendable`); and the bound. The bound is per run,
+  `HECO_PLANNER_OUTBOX_MAX_BYTES` (512 MB of JPEG bytes and JSON length):
+  past it, live-ring stage frames (not `match`, not `forensic`) are shed
+  first (`shedLiveFrame`), then forensic frames (`shedFrame`), then the
+  oldest writes (`shedOldest`) — never the run end; a single write larger
+  than the whole bound is `overflow`. A live-ring frame older than 30 s is
+  skipped at delivery (`stale`): it only feeds the planner's latest-frame
+  ring, and a late one would put an old picture over the live view.
+- **The run end is last.** The runner drains the queue (up to 30 s) before it
+  writes the run's record; a closing PUT that still finds the planner away is
+  queued behind everything else and delivered after the run thread has
+  returned (the runner process lives on). The run's local status `error`
+  says it is queued.
+- **Memory only.** A runner restart loses whatever is queued.
+
+### Two headers on every durable write
+
+Sent on the first attempt and every retry, identical each time:
+
+- **`X-Heco-Delivery: <runId>:<n>`** — unique per write (`n` counts per
+  runner client). At least once means a write whose reply was lost after the
+  planner stored it is sent again; the planner MAY answer a repeated id 2xx
+  without storing it twice. Frame records are already idempotent (upsert on
+  `(run, seq)`); taps, frames and face cards are not.
+- **`X-Heco-At: <ISO-8601 UTC, ms, Z>`** — when the runner MADE the call, not
+  when it arrived. A tap delivered three minutes late still says when it
+  happened; the planner SHOULD date a late write by it, and its silence
+  detector should read a burst of old `X-Heco-At` values as a runner that
+  was talking all along, not one that went quiet.
+- Nothing else carries them: create, stats, samples and the feedback /
+  erasure calls go out exactly as before.
+
+### What the runner reports
+
+- `GET /health` → `plannerOutbox` (durable only): `queued`, `delivered`,
+  `deliveredLate` (after at least one failed attempt), `retried`, `dropped
+  {reason: n}`, `backlog` and `bytes` held NOW, `backlogMax` / `bytesMax`
+  (deepest one run's outbox got), `bytesLimit`, `runsHolding`.
+- Run status, notes and results carry `outboxDelivered`, `outboxDropped`,
+  `outboxBacklogMax` and, beside the posted counts, `frameRecordsQueued` /
+  `faceCardsQueued` — ONLY when the outbox was used. A run whose every write
+  landed reports exactly what it always did (the pinned call-sequence fixture
+  replays unchanged through a durable client). Status alone adds
+  `outboxBacklog` and `forensicFramesQueued`.
+- One WARNING when the planner stops answering, one line when it is back.
