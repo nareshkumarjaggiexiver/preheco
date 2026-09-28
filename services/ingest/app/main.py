@@ -7,10 +7,12 @@ Endpoints (CONTRACTS.md):
   EOF) rather than a live stream.  The capture slot is EXCLUSIVE: see "one
   slot, one owner" below.
 * ``POST /close`` {owner?, force?} — release the slot at end of run.
-* ``GET /frame``  → {tMs, imageB64, w, h, seq, ended} — the LATEST frame only
-  (drop-not-queue; see app.capture for the policy). With a lever armed
-  (app.config) it is the OLDEST UNREAD frame instead, dequeued, and the body
-  also carries {motion, backlog, skipped, dropped, captured}.
+* ``GET /frame``  → {tMs, imageB64, w, h, seq, ended, frameRef} — the LATEST
+  frame only (drop-not-queue; see app.capture for the policy). With a lever
+  armed (app.config) it is the OLDEST UNREAD frame instead, dequeued, and the
+  body also carries {motion, backlog, skipped, dropped, captured}.
+  ``frameRef`` names the same frame on the shared tmpfs (heco_common.frameref;
+  null with no mount), and ``?jpeg=0`` drops the JPEG when a ref was written.
 * ``GET /health`` → {ok, model, version, owner, knobs, capture}.
 
 One slot, one owner
@@ -34,12 +36,14 @@ Frame encoding happens here, on demand, per request — the capture thread
 stores raw arrays so an idle pipeline costs no JPEG work.
 """
 
+import itertools
 import os
 import threading
 from contextlib import asynccontextmanager
 
 import cv2
 from fastapi import FastAPI, HTTPException
+from heco_common import frameref
 from heco_common.config import env_int
 from heco_common.gate_auth import install_bearer_gate
 from heco_common.imaging import encode_jpeg_b64
@@ -76,10 +80,19 @@ class _State:
         self.lock = threading.Lock()
 
     def swap(self, new: CaptureWorker | None, owner: str | None = None) -> None:
-        """Install a new worker (or None), stopping the previous one."""
+        """Install a new worker (or None), stopping the previous one.
+
+        The shared transport's frames go with the run that was served them
+        (frameref.clear): a closed run has no stage call left in flight — the
+        runner closes only after its last frame — and without this its last
+        HECO_FRAMES_KEEP frames (24 MB each at 4K) sat on tmpfs until the next
+        run's writes happened to retire them, or forever after a restart,
+        when the write numbers begin again below theirs.
+        """
         old, self.worker, self.owner = self.worker, new, (owner if new else None)
         if old is not None:
             old.stop()
+        frameref.clear()
 
     def held_by_live_run(self) -> bool:
         """True when an owning run's capture thread is still alive.
@@ -214,12 +227,47 @@ def _jpeg_once(worker: CaptureWorker, seq: int, img, quality: int) -> str:
     return b64
 
 
+#: The last frame written to the shared transport: ((generation, seq), ref).
+#: A frame is immutable for its (generation, seq), so re-writing it on a poll
+#: is pure waste — see get_frame.
+_ref_lock = threading.Lock()
+_ref_last: tuple[tuple[int, int], str | None] | None = None
+#: WRITE numbers, one per frame written, never reused in this process. The
+#: ref's number is this, not the capture seq, because frameref retires files
+#: more than HECO_FRAMES_KEEP NUMBERS behind the newest: numbered by capture
+#: seq, a gap wider than the keep between two SERVED frames — a still room
+#: under the motion gate publishes one frame a second, 15 seqs apart at
+#: 15 fps; an unbuffered camera outrunning a 1.5 fps consumer does it too —
+#: retired the frame the runner was still embedding. Numbered by write, the
+#: keep means "the last N frames handed out", whatever the gaps.
+_ref_ids = itertools.count(1)
+
+
+def _cached_ref(worker: CaptureWorker, seq: int, img) -> str | None:
+    """The shared-transport ref for this frame, writing it at most once.
+
+    Keyed by (generation, seq), as :func:`_jpeg_once` is: seq restarts at 1 on
+    every /open, and seq alone would hand a new run the previous run's frame.
+    The lock is held across the write so two concurrent polls of one frame
+    cannot write it twice. Only frames actually served are ever written — a
+    frame the motion gate skipped, or the buffer dropped, never touches tmpfs.
+    """
+    global _ref_last
+    key = (worker.generation, seq)
+    with _ref_lock:
+        if _ref_last is not None and _ref_last[0] == key:
+            return _ref_last[1]
+        ref = frameref.write_frame(img, next(_ref_ids))
+        _ref_last = (key, ref)
+        return ref
+
+
 # exclude_unset: a field is on the wire only when this handler SET it. With
 # every lever off that is exactly the six fields /frame has always carried —
-# byte for byte, so nothing downstream can tell the levers exist — and in
-# lever mode an unmeasured value still travels as an explicit null.
+# plus the frameRef this branch passes explicitly (null with no mount) — and
+# in lever mode an unmeasured value still travels as an explicit null.
 @app.get("/frame", response_model_exclude_unset=True)
-def get_frame() -> Frame:
+def get_frame(jpeg: bool = True) -> Frame:
     """Return the latest captured frame as base64 JPEG.
 
     409: no source open. 503: source open but no frame decoded yet (a live
@@ -227,21 +275,41 @@ def get_frame() -> Frame:
 
     Lever mode (a gate or buffer armed): the OLDEST unread frame, taken out
     of the store, plus the counters the runner carries into the run's notes.
+
+    The shared transport, when one is mounted: the SAME pixels written once
+    to tmpfs so the three consuming stages can take them without a codec.
+    imageB64 is still produced unless the caller declines it — the ref is an
+    optimisation and a consumer must always have something to fall back to.
+    ONCE PER FRAME, not once per request: the runner polls this endpoint at
+    source_poll_s (50 Hz) waiting for the seq to advance, every poll returns
+    the SAME frame, and writing on each one wrote 24 MB to tmpfs fifty times a
+    second for one frame (ref-only measured SLOWER than the JPEG it replaced,
+    2.32 fps against 5.14, until it stopped). With a lever armed the frame is
+    written when it is TAKEN, so the buffer's backlog lives in ingest's own
+    memory (INGEST_BUFFER_MB) and tmpfs holds only the last HECO_FRAMES_KEEP
+    frames handed out.
+
+    ``jpeg=0`` says the caller has verified it can read refs, so the encode is
+    waste — 13.9 ms per 4K frame, measured. Honoured ONLY when a ref was
+    actually written: a caller that declines the JPEG and gets no ref either
+    would receive a frame with no pixels in it at all, which is a far worse
+    failure than an encode nobody needed.
     """
     worker = state.worker
     if worker is None:
         raise HTTPException(status_code=409, detail="no source open — POST /open first")
+    quality = env_int("INGEST_JPEG_QUALITY", 85)
     if worker.levered:
         served = worker.take()
         if served is None:
             raise HTTPException(status_code=503, detail="no frame captured yet — retry")
         h, w = served.image.shape[:2]
+        frame_ref = _cached_ref(worker, served.seq, served.image)
+        skip_jpeg = (not jpeg) and frame_ref is not None
         return Frame(
             tMs=served.t_ms,
-            imageB64=_jpeg_once(
-                worker, served.seq, served.image, env_int("INGEST_JPEG_QUALITY", 85)
-            ),
-            w=w, h=h, seq=served.seq, ended=served.ended,
+            imageB64="" if skip_jpeg else _jpeg_once(worker, served.seq, served.image, quality),
+            w=w, h=h, seq=served.seq, ended=served.ended, frameRef=frame_ref,
             motion=served.motion, backlog=served.backlog, skipped=served.skipped,
             dropped=served.dropped, captured=served.captured,
         )
@@ -250,14 +318,16 @@ def get_frame() -> Frame:
         raise HTTPException(status_code=503, detail="no frame captured yet — retry")
     seq, t_ms, img = latest
     h, w = img.shape[:2]
-    quality = env_int("INGEST_JPEG_QUALITY", 85)
+    frame_ref = _cached_ref(worker, seq, img)
+    skip_jpeg = (not jpeg) and frame_ref is not None
     # `ended` is the only signal that separates a played-out file from a camera
     # that blinked: both freeze `seq`. The worker knows which it is (it retries
     # a live stream forever and only sets ended for a finished file), and until
     # now it kept that to itself.
     return Frame(
-        tMs=t_ms, imageB64=_jpeg_once(worker, seq, img, quality),
+        tMs=t_ms, imageB64="" if skip_jpeg else _jpeg_once(worker, seq, img, quality),
         w=w, h=h, seq=seq, ended=bool(getattr(worker, "ended", False)),
+        frameRef=frame_ref,
     )
 
 

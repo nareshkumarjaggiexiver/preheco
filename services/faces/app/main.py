@@ -25,7 +25,7 @@ from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .codec import b64_to_bgr
+from .codec import frame_from
 from .detector import (
     DEFAULT_MODEL,
     MODEL_PATH,
@@ -119,7 +119,13 @@ class WithinBox(BaseModel):
 class DetectRequest(BaseModel):
     """POST /detect body: a base64 JPEG frame, optionally scoped to boxes."""
 
-    imageB64: str = Field(min_length=1)
+    #: Empty is legal ONLY with a resolvable frameRef — the pixels come from
+    #: the shared transport instead. The handler refuses (400) when neither
+    #: yields a frame, which says WHICH half failed; a min_length here would
+    #: refuse the ref-only request before anything could look at the ref.
+    imageB64: str = ""
+    #: See persons.DetectRequest.frameRef — same contract, same fallback.
+    frameRef: str | None = None
     within: list[WithinBox] | None = None
 
 
@@ -288,7 +294,7 @@ def detect(req: DetectRequest) -> dict:
     if det is None:
         raise HTTPException(status_code=503, detail=_load_error or "model not loaded")
     try:
-        img = b64_to_bgr(req.imageB64)
+        img = frame_from(req.imageB64, req.frameRef)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     h, w = img.shape[:2]

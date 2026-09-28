@@ -1,0 +1,71 @@
+# Shared-frame transport — the pixels stop being JSON.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpumax.yml \
+#                  -f docker-compose.shm.yml up -d
+#
+# A tmpfs (RAM, never disk) mounted into ingest, the three stages that
+# consume a frame, and the runner (which cuts its descriptors from it).
+# Ingest writes each frame once as raw BGR and hands the others its name;
+# they read it straight out of the page cache. Measured cost
+# this removes, per 4K frame on the .94 box: one 13.9 ms JPEG encode, three
+# 17.8 ms decodes, and ~15 ms of base64+JSON for a 2.1 MB payload — about
+# 82 ms of a 224 ms budget, spent turning memory into text and back.
+#
+# SIZE. A 4K BGR frame is 24 MB, so HECO_FRAMES_KEEP (default 8, never under
+# 4: overlap + prefetch hold three frames in flight) wants ~200 MB
+# and the mount must hold comfortably more than that — a tmpfs that fills
+# makes every write fail and every frame fall back to JPEG, which is the slow
+# path plus the cost of trying. 1 GB is ~40 frames of headroom. tmpfs counts
+# against the box's RAM, not its disk, and only pages actually written are
+# resident. The ingest levers do not change this: with a live buffer
+# (INGEST_BUFFER_S) or the motion gate a frame is written when it is TAKEN,
+# so the backlog lives in ingest's own memory (INGEST_BUFFER_MB) and tmpfs
+# holds the last KEEP frames handed out, numbered by write so a gate's seq
+# gaps cannot retire a frame still in flight; a run's frames are cleared
+# when its source is closed.
+#
+# THIS DOES NOT CHANGE THE CONTRACT. imageB64 still travels on every request
+# and every consumer still decodes it when the ref does not resolve — an
+# un-mounted service, a frame already retired, a half-finished deploy. Drop
+# the -f and the pipeline is exactly what it was.
+#
+# WHAT IT COSTS ARCHITECTURALLY: the stages must now share a host to benefit.
+# HTTP did not require that — HECO_PERSONS_URL exists so a stage could live on
+# another machine. They still CAN; they just fall back to JPEG when they do.
+x-frames: &frames
+  HECO_FRAMES_DIR: /frames
+  HECO_FRAMES_KEEP: ${HECO_FRAMES_KEEP-}
+
+services:
+  ingest:
+    environment: *frames
+    volumes: ["frames:/frames"]
+  persons:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+  faces:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+  embed:
+    environment: *frames
+    volumes: ["frames:/frames:ro"]
+
+  runner:
+    # The runner READS frames too: its torso, head and beard descriptors (the
+    # appearance veto, the heal veto, the review queue's evidence) and its
+    # face cards are cut from the decoded frame, and a ref-only frame has no
+    # JPEG to decode. So it mounts the frames read-only, and the ref-only
+    # switch proves the runner AND the three stages can read a ref before it
+    # stops asking ingest for JPEGs — otherwise the run keeps its JPEGs.
+    environment:
+      <<: *frames
+      HECO_FRAMES_REF_ONLY: ${HECO_FRAMES_REF_ONLY-}
+    volumes: ["frames:/frames:ro"]
+
+volumes:
+  frames:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=${HECO_FRAMES_TMPFS_SIZE:-1g}

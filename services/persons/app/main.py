@@ -14,7 +14,7 @@ from heco_common.ort import is_trt
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .codec import b64_to_bgr
+from .codec import frame_from
 from .model import DEFAULT_MODEL, MODEL_PATH, PersonDetector, persist_selection, spec_for
 
 log = logging.getLogger("persons")
@@ -100,7 +100,15 @@ class ApplyModelRequest(BaseModel):
 class DetectRequest(BaseModel):
     """POST /detect body: a base64 JPEG frame plus an optional threshold."""
 
-    imageB64: str = Field(min_length=1)
+    #: Empty is legal ONLY with a resolvable frameRef — the pixels come from
+    #: the shared transport instead. The handler refuses (400) when neither
+    #: yields a frame, which says WHICH half failed; a min_length here would
+    #: refuse the ref-only request before anything could look at the ref.
+    imageB64: str = ""
+    #: Shared-transport handle for the same frame. Optional and advisory:
+    #: when it resolves the pixels come from tmpfs with no codec at all,
+    #: and when it does not the imageB64 beside it is decoded as always.
+    frameRef: str | None = None
     confMin: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
@@ -143,7 +151,7 @@ def detect(req: DetectRequest) -> dict:
     if det is None:
         raise HTTPException(status_code=503, detail=_load_error or "model not loaded")
     try:
-        img = b64_to_bgr(req.imageB64)
+        img = frame_from(req.imageB64, req.frameRef)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     boxes, infer_ms = det.detect(img, conf_min=req.confMin)

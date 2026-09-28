@@ -67,6 +67,7 @@ from functools import partial
 from urllib.parse import urlsplit
 
 import httpx
+from heco_common import frameref
 from heco_common.auth import TokenProvider
 from heco_common.geometry import dedupe_boxes, iou_xywh
 from heco_common.imaging import decode_jpeg_b64
@@ -801,6 +802,12 @@ class RunLoop:
             max_workers=1, thread_name_prefix="frame-prefetch"
         )
         self._lock = threading.Lock()
+        # Ref-only frames stay OFF until proven (see _negotiate_ref_only).
+        # Configuration is a request; a probe is evidence.
+        self._ref_only = False
+        # The frame the ref-only probe took from ingest, handed to the loop as
+        # the run's first frame by _next_frame (None once handed over).
+        self._held_frame: dict | None = None
         self._last_seq: int | None = None
         self._last_ms: float = 0.0
         # personKey -> how many templates that identity last reported holding.
@@ -1252,19 +1259,34 @@ class RunLoop:
             not self._stop.is_set() and not self._halt.is_set()
             and time.monotonic() < deadline
         ):
-            r = self.client.get(f"{self.s.ingest_url}/frame")
-            if r.status_code in (204, 404, 410):
-                self._end_reason = "source-ended"  # stub-style explicit end
-                return None
-            if r.status_code == 503:  # no frame decoded yet — retry
-                if wait_start is None:
-                    wait_start = time.monotonic()
-                time.sleep(self.s.source_poll_s)
-                continue
-            r.raise_for_status()
-            body = r.json()
+            # The ref-only probe's frame, if it took one, is this run's first
+            # frame: it was dequeued (a live buffer, a lockstep file), and
+            # asking again would process the NEXT one and lose it.
+            held, self._held_frame = self._held_frame, None
+            if held is not None:
+                body = held
+            else:
+                url = f"{self.s.ingest_url}/frame"
+                if self._ref_only:
+                    url += "?jpeg=0"
+                r = self.client.get(url)
+                if r.status_code in (204, 404, 410):
+                    self._end_reason = "source-ended"  # stub-style explicit end
+                    return None
+                if r.status_code == 503:  # no frame decoded yet — retry
+                    if wait_start is None:
+                        wait_start = time.monotonic()
+                    time.sleep(self.s.source_poll_s)
+                    continue
+                r.raise_for_status()
+                body = r.json()
             self._note_ingest(body)
-            if body.get("ended") or not body.get("imageB64"):
+            # "No pixels" means ended — but a ref-only frame legitimately
+            # carries NO imageB64, and reading that as end-of-source ended
+            # every ref-only run at frame zero with no error anywhere
+            # (measured live, 2026-09-24: 0 frames, state ended, err None).
+            # A frame is empty only when BOTH carriers are.
+            if body.get("ended") or not (body.get("imageB64") or body.get("frameRef")):
                 self._end_reason = "source-ended"
                 return None
             seq = body.get("seq")
@@ -1283,6 +1305,88 @@ class RunLoop:
             return None
         self._end_reason = "operator-stopped" if self._stop.is_set() else "source-stalled"
         return None
+
+    def _negotiate_ref_only(self) -> bool:
+        """Prove every consuming stage can read a shared frame, or do not use one.
+
+        Asked once per run, before the first counted frame. The setting says
+        the operator BELIEVES the mounts are right; this establishes it, on
+        the same frame the stages would really be sent.
+
+        Why it is worth a probe rather than a try/except in the loop: with
+        ref-only on, a stage that cannot resolve the ref is sent no pixels at
+        all. Discovering that per-frame would be a run that counts nobody
+        while every container reports healthy — the exact silent-failure shape
+        this project keeps finding. One probe turns it into a line in the log
+        and a run that simply keeps its JPEGs.
+
+        THE RUNNER IS A CONSUMER TOO. Its torso, head and beard readings (the
+        appearance veto, the heal veto and the review queue's evidence), the
+        white balance behind them and the face cards all read the decoded
+        frame, and a ref-only frame has no JPEG to decode — so the runner must
+        read the ref itself (HECO_FRAMES_DIR mounted on it as well), or every
+        one of them silently goes unmeasured for the whole run.
+
+        THE PROBE'S FRAME IS THE RUN'S FIRST FRAME. A GET /frame takes a frame
+        — with a live buffer (INGEST_BUFFER_S) it is dequeued, in lockstep the
+        reader moves on — so the probe asks once a frame exists, not twenty
+        times, and _next_frame hands that same frame to the loop.
+        """
+        if not self.s.frames_ref_only:
+            return False
+        # WAIT FOR A FRAME TO EXIST. The probe runs immediately after the
+        # source is opened, and a source that has not decoded its first frame
+        # yet answers 503 — which is not "no shared transport", it is "not
+        # yet". Reading that as a refusal silently kept the JPEGs on a stack
+        # that was configured correctly and writing refs the whole time
+        # (measured live, 2026-09-24). A live RTSP source can take a second or
+        # two to produce its first frame, so this waits about that long.
+        frame = None
+        for _ in range(20):
+            try:
+                r = self.client.get(f"{self.s.ingest_url}/frame")
+                body = r.json() if r.status_code == 200 and r.content else None
+            except Exception:  # noqa: BLE001 — not up yet is not a refusal
+                body = None
+            if isinstance(body, dict) and body.get("seq") is not None:
+                frame = body
+                break
+            if self._stop.wait(0.1):
+                return False
+        if frame is not None:
+            self._held_frame = frame
+        ref = (frame or {}).get("frameRef")
+        if not ref:
+            self.log.info(
+                "ref-only: ingest offered no frameRef in 2 s — keeping JPEG frames "
+                "(is HECO_FRAMES_DIR mounted on ingest?)"
+            )
+            return False
+        if frameref.read_frame(ref) is None:
+            self.log.info(
+                f"ref-only: the runner itself cannot read {ref} — keeping JPEG frames "
+                "(mount HECO_FRAMES_DIR on the runner too: its clothing, head and beard "
+                "reads and its face cards need the pixels)"
+            )
+            return False
+        probes = (
+            (f"{self.s.persons_url}/detect", {"imageB64": "", "frameRef": ref}),
+            (f"{self.s.faces_url}/detect", {"imageB64": "", "frameRef": ref, "within": None}),
+            (f"{self.s.embed_url}/embed", {"imageB64": "", "frameRef": ref, "faces": []}),
+        )
+        for url, payload in probes:
+            try:
+                self._post(url, payload)
+            except Exception as exc:
+                self.log.info(
+                    f"ref-only: {url} cannot read {ref} ({str(exc)[:120]}) — "
+                    "keeping JPEG frames for this run"
+                )
+                return False
+        self.log.info(
+            f"ref-only: every stage read {ref} — dropping the JPEG encode for this run"
+        )
+        return True
 
     #: Frame wire field -> the status counter that carries it (lever L1).
     #: CUMULATIVE on the wire, so the latest report is the run's figure.
@@ -1667,18 +1771,39 @@ class RunLoop:
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
 
+    @staticmethod
+    def _pixels(frame: dict) -> dict:
+        """A stage request's picture: the JPEG, and the shared-frame ref when
+        ingest offered one.
+
+        The ref rides BESIDE imageB64, never instead of it (the stages fall
+        back per request, so a retired frame or an un-mounted consumer costs a
+        decode, not a run; under ref-only imageB64 is simply empty). Absent
+        when there is no ref, so a stack without the shared transport sends
+        exactly the bodies it always sent — pinned call for call.
+        """
+        ref = frame.get("frameRef")
+        return {"imageB64": frame["imageB64"], **({"frameRef": ref} if ref else {})}
+
     def _post_persons(self, frame: dict) -> dict:
         """POST one frame to persons /detect (inline or from the detect worker).
 
         Takes the FRAME, not its picture, so a transport that carries more
         than the JPEG (a shared-memory frame reference) is one line here.
         """
-        return self._post(f"{self.s.persons_url}/detect", {"imageB64": frame["imageB64"]})
+        return self._post(f"{self.s.persons_url}/detect", self._pixels(frame))
 
     def _post_faces(self, frame: dict, within: list | None) -> dict:
-        """POST one frame to faces /detect; ``within`` None searches it whole."""
+        """POST one frame to faces /detect; ``within`` None searches it whole.
+
+        The shared-transport ref rides with the JPEG exactly as on persons and
+        embed — from the loop, the detect worker (L3) and the parallel detect
+        alike, for the crops, the whole frame and the operator's region (L7):
+        this and :meth:`_post_persons` are the only places those POSTs are
+        built, so no path can send a different carrier from the loop's.
+        """
         return self._post(
-            f"{self.s.faces_url}/detect", {"imageB64": frame["imageB64"], "within": within}
+            f"{self.s.faces_url}/detect", {**self._pixels(frame), "within": within}
         )
 
     def _take_detected(
@@ -1949,6 +2074,9 @@ class RunLoop:
         self._maybe_purge_staff()  # before the first frame is matched
         self._post(f"{self.s.tracker_url}/reset", {"runId": planner_run_id})
         self._open_source()
+        # AFTER the source is open (there is no frame to probe with before
+        # that) and BEFORE the first counted frame.
+        self._ref_only = self._negotiate_ref_only()
 
         t0 = time.monotonic()
         last_flush = t0
@@ -2273,6 +2401,10 @@ class RunLoop:
         self._frame_clock_s: float | None = t_ms / 1000.0
         s, board, samples = self.s, self.board, self.samples
         image_b64 = frame["imageB64"]
+        # Ride the shared transport when ingest offered one. Sent beside
+        # imageB64, never instead of it: the stages fall back per-request, so
+        # a retired frame or an un-mounted consumer costs a decode, not a run.
+        frame_ref = frame.get("frameRef")
         site_id = self.request.get("siteId")
 
         # person-detect
@@ -2392,7 +2524,7 @@ class RunLoop:
             "embed",
             "embedMs",
             lambda: self._post(
-                f"{s.embed_url}/embed", {"imageB64": image_b64, "faces": kept}
+                f"{s.embed_url}/embed", {**self._pixels(frame), "faces": kept}
             ),
         )
         board.frame("embed")
@@ -2458,7 +2590,14 @@ class RunLoop:
             # was invisible to every stage timer.
             td = time.perf_counter()
             try:
-                frame_img = decode_jpeg_b64(image_b64)
+                if image_b64:
+                    frame_img = decode_jpeg_b64(image_b64)
+                elif frame_ref:
+                    # REF-ONLY (HECO_FRAMES_REF_ONLY): no JPEG came, so the
+                    # pixels are the shared frame's — which the negotiation
+                    # proved this runner can read before it stopped the JPEGs.
+                    # None (retired, unreadable) is "no descriptor", as ever.
+                    frame_img = frameref.read_frame(frame_ref)
             except Exception:  # noqa: BLE001 — undecodable frame: no descriptor
                 frame_img = None
             board.observe("count", "frameDecodeMs", (time.perf_counter() - td) * 1000.0)
@@ -5158,14 +5297,8 @@ class RunLoop:
             if frame is None:
                 break
             frames += 1
-            image_b64 = frame["imageB64"]
-            boxes = self._post(
-                f"{self.s.persons_url}/detect", {"imageB64": image_b64}
-            ).get("boxes", [])
-            faces = self._post(
-                f"{self.s.faces_url}/detect",
-                {"imageB64": image_b64, "within": boxes or None},
-            ).get("faces", [])
+            boxes = self._post_persons(frame).get("boxes", [])
+            faces = self._post_faces(frame, boxes or None).get("faces", [])
             # The SAME gate as counting: a template captured from a face the
             # count would have discarded is a template that will not match.
             kept = gate.gate_faces(faces, self.gate).kept
@@ -5176,7 +5309,7 @@ class RunLoop:
                 continue
             faces_seen += 1
             embeddings = self._post(
-                f"{self.s.embed_url}/embed", {"imageB64": image_b64, "faces": kept}
+                f"{self.s.embed_url}/embed", {**self._pixels(frame), "faces": kept}
             ).get("embeddings", [])
             for face, emb in zip(kept, embeddings, strict=False):
                 captured.append((enrol_score(face), emb))

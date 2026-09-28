@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 from . import __version__
 from .align import align_face, half_balance
 from .attributes import ATTR_MODEL_EXPLICIT, ATTR_MODEL_PATH, AttributeModel, build_attributes
-from .codec import b64_to_bgr
+from .codec import b64_to_bgr, frame_from
 from .headwear import HEADWEAR_MODEL_PATH, PROMPTS_FILE, HeadwearReader, build_headwear
 from .recognizer import BATCH, BATCH_MAX, DEVICE, MODEL_PATH, FaceEmbedder, build_embedder
 
@@ -229,7 +229,13 @@ class FaceIn(BaseModel):
 class EmbedRequest(BaseModel):
     """POST /embed body: the frame plus the faces to align and embed."""
 
-    imageB64: str = Field(min_length=1)
+    #: Empty is legal ONLY with a resolvable frameRef — the pixels come from
+    #: the shared transport instead. The handler refuses (400) when neither
+    #: yields a frame, which says WHICH half failed; a min_length here would
+    #: refuse the ref-only request before anything could look at the ref.
+    imageB64: str = ""
+    #: See persons.DetectRequest.frameRef — same contract, same fallback.
+    frameRef: str | None = None
     faces: list[FaceIn]
 
 
@@ -358,7 +364,7 @@ def embed(req: EmbedRequest) -> dict:
     if emb is None:
         raise HTTPException(status_code=503, detail=_load_error or "model not loaded")
     try:
-        img = b64_to_bgr(req.imageB64)
+        img = frame_from(req.imageB64, req.frameRef)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:

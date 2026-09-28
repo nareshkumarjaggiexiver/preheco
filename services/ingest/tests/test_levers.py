@@ -108,7 +108,10 @@ def test_off_runs_todays_loop_grab_not_retrieve(synthetic):
 
 def test_off_frame_body_is_byte_for_byte_the_old_six_fields(client, synthetic_video):
     """GET /frame with every lever off: the same six keys, same order, same
-    bytes — nothing downstream can tell the levers exist."""
+    bytes — nothing downstream can tell the levers exist.
+
+    On this branch "the old" body is main's six plus ``frameRef``, which the
+    shared transport has always put on the wire (null with no mount)."""
     client.post("/open", json={"path": synthetic_video, "loop": True})
     for _ in range(300):
         res = client.get("/frame")
@@ -116,7 +119,8 @@ def test_off_frame_body_is_byte_for_byte_the_old_six_fields(client, synthetic_vi
             break
         time.sleep(0.01)
     body = res.json()
-    assert list(body) == ["tMs", "imageB64", "w", "h", "seq", "ended"]
+    assert list(body) == ["tMs", "imageB64", "w", "h", "seq", "ended", "frameRef"]
+    assert body["frameRef"] is None
     expected = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
     assert res.content == expected
 
