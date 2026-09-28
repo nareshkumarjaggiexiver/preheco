@@ -201,6 +201,18 @@ carries information.
   residual risk; it does not eliminate it (same-colour swaps are invisible to
   it — that is what track-quality gating remains for). Appearance agreement
   never lowers a cosine floor: the signal only ever fails to object.
+- **Fold guard — the face (2026-09-29).** The same-colour swap the clothing
+  bands cannot see happened on the Sharon clip: the tracker moved p00022's
+  box onto an older man in similar dark clothes, and the lock folded his
+  fresh key into p00022 at a face score of about 0.0 — one guest short, and
+  every later sighting of him then enrolled into p00022. Both folds now send
+  `minFaceCosine = HECO_FOLD_MIN_FACE_COSINE` (**0.10**) with the `/merge`;
+  the match service (0.19.0) refuses when the two identities' best face score
+  is under it, and the loop counts `foldVetoedByFace` (a refused lock also
+  drops the lock). Over six galleries, certainly-different people
+  (co-present) scored 0.12 at the median; the lowest same-person fold on
+  record scored 0.21 (bench 6e1a5d). `0` turns the guard off; an older match
+  service ignores the field.
 - **Enrolment veto (match-side, reported here).** The descriptor rides every
   `/match` body as `appearance`; the matcher may refuse to keep a clashing
   sighting as an *additional template* (anti-poison,

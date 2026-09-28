@@ -22,8 +22,8 @@ Endpoints:
     POST /staff/enrol {siteId, staffId, samples:[{embedding, quality?, subCanon?}]}
         -> {staffId, sampleCount}
     POST /staff/purge {siteId, staffIds[]}    -> {siteId, removed}    (erasure)
-    POST /merge  {runId, keep, drop, onlyIfSingleton?}
-        -> {merged, galleryN}                                         (duplicate)
+    POST /merge  {runId, keep, drop, onlyIfSingleton?, minFaceCosine?}
+        -> {merged, galleryN, faceCosine?, refused?}                  (duplicate)
     POST /split  {runId, a, b}   -> {ok, galleryN}   (false-match / co-presence)
     POST /mark-staff {runId, personKey, siteId, staffId?}
         -> {moved, galleryN, staffKey}                                (mark-staff)
@@ -98,7 +98,14 @@ def _env_s(name: str, default: float) -> float:
 #: default 0 = off; /health reviewHeadwearCapP): why.headwear gains capA/capB
 #: and the label "cap", and with the rule on a turban against a cap is set
 #: aside like a turban against a bare head.  Additive.
-VERSION = "0.18.0"
+#: 0.19.0 (2026-09-29): POST /merge takes minFaceCosine — a machine fold
+#: (the runner's heal and lock fold) is refused when the two identities'
+#: faces disagree, and the reply says so (refused: "faces-disagree",
+#: faceCosine); the review's one-crossing clothing tier
+#: (HECO_REVIEW_CLOTHES_BURST_CLASH, default 0.25; /health
+#: reviewClothesBurstClash).  Additive: an older runner sends no
+#: minFaceCosine and folds as before.
+VERSION = "0.19.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -399,6 +406,10 @@ class MergeRequest(BaseModel):
     keep: str
     drop: str
     onlyIfSingleton: bool = False
+    #: Refuse unless the two identities' best face score reaches this (0 =
+    #: no check).  The runner's heal and lock folds send it; an operator's
+    #: merge does not — see :func:`app.gallery.merge`.
+    minFaceCosine: float = 0.0
 
 
 class SplitRequest(BaseModel):
@@ -514,6 +525,7 @@ def health() -> dict:
         "reviewClothesSelfMin": config.review_clothes_self_min(),
         "reviewClothesWellSeenN": config.review_clothes_well_seen_n(),
         "reviewClothesWellSeenClash": config.review_clothes_well_seen_clash(),
+        "reviewClothesBurstClash": config.review_clothes_burst_clash(),
         "reviewHeadClash": config.review_head_clash(),
         "reviewBeardMinN": config.review_beard_min_n(),
         "reviewBeardPale": config.review_beard_pale(),
@@ -713,6 +725,7 @@ def merge(body: MergeRequest) -> dict:
     The cap is passed through because the survivor inherits both identities'
     templates and would otherwise sit above it — see :func:`gallery.merge`.
     """
+    why: dict = {}
     try:
         merged, n = gallery.merge(
             config.data_dir(),
@@ -721,10 +734,12 @@ def merge(body: MergeRequest) -> dict:
             body.drop,
             config.templates_per_person(),
             only_if_singleton=body.onlyIfSingleton,
+            min_face_cosine=body.minFaceCosine,
+            why=why,
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return {"merged": merged, "galleryN": n}
+    return {"merged": merged, "galleryN": n, **why}
 
 
 @app.post("/exclude")
@@ -842,6 +857,7 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             headwear_turban_p=config.review_headwear_turban_p(),
             headwear_bare_p=config.review_headwear_bare_p(),
             headwear_cap_p=config.review_headwear_cap_p(),
+            clothes_burst_clash=config.review_clothes_burst_clash(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e

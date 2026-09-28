@@ -878,6 +878,57 @@ def test_without_the_flag_a_multi_template_merge_still_works(client):
     assert out == {"merged": True, "galleryN": 1}
 
 
+def test_min_face_cosine_refuses_a_fold_between_two_different_faces(client, tmp_path):
+    """The Sharon clip's lock fold (2026-09-29): the tracker handed p00022's
+    box to another man, whose fresh key was folded into p00022 at a face score
+    of about 0.0 — one guest short, and one record holding two men. A machine
+    fold whose faces disagree is refused, the reply says why, nothing moves."""
+    first = _match(client, "run-fold", pose(0.0))
+    stranger = _match(client, "run-fold", pose(90.0))  # cosine 0.0: somebody else
+    assert stranger["isNew"] is True
+
+    out = _merge(
+        client, "run-fold", first["personKey"], stranger["personKey"],
+        onlyIfSingleton=True, minFaceCosine=0.10,
+    )
+    assert out["merged"] is False and out["galleryN"] == 2
+    assert out["refused"] == "faces-disagree"
+    assert out["faceCosine"] == pytest.approx(0.0, abs=1e-6)
+    assert len(_templates(tmp_path, "run-fold", stranger["personKey"])) == 1
+
+
+def test_min_face_cosine_still_folds_the_same_face_missed(client):
+    """The fold's reason to exist survives the guard: tonight's same-man miss
+    (0.347) folds at 0.10, and the reply carries the score it measured."""
+    a, b, _ = tonight_views()
+    first = _match(client, "run-fold2", a)
+    junk = _match(client, "run-fold2", b)
+    out = _merge(
+        client, "run-fold2", first["personKey"], junk["personKey"],
+        onlyIfSingleton=True, minFaceCosine=0.10,
+    )
+    assert out["merged"] is True and out["galleryN"] == 1
+    assert out["faceCosine"] == pytest.approx(TONIGHT_AB, abs=1e-3)
+    assert "refused" not in out
+
+
+def test_an_operator_merge_sends_no_face_guard(client):
+    """Off is off: an operator looked at the two faces, so their merge of two
+    different-looking keys still lands, and the reply is exactly as before."""
+    a = _match(client, "run-fold3", pose(0.0))
+    b = _match(client, "run-fold3", pose(90.0))
+    out = _merge(client, "run-fold3", a["personKey"], b["personKey"])
+    assert out == {"merged": True, "galleryN": 1}
+
+
+def test_the_face_guard_is_checked_after_the_singleton_rule(client):
+    """A re-sighted drop is refused as before, without a face score."""
+    _match(client, "run-fold4", pose(150.0))
+    _walk(client, "run-fold4", arc(3, 35.0))  # p00002 with 3 views
+    out = _merge(client, "run-fold4", "p00001", "p00002", onlyIfSingleton=True, minFaceCosine=0.10)
+    assert out == {"merged": False, "galleryN": 2}
+
+
 def test_only_if_singleton_still_respects_cannot_link(client):
     """An operator's split beats the heal even when the drop is a singleton.
 

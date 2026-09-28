@@ -33,7 +33,7 @@ evidence (project hard rule: measure first).
 | POST | `/reset` | `{runId}` | `{ok, runId}` — wipes the run's gallery |
 | POST | `/match` | `{runId, embedding, quality?, siteId?, appearance?, attributes?, featNorm?, body?, head?, beard?}` | `{personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId, templateN, templateAdded, appearanceSim, appearanceVetoed, nearMiss: {key, cosine, appearanceSim, basis} \| null}` |
 | POST | `/staff/enrol` | `{siteId, staffId, samples:[{embedding, quality?, subCanon?}]}` | `{staffId, sampleCount}` |
-| POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?}` | `{merged, galleryN}` — *duplicate* correction; `onlyIfSingleton` guards the runner's track heal |
+| POST | `/merge` | `{runId, keep, drop, onlyIfSingleton?, minFaceCosine?}` | `{merged, galleryN, faceCosine?, refused?}` — *duplicate* correction; `onlyIfSingleton` and `minFaceCosine` guard the runner's heal and lock folds |
 | POST | `/split` | `{runId, a, b}` | `{ok, galleryN}` — *false-match* correction, **or the runner's co-presence assertion** (same door, same meaning) |
 | POST | `/mark-staff` | `{runId, personKey, siteId, staffId?}` | `{moved, galleryN, staffKey}` — **400 without a siteId** |
 | POST | `/count/manual` | `{runId, note?}` | `{personKey, galleryN, manual:true}` — *missed* correction |
@@ -90,6 +90,13 @@ already been answered. See the near-miss section below.
   has been independently re-sighted and is no longer safely foldable by
   heuristic. Operator merges omit the flag and behave exactly as before; a
   cannot-link split refuses the merge either way.
+- **`/merge` with `minFaceCosine` > 0 refuses when the faces disagree**
+  (0.19.0): the best face score between the two keys' templates must reach
+  it, or the reply is `merged: false, refused: "faces-disagree"` with the
+  `faceCosine` it measured. The runner's heal and lock folds send 0.10
+  (`HECO_FOLD_MIN_FACE_COSINE`) — a fold rests on a track, and a tracker that
+  hands one guest's box to another made the Sharon clip's lock fold put an
+  older man into p00022 at a face score of about 0.0.
 - **`/count/manual` is the only lever that moves the count UP.** Under-counting
   is the dominant failure mode (open-set 1:N at a 1:1 verification threshold),
   so a *missed* correction mints an `m#####` person with NO embedding: counted,
@@ -440,6 +447,17 @@ against a blue one (0.374) and a black kurta against a light check
 (0.496); 0.55 sets both aside. Older galleries (f0bfc5, c84098, 8b8b87)
 replay unchanged.
 
+**The one-crossing tier (0.19.0).** A side whose reads all fall inside two
+seconds used to have no clothing at all, however well its reads agreed; the
+Sharon clip kept a light shirt against a dark one (best cross 0.12, 10 and
+28 reads agreeing at 0.93 and 0.96) in the queue that way. Such a side now
+speaks under `HECO_REVIEW_CLOTHES_BURST_CLASH` (0.25) — same read count and
+self-agreement bars. Measured on six galleries (the 19 Sep D02 clip and the
+Sharon clip, three runs each): an identity's first crossing against its own
+reads 12 s and more later never scored under 0.61 (32 identities); the
+Sharon stable run's queue drops from 8 to 7, and nothing a same-person split
+produced is touched.
+
 **The head covering (0.16.0) — LOG-ONLY by default.** The colour head rule
 cannot tell a dark turban from black hair, so it never sets covered against
 bare; run 8b8b87's pair p00005/p00009 (a sky-blue turban against a bare man)
@@ -552,6 +570,7 @@ even in identical clothes, and `/health` reports both new knobs.
 | `HECO_REVIEW_CLOTHES_MIN_N` | `3` | v3 torso reads (spanning two seconds) each identity needs before its clothing counts; clamped to at least 2. |
 | `HECO_REVIEW_CLOTHES_WELL_SEEN_N` | `8` | Torso reads BOTH identities need before the well-seen clash applies. **0 disables the tier** (the 0.35 rule stays). |
 | `HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH` | `0.55` | The clothing clash for a well-seen pair (both sides at `WELL_SEEN_N` reads or more). |
+| `HECO_REVIEW_CLOTHES_BURST_CLASH` | `0.25` | The clothing clash when a side's reads span under two seconds (one crossing); `0` = such a side never speaks. |
 | `HECO_REVIEW_HEAD_CLASH` | `0.45` | Best cross head intersection under which two HEADWEAR identities (both heads at least half chromatic) that each read one head are set aside. **0 disables head set-asides.** |
 | `HECO_REVIEW_BEARD_MIN_N` | `3` | Beard reads (over two seconds) each identity needs before none-vs-dark or dark-vs-white sets a pair aside. **0 disables beard set-asides.** |
 | `HECO_REVIEW_BEARD_PALE` | `0` | `1` lets none against a grey or white beard set a pair aside too (off: a warm light reads a white beard as none). |

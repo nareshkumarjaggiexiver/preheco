@@ -770,6 +770,8 @@ def merge(
     drop: str,
     templates_per_person: int = 0,
     only_if_singleton: bool = False,
+    min_face_cosine: float = 0.0,
+    why: dict | None = None,
 ) -> tuple[bool, int]:
     """Fold ``drop`` into ``keep`` (a *duplicate* correction).
 
@@ -807,11 +809,38 @@ def merge(
     ``templates_per_person`` of 0 or 1 prunes nothing, which is the pre-M1
     behaviour — so a caller that has not opted into multi-template gets exactly
     what it got before.
+
+    THE FACES MUST NOT DISAGREE (``min_face_cosine``, 2026-09-29).  A machine
+    fold rests on a TRACK: this box held X a moment ago, so a new face on it
+    is X again.  When the tracker hands the box to somebody else, that is
+    false — the Sharon clip's lock fold put p00031, an older man, into p00022
+    at a face score of about 0.0, and every later sighting of him then
+    enrolled into p00022: one guest short, and a guest record holding two
+    men.  With ``min_face_cosine`` > 0 the merge is refused unless the best
+    face score between ``drop``'s and ``keep``'s templates reaches it.  The
+    runner sends 0.10 for its heal and lock folds: certainly-different people
+    (co-present) score 0.12 at the median, and the lowest same-person fold on
+    record scored 0.21.  Operator merges send nothing — an operator looked at
+    two faces.  ``why`` (when given) receives ``faceCosine`` whenever the
+    score was computed and ``refused: "faces-disagree"`` on a refusal; an
+    identity with no template to compare is not a disagreement (absent is
+    not zero) and proceeds.
     """
     store = open_store(db_path(data_dir, run_id))
     with store.transaction():
         if only_if_singleton and store.count_for(drop) != 1:
             return False, store.distinct_count()
+        if min_face_cosine > 0:
+            a = [as_unit(v) for v in store.vectors_for(drop)]
+            b = [as_unit(v) for v in store.vectors_for(keep)]
+            if a and b:
+                best = max(float(x @ y) for x in a for y in b)
+                if why is not None:
+                    why["faceCosine"] = round(best, 4)
+                if best < min_face_cosine:
+                    if why is not None:
+                        why["refused"] = "faces-disagree"
+                    return False, store.distinct_count()
         merged = store.merge(keep, drop)
         if merged and templates_per_person > 1:
             store.prune_redundant(keep, templates_per_person)
@@ -1380,6 +1409,7 @@ def clothes_apart(
     clash: float,
     min_n: int,
     self_min: float,
+    burst_clash: float = 0.0,
 ) -> bool:
     """Do two identities' clothes say they are two people?
 
@@ -1390,15 +1420,26 @@ def clothes_apart(
     self-agreement is what makes the cross meaningful: an identity whose
     own reads disagree (a merged pair of two people, a band that kept
     catching a pillar) has no clothing to compare.  ``clash <= 0`` is off.
+
+    A side whose reads span under _CLOTHES_MIN_SPAN_S — one crossing — may
+    still speak when ``burst_clash`` > 0, but only under ``burst_clash``
+    (config.DEFAULT_REVIEW_CLOTHES_BURST_CLASH has the measurement): its
+    reads still have to agree with each other, and a crossing's worth of
+    them is a thinner testimony than two seconds' worth.
     """
     if clash <= 0 or cross is None or ra is None or rb is None:
         return False
+    burst = False
     for r in (ra, rb):
-        if r.n < min_n or r.span_s < _CLOTHES_MIN_SPAN_S:
+        if r.n < min_n:
             return False
+        if r.span_s < _CLOTHES_MIN_SPAN_S:
+            if burst_clash <= 0:
+                return False
+            burst = True
         if r.agreement is None or r.agreement < self_min:
             return False
-    return cross < clash
+    return cross < (min(clash, burst_clash) if burst else clash)
 
 
 def review_duplicates(
@@ -1427,6 +1468,7 @@ def review_duplicates(
     headwear_turban_p: float = 0.8,
     headwear_bare_p: float = 0.5,
     headwear_cap_p: float = 0.0,
+    clothes_burst_clash: float = 0.0,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1490,6 +1532,14 @@ def review_duplicates(
       against a light check (0.496); 0.55 sets both aside.  Galleries
       whose identities carry fewer reads (f0bfc5, c84098, 8b8b87) are
       unchanged, and ``clothes_clash <= 0`` still turns clothing off.
+    * **One crossing may speak, softly (2026-09-29).**  An identity whose
+      reads all fall inside two seconds used to have no clothing at all,
+      however well they agreed — which kept a light shirt against a dark
+      one (0.12) in the Sharon queue.  With ``clothes_burst_clash`` > 0 such
+      a side still counts, but the pair is set aside only under that lower
+      bar (config.DEFAULT_REVIEW_CLOTHES_BURST_CLASH carries the six-gallery
+      measurement: an identity's first crossing against its own later reads
+      never scored under 0.61).
 
     * **Sex, age and stature may SET A PAIR ASIDE (v4, 2026-09-24)** — after
       the band test and before the cap, so an excluded pair neither costs a
@@ -1685,7 +1735,9 @@ def review_duplicates(
             headwear_min_n, gender_min_p, cap=headwear_cap_p > 0,
         )
         colour = []
-        if clothes_apart(ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min) or (
+        if clothes_apart(
+            ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min, clothes_burst_clash,
+        ) or (
             clothes_clash > 0
             and clothes_well_seen_n > 0
             and clothes_apart(

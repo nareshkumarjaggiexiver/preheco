@@ -198,14 +198,72 @@ def test_under_three_reads_never_sets_aside(client, ticking):
     assert in_queue(review(client), kh, ks)
 
 
-def test_three_reads_inside_two_seconds_are_one_moment(client, monkeypatch):
-    """Three consecutive frames are one pose under one light, read three times."""
+@pytest.fixture()
+def one_moment(monkeypatch):
+    """A store clock that moves a quarter second per write: one crossing."""
     t0 = datetime(2026, 9, 24, 21, 0, 0, tzinfo=UTC)
     counter = itertools.count()
     monkeypatch.setattr(
         store, "_now",
         lambda: (t0 + timedelta(milliseconds=250 * next(counter))).isoformat(),
     )
+
+
+#: 2/9 red, 7/9 blue: agrees with RED at exactly 0.30 — under the two-second
+#: clash (0.35), over the one-crossing one (0.25).
+THIRD_RED = torso({0: 2.0, 24: 7.0})
+
+
+def test_three_reads_inside_two_seconds_are_one_moment(client, one_moment, monkeypatch):
+    """Three consecutive frames are one pose under one light, read three times:
+    with the one-crossing tier off they say nothing at all."""
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_BURST_CLASH", "0")
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    ks = sightings(client, "r", spoke(1), [BLUE] * 3)
+    assert in_queue(review(client), kh, ks)
+
+
+def test_one_crossing_that_clashes_hard_is_set_aside(client, one_moment):
+    """The Sharon pair p00020/p00041 (2026-09-29): a light shirt against a dark
+    one at 0.12, one side's ten reads inside 0.8 s. One crossing still speaks
+    — under the one-crossing clash."""
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    ks = sightings(client, "r", spoke(1), [BLUE] * 3)
+    got = review(client)
+    assert not in_queue(got, kh, ks)
+    assert got["excluded"]["clothes"] == 1
+    (row,) = got["setAside"]
+    assert row["reasons"] == ["clothes"]
+    assert row["why"]["clothes"]["cross"] == pytest.approx(0.10)
+
+
+def test_one_crossing_needs_the_lower_bar(client, one_moment):
+    """0.30 sets a two-second pair aside (under 0.35) but not a one-crossing
+    one (over 0.25): a crossing's reads are a thinner testimony."""
+    assert best_cross([np.asarray(RED)], [np.asarray(THIRD_RED)]) == pytest.approx(0.30)
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    ks = sightings(client, "r", spoke(1), [THIRD_RED] * 3)
+    got = review(client)
+    assert in_queue(got, kh, ks) and got["excluded"]["clothes"] == 0
+
+
+def test_the_same_clash_over_two_seconds_is_set_aside(client, ticking):
+    """The control for the test above: THIRD_RED over three seconds each side."""
+    kh = sightings(client, "r", hub(), [RED] * 3)
+    ks = sightings(client, "r", spoke(1), [THIRD_RED] * 3)
+    assert not in_queue(review(client), kh, ks)
+
+
+def test_one_crossing_still_needs_its_reads_to_agree(client, one_moment):
+    """Red, blue, red inside a second is no testimony, one crossing or not."""
+    kh = sightings(client, "r", hub(), [RED, BLUE, RED])
+    ks = sightings(client, "r", spoke(1), [torso({12: 1.0})] * 3)
+    assert in_queue(review(client), kh, ks)
+
+
+def test_clash_zero_turns_the_one_crossing_tier_off_too(client, one_moment, monkeypatch):
+    """CLOTHES_CLASH 0 is clothing off, whatever the tier's own knob says."""
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_CLASH", "0")
     kh = sightings(client, "r", hub(), [RED] * 3)
     ks = sightings(client, "r", spoke(1), [BLUE] * 3)
     assert in_queue(review(client), kh, ks)
@@ -419,6 +477,7 @@ def test_health_reports_the_clothing_policy_and_min_n_is_at_least_two(client, mo
     assert body["reviewClothesSelfMin"] == pytest.approx(0.6)
     assert body["reviewClothesWellSeenN"] == 8
     assert body["reviewClothesWellSeenClash"] == pytest.approx(0.55)
+    assert body["reviewClothesBurstClash"] == pytest.approx(0.25)
     for name in (
         "HECO_REVIEW_CLOTHES_CLASH", "HECO_REVIEW_CLOTHES_MIN_N", "HECO_REVIEW_CLOTHES_SELF_MIN",
     ):
