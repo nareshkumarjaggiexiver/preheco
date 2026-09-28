@@ -27,6 +27,15 @@ the wire contract as code:
   - `report_enrolment(staffId, enrolledAt, sampleCount)` — confirm a staff
     enrolment (`PUT /api/staff/:id`); this one retries (the samples are already
     stored, so the report is worth a retry).
+  - `durable=True` (opt-in; the runner turns it on): what the planner is away
+    for — taps, frames, face cards, frame records, a failed run end — is kept
+    in a bounded in-memory `Outbox` and delivered in order by one background
+    thread instead of dropped. The first attempt is unchanged. Each post has
+    an `offer_*` twin answering `accepted` / `queued` / `dropped` (a caller
+    that re-sends on failure must not re-send a queued write), every durable
+    write carries `X-Heco-Delivery` / `X-Heco-At`, and `outbox_stats()` says
+    what was delivered, dropped and is held. CONTRACTS.md: "a planner restart
+    loses nothing the runner posted".
 
 **Run.** It is a library — nothing to run. Field names are deliberately
 camelCase to mirror the JSON wire format byte-for-byte.
@@ -41,5 +50,7 @@ make lint   # ruff, root ruff.toml
 
 **Tune.** Nothing here reads env itself except through `heco_common.config`;
 services own their env names. `PlannerClient` retry/batch knobs are
-constructor arguments (`retries`, `backoff_s`, `batch_size`) so the runner can
-expose them as env without this library guessing names.
+constructor arguments (`retries`, `backoff_s`, `batch_size`, and for the
+outbox `durable`, `outbox_max_bytes`, `outbox_stale_frame_s`,
+`drain_timeout_s`) so the runner can expose them as env without this library
+guessing names.
