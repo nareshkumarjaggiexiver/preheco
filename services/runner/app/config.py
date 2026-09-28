@@ -430,6 +430,16 @@ class Settings:
     # (a squarer look at the same size moves the score by 15-50%).
     face_card_improve: float = 1.15
 
+    # THE PICTURE BELONGS TO ITS PERSON (loop._maybe_face_card, 2026-09-28).
+    # A better look may replace a guest's card only when its face agrees with
+    # the face ALREADY on the card at this cosine or above — not merely with
+    # some template of the identity. At JD Grand (run 71eb8e) two look-alike
+    # men matched p00296 and p00297 near the 0.363 line for a frame each, and
+    # their closer, clearer faces took over both cards; later the identity
+    # itself drifted (a third man matched p00297 at 0.70), so the verdict's
+    # cosine alone cannot guard the card. 0 turns the check off.
+    face_card_same_min: float = 0.5
+
     # CO-PRESENCE SPLITS (see loop._assert_co_presence).  1 = on, 0 = off.
     #
     # THE MEASUREMENT (run 05b3b7, 2026-08-06, ground truth THREE people,
@@ -638,6 +648,7 @@ def from_env() -> Settings:
         ),
         same_frame_clash=env_float("HECO_SAME_FRAME_CLASH", s.same_frame_clash),
         face_card_improve=env_float("HECO_FACE_CARD_IMPROVE", s.face_card_improve),
+        face_card_same_min=env_float("HECO_FACE_CARD_SAME_MIN", s.face_card_same_min),
         copresence_split=env_int("HECO_COPRESENCE_SPLIT", s.copresence_split),
         presence_split=env_int("HECO_PRESENCE_SPLIT", s.presence_split),
         quality_min_feat_norm=env_float(
