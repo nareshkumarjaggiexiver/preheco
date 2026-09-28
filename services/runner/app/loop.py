@@ -897,6 +897,9 @@ class RunLoop:
         #: sample: the whole point is that every frame is in here.
         self._frame_ledger: list[dict] = []
         self._face_cards: dict[str, float] = {}
+        # The embedding of the face on each guest's card (queued or uploaded):
+        # the reference a replacement must agree with (_maybe_face_card).
+        self._face_card_vecs: dict[str, list] = {}
         self._face_pending: dict[str, tuple[bytes, float]] = {}
         self._copresence_sent: set[str] = set()
         # Whether the cap has already been reported; the warning is worth
@@ -2687,6 +2690,10 @@ class RunLoop:
             # frontal and unobstructed this look is.
             if norm is not None and isinstance(m, dict):
                 m.setdefault("featNorm", norm)
+            # ...and its embedding, so the card can be kept to the person it
+            # shows (_maybe_face_card). Private: never copied into a tap.
+            if isinstance(m, dict):
+                m["_embedding"] = emb
             board.frame("match")
             if m.get("cosine") is not None:
                 board.observe("match", "matchCosine", float(m["cosine"]))
@@ -3086,6 +3093,7 @@ class RunLoop:
         # its absence is exactly the dead defence this codebase keeps catching.
         # "Better" is the card quality (size x pose x clarity), not width.
         width = self._card_quality(face, m)
+        vec = m.get("_embedding")
         # LOCKED, because the reporter thread reads this dict while uploading.
         # _flush_face_cards was always written for a concurrent writer ("a
         # better crop may have arrived while the upload was in flight") but
@@ -3099,7 +3107,21 @@ class RunLoop:
                 self._face_cards.get(key, 0.0),
                 self._face_pending.get(key, (None, 0.0))[1],
             )
+            card_vec = self._face_card_vecs.get(key)
         if best and width < best * self.s.face_card_improve:
+            return
+        # THE PICTURE BELONGS TO ITS PERSON (2026-09-28, JD Grand run 71eb8e):
+        # a look-alike matched near the line for one frame, and being closer
+        # and clearer, its face replaced the guest's card — p00296 showed the
+        # man beside him, p00297 a man who walked in 26 minutes later. So a
+        # replacement must agree with the face already on the card, not only
+        # with the identity (whose templates can drift). Without both vectors
+        # (an old verdict, a card from before this rule) the card is judged
+        # as before.
+        if (
+            card_vec is not None and vec is not None and self.s.face_card_same_min > 0
+            and _cosine(vec, card_vec) < self.s.face_card_same_min
+        ):
             return
         # Encoding stays OUTSIDE the lock: ~1 ms of JPEG work holding a lock
         # the reporter needs would hand back the stall this change removes.
@@ -3122,6 +3144,8 @@ class RunLoop:
             if current and width < current * self.s.face_card_improve:
                 return
             self._face_pending[key] = (jpeg, width)
+            if vec is not None:
+                self._face_card_vecs[key] = vec
 
     def _flush_face_cards(self, deadline: float) -> None:
         """Upload the face cards waiting from recent frames, inside the round.
@@ -5537,6 +5561,15 @@ def _clocked(fn) -> tuple:
 def _count(v) -> bool:
     """Whether ``v`` is a count: a non-negative int (a JSON bool is not one)."""
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _cosine(a, b) -> float:
+    """Cosine of two embeddings; 0.0 for an empty or zero vector. Plain Python:
+    it runs only when a card is about to be replaced, a handful of times per guest."""
+    dot = sum(float(x) * float(y) for x, y in zip(a, b))
+    na = sum(float(x) * float(x) for x in a) ** 0.5
+    nb = sum(float(y) * float(y) for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
 
 
 def _fmt(x) -> str:
