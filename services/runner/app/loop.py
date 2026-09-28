@@ -570,12 +570,23 @@ class MatchClient:
                 return self._call("/match", bare)
             raise
 
-    def merge(self, *, doomed: str, keeper: str, only_if_singleton: bool = True) -> dict:
-        """Fold one identity into another."""
-        return self._call("/merge", {
+    def merge(
+        self, *, doomed: str, keeper: str, only_if_singleton: bool = True,
+        min_face_cosine: float = 0.0,
+    ) -> dict:
+        """Fold one identity into another.
+
+        ``min_face_cosine`` > 0 asks the match service (0.19.0) to refuse when
+        the two identities' faces disagree — the reply then carries
+        ``refused: "faces-disagree"``.  An older service ignores the field.
+        """
+        wire = {
             "runId": self._run_id, "keep": keeper, "drop": doomed,
             "onlyIfSingleton": only_if_singleton,
-        })
+        }
+        if min_face_cosine > 0:
+            wire["minFaceCosine"] = min_face_cosine
+        return self._call("/merge", wire)
 
     def split(self, *, a: str, b: str) -> dict:
         """Assert two identities are different people."""
@@ -1067,6 +1078,11 @@ class RunLoop:
             # each /match reply's appearanceVetoed flag).
             "healVetoedByAppearance": 0,
             "enrolVetoedByAppearance": 0,
+            # foldVetoedByFace: heal and lock folds the match service refused
+            # because the two identities' faces disagree (HECO_FOLD_MIN_FACE_
+            # COSINE) — each one a guest the tracker would have folded into a
+            # stranger, kept in the count instead.
+            "foldVetoedByFace": 0,
             # appearanceRefused: /match calls the match service answered 422
             # about the torso descriptor (a release behind: it only knows the
             # 48-float v2) and that were re-asked without it.  Non-zero means
@@ -2229,6 +2245,9 @@ class RunLoop:
             # numbers months from now must see when the veto was doing the
             # refusing.
             f"healVetoedByAppearance={st['healVetoedByAppearance']} "
+            # Folds the FACE refused (match 0.19.0): a track that moved to
+            # somebody else, caught where the clothing could not see it.
+            f"foldVetoedByFace={st['foldVetoedByFace']} "
             # Folds that proceeded on a mediocre clothing reading.  Beside the
             # veto on purpose: together they say what the clothing signal
             # actually did — how often it refused, and how often it was too
@@ -2275,6 +2294,7 @@ class RunLoop:
             "frameRecordsDropped": st["frameRecordsDropped"],
             "distinctTracks": st["distinctTracks"],
             "healVetoedByAppearance": st["healVetoedByAppearance"],
+            "foldVetoedByFace": st["foldVetoedByFace"],
             "healUncertainAppearance": st["healUncertainAppearance"],
             "enrolVetoedByAppearance": st["enrolVetoedByAppearance"],
             "appearanceRefused": st["appearanceRefused"],
@@ -4234,7 +4254,10 @@ class RunLoop:
             ):
                 continue
             try:
-                r = self.match_port.merge(doomed=minted_key, keeper=matched_key)
+                r = self.match_port.merge(
+                    doomed=minted_key, keeper=matched_key,
+                    min_face_cosine=self.s.fold_min_face_cosine,
+                )
             except Exception as e:  # noqa: BLE001 — a heal must never stop the count
                 # Transient (match hiccup): put the bookkeeping back; the next
                 # verdict on this track retries while the window lasts.
@@ -4252,6 +4275,13 @@ class RunLoop:
                     f"healed split: track {track_id} minted {minted_key} "
                     f"(cosine={_fmt(entry['cosine'])}) then matched {matched_key} "
                     f"(cosine={_fmt(cosine)}) — mint folded, unique -1"
+                )
+            elif r.get("refused") == "faces-disagree":
+                self._bump("foldVetoedByFace")
+                self.log.info(
+                    f"heal refused for track {track_id}: {minted_key} and {matched_key} "
+                    f"are different faces (face score {_fmt(r.get('faceCosine'))}) — "
+                    "the track moved to somebody else; count unchanged"
                 )
             else:
                 self.log.info(
@@ -4455,6 +4485,13 @@ class RunLoop:
           the fold and counts ``healVetoedByAppearance``, and it also DROPS
           the lock: a clash says this track is probably carrying a different
           person now, and a lock about the wrong person is worse than no lock.
+        * the face guard (``fold_min_face_cosine``, match 0.19.0, 2026-09-29)
+          — the match service refuses the fold when the two identities' best
+          face score is under it, counted in ``foldVetoedByFace``, and that
+          too drops the lock.  On the Sharon clip the tracker moved p00022's
+          box onto an older man in similar dark clothes; his fresh key scored
+          about 0.0 against p00022 and was folded in anyway — the clothing
+          could not see it, the face could.
 
         WHY IT IS ENV-GATED AND COUNTED SEPARATELY.  A wrong split over-counts
         and somebody argues about the invoice; a wrong MERGE under-counts
@@ -4507,7 +4544,10 @@ class RunLoop:
                 self._locks.pop(track_id, None)
             return False
         try:
-            r = self.match_port.merge(doomed=minted_key, keeper=locked_key)
+            r = self.match_port.merge(
+                doomed=minted_key, keeper=locked_key,
+                min_face_cosine=self.s.fold_min_face_cosine,
+            )
         except Exception as e:  # noqa: BLE001 — a fold must never stop the count
             # Transient (match hiccup): the lock stays, and the mint falls
             # through to the heal bookkeeping, so both mechanisms still have a
@@ -4527,6 +4567,19 @@ class RunLoop:
                 "spot, unique -1"
             )
             return True
+        if r.get("refused") == "faces-disagree":
+            # The face says the box is on somebody else now: the lock is about
+            # the wrong person, so drop it before the next mint on this track
+            # is folded into a stranger too (the clothing clash does the same).
+            self._bump("foldVetoedByFace")
+            with self._lock:
+                self._locks.pop(track_id, None)
+            self.log.info(
+                f"lock fold refused for track {track_id}: {minted_key} and {locked_key} "
+                f"are different faces (face score {_fmt(r.get('faceCosine'))}) — the "
+                "tracker moved to somebody else; lock dropped, count unchanged"
+            )
+            return False
         self.log.info(
             f"lock fold refused for track {track_id}: {minted_key} is no longer a "
             f"singleton or is split from {locked_key} — count unchanged, which is "

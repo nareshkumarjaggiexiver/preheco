@@ -347,6 +347,15 @@ class Settings:
     # gated, counted (lockedTrackFolds) and guarded by the same clothing bands
     # as the heal.
     track_lock_min_cosine: float = 0.45
+    # FACE GUARD ON BOTH FOLDS (2026-09-29).  A heal or lock fold rests on a
+    # TRACK, and a tracker that hands one guest's box to another folds a
+    # stranger in: on the Sharon clip the lock put p00031, an older man, into
+    # p00022 at a face score of about 0.0 — one guest short, the record then
+    # holding two men.  The match service (0.19.0) refuses a fold whose two
+    # identities' best face score is under this.  0.10: certainly-different
+    # people (co-present) score 0.12 at the median over six galleries, the
+    # lowest same-person fold on record 0.21 (bench 6e1a5d).  0 = off.
+    fold_min_face_cosine: float = 0.10
     # HEAL APPEARANCE BANDS (see loop._appearance_refuses and app/appearance.py).
     # A fold candidate's remembered torso descriptor is compared with the
     # current frame's by histogram intersection, and the reading falls in one
@@ -653,6 +662,7 @@ def from_env() -> Settings:
         track_lock_min_cosine=env_float(
             "HECO_TRACK_LOCK_MIN_COSINE", s.track_lock_min_cosine
         ),
+        fold_min_face_cosine=env_float("HECO_FOLD_MIN_FACE_COSINE", s.fold_min_face_cosine),
         heal_appearance_clash=env_float(
             "HECO_HEAL_APPEARANCE_CLASH", s.heal_appearance_clash
         ),
@@ -711,4 +721,6 @@ def knobs(s: Settings) -> dict:
         # The head-covering reads for the review (background worker), off by default.
         "HECO_HEADWEAR": s.headwear,
         "HECO_HEADWEAR_QUEUE": s.headwear_queue,
+        # Not a throughput lever either: the face guard on heal and lock folds.
+        "HECO_FOLD_MIN_FACE_COSINE": s.fold_min_face_cosine,
     }

@@ -335,6 +335,9 @@ services:
       # clash of 0.55 instead (match config.py says why); N 0 = off.
       HECO_REVIEW_CLOTHES_WELL_SEEN_N: ${HECO_REVIEW_CLOTHES_WELL_SEEN_N-}
       HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH: ${HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH-}
+      # ONE CROSSING (0.19.0): a side whose reads span under 2 s may still set
+      # a pair aside, under this lower clash (default 0.25; 0 = off).
+      HECO_REVIEW_CLOTHES_BURST_CLASH: ${HECO_REVIEW_CLOTHES_BURST_CLASH-}
       # HEAD AND BEARD SET-ASIDES (0.14.0), read per sighting beside the torso.
       # HEAD_CLASH: two HEADWEAR identities (turban against turban; a covered
       # head is never set against a bare one - dupattas and rumals come and
@@ -432,6 +435,14 @@ services:
       # every mechanism that makes track identity more authoritative ships
       # with an off switch and its own counter.
       HECO_TRACK_LOCK_MIN_COSINE: ${HECO_TRACK_LOCK_MIN_COSINE-}
+      # FACE GUARD on BOTH folds (heal and lock), 2026-09-29: the match service
+      # refuses the fold when the two identities' best face score is under this
+      # (default 0.10; 0 = off; needs match 0.19.0). The Sharon clip's tracker
+      # handed p00022's box to another man and the lock folded him in at a
+      # face score of ~0.0 — one guest short. Different people score 0.12 at
+      # the median; the lowest same-person fold on record scored 0.21.
+      # Counted in foldVetoedByFace.
+      HECO_FOLD_MIN_FACE_COSINE: ${HECO_FOLD_MIN_FACE_COSINE-}
       # Clothing guard on BOTH folds (heal and lock), three bands, not a cliff:
       # below CLASH (default 0.35) is a genuine disagreement and refuses the
       # fold (healVetoedByAppearance); CLASH..UNSURE (default 0.55) proceeds

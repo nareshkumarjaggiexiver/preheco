@@ -369,6 +369,21 @@ DEFAULT_REVIEW_CLOTHES_SELF_MIN = 0.6
 DEFAULT_REVIEW_CLOTHES_WELL_SEEN_N = 8
 DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH = 0.55
 
+# THE ONE-CROSSING TIER (2026-09-29).  CLOTHES_CLASH asks each identity for
+# reads spanning two seconds, because five reads of one crossing agree with
+# each other trivially.  That kept a light shirt against a dark one — best
+# cross 0.12, 10 and 28 reads agreeing within themselves at 0.93 and 0.96 —
+# in the Sharon queue (p00020/p00041 on the bff5dce re-run, a pair the
+# operator judged two people): p00020's ten reads sat inside 0.8 s.  Measured
+# on six galleries (the 19 Sep D02 clip x3, the Sharon clip x3): an
+# identity's FIRST crossing (reads inside 2 s) against its own reads 12 s and
+# more later never scored a best cross under 0.61 (32 identities, p5 0.64),
+# while certainly-different people (co-present) fell under 0.39 one time in
+# ten.  So a side whose reads span under two seconds may still set a pair
+# aside, at BURST_CLASH — well under the lowest one-crossing same-person
+# score.  0 turns the tier off; CLOTHES_CLASH 0 turns it off too.
+DEFAULT_REVIEW_CLOTHES_BURST_CLASH = 0.25
+
 # Head: turban and hair colour above the eyes, per sighting in the body log,
 # under the clothing rule's own-testimony bar (three reads over two seconds
 # agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
@@ -539,6 +554,14 @@ def review_clothes_well_seen_clash() -> float:
     """Best cross-torso intersection under which a WELL-SEEN pair is set aside
     (env HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH)."""
     return _env_f("HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH)
+
+
+def review_clothes_burst_clash() -> float:
+    """Best cross-torso intersection under which a pair is set aside when a
+    side's reads span under two seconds — one crossing (env
+    HECO_REVIEW_CLOTHES_BURST_CLASH; 0 = off, and CLOTHES_CLASH 0 turns it
+    off too)."""
+    return _env_f("HECO_REVIEW_CLOTHES_BURST_CLASH", DEFAULT_REVIEW_CLOTHES_BURST_CLASH)
 
 
 def review_head_clash() -> float:

@@ -688,6 +688,18 @@ here is a MACHINE, and a machine's evidence is weaker than an operator's — a
 key that has accumulated more templates has been independently re-sighted and
 is no longer safely foldable by heuristic. Operator merges are unchanged.
 
+**`POST /merge` gains `minFaceCosine: float = 0` (match 0.19.0, 2026-09-29).**
+When above 0 the merge is REFUSED unless the best face score between the drop
+key's and the keep key's templates reaches it; the reply then carries
+`refused: "faces-disagree"` beside `merged=false`, and `faceCosine` whenever
+the score was computed. A key with no template to compare is not a
+disagreement and proceeds. The runner sends `HECO_FOLD_MIN_FACE_COSINE`
+(default 0.10) on its heal and lock folds and counts refusals in
+`foldVetoedByFace`: on the Sharon clip a tracker swap folded p00031 into
+p00022 at a face score of ~0.0, an under-count of one that no other guard
+could see. Operator merges send nothing and are unchanged; a match service
+older than 0.19.0 ignores the field.
+
 **KNOWN RESIDUAL RISK, documented rather than solved.** A tracker identity
 swap — two people crossing paths — can hand a track from person A to person B.
 If A's mint is still a singleton inside the window and B then matches at

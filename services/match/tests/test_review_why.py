@@ -888,9 +888,13 @@ def test_a_person_whose_own_reads_scatter_is_not_evidence(client, tmp_path, tick
 
 
 def test_reads_from_one_moment_are_one_read(client, tmp_path, monkeypatch):
-    """Three reads written in the same second agree trivially: still asks."""
+    """Three reads written in the same second agree trivially: with the
+    one-crossing tier off the pair is still asked; on (the default, 2026-09-29)
+    only a hard clash — 0.10 here, under 0.25 — sets it aside."""
     monkeypatch.setattr(store, "_now", lambda: "2026-09-24T21:00:00+00:00")
     kh, ks = _pair(client, tmp_path, [RED] * 3, [BLUE] * 3)
+    assert frozenset((kh, ks)) not in pairs_of(review(client))
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_BURST_CLASH", "0")
     assert frozenset((kh, ks)) in pairs_of(review(client))
 
 

@@ -100,6 +100,8 @@ class V1Fake:
         self.merge_status: int | None = None
         self.split_status: int | None = None
         self.merge_always_ok = False  # True: distinct drops all succeed (multi-heal)
+        #: True: /merge answers as match 0.19.0 does when the two faces disagree.
+        self.merge_refuse_faces = False
         self.feedback_sticky = False  # re-serve open items until a PUT lands
         # AUTH (v2). The fake mints tokens like the real service: `mints`
         # counts them, and `reject_planner_auth` makes the planner refuse
@@ -183,6 +185,11 @@ class V1Fake:
             # all, and the loop must roll back only for the second.
             if self.merge_status is not None:
                 return httpx.Response(self.merge_status, json={"detail": "no"})
+            if self.merge_refuse_faces:
+                return httpx.Response(200, json={
+                    "merged": False, "galleryN": self.guest_n,
+                    "refused": "faces-disagree", "faceCosine": 0.012,
+                })
             merged = self.merge_ok
             if not self.merge_always_ok:
                 self.merge_ok = False  # a merge is one-shot (drop key is gone)
@@ -898,7 +905,7 @@ def test_track_heal_replays_tonight_and_folds_the_junk_mint():
 
     assert fake.merges == [{
         "runId": "prun-1", "keep": "p00001", "drop": "p00002",
-        "onlyIfSingleton": True,
+        "onlyIfSingleton": True, "minFaceCosine": 0.1,
     }]
     assert final["unique"] == 1, "the folded mint must leave the count at truth"
     assert final["healedSplits"] == 1
@@ -929,7 +936,7 @@ def test_the_double_mint_is_healed_when_the_track_settles_on_its_second_key():
 
     assert fake.merges == [{
         "runId": "prun-1", "keep": "p00004", "drop": "p00003",
-        "onlyIfSingleton": True,
+        "onlyIfSingleton": True, "minFaceCosine": 0.1,
     }], "the earlier mint must fold into the key the track settled on"
     assert final["unique"] == 1, "one woman, one guest — not two"
     assert final["healedSplits"] == 1
@@ -1379,7 +1386,7 @@ def test_heal_proceeds_when_the_torsos_agree():
 
     assert fake.merges == [{
         "runId": "prun-1", "keep": "p00001", "drop": "p00002",
-        "onlyIfSingleton": True,
+        "onlyIfSingleton": True, "minFaceCosine": 0.1,
     }]
     assert final["unique"] == 1
     assert final["healedSplits"] == 1
@@ -1919,7 +1926,7 @@ def test_lock_folds_a_later_mint_without_waiting_for_a_second_match():
 
     assert fake.merges == [{
         "runId": "prun-1", "keep": "p00001", "drop": "p00009",
-        "onlyIfSingleton": True,
+        "onlyIfSingleton": True, "minFaceCosine": 0.1,
     }]
     assert final["unique"] == 1, "one person, one guest"
     assert final["lockedTrackFolds"] == 1
@@ -1998,6 +2005,54 @@ def test_lock_fold_refused_by_the_gallery_counts_nothing():
     assert len(fake.merges) == 1, "attempted once, refused, not retried in a loop"
     assert final["unique"] == 2, "the refused mint keeps its place in the count"
     assert final["lockedTrackFolds"] == 0
+
+
+def test_lock_fold_refused_when_the_faces_disagree():
+    """THE SHARON CLIP (2026-09-29): the tracker moved p00022's box onto an
+    older man in similar dark clothes and the lock folded his fresh key in at
+    a face score of ~0.0 — one guest short. The match service (0.19.0) now
+    refuses a fold whose faces disagree: the guest stays counted, the refusal
+    is counted apart, and the lock about the wrong person is dropped."""
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(LOCK_SCRIPT))
+    fake.merge_refuse_faces = True
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00001", "drop": "p00009",
+        "onlyIfSingleton": True, "minFaceCosine": 0.1,
+    }]
+    assert final["unique"] == 2, "a different face keeps its place in the count"
+    assert final["lockedTrackFolds"] == 0
+    assert final["foldVetoedByFace"] == 1
+    assert "foldVetoedByFace=1" in fake.run_ended["notes"]
+    assert fake.run_ended["results"]["foldVetoedByFace"] == 1
+
+
+def test_heal_refused_when_the_faces_disagree():
+    """The heal rests on the same track evidence and gets the same guard."""
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(TONIGHT_SCRIPT))
+    fake.merge_refuse_faces = True
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request).run()
+
+    assert [m["minFaceCosine"] for m in fake.merges] == [0.1]
+    assert final["unique"] == 2
+    assert final["healedSplits"] == 0
+    assert final["foldVetoedByFace"] == 1
+
+
+def test_the_face_guard_turns_off_and_sends_nothing():
+    """HECO_FOLD_MIN_FACE_COSINE=0: the fold asks exactly what it asked before."""
+    fake = V1Fake(n_frames=3, face_widths=(60.0,), match_script=list(LOCK_SCRIPT))
+    request = {"eventId": "ev-1", "source": {"path": "/x.mp4"}}
+    final = make_loop(fake, request, fold_min_face_cosine=0.0).run()
+
+    assert fake.merges == [{
+        "runId": "prun-1", "keep": "p00001", "drop": "p00009", "onlyIfSingleton": True,
+    }]
+    assert final["lockedTrackFolds"] == 1
+    assert final["foldVetoedByFace"] == 0
 
 
 def test_lock_fold_vetoed_when_the_locked_and_minting_frames_clash():
