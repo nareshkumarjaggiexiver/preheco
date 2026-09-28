@@ -169,7 +169,8 @@ carries information.
   `min(face bottom + 2.5 × face height, person box bottom)`, horizontally the
   person box inset 15% each side. **No descriptor** (None, never zero) when
   the crop is under 24 px in either dimension, there is no containing person
-  box, fewer than 100 unmasked pixels remain, or the frame does not decode —
+  box, fewer than 100 unmasked pixels remain, under 10% of the crop is lit
+  (a black shirt in a dim hall), or the frame does not decode —
   and an absent descriptor never vetoes anything, the codebase-wide
   absent-is-not-zero convention (`gatedUnmeasured` / `zoneUnmeasured`).
 - **Fold guard — the tracker-swap detector, in three bands not one cliff.**

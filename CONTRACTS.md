@@ -800,8 +800,10 @@ one.
   to `min(face bottom + 2.5 × face height, person box bottom)`; horizontally
   the person box inset 15% each side.
 - **No descriptor** when the crop is under 24 px in either dimension, when
-  there is no containing person box, or when fewer than 100 unmasked pixels
-  remain. **Absent is not zero** — an absent descriptor disables every
+  there is no containing person box, when fewer than 100 unmasked pixels
+  remain, or (2026-09-29) when under 10% of the crop is lit — a black shirt
+  in a dim hall leaves only specks (a chest logo, a button), and those are
+  not the garment. **Absent is not zero** — an absent descriptor disables every
   appearance behaviour for that sighting (the `gatedUnmeasured` /
   `zoneUnmeasured` convention applied to clothing).
 - **Similarity**: histogram intersection (sum of element-wise minimums; both
