@@ -185,6 +185,22 @@ class Settings:
     planner_timeout_s: float = 5.0  # retrying planner calls (run, stats, samples)
     report_timeout_s: float = 2.0  # best-effort planner calls (taps/frames/feedback)
 
+    # DURABLE PLANNER WRITES (heco_common.planner.Outbox), on by default.
+    # Best effort used to mean "lost on failure": the planner's restart
+    # dropped every tap and frame the runner posted meanwhile, and runs were
+    # marked failed "the runner went silent".  Durable, a tap, frame, face
+    # card or frame-record batch the planner was away for is kept in memory
+    # and delivered in order once it answers, and so is a run end that could
+    # not be delivered.  The first attempt is exactly as before (same client,
+    # same report_timeout_s); behind a backlog nothing is attempted from the
+    # reporting path at all, so an outage costs the loop less than it did.
+    # The bound is PER RUN, in payload bytes (JPEG bytes, JSON length): past
+    # it live-ring pictures go first, then forensic ones, then the oldest
+    # record — each counted.  Memory only: a runner restart still loses what
+    # is queued.  HECO_PLANNER_DURABLE=0 is exactly the old behaviour.
+    planner_durable: bool = True
+    planner_outbox_max_bytes: int = 512 * 1024 * 1024
+
     # Debug taps (annotated frames + structured payloads) cadence, and the
     # operator-feedback poll cadence (CONTRACTS.md v1: ~2 s / ~3 s). Both are
     # best-effort — a planner hiccup never blocks or crashes the loop.
@@ -641,6 +657,10 @@ def from_env() -> Settings:
         request_timeout_s=env_float("HECO_REQUEST_TIMEOUT_S", s.request_timeout_s),
         planner_timeout_s=env_float("HECO_PLANNER_TIMEOUT_S", s.planner_timeout_s),
         report_timeout_s=env_float("HECO_REPORT_TIMEOUT_S", s.report_timeout_s),
+        planner_durable=env_bool("HECO_PLANNER_DURABLE", s.planner_durable),
+        planner_outbox_max_bytes=env_int(
+            "HECO_PLANNER_OUTBOX_MAX_BYTES", s.planner_outbox_max_bytes
+        ),
         tap_budget_s=env_float("HECO_TAP_BUDGET_S", s.tap_budget_s),
         tap_duty_factor=env_float("HECO_TAP_DUTY_FACTOR", s.tap_duty_factor),
         staff_cooldown_s=env_float("HECO_STAFF_COOLDOWN_S", s.staff_cooldown_s),
@@ -710,4 +730,8 @@ def knobs(s: Settings) -> dict:
         "HECO_HEADWEAR_QUEUE": s.headwear_queue,
         # Not a throughput lever either: the face guard on heal and lock folds.
         "HECO_FOLD_MIN_FACE_COSINE": s.fold_min_face_cosine,
+        # Nor these: whether planner writes survive a planner restart, and the
+        # memory one run's outbox may hold meanwhile (live state: plannerOutbox).
+        "HECO_PLANNER_DURABLE": s.planner_durable,
+        "HECO_PLANNER_OUTBOX_MAX_BYTES": s.planner_outbox_max_bytes,
     }

@@ -491,6 +491,19 @@ services:
       # which is the shape that has been counting all along and is one env var
       # away if a live event ever needs it back.
       HECO_ASYNC_REPORTING: ${HECO_ASYNC_REPORTING-}
+      # DURABLE PLANNER WRITES (0|1, default 1 = on). A tap, frame, face card
+      # or frame-record batch the planner was away for is kept in memory and
+      # delivered in order once it answers, and so is a run end that could
+      # not be delivered. The planner's restart used to drop every tap and
+      # frame the runner posted meanwhile, and runs were marked failed "the
+      # runner went silent". The first attempt is unchanged; behind a backlog
+      # nothing waits on the planner. Memory only: a runner restart still
+      # loses what is queued. Live state: runner /health `plannerOutbox`.
+      HECO_PLANNER_DURABLE: ${HECO_PLANNER_DURABLE-}
+      # The outbox bound PER RUN, in payload bytes (default 536870912 =
+      # 512 MB). Past it live-ring pictures go first, then forensic ones, then
+      # the oldest record — each drop counted (outboxDropped).
+      HECO_PLANNER_OUTBOX_MAX_BYTES: ${HECO_PLANNER_OUTBOX_MAX_BYTES-}
       # Golden decision capture (eval/golden.py). A path here makes the run
       # also write every frame's reasoning to a JSONL file, so a refactor can
       # be proved to have changed nothing. `{runId}` is substituted. Points
