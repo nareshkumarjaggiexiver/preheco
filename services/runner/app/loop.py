@@ -732,6 +732,16 @@ def _clean_attributes(a) -> dict | None:
 
 
 @dataclass
+class _Silent:
+    """An observer that records nothing (``_low_boxes``: zone-filter without counting)."""
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: None
+
+
+_SILENT = _Silent()
+
+
 class _Detections:
     """One frame's detector replies, fetched OFF the loop thread.
 
@@ -1715,7 +1725,12 @@ class RunLoop:
         Takes the FRAME, not its picture, so a transport that carries more
         than the JPEG (a shared-memory frame reference) is one line here.
         """
-        return self._post(f"{self.s.persons_url}/detect", {"imageB64": frame["imageB64"]})
+        body = {"imageB64": frame["imageB64"]}
+        if self.s.tracker_low_conf_min > 0:
+            # The byte tracker's low-score boxes, returned apart (lowBoxes);
+            # `boxes` is unchanged by asking — see Settings.tracker_low_conf_min.
+            body["lowConfMin"] = self.s.tracker_low_conf_min
+        return self._post(f"{self.s.persons_url}/detect", body)
 
     def _post_faces(self, frame: dict, within: list | None) -> dict:
         """POST one frame to faces /detect; ``within`` None searches it whole."""
@@ -2102,6 +2117,7 @@ class RunLoop:
         st = self.status()
         levers = self._lever_counters(st)
         outbox = self._outbox_counters(st)
+        byte = self._tracker_counters(st)
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
@@ -2173,6 +2189,8 @@ class RunLoop:
             # The planner outbox's, when it was used (see OUTBOX_COUNTERS):
             # what reached the planner late, and what never did.
             + "".join(f"{k}={v} " for k, v in outbox.items())
+            # The byte tracker's, when low boxes were asked for.
+            + "".join(f"{k}={v} " for k, v in byte.items())
             + "(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. A run that stopped because the camera
@@ -2209,6 +2227,7 @@ class RunLoop:
             "excludedByZone": st["excludedByZone"],
             **levers,
             **outbox,
+            **byte,
         }
         try:
             self.planner.end_run(
@@ -2369,17 +2388,21 @@ class RunLoop:
         # and the annotated frame show the operator what the zone is eating;
         # only the tracker and the face search stop seeing them.
         trackable = self._apply_detection_zones(boxes, frame)
+        track_body = {"runId": planner_run_id, "tMs": t_ms, "boxes": trackable}
+        low = self._low_boxes(persons, frame)
+        if low:
+            track_body["lowBoxes"] = low
 
         # track (stateful per run — the tracker keys its state on runId)
         tracked = self._timed(
             "track",
             "trackMs",
-            lambda: self._post(
-                f"{s.tracker_url}/track",
-                {"runId": planner_run_id, "tMs": t_ms, "boxes": trackable},
-            ),
+            lambda: self._post(f"{s.tracker_url}/track", track_body),
         )
         board.frame("track")
+        if s.tracker_low_conf_min > 0:
+            self._bump("trackerLowBoxes", len(low))
+            self._bump("trackerLowHeld", int(tracked.get("lowMatched") or 0))
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
         self._note_tracks(tracks)
@@ -3897,6 +3920,19 @@ class RunLoop:
     def _apply_detection_zones(self, boxes: list, frame: dict) -> list:
         """Delegates to :func:`heco_counting.zones.apply_detection_zones`."""
         return zones.apply_detection_zones(boxes, frame, self.zones, self._observer)
+
+    def _low_boxes(self, persons: dict, frame: dict) -> list:
+        """The low-score person boxes for a byte-mode tracker, zone-filtered.
+
+        Empty unless ``tracker_low_conf_min`` is on.  The same detections-mode
+        zones apply — a phantom on a wall TV must not be kept alive by its
+        weak boxes either — but observed SILENTLY: the zone counters are about
+        the boxes the loop works with, and these reach the tracker alone.
+        """
+        if self.s.tracker_low_conf_min <= 0:
+            return []
+        low = persons.get("lowBoxes") or []
+        return zones.apply_detection_zones(low, frame, self.zones, _SILENT) if low else []
 
     def _mark_person_zones(self, boxes: list, frame: dict) -> None:
         """Delegates to :func:`heco_counting.zones.mark_person_zones`."""
@@ -5586,6 +5622,16 @@ class RunLoop:
     def _outbox_counters(self, st: dict) -> dict:
         """The outbox's counters for the notes and the results (see OUTBOX_COUNTERS)."""
         return {k: st[k] for k in self.OUTBOX_COUNTERS if st.get(k) is not None}
+
+    #: The byte tracker's, present only on a run that asked for low boxes
+    #: (HECO_TRACKER_LOW_CONF_MIN > 0): how many low-score boxes went to the
+    #: tracker, and how many of them kept a track alive.  Zeros are then
+    #: meaningful — the feature was on and did nothing — so they are kept.
+    TRACKER_COUNTERS = ("trackerLowBoxes", "trackerLowHeld")
+
+    def _tracker_counters(self, st: dict) -> dict:
+        """The byte tracker's counters for the notes and the results."""
+        return {k: st[k] for k in self.TRACKER_COUNTERS if st.get(k) is not None}
 
 
 #: The window behind count.windowFps (StatsBoard.observe_window_rate): at

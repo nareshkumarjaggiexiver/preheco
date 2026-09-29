@@ -1,7 +1,9 @@
 # tracker service — runtime + dev. heco-common (editable) brings pydantic,
-# numpy and opencv-python-headless. Association is greedy IoU (documented in
-# app/sort.py), so no scipy dependency at POC scale.
+# numpy and opencv-python-headless. scipy is for byte mode's optimal
+# assignment (app/sort.py, "BYTE MODE"); sort mode stays greedy and never
+# touches it.
 -e ../../common
+scipy>=1.11
 fastapi>=0.111
 uvicorn>=0.30
 # dev/test

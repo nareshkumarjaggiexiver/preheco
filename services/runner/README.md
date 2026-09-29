@@ -213,6 +213,15 @@ carries information.
   (co-present) scored 0.12 at the median; the lowest same-person fold on
   record scored 0.21 (bench 6e1a5d). `0` turns the guard off; an older match
   service ignores the field.
+- **Low-score boxes for the tracker (2026-09-29, off by default).**
+  `HECO_TRACKER_LOW_CONF_MIN` above 0 asks persons for the boxes scoring from
+  it up to its floor (`lowConfMin` → `lowBoxes`) and hands them to the tracker
+  ALONE, zone-filtered without counting: the faces search, torso and stature
+  reads, zone counters and frame records never see them. With the tracker in
+  `HECO_TRACKER_MODE=byte` they keep a half-hidden guest's track alive through
+  a group instead of coasting blind (the pipeline review of 2026-09-24
+  measured 190 tracks for 38 guests on one clip). The run records
+  `trackerLowBoxes` and `trackerLowHeld` only when the knob is on.
 - **Enrolment veto (match-side, reported here).** The descriptor rides every
   `/match` body as `appearance`; the matcher may refuse to keep a clashing
   sighting as an *additional template* (anti-poison,

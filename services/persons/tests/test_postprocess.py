@@ -132,3 +132,51 @@ def test_rtdetr_below_threshold_is_empty_not_an_error():
         np.array([[0]]), np.array([[[1.0, 1.0, 2.0, 2.0]]]), np.array([[0.1]]),
         0.5, 100, 100)
     assert out == []
+
+
+# ------------------------------------------------------------ byte split
+
+
+def test_the_split_leaves_the_confident_boxes_exactly_as_they_were():
+    """split_at: NMS over everything, confident list identical to the floor alone.
+
+    A low near-duplicate of A is still suppressed by A (a weaker box never
+    survives beside a stronger one it overlaps), a genuinely separate low box
+    comes back in the low list, and a 0.29996 box is LOW though its contract
+    conf rounds to 0.3 — the split reads raw scores.
+    """
+    decoded = np.stack(
+        [
+            _pred_row(100, 60, 40, 80, 0.9, 0, 0.9),     # A, .81
+            _pred_row(101, 60, 40, 80, 0.5, 0, 0.4),     # A again at .20 -> NMS'd
+            _pred_row(300, 200, 40, 40, 1.0, 0, 0.5),    # C, .50
+            _pred_row(500, 100, 40, 80, 0.5, 0, 0.3),    # half-hidden D, .15
+            _pred_row(600, 300, 40, 80, 1.0, 0, 0.29996),  # E, just under the floor
+            _pred_row(50, 50, 20, 20, 0.2, 0, 0.2),      # .04 < low floor
+        ]
+    )
+    alone = select_persons(decoded, 0.5, 0.3, 0.45, 2000, 1000)
+    high, low = select_persons(decoded, 0.5, 0.1, 0.45, 2000, 1000, split_at=0.3)
+    assert high == alone
+    assert [b["conf"] for b in low] == [0.3, 0.15], "E (raw .29996) and D, best first"
+    assert all(b["x"] != 202.0 for b in low), "A's weak twin never comes back"
+
+
+def test_the_split_of_nothing_is_two_empty_lists():
+    """No box over the low floor: (confident, low) are both empty."""
+    decoded = _pred_row(10, 10, 5, 5, 0.1, 0, 0.1)[None, :]
+    assert select_persons(decoded, 1.0, 0.3, 0.45, 100, 100, split_at=0.5) == ([], [])
+
+
+def test_rtdetr_splits_on_the_same_rule():
+    """The DETR path partitions the same way, with no NMS to consider."""
+    from app.postprocess import select_persons_rtdetr
+
+    labels = np.array([[0, 0, 0]])
+    boxes = np.array([[
+        [10.0, 20.0, 110.0, 220.0], [200.0, 20.0, 260.0, 220.0], [300.0, 20.0, 360.0, 220.0],
+    ]])
+    scores = np.array([[0.9, 0.2, 0.05]])
+    high, low = select_persons_rtdetr(labels, boxes, scores, 0.1, 640, 480, split_at=0.3)
+    assert [b["conf"] for b in high] == [0.9]
+    assert [b["conf"] for b in low] == [0.2]

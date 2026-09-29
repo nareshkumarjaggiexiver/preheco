@@ -5,8 +5,10 @@ its own id space. Endpoints (CONTRACTS.md + tracker brief):
 
 * ``POST /reset``   {runId} — (re)create the run's tracker from current env.
 * ``POST /release`` {runId} — forget the run's tracker entirely (end of run).
-* ``POST /track``   {runId, tMs, boxes} → {tracks:[{id, box, ageFrames,
-  hits}]} — one frame's detections in, this frame's confirmed tracks out.
+* ``POST /track``   {runId, tMs, boxes, lowBoxes?} → {tracks:[{id, box,
+  ageFrames, hits}], lowMatched} — one frame's detections in, this frame's
+  confirmed tracks out.  ``lowBoxes`` matter only in byte mode
+  (``HECO_TRACKER_MODE=byte``, sort.py "BYTE MODE").
   An unknown runId is auto-created (first frame of a run needs no separate
   reset; /reset exists to *clear* state or pick up new env).
 * ``GET /health``   → {ok, model, version, runs} — ``runs`` is how many run
@@ -25,6 +27,7 @@ milliseconds.  ``tMs`` is read for one thing only: a jump of more than
 and clears the run's tracks (SortLite.step says why).
 """
 
+import os
 import time
 
 from fastapi import FastAPI
@@ -88,6 +91,15 @@ def _max_age() -> int:
     return env_int("HECO_TRACKER_MAX_AGE", legacy)
 
 
+def _mode() -> str:
+    """``HECO_TRACKER_MODE``: ``sort`` (default, unchanged) or ``byte``.
+
+    Anything else is refused at the first track rather than silently run as
+    sort: an A/B whose B arm quietly ran A's tracker measures nothing.
+    """
+    return (os.environ.get("HECO_TRACKER_MODE") or "sort").strip().lower()
+
+
 def _new_tracker() -> SortLite:
     """Build a SortLite from env (read per call so /reset picks up changes)."""
     return SortLite(
@@ -96,6 +108,8 @@ def _new_tracker() -> SortLite:
         iou_min=env_float("TRACKER_IOU_MIN", 0.2),
         vel_smooth=env_float("TRACKER_VEL_SMOOTH", 0.5),
         max_gap_ms=max(0, env_int("HECO_TRACKER_MAX_GAP_MS", DEFAULT_MAX_GAP_MS)),
+        mode=_mode(),
+        low_iou_min=env_float("HECO_TRACKER_LOW_IOU", 0.5),
     )
 
 
@@ -145,8 +159,11 @@ def track(body: TrackRequest) -> TrackResponse:
         tracker = _runs[body.runId] = _new_tracker()
     _last_used[body.runId] = now
     dets = [(b.x, b.y, b.w, b.h, b.conf) for b in body.boxes]
-    out = tracker.step(dets, t_ms=body.tMs)
+    low = [(b.x, b.y, b.w, b.h, b.conf) for b in body.lowBoxes]
+    before = tracker.low_matches
+    out = tracker.step(dets, t_ms=body.tMs, low=low)
     return TrackResponse(
+        lowMatched=tracker.low_matches - before,
         tracks=[
             Track(
                 id=t.tid,
@@ -168,6 +185,9 @@ def health() -> dict:
     """
     return {
         **Health(ok=True, model="sort-lite-iou-velocity", version=__version__).model_dump(),
+        # Which association this process builds new run trackers with.
+        "mode": _mode(),
+        "lowIouMin": env_float("HECO_TRACKER_LOW_IOU", 0.5),
         "runs": len(_runs),
         # Source breaks that cleared a resident run's tracks (max_gap_ms).
         "gapResets": sum(t.gap_resets for t in _runs.values()),

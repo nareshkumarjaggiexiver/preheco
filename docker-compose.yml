@@ -179,6 +179,13 @@ services:
       # continued onto whoever stands there after the outage. Default
       # 10000; 0 = off (frame-count coasting alone).
       HECO_TRACKER_MAX_GAP_MS: ${HECO_TRACKER_MAX_GAP_MS-}
+      # Association: "sort" (default, greedy IoU, unchanged) or "byte"
+      # (ByteTrack: optimal assignment, and the runner's low-score person boxes
+      # keep half-hidden guests' tracks alive — app/sort.py "BYTE MODE"; pair
+      # with the runner's HECO_TRACKER_LOW_CONF_MIN). HECO_TRACKER_LOW_IOU is
+      # the stricter IoU a low box must reach (default 0.5).
+      HECO_TRACKER_MODE: ${HECO_TRACKER_MODE-}
+      HECO_TRACKER_LOW_IOU: ${HECO_TRACKER_LOW_IOU-}
       # Inbound auth gate — see the ingest service for the whole story.
       HECO_REQUIRE_AUTH: ${HECO_REQUIRE_AUTH-}
       HECO_SCOPE_ENFORCE: ${HECO_SCOPE_ENFORCE-}
@@ -443,6 +450,9 @@ services:
       # the median; the lowest same-person fold on record scored 0.21.
       # Counted in foldVetoedByFace.
       HECO_FOLD_MIN_FACE_COSINE: ${HECO_FOLD_MIN_FACE_COSINE-}
+      # Above 0: ask persons for the boxes scoring from this up to its floor
+      # and hand them to the tracker alone (byte mode). 0/unset = off.
+      HECO_TRACKER_LOW_CONF_MIN: ${HECO_TRACKER_LOW_CONF_MIN-}
       # Clothing guard on BOTH folds (heal and lock), three bands, not a cliff:
       # below CLASH (default 0.35) is a genuine disagreement and refuses the
       # fold (healVetoedByAppearance); CLASH..UNSURE (default 0.55) proceeds

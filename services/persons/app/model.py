@@ -264,15 +264,23 @@ class PersonDetector:
         img: np.ndarray,
         conf_min: float | None = None,
         nms_iou: float | None = None,
-    ) -> tuple[list[dict], float]:
+        low_conf_min: float | None = None,
+    ) -> tuple:
         """Detect persons in a BGR image.
 
         Returns `(boxes, infer_ms)` where boxes are contract dicts in source
         pixels and `infer_ms` covers letterbox + ONNX run + decode/NMS (JPEG
         decode excluded — that belongs to transport, not the model).
+
+        With ``low_conf_min`` under the confidence floor, returns
+        `(boxes, low_boxes, infer_ms)`: ``boxes`` exactly as without it, and
+        the boxes scoring from ``low_conf_min`` up to the floor beside them
+        (postprocess.select_persons, ``split_at``) — for the byte tracker.
         """
         conf = CONF_MIN if conf_min is None else conf_min
         iou = NMS_IOU if nms_iou is None else nms_iou
+        split = low_conf_min is not None and low_conf_min < conf
+        floor, split_at = (low_conf_min, conf) if split else (conf, None)
         t0 = time.perf_counter()
         if self.family == "rtdetr":
             # Two-input contract: the graph takes the original size and does
@@ -285,13 +293,18 @@ class PersonDetector:
                     None, {self._input_name: blob[None, :], "orig_target_sizes": sizes}
                 )
             boxes = select_persons_rtdetr(
-                labels, out_boxes, scores, conf, img.shape[1], img.shape[0]
+                labels, out_boxes, scores, floor, img.shape[1], img.shape[0], split_at=split_at
             )
         else:
             blob, ratio = letterbox(img, self.input_size)
             with self._lock:
                 raw = self._session.run(None, {self._input_name: blob[None, :]})[0]
             decoded = decode_predictions(raw, self.input_size)
-            boxes = select_persons(decoded, ratio, conf, iou, img.shape[1], img.shape[0])
-        infer_ms = (time.perf_counter() - t0) * 1000.0
-        return boxes, round(infer_ms, 2)
+            boxes = select_persons(
+                decoded, ratio, floor, iou, img.shape[1], img.shape[0], split_at=split_at
+            )
+        infer_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        if split:
+            high, low = boxes
+            return high, low, infer_ms
+        return boxes, infer_ms

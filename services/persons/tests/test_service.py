@@ -52,6 +52,24 @@ def test_detect_contract_shape():
 
 
 @requires_model
+def test_low_boxes_come_apart_and_leave_boxes_unchanged():
+    """lowConfMin adds lowBoxes under the floor; boxes stay byte-identical."""
+    client = TestClient(app)
+    frame = _frame_b64()
+    plain = client.post("/detect", json={"imageB64": frame, "confMin": 0.3}).json()
+    split = client.post(
+        "/detect", json={"imageB64": frame, "confMin": 0.3, "lowConfMin": 0.01}
+    ).json()
+    assert split["boxes"] == plain["boxes"]
+    assert "lowBoxes" not in plain, "not asked, not sent"
+    assert all(0.01 <= b["conf"] <= 0.3 for b in split["lowBoxes"])
+    same = client.post(
+        "/detect", json={"imageB64": frame, "confMin": 0.3, "lowConfMin": 0.5}
+    ).json()
+    assert "lowBoxes" not in same, "a low floor above the floor asks for nothing"
+
+
+@requires_model
 def test_detect_conf_min_is_respected():
     client = TestClient(app)
     loose = client.post("/detect", json={"imageB64": _frame_b64(), "confMin": 0.01}).json()

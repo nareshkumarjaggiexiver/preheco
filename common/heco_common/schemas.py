@@ -223,11 +223,19 @@ class DetectRequest(BaseModel):
 
 
 class TrackRequest(BaseModel):
-    """POST /track body: per-frame detections for one run's tracker state."""
+    """POST /track body: per-frame detections for one run's tracker state.
+
+    ``lowBoxes`` are the persons service's LOW-SCORE boxes (``lowConfMin``
+    up to its ``confMin``) — the half-hidden guest in a group.  Only a
+    tracker in byte mode reads them, and only to keep an existing track
+    alive; sort mode ignores them.  Empty by default, so a runner that never
+    asks for them sends exactly what it always sent.
+    """
 
     runId: str
     tMs: int
     boxes: list[Box]
+    lowBoxes: list[Box] = Field(default_factory=list)
 
 
 class ResetRequest(BaseModel):
@@ -250,9 +258,15 @@ class Track(BaseModel):
 
 
 class TrackResponse(BaseModel):
-    """POST /track response: tracks confirmed and updated this frame."""
+    """POST /track response: tracks confirmed and updated this frame.
+
+    ``lowMatched`` counts the low-score boxes that kept a track alive on this
+    frame (byte mode; always 0 in sort mode) — the runner sums it so a run
+    can say how much the second association did.
+    """
 
     tracks: list[Track]
+    lowMatched: int = 0
 
 
 # ------------------------------------------------------------------- faces

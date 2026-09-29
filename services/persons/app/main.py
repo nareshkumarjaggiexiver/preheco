@@ -1,7 +1,8 @@
 """FastAPI app for the persons service (heco-pipeline port 7102).
 
 Contract (CONTRACTS.md):
-    POST /detect {imageB64, confMin?} -> {boxes: [{x, y, w, h, conf}], inferMs}
+    POST /detect {imageB64, confMin?, lowConfMin?}
+        -> {boxes: [{x, y, w, h, conf}], lowBoxes?, inferMs}
     GET  /health -> {ok, model, version}
 """
 
@@ -98,10 +99,17 @@ class ApplyModelRequest(BaseModel):
 
 
 class DetectRequest(BaseModel):
-    """POST /detect body: a base64 JPEG frame plus an optional threshold."""
+    """POST /detect body: a base64 JPEG frame plus optional thresholds.
+
+    ``lowConfMin`` asks for the LOW-SCORE boxes too — those from it up to the
+    confidence floor, returned apart as ``lowBoxes`` for the byte tracker.
+    ``boxes`` is unchanged by it; omitted (or not under the floor), the reply
+    has no ``lowBoxes`` at all.
+    """
 
     imageB64: str = Field(min_length=1)
     confMin: float | None = Field(default=None, ge=0.0, le=1.0)
+    lowConfMin: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 @app.get("/health")
@@ -146,7 +154,11 @@ def detect(req: DetectRequest) -> dict:
         img = b64_to_bgr(req.imageB64)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    boxes, infer_ms = det.detect(img, conf_min=req.confMin)
+    out = det.detect(img, conf_min=req.confMin, low_conf_min=req.lowConfMin)
+    if len(out) == 3:
+        boxes, low, infer_ms = out
+        return {"boxes": boxes, "lowBoxes": low, "inferMs": infer_ms}
+    boxes, infer_ms = out
     return {"boxes": boxes, "inferMs": infer_ms}
 
 

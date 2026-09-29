@@ -72,6 +72,19 @@ def nms(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]
     return keep
 
 
+def _split(boxes: list[dict], raw: list[float], split_at: float | None):
+    """``boxes`` as they were, or (confident, low) partitioned on RAW scores.
+
+    Raw, not the rounded ``conf`` the contract carries: a 0.29996 box rounds
+    to 0.3 and would be filed as confident by a split on the dict.
+    """
+    if split_at is None:
+        return boxes
+    high = [b for b, r in zip(boxes, raw, strict=True) if r >= split_at]
+    low = [b for b, r in zip(boxes, raw, strict=True) if r < split_at]
+    return high, low
+
+
 def select_persons(
     decoded: np.ndarray,
     ratio: float,
@@ -79,18 +92,25 @@ def select_persons(
     nms_iou: float,
     img_w: int,
     img_h: int,
-) -> list[dict]:
+    split_at: float | None = None,
+) -> list[dict] | tuple[list[dict], list[dict]]:
     """Turn decoded predictions into contract person boxes.
 
     Steps: score = objectness x person-class probability; threshold at
     `conf_min`; convert `cxcywh` to corners; undo the letterbox `ratio`; clamp
     to the source image; NMS at `nms_iou`. Returns CONTRACTS.md-shaped dicts
     `{x, y, w, h, conf}` in source-image pixels, best first.
+
+    With ``split_at`` (the byte tracker's low-score boxes): NMS runs over
+    everything at or above ``conf_min`` and the result comes back as
+    ``(boxes at or above split_at, boxes below it)``.  The confident list is
+    exactly what ``conf_min=split_at`` returns alone — NMS keeps boxes in
+    descending score, so a lower-scored box can never suppress a higher one.
     """
     scores = decoded[:, 4] * decoded[:, 5 + PERSON_CLASS]
     mask = scores >= conf_min
     if not mask.any():
-        return []
+        return _split([], [], split_at)
     boxes = decoded[mask, :4]
     scores = scores[mask]
     xyxy = np.empty_like(boxes)
@@ -102,7 +122,7 @@ def select_persons(
     xyxy[:, 0::2] = xyxy[:, 0::2].clip(0, img_w)
     xyxy[:, 1::2] = xyxy[:, 1::2].clip(0, img_h)
     keep = nms(xyxy, scores, nms_iou)
-    return [
+    out = [
         {
             "x": round(float(xyxy[i, 0]), 1),
             "y": round(float(xyxy[i, 1]), 1),
@@ -112,6 +132,7 @@ def select_persons(
         }
         for i in keep
     ]
+    return _split(out, [float(scores[i]) for i in keep], split_at)
 
 
 def select_persons_rtdetr(
@@ -121,8 +142,9 @@ def select_persons_rtdetr(
     conf_min: float,
     img_w: int,
     img_h: int,
-) -> list[dict]:
-    """RT-DETR outputs into contract person boxes.
+    split_at: float | None = None,
+) -> list[dict] | tuple[list[dict], list[dict]]:
+    """RT-DETR outputs into contract person boxes (``split_at``: as select_persons).
 
     The lyuwenyu export returns per-query (labels, boxes, scores) with boxes
     ALREADY in original-image xyxy pixels (the graph consumes
@@ -136,13 +158,13 @@ def select_persons_rtdetr(
     scores = np.asarray(scores).reshape(-1)
     mask = (labels == PERSON_CLASS) & (scores >= conf_min)
     if not mask.any():
-        return []
+        return _split([], [], split_at)
     kept = boxes[mask].astype(np.float64)
     kept[:, 0::2] = kept[:, 0::2].clip(0, img_w)
     kept[:, 1::2] = kept[:, 1::2].clip(0, img_h)
     kept_scores = scores[mask]
     order = np.argsort(-kept_scores)
-    return [
+    out = [
         {
             "x": round(float(kept[i, 0]), 1),
             "y": round(float(kept[i, 1]), 1),
@@ -152,3 +174,4 @@ def select_persons_rtdetr(
         }
         for i in order
     ]
+    return _split(out, [float(kept_scores[i]) for i in order], split_at)

@@ -28,9 +28,38 @@ ids through a crossing — the constant-velocity prediction carries each track
 through the overlap. If two detections become exactly coincident, the
 assignment is ambiguous and ids may swap; this is accepted at POC because
 identity repair lives downstream in the gallery.
+
+BYTE MODE (``mode="byte"``, 2026-09-29) — ByteTrack's association on the same
+motion model, for groups.  The pipeline review of 2026-09-24 measured the
+tracker, not the detector, as the weak stage in a crowd: 190 tracks for 38
+guests on one clip, and the heals and identity-lock folds that follow a
+fragmented or swapped track.  Two changes, both from ByteTrack (Zhang et al.,
+ECCV 2022; MIT):
+
+* LOW-SCORE BOXES KEEP TRACKS ALIVE.  A guest half-hidden behind another
+  scores 0.1-0.3 at the detector and was thrown away at the persons service,
+  so their track coasted blind and was re-born, or latched onto a neighbour,
+  when they re-emerged.  ``step(low=...)`` takes those boxes separately and
+  uses them ONLY in a second association, against tracks that were matched on
+  the previous frame and are confirmed, at a stricter IoU (``low_iou_min``).
+  A low box never starts a track, never reaches a lost track, and never
+  reaches anything downstream except through the track it kept alive.
+* OPTIMAL ASSIGNMENT.  Greedy best-first can take the one best pair and leave
+  a neighbour unmatched when three or more boxes contest a region, which is
+  what a group is (the note above predicted it); byte mode solves each
+  association as a linear assignment on 1 - IoU (scipy), gated at the IoU
+  floor.
+
+``mode="sort"`` (the default) is unchanged in every respect and ignores
+``low``, so a run that does not ask for byte mode tracks exactly as before.
 """
 
 from dataclasses import dataclass
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+MODES = ("sort", "byte")
 
 
 @dataclass
@@ -114,7 +143,8 @@ class SortLite:
 
     def __init__(self, max_age: int = 30, min_hits: int = 3,
                  iou_min: float = 0.2, vel_smooth: float = 0.5,
-                 max_gap_ms: int = 0) -> None:
+                 max_gap_ms: int = 0, mode: str = "sort",
+                 low_iou_min: float = 0.5) -> None:
         """Configure thresholds; state starts empty.
 
         WHY ``max_age`` DEFAULTS TO 30 AND NOT THE ORIGINAL 15 (bench 6e1a5d,
@@ -139,6 +169,14 @@ class SortLite:
         detector) exists and why this number is an env knob
         (``HECO_TRACKER_MAX_AGE``) with the old 15 one restart away.
         """
+        if mode not in MODES:
+            raise ValueError(f"tracker mode must be one of {MODES}, not {mode!r}")
+        self.mode = mode
+        #: Byte mode's second association gate: stricter than ``iou_min``
+        #: because a low-score box is weaker evidence of WHERE the person is.
+        self.low_iou_min = low_iou_min
+        #: Low-score boxes that kept a track alive, run total (byte mode).
+        self.low_matches = 0
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_min = iou_min
@@ -152,10 +190,33 @@ class SortLite:
         #: How many times a source break cleared the tracks (for /health).
         self.gap_resets = 0
 
+    def _match(
+        self,
+        track_idx: list[int],
+        detections: list[tuple[float, float, float, float, float | None]],
+        gate: float,
+    ) -> list[tuple[int, int]]:
+        """Optimal (track, detection) pairs with IoU at or above ``gate``.
+
+        Linear assignment on 1 - IoU over the IoU matrix; pairs under the
+        gate are priced out and dropped afterwards, so a forced pairing of two
+        boxes that do not overlap can never come back as a match.
+        """
+        if not track_idx or not detections:
+            return []
+        m = np.array([
+            [iou(self.tracks[ti].box(), (d[0], d[1], d[2], d[3])) for d in detections]
+            for ti in track_idx
+        ])
+        cost = np.where(m >= gate, 1.0 - m, 1e6)
+        rows, cols = linear_sum_assignment(cost)
+        return [(track_idx[r], int(c)) for r, c in zip(rows, cols, strict=True) if m[r, c] >= gate]
+
     def step(
         self,
         detections: list[tuple[float, float, float, float, float | None]],
         t_ms: int | None = None,
+        low: list[tuple[float, float, float, float, float | None]] | None = None,
     ) -> list[TrackState]:
         """Advance one frame with ``detections`` [(x, y, w, h, conf), ...].
 
@@ -190,6 +251,9 @@ class SortLite:
         for t in self.tracks:
             t.predict()
 
+        if self.mode == "byte":
+            return self._step_byte(detections, low or [])
+
         # Greedy best-first association on the IoU of predicted boxes.
         pairs: list[tuple[float, int, int]] = []
         for ti, t in enumerate(self.tracks):
@@ -222,8 +286,51 @@ class SortLite:
         # Deaths: coasted past max_age.
         self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
 
+        return self._reported()
+
+    def _reported(self) -> list[TrackState]:
+        """This frame's confirmed, updated tracks (min_hits waived at warm-up)."""
         warmup = self.frame_count <= self.min_hits
         return [
             t for t in self.tracks
             if t.misses == 0 and (t.hits >= self.min_hits or warmup)
         ]
+
+    def _step_byte(
+        self,
+        detections: list[tuple[float, float, float, float, float | None]],
+        low: list[tuple[float, float, float, float, float | None]],
+    ) -> list[TrackState]:
+        """Byte-mode association on already-predicted tracks (see module doc).
+
+        1. every track against the confident boxes, at ``iou_min``;
+        2. confirmed tracks matched on the PREVIOUS frame (so ``misses`` is
+           1 after predict) and still unmatched, against the low-score boxes,
+           at ``low_iou_min`` — a lost track is never revived by a weak box;
+        3. unmatched confident boxes are born; unmatched low boxes vanish.
+        """
+        first = self._match(list(range(len(self.tracks))), detections, self.iou_min)
+        for ti, di in first:
+            x, y, w, h, conf = detections[di]
+            self.tracks[ti].update(x, y, w, h, conf, self.vel_smooth)
+        matched = {ti for ti, _ in first}
+        held = [
+            ti for ti, t in enumerate(self.tracks)
+            if ti not in matched and t.misses == 1 and t.hits >= self.min_hits
+        ]
+        for ti, di in self._match(held, low, self.low_iou_min):
+            x, y, w, h, conf = low[di]
+            self.tracks[ti].update(x, y, w, h, conf, self.vel_smooth)
+            self.low_matches += 1
+
+        used = {di for _, di in first}
+        for di, (x, y, w, h, conf) in enumerate(detections):
+            if di not in used:
+                self.tracks.append(
+                    TrackState(tid=self._next_id, cx=x + w / 2.0, cy=y + h / 2.0,
+                               w=w, h=h, conf=conf)
+                )
+                self._next_id += 1
+
+        self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
+        return self._reported()

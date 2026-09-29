@@ -360,6 +360,15 @@ class Settings:
     # people (co-present) score 0.12 at the median over six galleries, the
     # lowest same-person fold on record 0.21 (bench 6e1a5d).  0 = off.
     fold_min_face_cosine: float = 0.10
+    # LOW-SCORE PERSON BOXES FOR THE TRACKER (byte mode, tracker 0.2.0).  In a
+    # group the half-hidden guest scores under the persons floor (0.30) and
+    # was dropped, so their track coasted blind; above 0 the runner asks
+    # persons for the boxes from this score up to the floor and hands them to
+    # the tracker ALONE — nothing else in the loop (faces, torso, stature,
+    # zones' counts, the frame record) ever sees them.  Pair with the
+    # tracker's HECO_TRACKER_MODE=byte; a sort-mode tracker ignores them.
+    # 0 = off: persons is asked exactly what it always was.
+    tracker_low_conf_min: float = 0.0
     # HEAL APPEARANCE BANDS (see loop._appearance_refuses and app/appearance.py).
     # A fold candidate's remembered torso descriptor is compared with the
     # current frame's by histogram intersection, and the reading falls in one
@@ -670,6 +679,7 @@ def from_env() -> Settings:
             "HECO_TRACK_LOCK_MIN_COSINE", s.track_lock_min_cosine
         ),
         fold_min_face_cosine=env_float("HECO_FOLD_MIN_FACE_COSINE", s.fold_min_face_cosine),
+        tracker_low_conf_min=env_float("HECO_TRACKER_LOW_CONF_MIN", s.tracker_low_conf_min),
         heal_appearance_clash=env_float(
             "HECO_HEAL_APPEARANCE_CLASH", s.heal_appearance_clash
         ),
@@ -730,6 +740,8 @@ def knobs(s: Settings) -> dict:
         "HECO_HEADWEAR_QUEUE": s.headwear_queue,
         # Not a throughput lever either: the face guard on heal and lock folds.
         "HECO_FOLD_MIN_FACE_COSINE": s.fold_min_face_cosine,
+        # Nor this: the low-score person boxes handed to a byte-mode tracker.
+        "HECO_TRACKER_LOW_CONF_MIN": s.tracker_low_conf_min,
         # Nor these: whether planner writes survive a planner restart, and the
         # memory one run's outbox may hold meanwhile (live state: plannerOutbox).
         "HECO_PLANNER_DURABLE": s.planner_durable,
