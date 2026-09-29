@@ -258,6 +258,16 @@ class QualityProfile(BaseModel):
     #: Seconds between face re-verifications of a track that already holds an
     #: identity.  0 disables the saving (search everyone every frame).
     faceReverifyIntervalS: float | None = Field(default=None, ge=0)
+    #: Best-face minting (2026-09-30): faces narrower than ``mintMinPx`` on an
+    #: unidentified track only claim existing guests (at ``smallMatchMinCosine``)
+    #: and are otherwise held; the guest is created from the track's best face.
+    mintMinPx: float | None = Field(default=None, ge=0)
+    smallMatchMinCosine: float | None = Field(default=None, ge=0, le=1)
+    holdFlushFrames: int | None = Field(default=None, ge=1)
+    #: The guest's best face is their card AND their best-face template.
+    bestFaceAnchor: bool | None = None
+    #: Match guests on their best-face template alone.
+    anchorOnly: bool | None = None
 
 
 class ModelProfile(BaseModel):

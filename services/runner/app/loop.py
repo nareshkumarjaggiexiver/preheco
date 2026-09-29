@@ -528,6 +528,10 @@ class MatchClient:
         head: list[float] | None = None,
         beard: list[float] | None = None,
         skin: list[float] | None = None,
+        mint: bool = True,
+        min_cosine: float | None = None,
+        anchor_only: bool = False,
+        best_face_anchor: bool = False,
     ) -> dict:
         """Resolve one embedding against this run's gallery.
 
@@ -565,6 +569,16 @@ class MatchClient:
             wire["beard"] = beard
         if skin is not None:
             wire["skin"] = skin
+        # The best-face options (match 0.20.0), sent only when on so a run
+        # that uses none of them asks exactly what it always asked.
+        if not mint:
+            wire["mint"] = False
+        if min_cosine:
+            wire["minCosine"] = float(min_cosine)
+        if anchor_only:
+            wire["anchorOnly"] = True
+        if best_face_anchor:
+            wire["bestFaceAnchor"] = True
         try:
             return self._call("/match", wire)
         except MatchRefused as e:
@@ -590,6 +604,20 @@ class MatchClient:
                 )
                 return self._call("/match", bare)
             raise
+
+    def anchor(
+        self, *, key: str, embedding: list[float], quality: float | None = None,
+        feat_norm: float | None = None, attributes: dict | None = None,
+    ) -> dict:
+        """Make this face ``key``'s best-face template (match 0.20.0)."""
+        wire: dict = {"runId": self._run_id, "personKey": key, "embedding": embedding}
+        if quality is not None:
+            wire["quality"] = quality
+        if feat_norm is not None:
+            wire["featNorm"] = feat_norm
+        if attributes is not None:
+            wire["attributes"] = attributes
+        return self._call("/template/anchor", wire)
 
     def merge(
         self, *, doomed: str, keeper: str, only_if_singleton: bool = True,
@@ -898,6 +926,18 @@ class RunLoop:
         # pruned the same way — a lock from minutes ago is not evidence.
         # Guarded by _lock.
         self._locks: dict[int, dict] = {}
+        # BEST-FACE MINTING (Settings.mint_min_px): per track, the best face
+        # held while the track had no identity — {rank, face, emb, ..., seen}
+        # — the guest is created from it later (see _hold_face / _tick_held).
+        self._held: dict[int, dict] = {}
+        # Held tracks seen in one frame together: two bodies, two people.
+        # Asserted as cannot_link once both sides have a key.
+        self._held_pairs: set[tuple[int, int]] = set()
+        # The key a held track was finally created (or matched) as.
+        self._held_keys: dict[int, str] = {}
+        # Each guest's card rank under best_face_anchor: (front band, width,
+        # sharpness) of the face on their card.
+        self._card_rank: dict[str, tuple] = {}
         # track_id -> monotonic time that track was last SCHEDULED for face
         # verification (see _reverify_within).  Loop-thread only, and pruned
         # against the live track set once it outgrows _REVERIFY_CAP, so a
@@ -2080,6 +2120,11 @@ class RunLoop:
         # The frame source first of all: its detect worker (if any) is joined
         # here, so nothing below races a stage call still in flight.
         self._drain_frames()
+        # Every guest still HELD (best-face minting) is created now, from the
+        # best face their track showed — before the reporter stops, so their
+        # cards still upload.
+        if self._held:
+            self._tick_held(self.status().get("plannerRunId"), [], force=True)
         # The head-covering reads still queued get a bounded moment to land
         # before the notes are written (the rest are counted as dropped).
         self._stop_headwear(self._HEADWEAR_DRAIN_S)
@@ -2102,6 +2147,7 @@ class RunLoop:
         st = self.status()
         levers = self._lever_counters(st)
         outbox = self._outbox_counters(st)
+        best = self._hold_counters(st)
         notes = (
             f"unique={st['unique']} frames={frames} matches={st['matches']} "
             f"staffCrossings={st['staffCrossings']} "
@@ -2173,6 +2219,8 @@ class RunLoop:
             # The planner outbox's, when it was used (see OUTBOX_COUNTERS):
             # what reached the planner late, and what never did.
             + "".join(f"{k}={v} " for k, v in outbox.items())
+            # Best-face minting's, when it was on.
+            + "".join(f"{k}={v} " for k, v in best.items())
             + "(POC geometry: 2.8mm @2.0m close-zone, faces ~64-85px, floor 56px)"
         )
         # A STALL IS NOT AN END. A run that stopped because the camera
@@ -2209,6 +2257,7 @@ class RunLoop:
             "excludedByZone": st["excludedByZone"],
             **levers,
             **outbox,
+            **best,
         }
         try:
             self.planner.end_run(
@@ -2383,6 +2432,8 @@ class RunLoop:
         tracks = tracked.get("tracks", [])
         board.observe("track", "tracksActive", float(len(tracks)))
         self._note_tracks(tracks)
+        if self._held:
+            self._tick_held(planner_run_id, tracks)
         if s.face_cadence:
             self._cadence_tracks = tracks  # what "settled" is judged on next
 
@@ -2555,6 +2606,11 @@ class RunLoop:
         # index-parallel to ``decided`` the way ``embeddings`` is, so a
         # same-frame re-resolve can re-send them with the vector.
         extras: list[dict] = []
+        # The embeddings of the faces that reached ``decided``, index-parallel
+        # to it: a face HELD for best-face minting (Settings.mint_min_px)
+        # leaves the frame's verdicts, so ``embeddings`` (one per kept face)
+        # would no longer line up with them.
+        used_embs: list = []
         # The frame's height, for the body rider: ingest states it beside the
         # picture, and the JPEG header (read at the first _remember) is the
         # fallback for a source that does not.
@@ -2607,12 +2663,17 @@ class RunLoop:
                 "attributes": attr, "featNorm": norm, "body": body_box,
                 "head": head, "beard": beard, "skin": skin,
             })
+            # BEST-FACE MINTING: a small face on a track with no identity may
+            # only claim an EXISTING guest (a probe); matching nobody, it is
+            # held on the track instead of creating a guest from a poor face.
+            hold_tid = self._hold_track(face, w, tracks)
             m = self._timed("match", "matchMs", partial(
                 self.match_port.match,
                 embedding=body["embedding"], quality=body["quality"],
                 appearance=body.get("appearance"), site_id=body.get("siteId"),
                 attributes=attr, feat_norm=norm, body=body_box,
                 head=head, beard=beard, skin=skin,
+                **self._match_options(hold_tid is not None),
             ))
             # The face's clarity rides its verdict to the card choice
             # (_card_quality): the recogniser's own reading of how clear,
@@ -2623,10 +2684,19 @@ class RunLoop:
             # shows (_maybe_face_card). Private: never copied into a tap.
             if isinstance(m, dict):
                 m["_embedding"] = emb
+                m["_attrs"] = attr
             board.frame("match")
             if m.get("cosine") is not None:
                 board.observe("match", "matchCosine", float(m["cosine"]))
                 samples.add("match", t_ms, {"matchCosine": float(m["cosine"])})
+            if hold_tid is not None and m.get("deferred") and not m.get("isStaff"):
+                extras.pop()  # this face leaves the frame's verdicts
+                self._hold_face(hold_tid, face, m, extras_row={
+                    "attributes": attr, "featNorm": norm, "body": body_box,
+                    "head": head, "beard": beard, "skin": skin,
+                    "appearance": face_desc, "siteId": site_id,
+                }, frame_img=frame_img, t_ms=t_ms)
+                continue
             verdicts.append(
                 {
                     "personKey": m.get("personKey"),
@@ -2670,6 +2740,7 @@ class RunLoop:
                 }
             )
             decided.append((face, m, face_desc, pbox_id))
+            used_embs.append(emb)
 
         # Everything from here to the ledger write is the frame's VERDICT
         # PASS: same-key splits, co-presence assertions, fold/heal decisions,
@@ -2685,7 +2756,7 @@ class RunLoop:
         # it — otherwise there is no pair to assert and the merge stands
         # (run fa8fc3: two men, one key, silently counted as one).
         decided = self._split_same_key(
-            planner_run_id, site_id, decided, embeddings, verdicts, extras
+            planner_run_id, site_id, decided, used_embs, verdicts, extras
         )
 
         # CO-PRESENCE, asserted between the passes: every distinct pair of
@@ -2811,6 +2882,8 @@ class RunLoop:
             track_id = self._track_for(face, tracks)
             if track_id is None:
                 continue
+            if track_id in self._held and m.get("personKey"):
+                self._resolve_held(track_id, m.get("personKey"))
             if m.get("isNew"):
                 # THE LOCK FIRST, then the heal's bookkeeping.  If this track
                 # has already resolved to an identity the fresh mint is folded
@@ -2825,6 +2898,8 @@ class RunLoop:
                 self._maybe_heal(planner_run_id, track_id, m, face_desc, frame_bodies)
                 self._note_lock(track_id, m, face_desc)
 
+        if self._held:
+            self._note_held_company(tracks, decided, present)
         board.observe("count", "verdictPassMs", (time.perf_counter() - tvp) * 1000.0)
 
         self._remember(image_b64, frame.get("seq"), t_ms, boxes, tracks, faces, verdicts)
@@ -3011,6 +3086,9 @@ class RunLoop:
         likeness is operator-attested elsewhere; carding them here would put a
         face nobody consented to in a register they do not appear in.
         """
+        if self.s.best_face_anchor:
+            self._maybe_best_face(frame_img, face, m)
+            return
         if frame_img is None or m.get("isStaff"):
             return
         key = m.get("personKey")
@@ -3075,6 +3153,321 @@ class RunLoop:
             self._face_pending[key] = (jpeg, width)
             if vec is not None:
                 self._face_card_vecs[key] = vec
+
+    # ------------------------------------------------------- best faces
+
+    #: Frontality bands for a face's rank: at least the first is "front-on",
+    #: at least the second "slightly turned", anything less "turned".
+    _FRONT_BANDS = (0.85, 0.7)
+
+    def _face_rank(self, face: dict) -> tuple:
+        """(front band, width px, sharpness): the operator's order (2026-09-30)
+        for a guest's best face — front-on first, then the widest, then the
+        sharpest. A face without a frontality reading sits in the middle band.
+        """
+        def num(v):
+            return float(v) if isinstance(v, int | float) and not isinstance(v, bool) else None
+
+        fr = num(face.get("frontality"))
+        if fr is None:
+            band = 1
+        else:
+            band = 2 if fr >= self._FRONT_BANDS[0] else 1 if fr >= self._FRONT_BANDS[1] else 0
+        width = num((face.get("box") or {}).get("w")) or 0.0
+        sharp = num(face.get("sharpness")) or 0.0
+        return (band, width, sharp)
+
+    @staticmethod
+    def _rank_better(new: tuple, old: tuple | None) -> bool:
+        """Is a face of rank ``new`` clearly better than one of rank ``old``?
+
+        A more front-on band wins whatever the size. Within a band, 8% wider
+        wins, and about as wide (within 3%) but 20% sharper wins. The margins
+        stop a card flickering between near-equal looks and bound how many
+        times one guest's best face is replaced (each step is at least 8%).
+        """
+        if old is None:
+            return True
+        if new[0] != old[0]:
+            return new[0] > old[0]
+        if new[1] >= old[1] * 1.08:
+            return True
+        return new[1] >= old[1] * 0.97 and new[2] > 0 and new[2] >= old[2] * 1.2
+
+    def _maybe_best_face(self, frame_img, face: dict, m: dict) -> None:
+        """Keep the guest's BEST face on their card and as their best-face
+        template — one image for both (Settings.best_face_anchor).
+
+        The picture follows the guest as they walk in: each clearly better
+        face (:meth:`_rank_better`) replaces the card, and the same face's
+        embedding replaces their best-face template in the gallery, so the
+        face the register shows is the face the gallery recognises them by.
+        The look-alike guard of the card rule still applies: a replacement
+        must agree with the face already on the card (face_card_same_min),
+        or a stranger matched near the line could take over the guest's
+        identity along with their picture.
+        """
+        if frame_img is None or m.get("isStaff"):
+            return
+        key = m.get("personKey")
+        box = face.get("box")
+        vec = m.get("_embedding")
+        if not key or not box:
+            return
+        rank = self._face_rank(face)
+        with self._lock:
+            old = self._card_rank.get(key)
+            card_vec = self._face_card_vecs.get(key)
+        if not self._rank_better(rank, old):
+            return
+        if (
+            card_vec is not None and vec is not None and self.s.face_card_same_min > 0
+            and _cosine(vec, card_vec) < self.s.face_card_same_min
+        ):
+            self._bump("bestFaceRefusedLookalike")
+            return
+        try:
+            crop = annotate.face_crop(frame_img, box)
+            if crop is None:
+                return
+            jpeg = annotate.to_jpeg(crop, quality=82)
+        except Exception:  # noqa: BLE001 — a thumbnail must never kill a run
+            return
+        with self._lock:
+            if not self._rank_better(rank, self._card_rank.get(key)):
+                return
+            self._face_pending[key] = (jpeg, self._card_quality(face, m))
+            self._card_rank[key] = rank
+            if vec is not None:
+                self._face_card_vecs[key] = vec
+        # A mint's founding face is already its best-face template.
+        if vec is None or m.get("isNew"):
+            return
+        try:
+            self.match_port.anchor(
+                key=key, embedding=vec, quality=float(box.get("w") or 0.0) or None,
+                feat_norm=m.get("featNorm"), attributes=m.get("_attrs"),
+            )
+            self._bump("anchorsSet")
+        except Exception as e:  # noqa: BLE001 — a better picture must never cost a count
+            self.log.warning(f"best face for {key} not stored as its template: {e}")
+
+    # -------------------------------------------------- best-face minting
+
+    def _match_options(self, hold: bool) -> dict:
+        """The best-face options for one /match (none of them when all off)."""
+        s = self.s
+        opts: dict = {}
+        if hold:
+            opts["mint"] = False
+            if s.small_match_min_cosine > 0:
+                opts["min_cosine"] = s.small_match_min_cosine
+        if s.anchor_only:
+            opts["anchor_only"] = True
+        if s.best_face_anchor:
+            opts["best_face_anchor"] = True
+        return opts
+
+    def _hold_track(self, face: dict, width: float, tracks: list) -> int | None:
+        """The track to HOLD this face on, or None to decide it as always.
+
+        WHY (2026-09-30, Sharon 10 min). Letting faces from 80 px count found
+        guests the 112 px floor never saw close up, but it created most guests
+        EARLY, from a small far face — and a guest created from a poor face
+        is often not recognised by their own good face a moment later, which
+        creates them again (74 guests against 46; three were such doubles).
+        So a face narrower than ``mint_min_px`` on a track with no identity
+        may only claim an existing guest (a probe, at the stricter
+        ``small_match_min_cosine``); matching nobody, it is held on the track
+        and the guest is created from the track's best face — the first face
+        at least ``mint_min_px`` wide, or the best held face when the track
+        ends. A face outside every track has nothing to be held on and is
+        decided now, as always.
+        """
+        if self.s.mint_min_px <= 0 or width >= self.s.mint_min_px:
+            return None
+        tid = self._track_for(face, tracks)
+        if tid is None or tid in self._locks or tid in self._held_keys:
+            return None
+        return tid
+
+    def _hold_face(
+        self, tid: int, face: dict, m: dict, extras_row: dict, frame_img, t_ms: int
+    ) -> None:
+        """Hold this face on track ``tid`` if it is the track's best so far."""
+        rank = self._face_rank(face)
+        held = self._held.get(tid)
+        self._bump("facesHeld")
+        if held is None:
+            self._event(f"hold track {tid} ({rank[1]:.0f}px)")
+        else:
+            held["seen"] = self._frame_no
+            held["n"] += 1
+            if not self._rank_better(rank, held["rank"]):
+                return
+        card = None
+        if frame_img is not None and face.get("box"):
+            try:
+                crop = annotate.face_crop(frame_img, face["box"])
+                card = None if crop is None else annotate.to_jpeg(crop, quality=82)
+            except Exception:  # noqa: BLE001 — a thumbnail must never kill a run
+                card = None
+        self._held[tid] = {
+            "rank": rank, "face": face, "emb": m.get("_embedding"),
+            "featNorm": m.get("featNorm"), "extras": extras_row, "card": card,
+            "tMs": t_ms, "seen": self._frame_no,
+            "since": held["since"] if held else self._frame_no,
+            "n": held["n"] if held else 1,
+            "keys": held["keys"] if held else set(),
+        }
+
+    def _note_held_company(self, tracks: list, decided: list, present: list) -> None:
+        """Who shared this frame with each held body — two bodies, two people.
+
+        Held guests have no key yet, so co-presence cannot be asserted for
+        them now; it is remembered and asserted when they get one (the keys
+        of the guests beside them, and the pairs of held bodies seen
+        together).
+        """
+        boxes = {t.get("id"): t.get("box") for t in tracks}
+        here = [tid for tid in self._held if boxes.get(tid)]
+        if not here:
+            return
+
+        def inside(f, b):
+            fb = f.get("box") or {}
+            cx = float(fb.get("x", 0)) + float(fb.get("w", 0)) / 2.0
+            cy = float(fb.get("y", 0)) + float(fb.get("h", 0)) / 2.0
+            return (b["x"] <= cx <= b["x"] + b["w"]) and (b["y"] <= cy <= b["y"] + b["h"])
+
+        for tid in here:
+            box = boxes[tid]
+            keys = self._held[tid]["keys"]
+            for f, m, _d, _p in decided:
+                k = m.get("personKey")
+                if k and not m.get("isStaff") and not inside(f, box):
+                    keys.add(k)
+            for k, _tok in present or ():
+                if k:
+                    keys.add(k)
+        for i, a in enumerate(here):
+            for b in here[i + 1:]:
+                self._held_pairs.add((min(a, b), max(a, b)))
+
+    def _resolve_held(self, tid: int, key: str) -> None:
+        """A held track got an identity from an ordinary verdict: stop holding it."""
+        held = self._held.pop(tid, None)
+        if held is None:
+            return
+        self._held_keys[tid] = key
+        self._bump("heldResolved")
+        self._assert_held_company(self.status().get("plannerRunId"), tid, key, held)
+
+    def _assert_held_company(self, planner_run_id, tid: int, key: str, held: dict) -> None:
+        """Assert co-presence for a held guest now that they have ``key``."""
+        others = set(held.get("keys") or ())
+        for pair in [p for p in self._held_pairs if tid in p]:
+            other = pair[0] if pair[1] == tid else pair[1]
+            other_key = self._held_keys.get(other) or (self._locks.get(other) or {}).get("key")
+            if other_key:
+                others.add(other_key)
+                self._held_pairs.discard(pair)
+        for k in sorted(others):
+            if not k or k == key:
+                continue
+            a, b = sorted((key, k))
+            if f"{a}|{b}" in self._copresence_sent:
+                continue
+            if self._send_co_presence_split(planner_run_id, a, b):
+                self._bump("heldPresenceSplits")
+
+    def _tick_held(self, planner_run_id, tracks: list, force: bool = False) -> None:
+        """Create the guest of every held track that has left (or all, at the end).
+
+        A track counts as gone once the tracker has not reported it for
+        ``hold_flush_frames`` frames — longer than the tracker's own coast,
+        so a guest briefly hidden behind somebody is not created early.
+        """
+        live = {t.get("id") for t in tracks}
+        for tid in list(self._held):
+            held = self._held[tid]
+            if tid in live and not force:
+                held["seen"] = self._frame_no
+                continue
+            if force or self._frame_no - held["seen"] > self.s.hold_flush_frames:
+                self._mint_held(planner_run_id, tid, self._held.pop(tid))
+
+    def _mint_held(self, planner_run_id, tid: int, held: dict) -> None:
+        """Create (or find) the guest a held track was, from its best face."""
+        ex = held["extras"]
+        width = float((held["face"].get("box") or {}).get("w") or 0.0)
+        if held.get("emb") is None:
+            return
+        try:
+            m = self.match_port.match(
+                embedding=held["emb"], quality=width, appearance=ex.get("appearance"),
+                site_id=ex.get("siteId"), attributes=ex.get("attributes"),
+                feat_norm=ex.get("featNorm"), body=ex.get("body"),
+                head=ex.get("head"), beard=ex.get("beard"), skin=ex.get("skin"),
+                **self._match_options(False),
+            )
+        except Exception as e:  # noqa: BLE001 — logged and counted, the run goes on
+            self._bump("heldFailed")
+            self.log.warning(f"held track {tid}: creating its guest failed ({e}) — dropped")
+            return
+        if m.get("isStaff"):
+            self._count_staff(m)
+            return
+        key = m.get("personKey")
+        if not key:
+            return
+        self._held_keys[tid] = key
+        with self._lock:
+            st = self._status
+            st["matches"] += 1
+            if m.get("subCanon"):
+                st["subCanonMatches"] += 1
+            if m.get("isNew"):
+                st["unique"] += 1
+                self._mints.append({
+                    "personKey": key,
+                    "tMs": held["tMs"],
+                    "cosine": m.get("cosine"),
+                    "appearanceSim": m.get("appearanceSim"),
+                    "subCanon": bool(m.get("subCanon", False)),
+                    "nearMiss": m.get("nearMiss"),
+                    "overlap": m.get("overlap"),
+                })
+                del self._mints[:-500]
+                if m.get("nearMiss"):
+                    st["nearMissMints"] += 1
+            st["subCanonShare"] = st["subCanonMatches"] / st["matches"] if st["matches"] else 0.0
+            if m.get("templateAdded"):
+                st["templatesEnrolled"] += 1
+        self._note_templates(key, m.get("templateN"))
+        frames = self._frame_no - held["since"]
+        if m.get("isNew"):
+            self._bump("heldMinted")
+            self._event(f"mint {key} from held track {tid} @{_fmt(m.get('cosine'))}")
+            self.log.info(
+                f"held track {tid} became {key}: created from its best face "
+                f"({width:.0f} px, front band {held['rank'][0]}) after {frames} frames, "
+                f"{held['n']} small face(s) held"
+            )
+        else:
+            self._bump("heldMatched")
+        # Its picture: the held best face, when it beats the card (a match
+        # into an existing guest keeps that guest's card unless it is better).
+        if held.get("card"):
+            m_card = dict(m, featNorm=held.get("featNorm"))
+            with self._lock:
+                if self._rank_better(held["rank"], self._card_rank.get(key)):
+                    self._face_pending[key] = (
+                        held["card"], self._card_quality(held["face"], m_card)
+                    )
+                    self._face_card_vecs[key] = held["emb"]
+                    self._card_rank[key] = held["rank"]
+        self._assert_held_company(planner_run_id, tid, key, held)
 
     def _flush_face_cards(self, deadline: float) -> None:
         """Upload the face cards waiting from recent frames, inside the round.
@@ -5586,6 +5979,18 @@ class RunLoop:
     def _outbox_counters(self, st: dict) -> dict:
         """The outbox's counters for the notes and the results (see OUTBOX_COUNTERS)."""
         return {k: st[k] for k in self.OUTBOX_COUNTERS if st.get(k) is not None}
+
+    #: Best-face minting and best-face templates, present only on a run that
+    #: used them: faces held, guests created from a held track's best face,
+    #: held tracks that turned out to be a known guest, and best faces stored.
+    HOLD_COUNTERS = (
+        "facesHeld", "heldMinted", "heldMatched", "heldResolved", "heldPresenceSplits",
+        "heldFailed", "anchorsSet", "bestFaceRefusedLookalike",
+    )
+
+    def _hold_counters(self, st: dict) -> dict:
+        """The best-face counters for the notes and the results (see HOLD_COUNTERS)."""
+        return {k: st[k] for k in self.HOLD_COUNTERS if st.get(k) is not None}
 
 
 #: The window behind count.windowFps (StatsBoard.observe_window_rate): at

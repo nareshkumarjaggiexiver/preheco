@@ -62,9 +62,14 @@ class BadRunIdError(ValueError):
 
 @dataclass
 class MatchResult:
-    """Outcome of one gallery lookup: who, whether new, how close, gallery size."""
+    """Outcome of one gallery lookup: who, whether new, how close, gallery size.
 
-    person_key: str
+    ``person_key`` is None only for a probe (``mint=False``) that matched
+    nobody: the caller asked "is this someone we know?" and the answer is no,
+    with nothing written.
+    """
+
+    person_key: str | None
     is_new: bool
     cosine: float | None  # best similarity vs the pre-existing gallery; None if it was empty
     gallery_n: int  # distinct persons after this operation
@@ -450,6 +455,21 @@ def match(
     head: list[float] | None = None,
     beard: list[float] | None = None,
     skin: list[float] | None = None,
+    # THE BEST-FACE OPTIONS (2026-09-30), all off by default.
+    # ``mint=False`` makes the call a PROBE: a face that matches nobody comes
+    # back with person_key None and NOTHING written — the runner holds such a
+    # face on its track and creates the guest later from the track's best face.
+    mint: bool = True,
+    # A stricter bar for this probe than the gallery's threshold (never a
+    # looser one): a small, far face may only claim an EXISTING guest when it
+    # is clearly them, or a poor early face locks onto the wrong person.
+    min_cosine: float | None = None,
+    # Compare an identity that holds a best-face template on that template
+    # alone (the anchor-only variant; see VectorStore.search_anchors).
+    anchor_only: bool = False,
+    # A mint's founding template is flagged as its best face so far, so the
+    # first better face (set_anchor) replaces it rather than joining it.
+    best_face_anchor: bool = False,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -563,9 +583,16 @@ def match(
     sub_canon = quality is not None and quality < canon_px
     store = open_store(db_path(data_dir, run_id))
 
+    # The bar a match must clear: the gallery's threshold, raised (never
+    # lowered) by a probe that asks for a stricter one.
+    bar = threshold if min_cosine is None else max(threshold, float(min_cosine))
     with store.transaction():
-        hit = store.search(embedding, exclude=exclude_keys)
-        if hit is not None and hit.cosine >= threshold:
+        hit = (
+            store.search_anchors(embedding, exclude=exclude_keys)
+            if anchor_only
+            else store.search(embedding, exclude=exclude_keys)
+        )
+        if hit is not None and hit.cosine >= bar:
             # Similarity vs what is ALREADY stored, computed before this call
             # writes anything — otherwise an enrolled sighting would be
             # compared against itself and always report 1.0.
@@ -627,10 +654,19 @@ def match(
                 body_id=body_id,
                 overlap=overlap,
             )
+        if not mint:
+            # A PROBE that matched nobody: say so, write nothing — no template,
+            # no body row. The caller creates the guest later from its best face.
+            return MatchResult(
+                None, False, hit.cosine if hit is not None else None,
+                store.distinct_count(), sub_canon, 0, False,
+            )
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p",
             appearance=appearance, attributes=attributes, feat_norm=feat_norm,
         )
+        if best_face_anchor:
+            store.mark_founding_anchor(key)
         body_id = _log_body(store, key, body, quality, appearance, head, beard, skin)
         # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
         # BEFORE this mint wrote anything — and against the near-missed
@@ -1804,6 +1840,32 @@ def review_duplicates(
         # because their two identities were read under different light.
         "keptByLight": kept_by_light,
     }
+
+
+def set_anchor(
+    data_dir: Path,
+    run_id: str,
+    key: str,
+    embedding: list[float],
+    quality: float | None = None,
+    canon_px: float = 0.0,
+    appearance: list[float] | None = None,
+    attributes: dict | None = None,
+    feat_norm: float | None = None,
+) -> int:
+    """Replace ``key``'s best-face template with this face; its template count after.
+
+    See :meth:`VectorStore.set_anchor`. KeyError when the run's gallery does
+    not hold ``key`` — an anchor upgrades somebody, it never creates them.
+    """
+    store = open_store(db_path(data_dir, run_id))
+    sub_canon = quality is not None and quality < canon_px
+    with store.transaction():
+        store.set_anchor(
+            key, embedding, quality=quality, sub_canon=sub_canon,
+            appearance=appearance, attributes=attributes, feat_norm=feat_norm,
+        )
+        return store.count_for(key)
 
 
 def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:

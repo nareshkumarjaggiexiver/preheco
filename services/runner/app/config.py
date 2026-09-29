@@ -360,6 +360,24 @@ class Settings:
     # people (co-present) score 0.12 at the median over six galleries, the
     # lowest same-person fold on record 0.21 (bench 6e1a5d).  0 = off.
     fold_min_face_cosine: float = 0.10
+    # BEST-FACE MINTING (2026-09-30), off at 0. A face narrower than this on a
+    # track with no identity may only claim an EXISTING guest; matching
+    # nobody, it is HELD on the track and the guest is created from the
+    # track's best face (the first face at least this wide, or the best held
+    # face when the track ends) — see RunLoop._hold_track. Pair with a lower
+    # face floor (quality_min_px, e.g. 80) so far faces are seen at all.
+    mint_min_px: float = 0.0
+    # The bar such a small face must clear to claim an existing guest; 0 = the
+    # gallery threshold. Only ever raises it.
+    small_match_min_cosine: float = 0.0
+    # Frames a held track may go unreported before its guest is created
+    # (longer than the tracker's 30-frame coast; ~3 s at 15 fps).
+    hold_flush_frames: int = 45
+    # The guest's best face — front-on first, then widest, then sharpest — is
+    # both their card and their best-face template in the gallery.
+    best_face_anchor: bool = False
+    # Match guests on their best-face template alone (the A/B variant).
+    anchor_only: bool = False
     # HEAL APPEARANCE BANDS (see loop._appearance_refuses and app/appearance.py).
     # A fold candidate's remembered torso descriptor is compared with the
     # current frame's by histogram intersection, and the reading falls in one
@@ -670,6 +688,11 @@ def from_env() -> Settings:
             "HECO_TRACK_LOCK_MIN_COSINE", s.track_lock_min_cosine
         ),
         fold_min_face_cosine=env_float("HECO_FOLD_MIN_FACE_COSINE", s.fold_min_face_cosine),
+        mint_min_px=env_float("HECO_MINT_MIN_PX", s.mint_min_px),
+        small_match_min_cosine=env_float("HECO_SMALL_MATCH_MIN_COSINE", s.small_match_min_cosine),
+        hold_flush_frames=env_int("HECO_HOLD_FLUSH_FRAMES", s.hold_flush_frames),
+        best_face_anchor=env_bool("HECO_BEST_FACE_ANCHOR", s.best_face_anchor),
+        anchor_only=env_bool("HECO_ANCHOR_ONLY", s.anchor_only),
         heal_appearance_clash=env_float(
             "HECO_HEAL_APPEARANCE_CLASH", s.heal_appearance_clash
         ),
@@ -730,6 +753,12 @@ def knobs(s: Settings) -> dict:
         "HECO_HEADWEAR_QUEUE": s.headwear_queue,
         # Not a throughput lever either: the face guard on heal and lock folds.
         "HECO_FOLD_MIN_FACE_COSINE": s.fold_min_face_cosine,
+        # Nor these: best-face minting and best-face templates (off by default).
+        "HECO_MINT_MIN_PX": s.mint_min_px,
+        "HECO_SMALL_MATCH_MIN_COSINE": s.small_match_min_cosine,
+        "HECO_HOLD_FLUSH_FRAMES": s.hold_flush_frames,
+        "HECO_BEST_FACE_ANCHOR": s.best_face_anchor,
+        "HECO_ANCHOR_ONLY": s.anchor_only,
         # Nor these: whether planner writes survive a planner restart, and the
         # memory one run's outbox may hold meanwhile (live state: plannerOutbox).
         "HECO_PLANNER_DURABLE": s.planner_durable,

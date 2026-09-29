@@ -201,6 +201,24 @@ carries information.
   residual risk; it does not eliminate it (same-colour swaps are invisible to
   it — that is what track-quality gating remains for). Appearance agreement
   never lowers a cosine floor: the signal only ever fails to object.
+- **Best-face minting and best-face templates (2026-09-30, off by default).**
+  Letting faces from 80 px count found Sharon guests the 112 px floor never saw
+  close up (74 guests against 46), but it created most guests EARLY from a small
+  far face, and a guest created from a poor face is often not recognised by
+  their own good face moments later — three such doubles on that clip.
+  `mintMinPx` (HECO_MINT_MIN_PX, e.g. 112 with `minPx` 80): a narrower face on
+  a track with no identity may only claim an EXISTING guest — a probe, at
+  `smallMatchMinCosine` when set — and otherwise is HELD on its track; the
+  guest is created from the track's best face, the first one at least
+  `mintMinPx` wide, or the best held face once the track has been gone
+  `holdFlushFrames` (45) frames, or at end of run. Held bodies seen together
+  are asserted as two people when they get keys. `bestFaceAnchor`: the guest's
+  best face — front-on first, then 8% wider, then 20% sharper — is their card
+  AND their best-face template in the gallery (POST /template/anchor), one
+  image for both; `anchorOnly` matches guests on that template alone. All are
+  per-run `quality` fields too; the counters (`facesHeld`, `heldMinted`,
+  `heldMatched`, `heldResolved`, `heldPresenceSplits`, `anchorsSet`,
+  `bestFaceRefusedLookalike`) appear only on a run that used them.
 - **Fold guard — the face (2026-09-29).** The same-colour swap the clothing
   bands cannot see happened on the Sharon clip: the tracker moved p00022's
   box onto an older man in similar dark clothes, and the lock folded his

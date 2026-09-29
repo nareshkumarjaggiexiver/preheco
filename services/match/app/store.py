@@ -197,6 +197,7 @@ _VECTOR_COLUMNS_ADDED = (
     ("gender_p", "REAL"),     # ... probability of that reported sex, 0..1
     ("age", "REAL"),          # ... estimated age in years
     ("feat_norm", "REAL"),    # ... L2 norm of the raw embedding feature
+    ("anchor", "INTEGER"),    # 2026-09-30: 1 on the identity's BEST-FACE template
 )
 #: Same for ``body_sightings``, which shipped without ``face_w`` for a day
 #: and without the sighting's appearance readings until that night.
@@ -1111,7 +1112,7 @@ class VectorStore:
         self._index()  # load BEFORE the delete, so the index still has the rows
         rows = self.conn.execute(
             "SELECT id FROM vectors WHERE key = ?"
-            " ORDER BY (quality IS NULL) ASC, quality DESC, id ASC",
+            " ORDER BY COALESCE(anchor, 0) DESC, (quality IS NULL) ASC, quality DESC, id ASC",
             (key,),
         ).fetchall()
         doomed = {int(r[0]) for r in rows[cap:]}
@@ -1176,7 +1177,8 @@ class VectorStore:
         if cap < 1:
             raise ValueError("cap must be at least 1")
         rows = self.conn.execute(
-            "SELECT id, vec, dim, quality FROM vectors WHERE key = ? ORDER BY id ASC",
+            "SELECT id, vec, dim, quality, COALESCE(anchor, 0) FROM vectors"
+            " WHERE key = ? ORDER BY id ASC",
             (key,),
         ).fetchall()
         if len(rows) <= cap:
@@ -1189,6 +1191,9 @@ class VectorStore:
             )
             for r in rows
         ]
+        # The BEST-FACE template (set_anchor) is never evictable: it is the view
+        # the guest's card shows and the one an anchor-only match relies on.
+        anchors = {int(r[0]) for r in rows if r[4]}
         doomed: set[int] = set()
         while len(live) > cap:
             mat = np.stack([v for _, v, _ in live])
@@ -1198,8 +1203,11 @@ class VectorStore:
             # Most redundant first.  Tie-break keys are NEGATED quality (so the
             # lower quality sorts higher = more evictable, and a quality-less
             # row is the most evictable of all) then row id (newer goes first).
+            evictable = [i for i in range(len(live)) if live[i][0] not in anchors]
+            if not evictable:
+                break
             worst = max(
-                range(len(live)),
+                evictable,
                 key=lambda i: (
                     float(nearest[i]),
                     -(live[i][2] if live[i][2] is not None else -1.0),
@@ -1212,6 +1220,93 @@ class VectorStore:
         self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in doomed])
         self._drop_ids(doomed)
         return len(doomed)
+
+    def set_anchor(
+        self,
+        key: str,
+        embedding: list[float] | np.ndarray,
+        quality: float | None = None,
+        sub_canon: bool = False,
+        appearance: list[float] | np.ndarray | None = None,
+        attributes: dict | None = None,
+        feat_norm: float | None = None,
+    ) -> int:
+        """Make this face the identity's BEST-FACE template; returns its rowid.
+
+        The operator's rule (2026-09-30): as a guest walks towards the camera
+        their face gets better, and the face the register shows AND the vector
+        the gallery holds for them should both be the best one seen — front-on
+        first, then widest, then sharpest (the runner judges that; this only
+        stores it). So the new face is written as a template flagged ``anchor``
+        and the previous anchor, if any, is removed: one best-face template per
+        identity, replaced as better faces arrive. The identity's other
+        templates (other angles) are untouched; :meth:`prune_redundant` never
+        evicts an anchor.
+
+        Raises KeyError for a key with no templates — an anchor is an upgrade
+        of somebody who exists, never a way to create them.
+        """
+        held = self.conn.execute(
+            "SELECT count(*) FROM vectors WHERE key = ?", (key,)
+        ).fetchone()[0]
+        if not held:
+            raise KeyError(key)
+        old = [
+            int(r[0]) for r in self.conn.execute(
+                "SELECT id FROM vectors WHERE key = ? AND anchor = 1", (key,)
+            )
+        ]
+        row_id = self.add(key, embedding, quality, sub_canon, appearance, attributes, feat_norm)
+        self.conn.execute("UPDATE vectors SET anchor = 1 WHERE id = ?", (row_id,))
+        if old:
+            self._index()
+            self.conn.executemany("DELETE FROM vectors WHERE id = ?", [(i,) for i in old])
+            self._drop_ids(set(old))
+        return row_id
+
+    def mark_founding_anchor(self, key: str) -> None:
+        """Flag a freshly minted key's founding template as its best face."""
+        self.conn.execute(
+            "UPDATE vectors SET anchor = 1 WHERE id ="
+            " (SELECT min(id) FROM vectors WHERE key = ?)",
+            (key,),
+        )
+
+    def anchor_count(self, key: str) -> int:
+        """How many best-face templates ``key`` holds (0 or 1 by construction)."""
+        return int(self.conn.execute(
+            "SELECT count(*) FROM vectors WHERE key = ? AND anchor = 1", (key,)
+        ).fetchone()[0])
+
+    def search_anchors(
+        self, embedding: list[float] | np.ndarray, exclude: set[str] | None = None
+    ) -> Neighbour | None:
+        """:meth:`search`, but an identity that HAS a best-face template is
+        compared on that template alone (the anchor-only match variant).
+
+        Identities without an anchor (minted before the feature, or with it
+        off) are compared on all their templates, exactly as :meth:`search`
+        does, so switching the variant on mid-gallery drops nobody. A plain
+        scan over the rows — this is an experiment arm, not the hot path.
+        """
+        q = as_unit(embedding)
+        rows = self.conn.execute(
+            "SELECT key, vec, dim, COALESCE(anchor, 0) FROM vectors"
+        ).fetchall()
+        anchored = {r[0] for r in rows if r[3]}
+        best: Neighbour | None = None
+        for key, vec, dim, is_anchor in rows:
+            if exclude and key in exclude:
+                continue
+            if key in anchored and not is_anchor:
+                continue
+            v = as_unit(np.frombuffer(vec, dtype=np.float32).reshape(dim))
+            if v.size != q.size:
+                raise ValueError(f"embedding dim {q.size} != store dim {v.size}")
+            c = float(v @ q)
+            if best is None or c > best.cosine:
+                best = Neighbour(key=key, cosine=c)
+        return best
 
     def forget_template(self, row_id: int) -> bool:
         """Retract ONE enrolled template by rowid; True if it was removed.
