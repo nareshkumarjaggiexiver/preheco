@@ -217,8 +217,10 @@ carries information.
   AND their best-face template in the gallery (POST /template/anchor), one
   image for both; `anchorOnly` matches guests on that template alone. All are
   per-run `quality` fields too; the counters (`facesHeld`, `heldMinted`,
-  `heldMatched`, `heldResolved`, `heldPresenceSplits`, `anchorsSet`,
-  `bestFaceRefusedLookalike`) appear only on a run that used them.
+  `heldMatched`, `heldResolved`, `heldPresenceSplits`, `heldTurned`, `anchorsSet`,
+  `bestFaceRefusedLookalike`) appear only on a run that used them. A held
+  track whose best face is TURNED (frontality under 0.7) may claim a known
+  guest but never creates one — both Sharon doubles were such mints.
 - **Fold guard — the face (2026-09-29).** The same-colour swap the clothing
   bands cannot see happened on the Sharon clip: the tracker moved p00022's
   box onto an older man in similar dark clothes, and the lock folded his

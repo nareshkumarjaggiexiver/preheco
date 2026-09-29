@@ -902,6 +902,11 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             headwear_bare_p=config.review_headwear_bare_p(),
             headwear_cap_p=config.review_headwear_cap_p(),
             clothes_burst_clash=config.review_clothes_burst_clash(),
+            clothes_gap=config.review_clothes_gap(),
+            clothes_gap_min_n=config.review_clothes_gap_min_n(),
+            single_min_clashes=config.review_single_min_clashes(),
+            single_est_n=config.review_single_est_n(),
+            single_sex_p=config.review_single_sex_p(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -927,6 +932,11 @@ def _review_policy() -> dict:
         "clothesWellSeenN": config.review_clothes_well_seen_n(),
         "clothesWellSeenClash": config.review_clothes_well_seen_clash(),
         "clothesBurstClash": config.review_clothes_burst_clash(),
+        "clothesGap": config.review_clothes_gap(),
+        "clothesGapMinN": config.review_clothes_gap_min_n(),
+        "singleMinClashes": config.review_single_min_clashes(),
+        "singleEstN": config.review_single_est_n(),
+        "singleSexP": config.review_single_sex_p(),
         "headClash": config.review_head_clash(),
         "beardMinN": config.review_beard_min_n(),
         "lightTol": config.review_light_tol(),

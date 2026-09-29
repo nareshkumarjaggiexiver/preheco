@@ -3398,18 +3398,28 @@ class RunLoop:
                 self._mint_held(planner_run_id, tid, self._held.pop(tid))
 
     def _mint_held(self, planner_run_id, tid: int, held: dict) -> None:
-        """Create (or find) the guest a held track was, from its best face."""
+        """Create (or find) the guest a held track was, from its best face.
+
+        A best face that is TURNED (front band 0) may claim an existing guest
+        but never create one: on the Sharon clip both held-track mints from a
+        turned face (2 of 21) were doubles — the guest's own frontal face,
+        seen later, did not recognise its turned founding view and minted
+        again. Such a track is counted in ``heldTurned`` and its guest, if
+        they never show a better face, is not counted: a miss the operator
+        can see, against a double they could not.
+        """
         ex = held["extras"]
         width = float((held["face"].get("box") or {}).get("w") or 0.0)
         if held.get("emb") is None:
             return
+        turned = held["rank"][0] == 0
         try:
             m = self.match_port.match(
                 embedding=held["emb"], quality=width, appearance=ex.get("appearance"),
                 site_id=ex.get("siteId"), attributes=ex.get("attributes"),
                 feat_norm=ex.get("featNorm"), body=ex.get("body"),
                 head=ex.get("head"), beard=ex.get("beard"), skin=ex.get("skin"),
-                **self._match_options(False),
+                **{**self._match_options(False), **({"mint": False} if turned else {})},
             )
         except Exception as e:  # noqa: BLE001 — logged and counted, the run goes on
             self._bump("heldFailed")
@@ -3420,6 +3430,9 @@ class RunLoop:
             return
         key = m.get("personKey")
         if not key:
+            if turned:
+                self._bump("heldTurned")
+                self._event(f"held track {tid}: only a turned face, not counted")
             return
         self._held_keys[tid] = key
         with self._lock:
@@ -5985,7 +5998,7 @@ class RunLoop:
     #: held tracks that turned out to be a known guest, and best faces stored.
     HOLD_COUNTERS = (
         "facesHeld", "heldMinted", "heldMatched", "heldResolved", "heldPresenceSplits",
-        "heldFailed", "anchorsSet", "bestFaceRefusedLookalike",
+        "heldTurned", "heldFailed", "anchorsSet", "bestFaceRefusedLookalike",
     )
 
     def _hold_counters(self, st: dict) -> dict:

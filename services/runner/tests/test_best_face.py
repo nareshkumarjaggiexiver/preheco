@@ -249,3 +249,23 @@ def test_front_on_beats_width_then_width_then_sharpness():
     assert better((2, 99.0, 130.0), (2, 100.0, 100.0)), "as wide and 30% sharper"
     assert not better((2, 99.0, 110.0), (2, 100.0, 100.0))
     assert better((0, 50.0, 1.0), None), "anything beats nothing"
+
+
+def test_a_track_whose_best_face_is_turned_may_claim_a_guest_but_never_creates_one():
+    """Both Sharon doubles came from a held track created off a turned face:
+    such a track probes (it may be a known guest), and otherwise is not counted."""
+    turned = [[_person(1, 20, 95, _vec(1), frontality=0.4)], [], [], [], []]
+    fake = WalkIn(turned)
+    make_loop(fake, **HOLD).run()
+    res = _counters(fake)
+    assert res["unique"] == 0 and res["heldTurned"] == 1
+    assert "heldMinted" not in res
+    assert all(b.get("mint") is False for b in fake.match_bodies), "every ask was a probe"
+
+    # A known guest is still claimed — on the first frame, as an ordinary
+    # small-face probe: never held, never turned away.
+    known = WalkIn(turned, known={"p00001": _vec(1)})
+    make_loop(known, **HOLD).run()
+    res = _counters(known)
+    assert res["unique"] == 0 and res["matches"] == 1
+    assert "heldTurned" not in res and "facesHeld" not in res

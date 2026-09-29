@@ -174,3 +174,4 @@ def test_anchor_only_compares_a_guest_on_the_best_face_alone(tmp_path):
         tmp_path, "r1", _json(b), 120.0, threshold=THRESHOLD, canon_px=80.0
     ).person_key
     assert probe_key(_at(b, 0.8, 11), anchor_only=True) == other
+

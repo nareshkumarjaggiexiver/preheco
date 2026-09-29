@@ -72,6 +72,7 @@ def excluded(**counts) -> dict:
     """The reply's ``excluded`` block: every signal at zero but those named."""
     return {
         "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        "single": 0,
         **counts,
     }
 
@@ -624,7 +625,9 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
             },
             # v2 torsos are not clothing EVIDENCE (nA/nB count v3 reads), even
             # though the 48-d pair still ranks by its own intersection below.
-            "clothes": {"selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0},
+            "clothes": {
+                "selfA": None, "selfB": None, "cross": None, "nA": 0, "nB": 0, "gap": None,
+            },
             "head": {
                 "a": None, "b": None, "sim": None, "selfA": None, "selfB": None,
                 "nA": 0, "nB": 0, "wearA": None, "wearB": None,
@@ -635,6 +638,7 @@ def test_a_legacy_gallery_answers_null_everywhere_and_excludes_nothing(client, t
                 "a": None, "b": None, "nA": 0, "nB": 0,
                 "turbanA": 0, "bareA": 0, "turbanB": 0, "bareB": 0, "capA": 0, "capB": 0,
             },
+            "single": None,
         }
         assert p["clothes"] == pytest.approx(1.0), "the 48-d torsos still compare"
     assert got["setAside"] == []
@@ -855,7 +859,7 @@ def test_a_clear_clothing_clash_sets_the_pair_aside_and_keeps_it_visible(client,
     # float64 (1.0000000298), the arithmetic the body-log rule uses.
     assert row["why"]["clothes"] == {
         "selfA": pytest.approx(1.0), "selfB": pytest.approx(1.0), "cross": pytest.approx(0.0),
-        "nA": 3, "nB": 3,
+        "nA": 3, "nB": 3, "gap": None,
     }
     s = opened(tmp_path, "r")
     with s.reading():
