@@ -552,6 +552,30 @@ def test_age_exclusion_is_child_against_adult_and_the_dead_zone_still_asks(clien
     assert got["excluded"] == excluded(age=1)
 
 
+def test_age_gap_sets_aside_two_adults_far_apart_only_when_switched_on(client, monkeypatch):
+    """Off by default (genderage's ages wander 10 years on one guest): two
+    adults 16 years apart are asked about.  HECO_REVIEW_AGE_GAP=15 (the
+    faceage calibration) sets them aside; 10 years apart is still asked."""
+    kh = match(client, "r", hub(), attrs("F", 0.7, 30.0))["personKey"]
+    k_far = match(client, "r", spoke(1), attrs("F", 0.7, 46.0))["personKey"]
+    k_near = match(client, "r", spoke(2), attrs("F", 0.7, 40.0))["personKey"]
+
+    got = review(client)
+    assert frozenset((kh, k_far)) in pairs_of(got)
+    assert got["excluded"] == excluded()
+    assert client.get("/health").json()["reviewAgeGap"] == 0
+
+    monkeypatch.setenv("HECO_REVIEW_AGE_GAP", "15")
+    got = review(client)
+    by = pairs_of(got)
+    assert frozenset((kh, k_far)) not in by
+    assert frozenset((kh, k_near)) in by
+    assert got["excluded"] == excluded(age=1)
+    assert [p["reasons"] for p in got["setAside"]] == [["age"]]
+    assert client.get("/health").json()["reviewAgeGap"] == pytest.approx(15.0)
+    assert got["policy"]["ageGap"] == pytest.approx(15.0)
+
+
 def test_stature_exclusion_sets_aside_a_child_sized_body_against_an_adult(client, ticking):
     """Two identities in the face band; one walks the hall at 0.7 of adult height."""
     kh = match(client, "r", hub())["personKey"]

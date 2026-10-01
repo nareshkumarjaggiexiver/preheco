@@ -301,6 +301,16 @@ DEFAULT_REVIEW_GENDER_MIN_P = 0.8
 # Either knob at 0 turns the signal off.
 DEFAULT_REVIEW_AGE_CHILD_MAX = 12.0
 DEFAULT_REVIEW_AGE_ADULT_MIN = 20.0
+# Age GAP: two medians this many years apart or more are two people, child
+# or adult.  Off (0) by default: it is a rule for an attribute model whose
+# ages hold still — calibrated 2026-10-01 on the Sharon clip's 36 guests
+# (703 distinct-guest pairs) under faceage-dino, whose age spread over one
+# guest's clean views is 3.6 years: a 15-year gap set aside 49 % of the pairs
+# with 0 misfires; 12 years, 57 % with 1.  genderage's spread on the same
+# crops is 10.4 years, and under it any gap worth having misfires — so the
+# knob is set where the embed service runs faceage (its /health attrFamily)
+# and nowhere else.
+DEFAULT_REVIEW_AGE_GAP = 0.0
 
 # Stature: each standing person box in the run is fitted, box height against
 # box bottom-y (the camera's perspective: further from the lens = higher in
@@ -542,6 +552,13 @@ def review_age_adult_min() -> float:
     """Median age at or above which an identity reads as an adult
     (env HECO_REVIEW_AGE_ADULT_MIN; 0 = the age signal is off)."""
     return _env_f("HECO_REVIEW_AGE_ADULT_MIN", DEFAULT_REVIEW_AGE_ADULT_MIN)
+
+
+def review_age_gap() -> float:
+    """Years between two median ages at or beyond which a pair is set aside,
+    whatever the bands (env HECO_REVIEW_AGE_GAP; 0 = off, the default — see
+    DEFAULT_REVIEW_AGE_GAP for the model it is calibrated to)."""
+    return _env_f("HECO_REVIEW_AGE_GAP", DEFAULT_REVIEW_AGE_GAP)
 
 
 def review_stature_gap() -> float:

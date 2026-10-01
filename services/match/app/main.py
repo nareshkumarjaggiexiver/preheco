@@ -111,7 +111,7 @@ def _env_s(name: str, default: float) -> float:
 #: minFaceCosine and folds as before.
 #: 0.19.1 (2026-09-29): /review/duplicates replies with ``policy`` — the bars
 #: that queue was made under.  Additive.
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -549,6 +549,7 @@ def health() -> dict:
         "reviewGenderMinP": config.review_gender_min_p(),
         "reviewAgeChildMax": config.review_age_child_max(),
         "reviewAgeAdultMin": config.review_age_adult_min(),
+        "reviewAgeGap": config.review_age_gap(),
         "reviewStatureGap": config.review_stature_gap(),
         "reviewStatureMinN": config.review_stature_min_n(),
         "adultM": config.adult_height_m(),
@@ -884,6 +885,7 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             gender_min_p=config.review_gender_min_p(),
             age_child_max=config.review_age_child_max(),
             age_adult_min=config.review_age_adult_min(),
+            age_gap=config.review_age_gap(),
             stature_gap=config.review_stature_gap(),
             stature_min_n=config.review_stature_min_n(),
             adult_m=config.adult_height_m(),
@@ -924,6 +926,7 @@ def _review_policy() -> dict:
         "genderMinP": config.review_gender_min_p(),
         "ageChildMax": config.review_age_child_max(),
         "ageAdultMin": config.review_age_adult_min(),
+        "ageGap": config.review_age_gap(),
         "statureGap": config.review_stature_gap(),
         "statureMinN": config.review_stature_min_n(),
         "clothesClash": config.review_clothes_clash(),

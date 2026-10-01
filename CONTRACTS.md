@@ -2133,3 +2133,40 @@ Sent on the first attempt and every retry, identical each time:
   replays unchanged through a durable client). Status alone adds
   `outboxBacklog` and `forensicFramesQueued`.
 - One WARNING when the planner stops answering, one line when it is back.
+
+## v4 addition — the attribute pass learns a second family, and the review sets aside on an age gap (embed + match 0.21.0, 2026-10-01)
+
+genderage's ages wander: over one guest's clean views on the Sharon clip
+(43 guests, 211 crops at ≥ 80 px) its spread is 10.4 years, which is why the
+v4 age rule could only tell a child from an adult. **faceage-dino**
+(DINOv3 ViT-L/16, CORAL age head, gender head — `imbcmdth/faceage-onnx`,
+Apache-2.0) reads the same crops with a 3.6-year spread; between guests a
+15-year gap in medians separates 49 % of the 703 pairs with 0 misfires
+(36 guests with ≥ 2 reads).
+
+### embed → `/embed` and `/health` (E1)
+
+- `EMBED_ATTR_MODEL` may name either family; the service reads the family
+  off the graph's outputs (one output 3 wide = genderage; two, 100 and 2
+  wide = faceage) and feeds each its own crop: genderage as before,
+  faceage a 224 px square at 1.2× the box's longer side, bicubic, RGB 0..1
+  ImageNet-normalised; age = Σ sigmoid(`age_logits`), gender = argmax
+  `gender_logits` (0 F, 1 M). The `attributes` wire shape is unchanged.
+- `GET /health` gains **`attrFamily`**: `"genderage" | "faceage" | null`,
+  beside `attrModel`. A deployment must be able to say which family
+  measured its ages, because the match rule below is calibrated per family.
+- On TensorRT the faceage engine is built with fp32 compute (`device
+  .attributes.trt.fp16` reads `false`): DINOv3's residual stream carries a
+  value near 1.57e5, past fp16, and a fp16 engine answers NaN. ~11 s cold
+  build, 14.6 ms a face.
+
+### match 0.20.0 → 0.21.0 (M1)
+
+- New knob **`HECO_REVIEW_AGE_GAP`** (years; default 0 = off): with it on,
+  a pair whose two median ages differ by that much or more is set aside
+  under `excluded.age` / reason `"age"`, whatever the child/adult bands say.
+  Both sides must be measured (absent is not zero). `/health` reports it as
+  `reviewAgeGap` and the review's `policy` as `ageGap`.
+- Off by default on purpose: 15 is the faceage calibration, and under
+  genderage any gap worth having misfires. Set it only where embed's
+  `/health` says `attrFamily: "faceage"`.

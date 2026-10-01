@@ -1155,6 +1155,7 @@ def stature_ratios(sightings: list, min_n: int) -> dict[str, float]:
 def _side_reasons(
     gender: dict, age: dict, stature: dict,
     gender_min_p: float, age_child_max: float, age_adult_min: float, stature_gap: float,
+    age_gap: float = 0.0,
 ) -> list[str]:
     """Which of sex, age and stature say this pair cannot be one person.
 
@@ -1171,7 +1172,10 @@ def _side_reasons(
       wrong, and it must not vote.
     * age — one median at or below ``age_child_max``, the other at or above
       ``age_adult_min``; the gap between the bands is the model's error
-      budget and a pair straddling it is still asked about.
+      budget and a pair straddling it is still asked about.  Or, with
+      ``age_gap`` on, the two medians ``age_gap`` years apart or more,
+      whatever the bands — the rule for an attribute model whose ages hold
+      still (config.DEFAULT_REVIEW_AGE_GAP).
     * stature — both ratios measured and ``|a-b| >= stature_gap``.
     """
     reasons: list[str] = []
@@ -1185,13 +1189,15 @@ def _side_reasons(
     ):
         reasons.append("gender")
     aa, ab = age["a"], age["b"]
-    if (
-        age_child_max > 0 and age_adult_min > 0
-        and aa is not None and ab is not None
-        and (
-            (aa <= age_child_max and ab >= age_adult_min)
-            or (ab <= age_child_max and aa >= age_adult_min)
+    if aa is not None and ab is not None and (
+        (
+            age_child_max > 0 and age_adult_min > 0
+            and (
+                (aa <= age_child_max and ab >= age_adult_min)
+                or (ab <= age_child_max and aa >= age_adult_min)
+            )
         )
+        or (age_gap > 0 and abs(aa - ab) >= age_gap)
     ):
         reasons.append("age")
     sa, sb = stature["a"], stature["b"]
@@ -1557,6 +1563,7 @@ def review_duplicates(
     gender_min_p: float = 0.0,
     age_child_max: float = 0.0,
     age_adult_min: float = 0.0,
+    age_gap: float = 0.0,
     stature_gap: float = 0.0,
     stature_min_n: int = 8,
     adult_m: float = 1.75,
@@ -1848,7 +1855,7 @@ def review_duplicates(
         }
         reasons = _side_reasons(
             why["gender"], why["age"], why["stature"],
-            gender_min_p, age_child_max, age_adult_min, stature_gap,
+            gender_min_p, age_child_max, age_adult_min, stature_gap, age_gap,
         )
         # The head covering is not a colour (the light guard never holds it)
         # and is checked last, so it is counted only where nothing else spoke.

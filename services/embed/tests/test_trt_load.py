@@ -32,7 +32,9 @@ class _Session:
 
     def __init__(self, falls_back, options, size, out_dim):
         self.falls_back, self.options = falls_back, options
-        self.size, self.out_dim, self.ran = size, out_dim, False
+        # ``out_dim``: one output's width, or a tuple of widths (faceage: two).
+        self.size, self.ran = size, False
+        self.out_dims = out_dim if isinstance(out_dim, tuple) else (out_dim,)
 
     def get_providers(self):
         if self.ran and self.falls_back:
@@ -47,12 +49,12 @@ class _Session:
                                 shape=["N", 3, self.size, self.size])]
 
     def get_outputs(self):
-        return [SimpleNamespace(shape=["N", self.out_dim])]
+        return [SimpleNamespace(shape=["N", d]) for d in self.out_dims]
 
     def run(self, _names, feeds):
         self.ran = True
         n = next(iter(feeds.values())).shape[0]
-        return [np.zeros((n, self.out_dim), dtype=np.float32)]
+        return [np.zeros((n, d), dtype=np.float32) for d in self.out_dims]
 
 
 @pytest.fixture
@@ -133,3 +135,31 @@ def test_both_graphs_key_their_engines_on_the_weights(fake_ort, tmp_path):
     dirs = [opts["trt_engine_cache_path"] for _, opts in fake_ort["seen"]]
     assert dirs == [str(tmp_path / "cache" / model_key(p))
                     for p in (b"arcface-v1", b"arcface-v2", b"genderage")]
+
+
+def test_faceage_on_tensorrt_rebuilds_its_session_with_fp32_compute(fake_ort, tmp_path):
+    """The family is read off the first session's outputs; faceage then
+    rebuilds ONCE with trt_fp16_enable off before the warm-up (its DINOv3
+    backbone overflows fp16 into NaN), and /health's read-back says so.
+    genderage's load is untouched: one session, fp16 on."""
+    fake_ort.update(size=224, out_dim=(100, 2))
+    attrs = AttributeModel(_weight(tmp_path, "faceage-dino-fp16.onnx", b"faceage"), "TRT")
+    assert attrs.family.name == "faceage"
+    assert attrs.providers_active == _TRT
+    assert attrs.trt["fp16"] is False
+    loads = [opts for _, opts in fake_ort["seen"]]
+    assert len(loads) == 2
+    assert loads[0]["trt_fp16_enable"] == "True" and loads[1]["trt_fp16_enable"] == "False"
+    assert loads[1]["trt_engine_cache_path"] == str(tmp_path / "cache" / model_key(b"faceage"))
+
+    fake_ort.update(size=96, out_dim=3, seen=[])
+    attrs = AttributeModel(_weight(tmp_path, "genderage.onnx", b"genderage"), "TRT")
+    assert attrs.family.name == "genderage" and attrs.trt["fp16"] is True
+    assert len(fake_ort["seen"]) == 1
+
+
+def test_off_tensorrt_faceage_loads_once_with_no_rebuild(fake_ort, tmp_path):
+    fake_ort.update(size=224, out_dim=(100, 2))
+    attrs = AttributeModel(_weight(tmp_path, "faceage-dino-fp16.onnx", b"faceage"), "CUDA")
+    assert attrs.family.name == "faceage" and attrs.trt is None
+    assert len(fake_ort["seen"]) == 1

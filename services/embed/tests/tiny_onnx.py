@@ -165,6 +165,43 @@ def embedding_model(weights_f32: bytes, dim: int, input_name: str = "pixel_value
     return _int(1, 8) + _blob(7, graph) + _blob(8, opset)
 
 
+def faceage_model(age_w_f32: bytes, gender_w_f32: bytes, size: int = 224,
+                  input_name: str = "face") -> bytes:
+    """A ModelProto shaped like faceage-dino: [N,3,size,size] -> age_logits [N,100] + gender_logits [N,2].
+
+    ReduceMean over the spatial axes gives each crop's mean R, G, B (as
+    the pass normalised them), then two MatMuls with constant [3, 100] and
+    [3, 2] weights (little-endian float32, row-major) — so a test computes
+    the exact logits from the exact blob, pinning the 224 crop at 1.2x the
+    box, the ImageNet normalisation and the CORAL decoding through a real
+    session. Two outputs is also what tells the family apart at load.
+    """
+    rm = (
+        _string(1, input_name) + _string(2, "m")
+        + _string(3, "reduce_mean") + _string(4, "ReduceMean")
+        + _blob(5, _attr_ints("axes", (2, 3))) + _blob(5, _attr_int("keepdims", 0))
+    )
+    age = (
+        _string(1, "m") + _string(1, "Wa") + _string(2, "age_logits")
+        + _string(3, "age_head") + _string(4, "MatMul")
+    )
+    sex = (
+        _string(1, "m") + _string(1, "Wg") + _string(2, "gender_logits")
+        + _string(3, "gender_head") + _string(4, "MatMul")
+    )
+    graph = (
+        _blob(1, rm) + _blob(1, age) + _blob(1, sex)
+        + _string(2, "tiny_faceage")
+        + _blob(5, _tensor("Wa", (3, 100), age_w_f32))
+        + _blob(5, _tensor("Wg", (3, 2), gender_w_f32))
+        + _blob(11, _value_info(input_name, FLOAT, ("N", 3, size, size)))
+        + _blob(12, _value_info("age_logits", FLOAT, ("N", 100)))
+        + _blob(12, _value_info("gender_logits", FLOAT, ("N", 2)))
+    )
+    opset = _int(2, 13)
+    return _int(1, 8) + _blob(7, graph) + _blob(8, opset)
+
+
 def write_model(directory: Path, filename: str, elem_type: int,
                 input_shape: tuple[int, ...]) -> Path:
     """Serialize a flatten_model to `directory/filename` and return the path."""
@@ -179,4 +216,12 @@ def write_reduce_mean_model(directory: Path, filename: str, elem_type: int,
     """Serialize a reduce_mean_model to `directory/filename` and return the path."""
     path = Path(directory) / filename
     path.write_bytes(reduce_mean_model(elem_type, input_shape, axes))
+    return path
+
+
+def write_faceage_model(directory: Path, filename: str, age_w_f32: bytes, gender_w_f32: bytes,
+                        size: int = 224) -> Path:
+    """Serialize a faceage_model to `directory/filename` and return the path."""
+    path = Path(directory) / filename
+    path.write_bytes(faceage_model(age_w_f32, gender_w_f32, size))
     return path

@@ -20,17 +20,30 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-from tiny_onnx import DOUBLE, FLOAT, FLOAT16, write_model, write_reduce_mean_model
+from tiny_onnx import (
+    DOUBLE,
+    FLOAT,
+    FLOAT16,
+    write_faceage_model,
+    write_model,
+    write_reduce_mean_model,
+)
 
 from app.attributes import (
     DEFAULT_ATTR_MODEL,
+    FACEAGE,
+    GENDERAGE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
     INPUT_SIZE,
     AttributeModel,
     attr_model_from_env,
     attribute_transform,
     box_geometry,
     crop_face,
+    family_of,
     postprocess,
+    postprocess_faceage,
 )
 
 REAL_MODEL = Path(__file__).resolve().parent.parent / "models" / "genderage.onnx"
@@ -282,3 +295,102 @@ def test_predict_many_off_or_static_is_the_per_box_loop(tmp_path):
     assert static.batch_active is False, "a batch-1 export cannot batch"
     img, box = _painted_frame((45, 20, 10))
     assert static.predict_many(img, [box, box]) == [static.predict(img, box)] * 2
+
+
+# --- the faceage family -------------------------------------------------------
+
+def _faceage(tmp_path, name="tiny_faceage.onnx"):
+    """A faceage-shaped graph whose logits are the crop's normalised channel
+    means: age_logits[k] = mean R for every k (so age = 100 * sigmoid(R)),
+    gender_logits = (mean G, mean B) (so G > B reads F, else M)."""
+    age_w = np.zeros((3, 100), dtype="<f4")
+    age_w[0, :] = 1.0
+    gender_w = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype="<f4")
+    return AttributeModel(write_faceage_model(tmp_path, name, age_w.tobytes(), gender_w.tobytes()), "CPU")
+
+
+def _normalised(bgr):
+    """What the pass feeds faceage for a flat BGR colour: RGB 0..1, ImageNet mean/std."""
+    rgb = np.array(bgr[::-1], dtype=np.float32) / 255.0
+    return (rgb - IMAGENET_MEAN) / IMAGENET_STD
+
+
+def test_the_family_is_read_off_the_graphs_outputs():
+    assert family_of("a.onnx", (3,)) is GENDERAGE
+    assert family_of("a.onnx", (None,)) is GENDERAGE, "a dynamic width matches, as it always did"
+    assert family_of("b.onnx", (100, 2)) is FACEAGE
+    assert family_of("b.onnx", (None, None)) is FACEAGE
+    with pytest.raises(ValueError, match="27648 values per face"):
+        family_of("flat.onnx", (27648,))
+    with pytest.raises(ValueError, match=r"2 outputs \[100, 3\] wide"):
+        family_of("odd.onnx", (100, 3))
+    with pytest.raises(ValueError, match="3 outputs"):
+        family_of("odd.onnx", (100, 2, 1))
+
+
+def test_faceage_crop_is_224_at_1_2x_the_box_and_bicubic():
+    """1.2x the longer side fills the window (the card's 10 % padding each
+    side; the calibration's crop), at 224 — and the transform is the same
+    affine with the family's margin."""
+    box = {"x": 100.0, "y": 50.0, "w": 80.0, "h": 120.0}
+    m = attribute_transform(box, FACEAGE.size, FACEAGE.margin)
+    scale = 224 / (120.0 * 1.2)
+    np.testing.assert_allclose(
+        m, [[scale, 0.0, 112.0 - 140.0 * scale], [0.0, scale, 112.0 - 110.0 * scale]], rtol=1e-6
+    )
+    img, box = _painted_frame((10, 20, 30))
+    crop = crop_face(img, box, FACEAGE.size, FACEAGE.margin, FACEAGE.cubic)
+    assert crop.shape == (224, 224, 3)
+    assert tuple(crop[112, 112]) == (10, 20, 30)
+    assert GENDERAGE.size == INPUT_SIZE and GENDERAGE.margin == 1.5, "genderage is unchanged"
+
+
+def test_faceage_blob_is_rgb_0_1_imagenet_normalised(tmp_path):
+    model = _faceage(tmp_path)
+    assert model.family is FACEAGE
+    img, box = _painted_frame((30, 200, 100))
+    blob = model.blob(img, box)
+    assert blob.shape == (1, 3, 224, 224) and blob.dtype == np.float32
+    want = _normalised((30, 200, 100))
+    for c in range(3):
+        np.testing.assert_allclose(blob[0, c], want[c], atol=1e-5)
+
+
+def test_faceage_predict_decodes_coral_age_and_gender_through_a_real_session(tmp_path):
+    """Painted BGR (30, 200, 100): R normalises to -0.405 -> age 100*sigmoid
+    = 40.0; G above B reads F with the softmax mass of (G, B)."""
+    model = _faceage(tmp_path)
+    img, box = _painted_frame((30, 200, 100))
+    r, g, b = _normalised((30, 200, 100))
+    got = model.predict(img, box)
+    assert got["gender"] == "F"
+    assert got["genderP"] == pytest.approx(1 / (1 + np.exp(-(g - b))), rel=1e-4)
+    assert got["age"] == pytest.approx(100 / (1 + np.exp(-r)), rel=1e-4)
+    assert 39.0 < got["age"] < 41.0
+    # B above G reads M; predict_many answers each box in order.
+    img2, box2 = _painted_frame((220, 40, 100))
+    many = model.predict_many(img2, [box2, box2])
+    assert [m["gender"] for m in many] == ["M", "M"]
+    assert many[0] == many[1]
+
+
+def test_postprocess_faceage_sums_sigmoids_and_survives_huge_logits():
+    ages = np.full(100, -50.0)
+    ages[:30] = 50.0  # thirty thresholds passed with certainty
+    out = postprocess_faceage(ages, [0.0, 2.0])
+    assert out["age"] == pytest.approx(30.0)
+    assert out["gender"] == "M" and out["genderP"] == pytest.approx(1 / (1 + np.exp(-2.0)))
+    huge = postprocess_faceage(np.full(100, 1e6), [5000.0, -5000.0])
+    assert huge["age"] == pytest.approx(100.0) and huge["gender"] == "F"
+    assert huge["genderP"] == pytest.approx(1.0)
+    assert np.isfinite(postprocess_faceage(np.full(100, -1e6), [0.0, 0.0])["age"])
+    with pytest.raises(ValueError, match="expected 100 and 2"):
+        postprocess_faceage(np.zeros(99), [0.0, 0.0])
+
+
+def test_a_faceage_graph_at_the_wrong_input_size_is_refused_by_the_familys_size(tmp_path):
+    age_w = np.zeros((3, 100), dtype="<f4").tobytes()
+    gender_w = np.zeros((3, 2), dtype="<f4").tobytes()
+    path = write_faceage_model(tmp_path, "tiny_faceage_96.onnx", age_w, gender_w, size=96)
+    with pytest.raises(ValueError, match="faceage crop is 224x224"):
+        AttributeModel(path, "CPU")

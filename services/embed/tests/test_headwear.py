@@ -256,8 +256,8 @@ def test_off_is_today_no_new_keys_and_the_route_is_not_there(arcface, monkeypatc
     an unknown route answers, byte for byte."""
     _headwear_at(monkeypatch, None)
     health = arcface.get("/health").json()
-    assert set(health) == {"ok", "model", "version", "attrModel", "attrError", "error",
-                           "device", "knobs"}
+    assert set(health) == {"ok", "model", "version", "attrModel", "attrFamily", "attrError",
+                           "error", "device", "knobs"}
     img = frame(240, 320, 0)
     emb = arcface.post("/embed", json={"imageB64": _b64_png(img), "faces": [FACE]}).json()
     assert set(emb) == {"embeddings", "alignMs", "norms", "attributes", "attrMs", "balance"}

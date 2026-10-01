@@ -286,6 +286,7 @@ def test_embed_serves_norms_and_attributes_beside_the_embeddings(tmp_path, monke
     health = client.get("/health").json()
     assert health["ok"] is True
     assert health["attrModel"] == "tiny_genderage.onnx"
+    assert health["attrFamily"] == "genderage"
     assert health["attrError"] is None
 
     # Paint the frame so the attribute crop reads [R, G, B] = [10, 20, 45]:

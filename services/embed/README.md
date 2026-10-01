@@ -61,6 +61,30 @@ There is no direct download URL for the single file (it ships inside the
 zip), so it is placed by hand: unzip `buffalo_l.zip` and copy
 `genderage.onnx` into `models/`, or point `EMBED_ATTR_MODEL` at it.
 
+#### The faceage family
+
+`EMBED_ATTR_MODEL=models/faceage-dino-fp16.onnx` runs the same pass with
+[faceage-onnx](https://huggingface.co/imbcmdth/faceage-onnx) (Apache-2.0;
+"Built with DINOv3", whose licence travels with it): a DINOv3 ViT-L/16
+backbone with a CORAL ordinal age head and a gender head, 612 MB, sha256
+`b2e804783e197066cd8cf65a7cbc39a0579ea87c34660abd8ca942df8672cf70`. The
+graph's two outputs (`age_logits[100]`, `gender_logits[2]`) are how the
+service tells it from genderage; the crop is a 224 px square at 1.2× the
+box's longer side (the card's 10 % padding), bicubic, ImageNet-normalised,
+and the age is the sum of the CORAL thresholds' sigmoids. The wire reply is
+unchanged.
+
+Why it exists (2026-10-01, the Sharon clip, 43 guests / 211 clean crops):
+genderage's ages wander 10.4 years over one guest's views; faceage's 3.6.
+Between two guests, a 15-year gap in medians then separates 49 % of the 703
+pairs with 0 misfires (36 guests), which is what the match service's
+`HECO_REVIEW_AGE_GAP` rule is calibrated to — set that knob only where embed
+runs this family. Cost: 14.6 ms a face on the 4060 against 1.5 for
+genderage. On TensorRT its engine is built with **fp32 compute** (the fp16
+weights stay): DINOv3 carries a residual channel near 1.57e5, past fp16's
+range, and a fp16 engine answers NaN for every face. The first `/health`
+builds that engine (~11 s on the 4060; a warm reload is 2 s).
+
 ## Run
 
 ```sh
@@ -131,7 +155,7 @@ model-dependent tests fully exercise the real graph with synthetic frames
 | env | default | meaning |
 | --- | --- | --- |
 | `EMBED_MODEL` | `models/face_recognition_sface_2021dec.onnx` | weights path |
-| `EMBED_ATTR_MODEL` | `models/genderage.onnx` if present, else off | gender/age weights path; `off` disables the pass even when the default file exists |
+| `EMBED_ATTR_MODEL` | `models/genderage.onnx` if present, else off | gender/age weights path — either family, told apart by the graph's outputs (`/health` `attrFamily`: `genderage` or `faceage`); `off` disables the pass even when the default file exists |
 | `EMBED_HEADWEAR_MODEL` | off | the SigLIP head-covering graph, e.g. `models/siglip_b16_224_image_fp32.onnx` (prompt JSON + text bank beside it). Unset, empty or `off` = no reader, no `/health` key, `/headwear` 404. Runs on `HECO_DEVICE` (TRT: its own fp16 engine, cold build at the first `/health`) |
 | `HECO_DEVICE` | `CPU` | ORT providers for the arcface family and the attribute pass (`CUDA`, `TRT`, `GPU`, …); the sface family is cv2 and ignores it. `TRT` = TensorRT fp16 then CUDA then CPU: ArcFace-R50 vs fp32 on 40 frames (208 faces) cosine min 0.9997 (0.9999 for faces >= 56 px), feature norm within 1.1%, no gender flips, age within 0.17 y |
 | `HECO_TRT_CACHE` | `/srv/trt-cache` | where `HECO_DEVICE=TRT` keeps its TensorRT engines and timing cache; a volume in `docker-compose.trt.yml` (cold build 20-160 s per model, cached start under 1 s) |

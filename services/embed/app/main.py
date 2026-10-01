@@ -6,7 +6,7 @@ Contract (CONTRACTS.md):
             norms: [float],                       # L2 norm of each RAW feature
             attributes: [{gender, genderP, age} | null] | null,
             attrMs: float | null}
-    GET  /health -> {ok, model, version, device, attrModel, attrError,
+    GET  /health -> {ok, model, version, device, attrModel, attrFamily, attrError,
                      headwear?: {model, stamp, error, device}}
     POST /headwear {imageB64, faces: [{box}], crop?: {x, y, frameW, frameH}}
         -> {readings: [[8 floats] | null], model, ms}
@@ -298,6 +298,10 @@ def _health_body(emb, attrs) -> dict:
         # while off — and, when a NAMED file will not load, the reason
         # (ok stays true: embedding works, the loss must just not be silent).
         "attrModel": attrs.model_name if attrs else None,
+        # ...and its family (genderage | faceage), read off the graph: the
+        # match service's age rules are calibrated per family, so a
+        # deployment must be able to say which one measured its ages.
+        "attrFamily": attrs.family.name if attrs else None,
         "attrError": None if attrs is not None else _attr_error,
         # While unhealthy, say WHY: an operator staring at a red healthcheck
         # needs the blocking error (missing file? truncated? bad dtype?)
