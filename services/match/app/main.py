@@ -7,8 +7,9 @@ Endpoints:
     GET  /health -> {ok, model, version, threshold, canonPx, template policy}
     POST /reset  {runId} -> {ok, runId}
     POST /match  {runId, embedding, quality?, siteId?, appearance?,
-                  attributes?, featNorm?, body?, head?, beard?, skin?}
-        -> {personKey, isNew, cosine, galleryN, subCanon, isStaff, staffId,
+                  attributes?, featNorm?, body?, head?, beard?, skin?,
+                  mint?, minCosine?, anchorOnly?, bestFaceAnchor?}
+        -> {personKey, deferred, isNew, cosine, galleryN, subCanon, isStaff, staffId,
             templateN, templateAdded, appearanceSim, appearanceVetoed, templateId,
             nearMiss: {key, cosine, appearanceSim, basis} | null}
     POST /review/duplicates {runId, limit?}
@@ -25,6 +26,9 @@ Endpoints:
     POST /merge  {runId, keep, drop, onlyIfSingleton?, minFaceCosine?}
         -> {merged, galleryN, faceCosine?, refused?}                  (duplicate)
     POST /split  {runId, a, b}   -> {ok, galleryN}   (false-match / co-presence)
+    POST /template/anchor {runId, personKey, embedding, quality?, featNorm?,
+                  attributes?, appearance?} -> {ok, personKey, templateN}
+                                              (the guest's best face, replaced)
     POST /mark-staff {runId, personKey, siteId, staffId?}
         -> {moved, galleryN, staffKey}                                (mark-staff)
     POST /count/manual {runId, note?}
@@ -107,7 +111,7 @@ def _env_s(name: str, default: float) -> float:
 #: minFaceCosine and folds as before.
 #: 0.19.1 (2026-09-29): /review/duplicates replies with ``policy`` — the bars
 #: that queue was made under.  Additive.
-VERSION = "0.19.1"
+VERSION = "0.20.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -279,6 +283,15 @@ class MatchRequest(BaseModel):
     head: list[float] | None = None
     beard: list[float] | None = None
     skin: list[float] | None = None
+    #: BEST-FACE options (0.20.0), all off by default — see gallery.match.
+    #: ``mint: false`` is a probe: no match means ``personKey: null`` and
+    #: nothing written. ``minCosine`` raises (never lowers) the bar for this
+    #: call. ``anchorOnly`` compares identities on their best-face template
+    #: alone. ``bestFaceAnchor`` flags a mint's founding face as its best.
+    mint: bool = True
+    minCosine: float | None = Field(default=None, ge=0, le=1)
+    anchorOnly: bool = False
+    bestFaceAnchor: bool = False
 
     @field_validator("skin")
     @classmethod
@@ -429,6 +442,23 @@ class ReviewDuplicatesRequest(BaseModel):
     # Bounds the queue, never the analysis: everything is examined and the
     # count beyond the cap comes back as `dropped` rather than vanishing.
     limit: int = Field(default=50, ge=1, le=500)
+
+
+class AnchorRequest(BaseModel):
+    """Body of POST /template/anchor — this face is now ``personKey``'s best.
+
+    The runner sends it when a guest's face card is replaced by a better face
+    (front-on first, then wider, then sharper): the same face becomes the
+    identity's best-face template, replacing the previous one.
+    """
+
+    runId: str
+    personKey: str = Field(min_length=1)
+    embedding: list[float] = Field(min_length=8)
+    quality: float | None = None
+    featNorm: float | None = None
+    attributes: FaceAttributes | None = None
+    appearance: list[float] | None = None
 
 
 class ForgetTemplateRequest(BaseModel):
@@ -638,6 +668,10 @@ def match(body: MatchRequest) -> dict:
             head=body.head,
             beard=body.beard,
             skin=body.skin,
+            mint=body.mint,
+            min_cosine=body.minCosine,
+            anchor_only=body.anchorOnly,
+            best_face_anchor=body.bestFaceAnchor,
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -645,6 +679,9 @@ def match(body: MatchRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {
         "personKey": r.person_key,
+        # A probe (mint: false) that matched nobody: held by the caller, not
+        # counted, nothing written.
+        "deferred": r.person_key is None,
         "isNew": r.is_new,
         "cosine": r.cosine,
         "galleryN": r.gallery_n,
@@ -865,6 +902,11 @@ def review_duplicates(body: ReviewDuplicatesRequest) -> dict:
             headwear_bare_p=config.review_headwear_bare_p(),
             headwear_cap_p=config.review_headwear_cap_p(),
             clothes_burst_clash=config.review_clothes_burst_clash(),
+            clothes_gap=config.review_clothes_gap(),
+            clothes_gap_min_n=config.review_clothes_gap_min_n(),
+            single_min_clashes=config.review_single_min_clashes(),
+            single_est_n=config.review_single_est_n(),
+            single_sex_p=config.review_single_sex_p(),
         )
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -890,6 +932,11 @@ def _review_policy() -> dict:
         "clothesWellSeenN": config.review_clothes_well_seen_n(),
         "clothesWellSeenClash": config.review_clothes_well_seen_clash(),
         "clothesBurstClash": config.review_clothes_burst_clash(),
+        "clothesGap": config.review_clothes_gap(),
+        "clothesGapMinN": config.review_clothes_gap_min_n(),
+        "singleMinClashes": config.review_single_min_clashes(),
+        "singleEstN": config.review_single_est_n(),
+        "singleSexP": config.review_single_sex_p(),
         "headClash": config.review_head_clash(),
         "beardMinN": config.review_beard_min_n(),
         "lightTol": config.review_light_tol(),
@@ -922,6 +969,31 @@ def body_sighting_headwear(body: HeadwearWrite) -> dict:
     except gallery.BadRunIdError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {"ok": True, "written": written}
+
+
+@app.post("/template/anchor")
+def template_anchor(body: AnchorRequest) -> dict:
+    """Make this face ``personKey``'s best-face template (replacing the last one).
+
+    404 when the run's gallery holds no such guest — an anchor upgrades
+    somebody who exists and never creates anybody, so the count cannot move
+    through this route.
+    """
+    try:
+        n = gallery.set_anchor(
+            config.data_dir(), body.runId, body.personKey, body.embedding,
+            quality=body.quality, canon_px=config.canon_px(),
+            appearance=body.appearance,
+            attributes=None if body.attributes is None else body.attributes.model_dump(),
+            feat_norm=body.featNorm,
+        )
+    except gallery.BadRunIdError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=f"no guest {body.personKey} in this run") from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "personKey": body.personKey, "templateN": n}
 
 
 @app.post("/template/forget")

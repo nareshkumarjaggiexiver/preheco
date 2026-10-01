@@ -443,6 +443,13 @@ services:
       # the median; the lowest same-person fold on record scored 0.21.
       # Counted in foldVetoedByFace.
       HECO_FOLD_MIN_FACE_COSINE: ${HECO_FOLD_MIN_FACE_COSINE-}
+      # Best-face minting and best-face templates (all off when unset; also
+      # settable per run through the start body's `quality` block).
+      HECO_MINT_MIN_PX: ${HECO_MINT_MIN_PX-}
+      HECO_SMALL_MATCH_MIN_COSINE: ${HECO_SMALL_MATCH_MIN_COSINE-}
+      HECO_HOLD_FLUSH_FRAMES: ${HECO_HOLD_FLUSH_FRAMES-}
+      HECO_BEST_FACE_ANCHOR: ${HECO_BEST_FACE_ANCHOR-}
+      HECO_ANCHOR_ONLY: ${HECO_ANCHOR_ONLY-}
       # Clothing guard on BOTH folds (heal and lock), three bands, not a cliff:
       # below CLASH (default 0.35) is a genuine disagreement and refuses the
       # fold (healVetoedByAppearance); CLASH..UNSURE (default 0.55) proceeds

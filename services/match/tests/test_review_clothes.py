@@ -83,14 +83,20 @@ def excluded(**counts) -> dict:
     """The reply's ``excluded`` block: every signal at zero but those named."""
     return {
         "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        "single": 0,
         **counts,
     }
 
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    """TestClient with gallery data redirected to a temp directory."""
+    """TestClient with gallery data redirected to a temp directory.
+
+    The clothes GAP rule (2026-09-30) is held OFF here: these tests are about
+    the clash tiers, and their synthetic garments sit a whole gap apart.
+    """
     monkeypatch.setenv("HECO_MATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HECO_REVIEW_CLOTHES_GAP", "0")
     store.close_all_stores()
     with TestClient(main.app) as c:
         yield c

@@ -26,6 +26,13 @@ QUALITY_FIELDS = {
     "minEyeSpan": "quality_min_eye_span",
     "requireLandmarks": "quality_require_landmarks",
     "faceReverifyIntervalS": "face_reverify_interval_s",
+    # Best-face minting (2026-09-30) — runner Settings only; a config without
+    # these fields simply ignores them (fold_quality_profile checks hasattr).
+    "mintMinPx": "mint_min_px",
+    "smallMatchMinCosine": "small_match_min_cosine",
+    "holdFlushFrames": "hold_flush_frames",
+    "bestFaceAnchor": "best_face_anchor",
+    "anchorOnly": "anchor_only",
 }
 
 
@@ -55,6 +62,14 @@ class CountingConfig:
     #: How often a track that ALREADY holds an identity is re-searched for a
     #: face. 0.0 searches every track every frame.
     face_reverify_interval_s: float = 0.0
+    #: Best-face minting (2026-09-30): the runner's settings, carried here so
+    #: a per-run profile folds onto either type alike. See the runner's
+    #: Settings.mint_min_px for what they do; 0 / False is off.
+    mint_min_px: float = 0.0
+    small_match_min_cosine: float = 0.0
+    hold_flush_frames: int = 45
+    best_face_anchor: bool = False
+    anchor_only: bool = False
 
     @classmethod
     def from_settings(cls, s) -> "CountingConfig":
@@ -125,4 +140,18 @@ def gate_config(config, armed) -> dict:
         "qualityRequireLandmarks": config.quality_require_landmarks,
         "faceReverifyIntervalS": config.face_reverify_interval_s,
         "gateArmed": list(armed),
+        # Best-face minting, recorded only when on so older records keep
+        # their exact shape.
+        **{
+            wire: getattr(config, field)
+            for wire, field in (
+                ("mintMinPx", "mint_min_px"),
+                ("smallMatchMinCosine", "small_match_min_cosine"),
+                ("holdFlushFrames", "hold_flush_frames"),
+                ("bestFaceAnchor", "best_face_anchor"),
+                ("anchorOnly", "anchor_only"),
+            )
+            if getattr(config, field, None) and (field != "hold_flush_frames"
+                                                 or getattr(config, "mint_min_px", 0))
+        },
     }

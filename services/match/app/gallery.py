@@ -42,6 +42,7 @@ from .appearance import (
     SKIN_DIM,
     TORSO_DIM,
     beard_class,
+    beard_read_class,
     beards_differ,
     best_cross,
     best_intersection,
@@ -50,7 +51,7 @@ from .appearance import (
     self_agreement,
     spread,
 )
-from .headwear import headwear_apart, headwear_tallies, headwear_why
+from .headwear import headwear_apart, headwear_label, headwear_tallies, headwear_why
 from .store import Neighbour, VectorStore, as_unit, close_store, open_store
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -62,9 +63,14 @@ class BadRunIdError(ValueError):
 
 @dataclass
 class MatchResult:
-    """Outcome of one gallery lookup: who, whether new, how close, gallery size."""
+    """Outcome of one gallery lookup: who, whether new, how close, gallery size.
 
-    person_key: str
+    ``person_key`` is None only for a probe (``mint=False``) that matched
+    nobody: the caller asked "is this someone we know?" and the answer is no,
+    with nothing written.
+    """
+
+    person_key: str | None
     is_new: bool
     cosine: float | None  # best similarity vs the pre-existing gallery; None if it was empty
     gallery_n: int  # distinct persons after this operation
@@ -450,6 +456,21 @@ def match(
     head: list[float] | None = None,
     beard: list[float] | None = None,
     skin: list[float] | None = None,
+    # THE BEST-FACE OPTIONS (2026-09-30), all off by default.
+    # ``mint=False`` makes the call a PROBE: a face that matches nobody comes
+    # back with person_key None and NOTHING written — the runner holds such a
+    # face on its track and creates the guest later from the track's best face.
+    mint: bool = True,
+    # A stricter bar for this probe than the gallery's threshold (never a
+    # looser one): a small, far face may only claim an EXISTING guest when it
+    # is clearly them, or a poor early face locks onto the wrong person.
+    min_cosine: float | None = None,
+    # Compare an identity that holds a best-face template on that template
+    # alone (the anchor-only variant; see VectorStore.search_anchors).
+    anchor_only: bool = False,
+    # A mint's founding template is flagged as its best face so far, so the
+    # first better face (set_anchor) replaces it rather than joining it.
+    best_face_anchor: bool = False,
 ) -> MatchResult:
     """Match one embedding against the run's gallery; insert if new.
 
@@ -563,9 +584,16 @@ def match(
     sub_canon = quality is not None and quality < canon_px
     store = open_store(db_path(data_dir, run_id))
 
+    # The bar a match must clear: the gallery's threshold, raised (never
+    # lowered) by a probe that asks for a stricter one.
+    bar = threshold if min_cosine is None else max(threshold, float(min_cosine))
     with store.transaction():
-        hit = store.search(embedding, exclude=exclude_keys)
-        if hit is not None and hit.cosine >= threshold:
+        hit = (
+            store.search_anchors(embedding, exclude=exclude_keys)
+            if anchor_only
+            else store.search(embedding, exclude=exclude_keys)
+        )
+        if hit is not None and hit.cosine >= bar:
             # Similarity vs what is ALREADY stored, computed before this call
             # writes anything — otherwise an enrolled sighting would be
             # compared against itself and always report 1.0.
@@ -627,10 +655,19 @@ def match(
                 body_id=body_id,
                 overlap=overlap,
             )
+        if not mint:
+            # A PROBE that matched nobody: say so, write nothing — no template,
+            # no body row. The caller creates the guest later from its best face.
+            return MatchResult(
+                None, False, hit.cosine if hit is not None else None,
+                store.distinct_count(), sub_canon, 0, False,
+            )
         key = store.add_auto(
             embedding, quality=quality, sub_canon=sub_canon, prefix="p",
             appearance=appearance, attributes=attributes, feat_norm=feat_norm,
         )
+        if best_face_anchor:
+            store.mark_founding_anchor(key)
         body_id = _log_body(store, key, body, quality, appearance, head, beard, skin)
         # NEAR-MISS: judged against `hit` — the best of the gallery as it stood
         # BEFORE this mint wrote anything — and against the near-missed
@@ -1402,6 +1439,75 @@ def beards_apart(
     return ca, cb, beards_differ(ca, cb, pale)
 
 
+def clothes_gap_of(
+    ra: IdentityReads | None, rb: IdentityReads | None, min_n: int
+) -> float | None:
+    """min(self-agreement A, B) minus the MEDIAN cross reading, or None.
+
+    The typical-against-typical comparison (config.DEFAULT_REVIEW_CLOTHES_GAP
+    says why the best-of-all-pairs one is not enough).  None unless both
+    sides hold at least ``min_n`` reads with a self-agreement — a gap needs
+    two settled garments to be a gap between.
+    """
+    if ra is None or rb is None or ra.n < min_n or rb.n < min_n:
+        return None
+    if ra.agreement is None or rb.agreement is None:
+        return None
+    if not ra.vectors or not rb.vectors:
+        return None
+    a = np.stack(ra.vectors).astype(np.float64)
+    b = np.stack(rb.vectors).astype(np.float64)
+    cross = np.minimum(a[:, None, :], b[None, :, :]).sum(-1)
+    return float(min(ra.agreement, rb.agreement) - np.median(cross))
+
+
+def single_view_apart(
+    a: str, b: str, singles: dict, genders: dict, beard_a, beard_b, coverings: dict,
+    rows_a: int, rows_b: int, min_clashes: int, est_n: int, sex_p: float,
+    gender_min_p: float, pale: bool, headwear_min_n: int,
+) -> dict | None:
+    """The single-good-view reading for a pair, or None when it does not apply.
+
+    Applies when exactly one side holds a single template and the other holds
+    at least ``est_n`` body rows.  Returns ``{"single": key, "clashes":
+    [...]}`` naming the hard attributes the one view contradicts the
+    established side on — ``sex`` (the view's own reading at ``sex_p`` or
+    more against the identity's vote at ``gender_min_p`` or more, different),
+    ``beard`` (:func:`app.appearance.beards_differ` on the view's class
+    against the identity's), ``turban`` (an established turban against a
+    bare read, or the reverse).  The caller sets the pair aside at
+    ``min_clashes`` or more.  0 clashes is a reading, not a verdict.
+    """
+    if min_clashes <= 0:
+        return None
+    if (a in singles) == (b in singles):
+        return None  # both once-seen, or neither: the rule has no side to trust
+    s, e = (a, b) if a in singles else (b, a)
+    est_rows = rows_b if s == a else rows_a
+    if est_rows < est_n:
+        return None
+    clashes: list[str] = []
+    g_s, p_s, _age = singles[s]
+    g_e, p_e = genders.get(e, (None, None))
+    if (
+        g_s in ("M", "F") and p_s is not None and p_s >= sex_p
+        and g_e is not None and p_e is not None and p_e >= gender_min_p and g_e != g_s
+    ):
+        clashes.append("sex")
+    reads_s, reads_e = (beard_a, beard_b) if s == a else (beard_b, beard_a)
+    if reads_s is not None and reads_e is not None and reads_s.vectors and reads_e.vectors:
+        cls_s = beard_read_class(reads_s.vectors[0])
+        cls_e = beard_class(reads_e.vectors)
+        if beards_differ(cls_s, cls_e, pale):
+            clashes.append("beard")
+    cov_s, cov_e = coverings.get(s), coverings.get(e)
+    lab_e = headwear_label(cov_e, headwear_min_n)
+    lab_s = headwear_label(cov_s, 1)
+    if lab_e in ("turban", "bare") and lab_s in ("turban", "bare") and lab_e != lab_s:
+        clashes.append("turban")
+    return {"single": s, "clashes": clashes}
+
+
 def clothes_apart(
     ra: IdentityReads | None,
     rb: IdentityReads | None,
@@ -1469,6 +1575,13 @@ def review_duplicates(
     headwear_bare_p: float = 0.5,
     headwear_cap_p: float = 0.0,
     clothes_burst_clash: float = 0.0,
+    # The clothes GAP (config.DEFAULT_REVIEW_CLOTHES_GAP) and the SINGLE GOOD
+    # VIEW (config.DEFAULT_REVIEW_SINGLE_MIN_CLASHES), both 0 = off.
+    clothes_gap: float = 0.0,
+    clothes_gap_min_n: int = 8,
+    single_min_clashes: int = 0,
+    single_est_n: int = 8,
+    single_sex_p: float = 0.95,
 ) -> dict:
     """Identity pairs a human should look at, ranked. Never a verdict.
 
@@ -1634,6 +1747,7 @@ def review_duplicates(
     store = open_store(db_path(data_dir, run_id))
     excluded = {
         "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        "single": 0,
     }
     with store.reading():
         # An operator's not-a-guest removal is never asked about again.
@@ -1646,6 +1760,11 @@ def review_duplicates(
         attrs = {k: store.attributes_for(k) for k in keys}
         genders = {k: identity_gender(attrs[k]) for k in keys}
         ages = {k: identity_age(attrs[k]) for k in keys}
+        # The single-view rule reads the single side's OWN template reading
+        # (its reported sex at its own probability), not the shrunk vote.
+        singles = {
+            k: attrs[k][0] for k in keys if len(attrs[k]) == 1
+        }
         statures = stature_ratios(store.body_sightings(), stature_min_n)
         evidence = store.sighting_evidence()
         in_band, considered = [], 0
@@ -1665,6 +1784,9 @@ def review_duplicates(
             in_band.append((a, b, cosine, max(scores) if scores else None))
 
     torsos = torso_reads(evidence, tpl_torsos)
+    evidence_rows: dict[str, int] = {}
+    for row in evidence:
+        evidence_rows[row.key] = evidence_rows.get(row.key, 0) + 1
     heads = head_reads(evidence)
     wears = head_wear(evidence)
     beards = beard_reads(evidence)
@@ -1735,9 +1857,11 @@ def review_duplicates(
             headwear_min_n, gender_min_p, cap=headwear_cap_p > 0,
         )
         colour = []
+        gap = clothes_gap_of(ta, tb, clothes_gap_min_n)
+        why["clothes"]["gap"] = gap
         if clothes_apart(
             ta, tb, cross, clothes_clash, clothes_min_n, clothes_self_min, clothes_burst_clash,
-        ) or (
+        ) or (clothes_gap > 0 and gap is not None and gap >= clothes_gap) or (
             clothes_clash > 0
             and clothes_well_seen_n > 0
             and clothes_apart(
@@ -1760,6 +1884,16 @@ def review_duplicates(
         reasons += colour
         if covered_apart:
             reasons.append("headwear")
+        # THE SINGLE GOOD VIEW, last: a once-seen side against an established
+        # one, on two or more hard clashes at once (config says the measurement).
+        single = single_view_apart(
+            a, b, singles, genders, ba, bb, coverings, evidence_rows.get(a, 0),
+            evidence_rows.get(b, 0), single_min_clashes, single_est_n, single_sex_p,
+            gender_min_p, beard_pale, headwear_min_n,
+        )
+        why["single"] = single
+        if single and single["clashes"] and len(single["clashes"]) >= single_min_clashes > 0:
+            reasons.append("single")
         entry = {"a": a, "b": b, "cosine": cosine, "clothes": clothes, "why": why}
         if reasons:
             excluded[reasons[0]] += 1
@@ -1804,6 +1938,32 @@ def review_duplicates(
         # because their two identities were read under different light.
         "keptByLight": kept_by_light,
     }
+
+
+def set_anchor(
+    data_dir: Path,
+    run_id: str,
+    key: str,
+    embedding: list[float],
+    quality: float | None = None,
+    canon_px: float = 0.0,
+    appearance: list[float] | None = None,
+    attributes: dict | None = None,
+    feat_norm: float | None = None,
+) -> int:
+    """Replace ``key``'s best-face template with this face; its template count after.
+
+    See :meth:`VectorStore.set_anchor`. KeyError when the run's gallery does
+    not hold ``key`` — an anchor upgrades somebody, it never creates them.
+    """
+    store = open_store(db_path(data_dir, run_id))
+    sub_canon = quality is not None and quality < canon_px
+    with store.transaction():
+        store.set_anchor(
+            key, embedding, quality=quality, sub_canon=sub_canon,
+            appearance=appearance, attributes=attributes, feat_norm=feat_norm,
+        )
+        return store.count_for(key)
 
 
 def forget_template(data_dir: Path, run_id: str, template_id: int) -> bool:

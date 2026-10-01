@@ -1179,13 +1179,13 @@ def test_review_on_an_empty_or_unknown_run_is_an_empty_queue(client):
     """No gallery, no question — not a 500."""
     got = review(client, run="never-ran")
     policy = got.pop("policy")
-    assert policy["threshold"] == config.DEFAULT_THRESHOLD, "the bars travel with the queue (0.19.1)"
+    assert policy["threshold"] == config.DEFAULT_THRESHOLD, "the bars travel with the queue"
     assert got == {
         "runId": "never-ran", "threshold": config.DEFAULT_THRESHOLD,
         "pairs": [], "considered": 0, "returned": 0, "dropped": 0,
         "excluded": {
             "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0,
-            "headwear": 0,
+            "headwear": 0, "single": 0,
         },
         "setAside": [], "setAsideDropped": 0, "keptByLight": 0,
     }

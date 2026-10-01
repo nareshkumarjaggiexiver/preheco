@@ -90,6 +90,7 @@ def excluded(**counts) -> dict:
     """The reply's ``excluded`` block: every signal at zero but those named."""
     return {
         "gender": 0, "age": 0, "stature": 0, "clothes": 0, "head": 0, "beard": 0, "headwear": 0,
+        "single": 0,
         **counts,
     }
 

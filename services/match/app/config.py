@@ -384,6 +384,39 @@ DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH = 0.55
 # score.  0 turns the tier off; CLOTHES_CLASH 0 turns it off too.
 DEFAULT_REVIEW_CLOTHES_BURST_CLASH = 0.25
 
+# THE CLOTHES GAP (2026-09-30).  The clash tiers above take the BEST cross
+# reading of every read pair, and colour is 90% of the score — so a plain
+# cream kurta against a white-and-grey striped shirt (p00012/p00016 on
+# Sharon, 24 and 18 reads) scored 0.76 and was asked, though the typical
+# comparison was 0.57 against self-agreement of 0.92 either side.  The gap
+# statistic — min(self median A, self median B) minus the MEDIAN cross — is
+# what separates them: measured over 29 same-person two-appearance cases in
+# six galleries (one guest who left and came back), the gap was at most 0.29
+# (p90 0.25), while the questions the operator judged different scored
+# 0.33-0.84.  So two WELL-SEEN sides (GAP_MIN_N reads each, the well-seen
+# tier's bar) whose gap is at least CLOTHES_GAP are set aside on clothes.
+# 0 turns it off.  The margin over 0.29 is thin and the sample small; the
+# operator's verdicts on the pairs it removes (p00012/p00016, p00014/p00024,
+# p00022/p00039: all "different") are the evidence it rests on.
+DEFAULT_REVIEW_CLOTHES_GAP = 0.32
+DEFAULT_REVIEW_CLOTHES_GAP_MIN_N = 8
+
+# THE SINGLE GOOD VIEW (2026-09-30).  Every set-aside rule wants evidence on
+# BOTH sides, so a guest seen once — one template, one body row — could never
+# be set aside, and p00023 on Sharon carried a question against every
+# neighbour: p00004 (a bearded, turbaned man at 0.85 male over 27 reads)
+# against her one 0.996-female, beardless, bare-headed view.  One misread is
+# common; a view that misreads sex AND beard AND turban together is not
+# unless the view itself is broken.  So a side with ONE template, against a
+# side with at least SINGLE_EST_N body rows, is set aside when at least
+# SINGLE_MIN_CLASHES of {sex (single p >= SINGLE_SEX_P vs established
+# identity_gender >= gender_min_p, different), beard (beards_differ), turban
+# vs bare} hold.  Calibrated on 610 held-out single views of well-seen
+# guests across six galleries: 0 misfires at two clashes (5 at one).
+DEFAULT_REVIEW_SINGLE_MIN_CLASHES = 2
+DEFAULT_REVIEW_SINGLE_EST_N = 8
+DEFAULT_REVIEW_SINGLE_SEX_P = 0.95
+
 # Head: turban and hair colour above the eyes, per sighting in the body log,
 # under the clothing rule's own-testimony bar (three reads over two seconds
 # agreeing at 0.6 each side) and only HEADWEAR against HEADWEAR (both heads
@@ -554,6 +587,31 @@ def review_clothes_well_seen_clash() -> float:
     """Best cross-torso intersection under which a WELL-SEEN pair is set aside
     (env HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH)."""
     return _env_f("HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH", DEFAULT_REVIEW_CLOTHES_WELL_SEEN_CLASH)
+
+
+def review_clothes_gap() -> float:
+    """The clothes-gap set-aside bar (0 = off); HECO_REVIEW_CLOTHES_GAP."""
+    return _env_f("HECO_REVIEW_CLOTHES_GAP", DEFAULT_REVIEW_CLOTHES_GAP)
+
+
+def review_clothes_gap_min_n() -> int:
+    """Reads each side needs for the clothes gap; HECO_REVIEW_CLOTHES_GAP_MIN_N."""
+    return int(_env_f("HECO_REVIEW_CLOTHES_GAP_MIN_N", DEFAULT_REVIEW_CLOTHES_GAP_MIN_N))
+
+
+def review_single_min_clashes() -> int:
+    """Hard clashes a single good view needs (0 = off); HECO_REVIEW_SINGLE_MIN_CLASHES."""
+    return int(_env_f("HECO_REVIEW_SINGLE_MIN_CLASHES", DEFAULT_REVIEW_SINGLE_MIN_CLASHES))
+
+
+def review_single_est_n() -> int:
+    """Body rows the OTHER side needs for the single-view rule; HECO_REVIEW_SINGLE_EST_N."""
+    return int(_env_f("HECO_REVIEW_SINGLE_EST_N", DEFAULT_REVIEW_SINGLE_EST_N))
+
+
+def review_single_sex_p() -> float:
+    """The single view's own sex confidence bar; HECO_REVIEW_SINGLE_SEX_P."""
+    return _env_f("HECO_REVIEW_SINGLE_SEX_P", DEFAULT_REVIEW_SINGLE_SEX_P)
 
 
 def review_clothes_burst_clash() -> float:
