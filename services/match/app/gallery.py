@@ -734,7 +734,7 @@ def _log_body(
     fw = float(face_w) if face_w is not None and float(face_w) > 0 else None
     return store.add_body_sighting(
         key, h, w, y_bottom, frame_h, fw, appearance=appearance, head=head, beard=beard,
-        skin=skin,
+        skin=skin, contested=bool(body.get("contested", False)),
     )
 
 
@@ -1268,11 +1268,20 @@ def torso_reads(
     sighting that wrote it, and counting it twice would inflate ``n``.
     """
     by_key: dict[str, list] = {}
+    contested: dict[str, list] = {}
     for row in evidence:
         vec = row.appearance
         if vec is None or vec.size != TORSO_DIM:
             continue
-        by_key.setdefault(row.key, []).append((_seconds(row.created_at), vec))
+        # A read taken with another person's box across the band
+        # (SightingEvidence.contested) is kept apart: it stands in for the
+        # guest's clothes only when they have NO clean read — the measured
+        # alternative was a neighbour's shirt agreeing with a stranger's.
+        bucket = contested if getattr(row, "contested", False) else by_key
+        bucket.setdefault(row.key, []).append((_seconds(row.created_at), vec))
+    for key, rows in contested.items():
+        if key not in by_key:
+            by_key[key] = rows
     for key, rows in (templates or {}).items():
         if key in by_key:
             continue

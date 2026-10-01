@@ -364,7 +364,7 @@ def test_an_existing_gallery_migrates_and_its_rows_read_null(tmp_path):
     conn.close()
     with store.VectorStore(path) as s:
         cols = [row[1] for row in s.conn.execute("PRAGMA table_info(body_sightings)")]
-        assert cols[-1] == "headwear", "added last, like every column before it"
+        assert cols[-2:] == ["headwear", "contested"], "added last, like every column before them"
         (row,) = s.sighting_evidence()
         assert row.headwear is None and row.skin.size == 2
         assert s.headwear_stamp() is None

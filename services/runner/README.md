@@ -201,6 +201,15 @@ carries information.
   residual risk; it does not eliminate it (same-colour swaps are invisible to
   it — that is what track-quality gating remains for). Appearance agreement
   never lowers a cosine floor: the signal only ever fails to object.
+- **Contested torso reads (2026-10-01).** The torso read is a rectangle in the
+  person box, not a body mask, so a neighbour standing in the band is read as
+  the guest's clothes — on the D02 clip 36-100% of four review pairs' reads
+  had another person's box in the band, and their clothes "agreed" though the
+  pictures showed different garments. The runner now flags such a read
+  (`heco_counting.appearance.band_contested`: a neighbour's box covering 5% or
+  more of the band) as `body.contested`; the match service (0.21.0) stores it
+  and the review uses only uncontested reads while the guest has any. Counted
+  in `torsoReadsContested`.
 - **Best-face minting and best-face templates (2026-09-30, off by default).**
   Letting faces from 80 px count found Sharon guests the 112 px floor never saw
   close up (74 guests against 46), but it created most guests EARLY from a small

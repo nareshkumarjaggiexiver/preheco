@@ -208,6 +208,7 @@ _BODY_COLUMNS_ADDED = (
     ("beard", "BLOB"),        # ... beard reading, float32[4]
     ("skin", "BLOB"),         # 2026-09-25: cheek log(R/G), log(B/G), float32[2]
     ("headwear", "BLOB"),     # 2026-09-25: SigLIP head-covering logits, float32[8]
+    ("contested", "INTEGER"), # 2026-10-01: 1 when another person's box covered the band
 )
 
 #: ``store_meta`` key of the head-covering model stamp: WHOSE logits the
@@ -265,6 +266,9 @@ class SightingEvidence(NamedTuple):
     beard: np.ndarray | None = None
     skin: np.ndarray | None = None
     headwear: np.ndarray | None = None
+    #: Another person's box covered this read's torso band (2026-10-01):
+    #: its clothing may be the neighbour's. False for rows from before.
+    contested: bool = False
 
 
 #: Which embedder's vectors this process writes and expects. The catalog id
@@ -812,7 +816,8 @@ class VectorStore:
         by a runner whose reader was off simply has none.
         """
         rows = self.conn.execute(
-            "SELECT key, created_at, appearance, head, beard, skin, headwear FROM body_sightings"
+            "SELECT key, created_at, appearance, head, beard, skin, headwear,"
+            " COALESCE(contested, 0) FROM body_sightings"
             " WHERE appearance IS NOT NULL OR head IS NOT NULL OR beard IS NOT NULL"
             " OR skin IS NOT NULL OR headwear IS NOT NULL"
             " ORDER BY id ASC"
@@ -822,8 +827,10 @@ class VectorStore:
             return None if blob is None else np.frombuffer(blob, dtype=np.float32)
 
         return [
-            SightingEvidence(str(k), str(ts), arr(a), arr(h), arr(b), arr(sk), arr(hw))
-            for k, ts, a, h, b, sk, hw in rows
+            SightingEvidence(
+                str(k), str(ts), arr(a), arr(h), arr(b), arr(sk), arr(hw), bool(ct),
+            )
+            for k, ts, a, h, b, sk, hw, ct in rows
         ]
 
     def headwear_stamp(self) -> str | None:
@@ -1008,6 +1015,7 @@ class VectorStore:
         head: list[float] | np.ndarray | None = None,
         beard: list[float] | np.ndarray | None = None,
         skin: list[float] | np.ndarray | None = None,
+        contested: bool = False,
     ) -> int:
         """Record one sighting's containing PERSON box under ``key``; its rowid.
 
@@ -1042,12 +1050,12 @@ class VectorStore:
 
         cur = self.conn.execute(
             "INSERT INTO body_sightings (key, h, w, y_bottom, frame_h, created_at, face_w,"
-            " appearance, head, beard, skin)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " appearance, head, beard, skin, contested)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key, float(h), float(w), float(y_bottom), int(frame_h), _now(),
                 None if face_w is None else float(face_w),
-                blob(appearance), blob(head), blob(beard), blob(skin),
+                blob(appearance), blob(head), blob(beard), blob(skin), int(bool(contested)),
             ),
         )
         return int(cur.lastrowid)

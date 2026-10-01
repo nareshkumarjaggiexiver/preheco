@@ -2659,6 +2659,13 @@ class RunLoop:
             # frame height, so the match service can fit stature across the
             # whole run.  None without a box or a height — absent is not zero.
             body_box = self._body_box(pbox, frame_h)
+            if body_box is not None and face_desc is not None:
+                # Another person's box inside this read's band: the colours
+                # may be theirs (appearance.band_contested says the measurement).
+                contested = appearance.band_contested(face["box"], pbox, boxes)
+                body_box["contested"] = contested
+                if contested:
+                    self._bump("torsoReadsContested")
             extras.append({
                 "attributes": attr, "featNorm": norm, "body": body_box,
                 "head": head, "beard": beard, "skin": skin,

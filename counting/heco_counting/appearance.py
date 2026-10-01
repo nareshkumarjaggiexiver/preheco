@@ -480,6 +480,64 @@ def _l1(part: np.ndarray) -> np.ndarray | None:
     return None if total <= 0.0 else part / total
 
 
+#: A neighbour's box covering at least this share of the torso band makes the
+#: read CONTESTED: its colours may be the neighbour's.  5%: a sleeve at the
+#: band's edge is noise the quarter-weighted skin already absorbs; a shoulder
+#: or a back across the band is not.
+CONTESTED_MIN_SHARE = 0.05
+
+
+def torso_band(face_box: dict, person_box: dict) -> tuple[float, float, float, float] | None:
+    """The torso band's frame rectangle (x0, y0, x1, y1), or None when empty.
+
+    The crop rule of :func:`torso_descriptor`, stated once so a caller can
+    ask what the read would look at before (or without) reading it.
+    """
+    try:
+        fx, fy, fw, fh = (float(face_box[k]) for k in ("x", "y", "w", "h"))
+        px, py, pw, ph = (float(person_box[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    y0 = fy + fh + 0.5 * fh
+    y1 = min(fy + fh + 3.0 * fh, py + ph)
+    x0 = max(px + 0.15 * pw, fx + fw / 2.0 - 1.5 * fw)
+    x1 = min(px + 0.85 * pw, fx + fw / 2.0 + 1.5 * fw)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def band_contested(face_box: dict, person_box: dict | None, boxes: list) -> bool:
+    """Does another person's box cover the torso band (CONTESTED_MIN_SHARE)?
+
+    THE MIXING THE OPERATOR SAW (D02, 2026-10-01): four review pairs whose
+    clothes "agreed" though the pictures showed different garments.  Measured
+    on that run, 36-100% of those guests' torso reads had another person's
+    box inside their band — the read is a rectangle, and a neighbour standing
+    in it is histogrammed as the guest's clothes.  A contested read is still
+    taken (it is honest evidence of what the band held) but flagged, so the
+    review can keep to the clean ones.  ``boxes`` is every person box in the
+    frame; ``person_box`` is the guest's own and is skipped by identity.
+    """
+    band = None if person_box is None else torso_band(face_box, person_box)
+    if band is None:
+        return False
+    x0, y0, x1, y1 = band
+    area = (x1 - x0) * (y1 - y0)
+    for b in boxes or ():
+        if b is person_box:
+            continue
+        try:
+            bx, by, bw, bh = (float(b[k]) for k in ("x", "y", "w", "h"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        ix = max(0.0, min(x1, bx + bw) - max(x0, bx))
+        iy = max(0.0, min(y1, by + bh) - max(y0, by))
+        if ix * iy / area >= CONTESTED_MIN_SHARE:
+            return True
+    return False
+
+
 def torso_descriptor(
     image_bgr: np.ndarray,
     face_box: dict,

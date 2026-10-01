@@ -314,3 +314,28 @@ def test_intersection_is_bounded_and_symmetric():
     b = ap.torso_descriptor(striped(BLUE, RED), FACE, PERSON)
     assert 0.0 <= ap.intersection(a, b) <= 1.0
     assert ap.intersection(a, b) == pytest.approx(ap.intersection(b, a), abs=1e-12)
+
+
+def test_a_neighbours_box_across_the_torso_band_makes_the_read_contested():
+    """band_contested: the guest's own box never counts; a neighbour covering
+    5% or more of the band does; a sliver at the edge does not."""
+    from heco_counting.appearance import band_contested, torso_band
+
+    face = {"x": 100.0, "y": 50.0, "w": 40.0, "h": 50.0}
+    mine = {"x": 60.0, "y": 40.0, "w": 120.0, "h": 400.0}
+    band = torso_band(face, mine)
+    assert band is not None
+    x0, y0, x1, y1 = band
+    assert y0 == 50 + 50 + 25 and y1 == min(50 + 50 + 150, 440)
+    assert band_contested(face, mine, [mine]) is False, "my own box is not a neighbour"
+    # A neighbour standing half across the band.
+    beside = {"x": x1 - (x1 - x0) / 2, "y": y0, "w": 200.0, "h": 400.0}
+    assert band_contested(face, mine, [mine, beside]) is True
+    # A sliver at the band's edge: under 5% of its area.
+    sliver = {"x": x1 - 1.0, "y": y0, "w": 100.0, "h": 400.0}
+    assert band_contested(face, mine, [mine, sliver]) is False
+    # Far away: never.
+    far = {"x": 2000.0, "y": 0.0, "w": 100.0, "h": 400.0}
+    assert band_contested(face, mine, [mine, far]) is False
+    # No person box: nothing to be contested.
+    assert band_contested(face, None, [beside]) is False

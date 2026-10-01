@@ -111,7 +111,7 @@ def _env_s(name: str, default: float) -> float:
 #: minFaceCosine and folds as before.
 #: 0.19.1 (2026-09-29): /review/duplicates replies with ``policy`` — the bars
 #: that queue was made under.  Additive.
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 
 #: Default age after which an unreferenced gallery file is sweepable (24 h).
 #: Long enough that a same-day re-run of a crashed event still has its data,
@@ -223,6 +223,10 @@ class FaceAttributes(BaseModel):
 class PersonBox(BaseModel):
     """The sighting's containing PERSON box, in raw detector pixels.
 
+    ``contested`` (0.21.0): another person's box covered the torso band this
+    read came from, so its clothing may be the neighbour's.  The review
+    keeps to uncontested reads where it has them.
+
     ``h``/``w`` the box size, ``yBottom`` the y of its bottom edge, ``frameH``
     the frame height it was measured in — enough to tell a standing body
     from a seated one and to place it on the camera's perspective line.  The
@@ -230,6 +234,7 @@ class PersonBox(BaseModel):
     on every guest call, not only when a template is written.
     """
 
+    contested: bool = False
     h: float = Field(gt=0.0)
     w: float = Field(gt=0.0)
     yBottom: float
