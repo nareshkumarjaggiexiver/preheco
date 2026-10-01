@@ -67,7 +67,8 @@ zip), so it is placed by hand: unzip `buffalo_l.zip` and copy
 [faceage-onnx](https://huggingface.co/imbcmdth/faceage-onnx) (Apache-2.0;
 "Built with DINOv3", whose licence travels with it): a DINOv3 ViT-L/16
 backbone with a CORAL ordinal age head and a gender head, 612 MB, sha256
-`b2e804783e197066cd8cf65a7cbc39a0579ea87c34660abd8ca942df8672cf70`. The
+`b2e804783e197066cd8cf65a7cbc39a0579ea87c34660abd8ca942df8672cf70` (in
+`models.lock`: `make models` fetches and verifies it). The
 graph's two outputs (`age_logits[100]`, `gender_logits[2]`) are how the
 service tells it from genderage; the crop is a 224 px square at 1.2× the
 box's longer side (the card's 10 % padding), bicubic, ImageNet-normalised,

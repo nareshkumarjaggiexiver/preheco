@@ -9,6 +9,7 @@
 #   yolox_s.onnx                         Apache-2.0  (same release — the stronger arm; 640² input, MODEL_SPECS knows)
 #   face_detection_yunet_2023mar.onnx    MIT         (OpenCV zoo, YuNet; LICENSE in model dir)
 #   face_recognition_sface_2021dec.onnx  Apache-2.0  (OpenCV zoo, SFace author grant)
+#   faceage-dino-fp16.onnx               Apache-2.0  (imbcmdth/faceage-onnx; the DINOv3 backbone's own licence travels with it — "Built with DINOv3"; the customer buys what needs buying, doc 15 §3)
 #
 # OpenCV-zoo URLs are pinned to commit 47534e27c9851bb1128ccc0102f1145e27f23f98
 # (media.githubusercontent serves the Git-LFS binary, not the pointer file).
@@ -18,3 +19,4 @@ persons  yolox_nano.onnx  c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc600
 persons  yolox_s.onnx  c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063  https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx
 faces  face_detection_yunet_2023mar.onnx  8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  https://media.githubusercontent.com/media/opencv/opencv_zoo/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
 embed  face_recognition_sface_2021dec.onnx  0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79  https://media.githubusercontent.com/media/opencv/opencv_zoo/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+embed  faceage-dino-fp16.onnx  b2e804783e197066cd8cf65a7cbc39a0579ea87c34660abd8ca942df8672cf70  https://huggingface.co/imbcmdth/faceage-onnx/resolve/main/faceage-dino-fp16.onnx

@@ -137,6 +137,19 @@ export HECO_REVIEW_HEADWEAR=${HECO_REVIEW_HEADWEAR:-1}
 # bare head (caps come off). One run's evidence, so it lives here, not in the
 # service default: HECO_REVIEW_HEADWEAR_CAP_P=0 turns the cap call off.
 export HECO_REVIEW_HEADWEAR_CAP_P=${HECO_REVIEW_HEADWEAR_CAP_P:-0.5}
+# THE AGE AND SEX READER, faceage-dino (embed, 2026-10-01). genderage's ages
+# wandered 10 years on one guest and read a toddler as 39; faceage-dino
+# (DINOv3 ViT-L/16, CORAL age head) holds within 3.6 years and its sex
+# confidence lets the gender AND turban rules fire. Sharon: 7 questions for
+# 10 under the same rules; D02: 25 for 30, every extra set-aside checked on
+# the face cards. models/faceage-dino-fp16.onnx is in models.lock (make
+# models); its TensorRT engine is built with fp32 compute at the first
+# /health (~11 s). The age-gap rule BELONGS TO THIS MODEL: 15 years between
+# two medians had 0 misfires in 36 guests under faceage and would misfire
+# under genderage, so EMBED_ATTR_MODEL=models/genderage.onnx must come with
+# HECO_REVIEW_AGE_GAP=0.
+export EMBED_ATTR_MODEL=${EMBED_ATTR_MODEL-models/faceage-dino-fp16.onnx}
+export HECO_REVIEW_AGE_GAP=${HECO_REVIEW_AGE_GAP:-15}
 export PLANNER_URL=${PLANNER_URL:-http://192.168.1.55:8787}
 # The review's light guard OFF (match default 0.07). It holds back a colour
 # set-aside when two identities' face skin says they were read under
@@ -226,7 +239,7 @@ show() {
 knobs() {
   local name=$1; shift
   show "$name" match HECO_REVIEW_FLOOR HECO_REVIEW_GENDER_MIN_P HECO_REVIEW_AGE_CHILD_MAX \
-       HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
+       HECO_REVIEW_AGE_ADULT_MIN HECO_REVIEW_AGE_GAP HECO_REVIEW_STATURE_GAP HECO_REVIEW_STATURE_MIN_N \
        HECO_STATURE_ADULT_M HECO_REVIEW_CLOTHES_CLASH HECO_REVIEW_CLOTHES_MIN_N \
        HECO_REVIEW_CLOTHES_SELF_MIN HECO_REVIEW_CLOTHES_WELL_SEEN_N \
        HECO_REVIEW_CLOTHES_WELL_SEEN_CLASH HECO_REVIEW_HEAD_CLASH HECO_REVIEW_BEARD_MIN_N \
@@ -242,7 +255,7 @@ knobs() {
        INGEST_MOTION_KEEPALIVE_S INGEST_BUFFER_S INGEST_BUFFER_MB INGEST_DECODER \
        INGEST_CV_THREADS INGEST_LIVE_TIMEOUT_S -- "$@"
   show "$name" faces HECO_DEVICE FACES_MODEL FACES_SCRFD_INPUT HECO_TRT_CACHE -- "$@"
-  show "$name" embed HECO_DEVICE EMBED_BATCH HECO_TRT_CACHE EMBED_HEADWEAR_MODEL -- "$@"
+  show "$name" embed HECO_DEVICE EMBED_BATCH HECO_TRT_CACHE EMBED_ATTR_MODEL EMBED_HEADWEAR_MODEL -- "$@"
 }
 
 status() {
@@ -305,7 +318,7 @@ PY
   knobs A "${A[@]}"
   knobs B -p heco-pipeline-b "${B[@]}"
   echo '    defaults: REVIEW_FLOOR 0.15 in the service (0.28 from this script) · GENDER_MIN_P 0.8 ·'
-  echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
+  echo '    AGE_CHILD_MAX 12 / AGE_ADULT_MIN 20 · AGE_GAP 0 in the service, 15 here (faceage) · STATURE_GAP 0.2 · STATURE_MIN_N 8 · STATURE_ADULT_M 1.75 ·'
   echo '    CLOTHES_CLASH 0.35 · CLOTHES_MIN_N 3 · CLOTHES_SELF_MIN 0.6 · CLOTHES_WELL_SEEN_N 8 / _CLASH 0.55 (both'
   echo '    sides with 8+ reads are held to 0.55) · HEAD_CLASH 0.45 · BEARD_MIN_N 3 · BEARD_PALE 0 ·'
   echo '    LIGHT_TOL 0.07 in the service (0 from this script: fixed chandelier light — the guard is off) ·'
